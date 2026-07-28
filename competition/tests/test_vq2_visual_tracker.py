@@ -1173,7 +1173,7 @@ def test_adjacent_handoff_invalidates_noncontiguous_successor_observations(
     assert not snapshot.next_candidates[0].promotable
 
 
-def test_adjacent_handoff_expires_when_predecessor_track_lease_retires() -> None:
+def test_authoritative_current_identity_outlives_local_tracker_age_lease() -> None:
     tracker, graph, _, _ = _bound_aperture_filling_current()
     for offset in range(13):
         update = tracker.update(
@@ -1196,7 +1196,13 @@ def test_adjacent_handoff_expires_when_predecessor_track_lease_retires() -> None
             assert snapshot.next_candidates[0].promotable
 
     assert snapshot.current_track is not None
-    assert snapshot.current_track.role is VisualTrackRole.RETIRED
+    assert snapshot.current_track.role is VisualTrackRole.CURRENT
+    assert snapshot.current_track.authoritative_gate_index == 0
+    assert snapshot.current_track.missed_frame_count == 13
+    assert snapshot.current_track.track_id in update.missed_track_ids
+    assert snapshot.current_track.track_id not in update.retired_track_ids
+    assert snapshot.authority_usable is False
+    assert snapshot.withholding_reason == "current_track_not_visible"
     assert len(snapshot.next_candidates) == 1
     assert not snapshot.next_candidates[0].promotable
     with pytest.raises(
@@ -1213,6 +1219,35 @@ def test_adjacent_handoff_expires_when_predecessor_track_lease_retires() -> None
             ),
             camera_token_at_credit=update.token,
         )
+
+
+@pytest.mark.parametrize(
+    "role",
+    (
+        pytest.param(None, id="unknown"),
+        pytest.param(VisualTrackRole.NEXT, id="next"),
+        pytest.param(VisualTrackRole.CURRENT, id="non-authoritative-current"),
+    ),
+)
+def test_non_authoritative_tracks_still_retire_after_local_age_lease(
+    role: VisualTrackRole | None,
+) -> None:
+    tracker = MultiTargetVisualTracker()
+    update = tracker.update(
+        _frame(1, (_detection(0, 0.0, 0.0, 0.20, 0.22),))
+    )
+    track_id = update.visible_track_ids[0]
+    if role is not None:
+        tracker.assign_role(track_id, role)
+
+    for sequence in range(2, 15):
+        update = tracker.update(_frame(sequence, ()))
+
+    track = tracker.track(track_id)
+    assert track.role is VisualTrackRole.RETIRED
+    assert track.authoritative_gate_index is None
+    assert update.retired_track_ids == (track_id,)
+    assert track_id not in update.missed_track_ids
 
 
 def test_adjacent_handoff_rejects_stale_race_credit_after_camera_freezes() -> None:

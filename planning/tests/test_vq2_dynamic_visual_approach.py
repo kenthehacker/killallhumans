@@ -2049,7 +2049,7 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
     bearing_deadline_ns = None
     last_measurement_ns = None
     previous_remaining_horizon_s = None
-    for sequence in range(8, 18):
+    for sequence in range(8, 21):
         if sequence != 8:
             update = tracker.update(
                 replace(
@@ -2137,7 +2137,11 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
 
     authority = authorities[-1]
     now_ns = update.observation_monotonic_ns + 5_000_000
-    assert authority["missed_frame_count"] == 10
+    assert authority["missed_frame_count"] == 13
+    retained_current = tracker.track(current_id)
+    assert retained_current.role is VisualTrackRole.CURRENT
+    assert retained_current.authoritative_gate_index == 0
+    assert snapshot.withholding_reason == "current_track_not_visible"
     assert authority["basis"] == (
         "propagated-current-visibility-gap-guidance-v2"
     )

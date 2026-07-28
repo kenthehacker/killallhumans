@@ -1124,11 +1124,26 @@ class MultiTargetVisualTracker:
                 if track_index in ambiguous_track_indexes:
                     state.ambiguous = True
                     state.unambiguous_streak = 0
-                if state.missed_frame_count > self.config.max_missed_frames:
+                retains_authoritative_current_identity = bool(
+                    state.nominal_role is VisualTrackRole.CURRENT
+                    and state.authoritative_gate_index is not None
+                    and state.authority_race_status_boot_ms is not None
+                )
+                if (
+                    state.missed_frame_count > self.config.max_missed_frames
+                    and not retains_authoritative_current_identity
+                ):
                     state.retired = True
                     state.nominal_role = VisualTrackRole.RETIRED
                     retired_ids.append(state.track_id)
                 else:
+                    # Camera-age retirement may discard an ordinary local
+                    # association, but it cannot revoke race-authoritative
+                    # current-gate identity.  The rolling gate graph owns that
+                    # semantic lifecycle and explicitly retires the crossed
+                    # track on credit.  While it remains invisible, graph
+                    # measurement authority stays withheld; a separately
+                    # proof-bound controller lease may still expire normally.
                     missed_ids.append(state.track_id)
                 continue
 
