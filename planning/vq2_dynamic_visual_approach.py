@@ -1156,13 +1156,12 @@ class DynamicVisualCourseSession:
 
         targets = self._successor_steering_targets(prediction)
         unconstrained_target_roll = float(targets["target_roll_rad"])
-        # Authoritative post-credit navigation is point-then-advance: yaw owns
-        # horizontal pointing and roll remains level.  Retaining a pre-credit
-        # bank translates the vehicle sideways while yaw is already turning
-        # toward the gate.
+        # After credit, fresh successor geometry may bend the trajectory as
+        # well as point the camera.  Never retain the old pre-credit bank:
+        # this proportional request is recomputed from the promoted gate.
         self._pending_post_credit_roll_reference = None
         self._post_credit_roll_reference_handoff = None
-        target_roll = 0.0
+        target_roll = unconstrained_target_roll
         target_pitch = float(targets["target_pitch_rad"])
         yaw_rate = float(targets["yaw_rate_rad_s"])
         camera_elevation = float(
@@ -1287,19 +1286,9 @@ class DynamicVisualCourseSession:
                 ),
             }
         )
-        self._pending_post_credit_roll_reference = (
-            None
-            if abs(target_roll) <= 1e-12
-            else _PendingPostCreditRollReference(
-                to_gate_index=lease.to_gate_index,
-                track_id=lease.reviewed_track_id,
-                stream_generation=lease.stream_generation,
-                promotion_count=lease.promotion_count,
-                target_roll_rad=target_roll,
-                authority_monotonic_ns=now_monotonic_ns,
-                expires_monotonic_ns=lease.expires_monotonic_ns,
-            )
-        )
+        # Fresh promoted-gate roll is recomputed every frame.  It must never
+        # become a retained handoff reference.
+        self._pending_post_credit_roll_reference = None
         return evidence
 
     def _retain_fresh_reacquisition_roll_reference(
@@ -1774,33 +1763,6 @@ class DynamicVisualCourseSession:
             MAX_TARGET_ROLL_RAD,
             max(-MAX_TARGET_ROLL_RAD, target_roll),
         )
-        successor_outward = bool(
-            abs(self.core.config.roll_guidance_sign) > 1e-12
-            and abs(target_roll) > 1e-12
-            and prediction.bearing_std_rad[0]
-            <= (
-                self.core.config
-                .successor_prediction_max_extrapolation_rad
-            )
-            + 1e-12
-            and abs(prediction.stable_bearing_rad[0])
-            >= self.core.config.off_axis_brake_rad
-            and prediction.stable_bearing_rad[0]
-            * prediction.stable_bearing_rate_rad_s[0]
-            > 0.0
-            and target_roll
-            * self.core.config.roll_guidance_sign
-            * prediction.stable_bearing_rad[0]
-            > 0.0
-        )
-        if successor_outward:
-            # Preserve the useful graph-vetted pre-turn through authoritative
-            # promotion.  This bounded steering lease expires independently;
-            # the promoted current-gate law has no full-bank escalation.
-            target_roll = math.copysign(
-                MAX_TARGET_ROLL_RAD,
-                target_roll,
-            )
         (
             target_pitch,
             camera_elevation,
@@ -2016,20 +1978,6 @@ class DynamicVisualCourseSession:
         decision = self._apply_post_credit_roll_reference_handoff(
             decision
         )
-        if decision.current_gate_index > 0:
-            self._pending_post_credit_roll_reference = None
-            self._post_credit_roll_reference_handoff = None
-            decision = replace(
-                decision,
-                proposed_command=replace(
-                    decision.proposed_command,
-                    target_roll_rad=0.0,
-                ),
-                command=replace(
-                    decision.command,
-                    target_roll_rad=0.0,
-                ),
-            )
         self._last_decision = decision
         return decision
 

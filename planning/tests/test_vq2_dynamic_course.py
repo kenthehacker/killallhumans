@@ -2957,9 +2957,14 @@ def test_committed_off_axis_successor_preturns_with_yaw_not_bank(
     )
 
 
-def test_later_gate_points_with_yaw_while_commanding_level_roll() -> None:
+def test_later_gate_bends_with_fresh_roll_and_points_with_yaw() -> None:
     core = DynamicCourseCore(
-        DynamicCourseConfig(camera_delay_s=0.0)
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            roll_guidance_sign=-1.0,
+            roll_gain=0.18,
+            lateral_rate_gain=0.045,
+        )
     )
     core.record_applied_command(_command(0.90))
     decision = None
@@ -2990,7 +2995,7 @@ def test_later_gate_points_with_yaw_while_commanding_level_roll() -> None:
     assert decision is not None
     assert decision.current_gate_index == 1
     assert decision.current_center_norm[0] > 0.0
-    assert decision.command.target_roll_rad == pytest.approx(0.0)
+    assert -MAX_TARGET_ROLL_RAD <= decision.command.target_roll_rad < 0.0
     assert decision.command.yaw_rate_rad_s < 0.0
 
 

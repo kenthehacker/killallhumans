@@ -6642,7 +6642,7 @@ def _fresh_search_track(
     (
         (FrameEdge.TOP, -0.186, -0.186, 0.32),
         (FrameEdge.TOP | FrameEdge.RIGHT, -0.135, -0.135, 0.32),
-        (FrameEdge.TOP, None, 0.12, 0.275),
+        (FrameEdge.TOP, None, 0.12, 0.32),
         (FrameEdge.RIGHT, -0.186, 0.12, 0.275),
     ),
 )

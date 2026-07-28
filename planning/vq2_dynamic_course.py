@@ -3497,11 +3497,6 @@ class DynamicCourseCore:
                             committed_successor_target_pitch
                         ),
                     )
-        if state.current_gate_index > 0:
-            # Later gates use a point-then-advance strategy.  Yaw owns
-            # horizontal pointing; level roll prevents lateral translation
-            # from fighting that heading turn.
-            proposal = replace(proposal, target_roll_rad=0.0)
         return GuidanceDecision(
             monotonic_ns=monotonic_ns,
             current_gate_index=state.current_gate_index,

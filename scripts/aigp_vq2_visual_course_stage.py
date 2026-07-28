@@ -4527,8 +4527,10 @@ def _approach_expired_geometry_search_vertical_reference(
             if last_protected_target_pitch_rad is None
             else float(last_protected_target_pitch_rad)
         )
-        if math.isfinite(protected) and protected < brake_pitch:
-            return protected, support_collective
+        return (
+            protected if math.isfinite(protected) else brake_pitch,
+            support_collective,
+        )
     return brake_pitch, brake_collective
 
 
@@ -12132,10 +12134,19 @@ async def _run_visual_course_stage_impl(
                                 search_thrust,
                             ) = (
                                 _approach_expired_geometry_search_vertical_reference(
-                                    current_clipping=getattr(
-                                        snapshot.current_track,
-                                        "clipping",
-                                        FrameEdge.NONE,
+                                    current_clipping=(
+                                        getattr(
+                                            snapshot.current_track,
+                                            "clipping",
+                                            FrameEdge.NONE,
+                                        )
+                                        | (
+                                            FrameEdge.TOP
+                                            if segment[
+                                                "top_fov_pitch_protection"
+                                            ].get("active")
+                                            else FrameEdge.NONE
+                                        )
                                     ),
                                     last_protected_target_pitch_rad=segment[
                                         "top_fov_pitch_protection"
