@@ -4692,6 +4692,69 @@ def test_nonrapid_post_credit_top_recovery_keeps_fov_pitch_ownership(
     assert recovery.advance_authority is False
 
 
+def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
+    boundary, _exact_proposal, recovery = (
+        _latest_gate_one_top_pitch_arbitration_case()
+    )
+    authority = _propagated_top_fov_authority()
+    _observation, propagated_proposal = (
+        course_stage._propose_propagated_top_fov_pitch_reference(
+            authority,
+            requested_target_pitch_rad=0.12,
+            prior_target_pitch_rad=-0.25428633724968985,
+        )
+    )
+    recovery = replace(
+        recovery,
+        requested_target_pitch_rad=(
+            propagated_proposal.requested_target_pitch_rad
+        ),
+        fov_protected_target_pitch_rad=(
+            propagated_proposal.protected_target_pitch_rad
+        ),
+        allocated_target_pitch_rad=0.12,
+        expansion_rate_s=0.519210830297362,
+        time_to_contact_s=1.9259998860718694,
+    )
+
+    assert (
+        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
+            mode=VisualApproachMode.PROMOTE_REACQUIRE,
+            fov_proposal=propagated_proposal,
+            fresh_top_boundary=boundary,
+            closure_recovery=recovery,
+            rapid_expansion_rate_s=0.45,
+            rapid_closure_ttc_s=2.2,
+            propagated_state_handoff=authority,
+        )
+        is True
+    )
+    assert propagated_proposal.limited is True
+    assert (
+        propagated_proposal.protected_target_pitch_rad
+        < recovery.allocated_target_pitch_rad
+    )
+    assert recovery.passage_authority is False
+    assert recovery.advance_authority is False
+    ordinary_nonrapid = replace(
+        recovery,
+        expansion_rate_s=0.10,
+        time_to_contact_s=3.0,
+    )
+    assert (
+        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
+            mode=VisualApproachMode.APPROACH,
+            fov_proposal=propagated_proposal,
+            fresh_top_boundary=boundary,
+            closure_recovery=ordinary_nonrapid,
+            rapid_expansion_rate_s=0.45,
+            rapid_closure_ttc_s=2.2,
+            propagated_state_handoff=authority,
+        )
+        is False
+    )
+
+
 @pytest.mark.parametrize(
     ("recovery_change",),
     (

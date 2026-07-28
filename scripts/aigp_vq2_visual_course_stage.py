@@ -1801,6 +1801,7 @@ def _nonrapid_off_axis_top_fov_owns_pitch(
     rapid_expansion_rate_s: float,
     rapid_closure_ttc_s: float,
     retained_raw_handoff: Optional[Mapping[str, Any]] = None,
+    propagated_state_handoff: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Arbitrate one fresh TOP frame without reviving urgent closure.
 
@@ -1809,13 +1810,13 @@ def _nonrapid_off_axis_top_fov_owns_pitch(
     nonrapid approach, replacing the exact FOV-safe pitch reverses camera
     observability before the horizontal intercept can take effect.
 
-    Post-credit recovery may also consume the already-existing fixed,
-    nonrenewing retained-raw FOV lease.  That mode is itself bounded and
-    needs a second clean accepted wire before release.  It has no passage or
-    advance authority, so its exact FOV-safe pitch remains authoritative even
-    when the censored closure classifier reports aligned or rapid closure;
-    collective retains the positive closure brake.  Successor-propagated and
-    geometry-refusal paths never call this policy.
+    Post-credit recovery may also consume the already-existing bounded
+    propagated-state or fixed, nonrenewing retained-raw FOV lease.  That mode
+    is itself bounded and needs a second clean accepted wire before release.
+    It has no passage or advance authority, so its FOV-safe pitch remains
+    authoritative even when the censored closure classifier reports aligned
+    or rapid closure; collective retains the positive closure brake.
+    Geometry-refusal paths never call this policy.
     """
 
     rapid_expansion, rapid_ttc = map(
@@ -1823,11 +1824,14 @@ def _nonrapid_off_axis_top_fov_owns_pitch(
         (rapid_expansion_rate_s, rapid_closure_ttc_s),
     )
     retained = retained_raw_handoff is not None
+    propagated = propagated_state_handoff is not None
     if (
         type(mode) is not VisualApproachMode
         or type(fov_proposal) is not _TopFovPitchProposal
         or type(fresh_top_boundary) is not _FreshCurrentTopBoundaryAuthority
         or type(closure_recovery) is not _FreshTopCensoredClosureRecovery
+        or retained
+        and propagated
         or retained
         and (
             not isinstance(retained_raw_handoff, Mapping)
@@ -1856,6 +1860,34 @@ def _nonrapid_off_axis_top_fov_owns_pitch(
             )
             <= 0.0
         )
+        or propagated
+        and (
+            not isinstance(propagated_state_handoff, Mapping)
+            or propagated_state_handoff.get("basis")
+            != "propagated-current-fov-gap-steering-v1"
+            or propagated_state_handoff.get("steering_only") is not True
+            or propagated_state_handoff.get("passage_authority") is not False
+            or propagated_state_handoff.get("advance_authority") is not False
+            or type(
+                propagated_state_handoff.get(
+                    "aperture_prediction_horizon_remaining_s"
+                )
+            )
+            not in {int, float}
+            or not math.isfinite(
+                float(
+                    propagated_state_handoff[
+                        "aperture_prediction_horizon_remaining_s"
+                    ]
+                )
+            )
+            or float(
+                propagated_state_handoff[
+                    "aperture_prediction_horizon_remaining_s"
+                ]
+            )
+            <= 0.0
+        )
         or not all(
             math.isfinite(value)
             for value in (rapid_expansion, rapid_ttc)
@@ -1869,6 +1901,7 @@ def _nonrapid_off_axis_top_fov_owns_pitch(
     normal_exact_approach = bool(
         mode is VisualApproachMode.APPROACH
         and not retained
+        and not propagated
         and ttc is not None
     )
     bounded_post_credit_recovery = bool(
@@ -8332,13 +8365,20 @@ async def _run_visual_course_stage_impl(
                 if top_censored_closure_recovery is not None:
                     pitch_priority_proposal = (
                         top_fov_proposal
-                        if top_fov_proposal is not None
-                        else top_fov_retained_raw_proposal
+                        or top_fov_propagated_proposal
+                        or top_fov_retained_raw_proposal
+                    )
+                    pitch_priority_propagated_handoff = (
+                        top_fov_propagated_handoff
+                        if top_fov_proposal is None
+                        and top_fov_propagated_proposal is not None
+                        else None
                     )
                     pitch_priority_retained_handoff = (
-                        None
-                        if top_fov_proposal is not None
-                        else top_fov_retained_raw_handoff
+                        top_fov_retained_raw_handoff
+                        if top_fov_proposal is None
+                        and top_fov_propagated_proposal is None
+                        else None
                     )
                     fov_owns_pitch = (
                         pitch_priority_proposal is not None
@@ -8358,6 +8398,9 @@ async def _run_visual_course_stage_impl(
                             retained_raw_handoff=(
                                 pitch_priority_retained_handoff
                             ),
+                            propagated_state_handoff=(
+                                pitch_priority_propagated_handoff
+                            ),
                         )
                     )
                     if fov_owns_pitch:
@@ -8369,8 +8412,15 @@ async def _run_visual_course_stage_impl(
                             "lifecycle_mode": proposal.mode.value,
                             "fov_authority_kind": (
                                 "exact_same_publication"
-                                if pitch_priority_retained_handoff is None
-                                else "fixed_retained_raw_lease"
+                                if top_fov_proposal is not None
+                                else (
+                                    "bounded_propagated_state_lease"
+                                    if (
+                                        pitch_priority_propagated_handoff
+                                        is not None
+                                    )
+                                    else "fixed_retained_raw_lease"
+                                )
                             ),
                             "closure_recovery": asdict(
                                 top_censored_closure_recovery
@@ -8390,6 +8440,16 @@ async def _run_visual_course_stage_impl(
                                 if pitch_priority_retained_handoff is None
                                 else dict(
                                     pitch_priority_retained_handoff
+                                    )
+                            ),
+                            "propagated_state_handoff": (
+                                None
+                                if (
+                                    pitch_priority_propagated_handoff
+                                    is None
+                                )
+                                else dict(
+                                    pitch_priority_propagated_handoff
                                 )
                             ),
                             "steering_only": True,
