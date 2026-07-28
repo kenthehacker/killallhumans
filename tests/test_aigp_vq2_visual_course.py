@@ -3641,6 +3641,134 @@ def test_fresh_post_credit_top_boundary_gates_closure_without_aperture():
     assert successor_authority["thrust"] == pytest.approx(0.275)
 
 
+def _retained_post_credit_top_recovery_case():
+    source_token = _token(50)
+    current_token = _token(56)
+    track = SimpleNamespace(
+        track_id="track-1",
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=1,
+        latest_token=source_token,
+        visible=False,
+        ambiguous=False,
+        missed_frame_count=6,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+    )
+    snapshot = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="track-1",
+        latest_camera_token=current_token,
+        current_track=track,
+        authority_usable=False,
+        withholding_reason="current_track_not_visible",
+        race_finished=False,
+    )
+    authority = {
+        "reviewed_track_id": "track-1",
+        "to_gate_index": 1,
+        "stream_generation": source_token.generation,
+        "expires_monotonic_ns": 2_000_000_000,
+        "target_pitch_rad": -0.25,
+        "thrust": 0.29,
+        "steering_available": True,
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+    fov_summary = {
+        "last_exact_top_closure_recovery": {
+            "basis": (
+                course_stage
+                .RETAINED_FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS
+            ),
+            "source_basis": (
+                course_stage.FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS
+            ),
+            "gate_index": 1,
+            "track_id": "track-1",
+            "camera_token": asdict(source_token),
+            "source_wire_start_monotonic_ns": 1_000_000_000,
+            "expires_monotonic_ns": 2_000_000_000,
+            "target_pitch_floor_rad": 0.12,
+            "thrust_floor": 0.32,
+            "steering_only": True,
+            "passage_authority": False,
+            "advance_authority": False,
+        }
+    }
+    return authority, fov_summary, snapshot
+
+
+def test_exact_top_recovery_floor_survives_bounded_retained_current_loss():
+    authority, fov_summary, snapshot = (
+        _retained_post_credit_top_recovery_case()
+    )
+
+    retained = (
+        course_stage._retain_fresh_top_censored_closure_recovery(
+            authority=authority,
+            fov_summary=fov_summary,
+            recovery_snapshot=snapshot,
+            current_gate_index=1,
+            now_monotonic_ns=1_500_000_000,
+            requested_target_pitch_rad=authority["target_pitch_rad"],
+            requested_thrust=authority["thrust"],
+        )
+    )
+
+    assert retained is not None
+    assert retained.basis == (
+        course_stage.RETAINED_FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS
+    )
+    assert retained.source_camera_token == _token(50)
+    assert retained.current_camera_token == _token(56)
+    assert retained.missed_frame_count == 6
+    assert retained.requested_target_pitch_rad == pytest.approx(-0.25)
+    assert retained.retained_target_pitch_floor_rad == pytest.approx(0.12)
+    assert retained.allocated_target_pitch_rad == pytest.approx(0.12)
+    assert retained.allocated_thrust == pytest.approx(0.32)
+    assert retained.forward_closure_authorized is False
+    assert retained.steering_only is True
+    assert retained.passage_authority is False
+    assert retained.advance_authority is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("visible", "ambiguous", "new_association", "expired"),
+)
+def test_retained_top_recovery_does_not_cross_loss_or_lease_boundary(
+    mutation,
+):
+    authority, fov_summary, snapshot = (
+        _retained_post_credit_top_recovery_case()
+    )
+    now_ns = 1_500_000_000
+    if mutation == "visible":
+        snapshot.current_track.visible = True
+        snapshot.current_track.missed_frame_count = 0
+    elif mutation == "ambiguous":
+        snapshot.current_track.ambiguous = True
+    elif mutation == "new_association":
+        snapshot.current_track.latest_token = snapshot.latest_camera_token
+    else:
+        now_ns = authority["expires_monotonic_ns"]
+
+    assert (
+        course_stage._retain_fresh_top_censored_closure_recovery(
+            authority=authority,
+            fov_summary=fov_summary,
+            recovery_snapshot=snapshot,
+            current_gate_index=1,
+            now_monotonic_ns=now_ns,
+            requested_target_pitch_rad=authority["target_pitch_rad"],
+            requested_thrust=authority["thrust"],
+        )
+        is None
+    )
+
+
 def test_fresh_post_credit_boundary_cannot_override_bad_current_lineage():
     state, decision, source, snapshot = (
         _fresh_post_credit_top_boundary_case()

@@ -158,6 +158,9 @@ APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS = (
 FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "fresh-top-boundary-imu-closure-recovery-v1"
 )
+RETAINED_FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
+    "retained-fresh-top-boundary-closure-recovery-v1"
+)
 FRESH_HORIZONTAL_DIRECT_TOP_FOV_BASIS = (
     "fresh-horizontal-edge-direct-top-fov-steering-v1"
 )
@@ -565,6 +568,32 @@ class _FreshTopCensoredClosureRecovery:
     requested_thrust: float
     allocated_thrust: float
     fresh_boundary_current_authority: bool
+    forward_closure_authorized: bool
+    steering_only: bool
+    passage_authority: bool
+    advance_authority: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedFreshTopCensoredClosureRecovery:
+    """Accepted exact-TOP allocation bridged across one retained-track loss."""
+
+    basis: str
+    source_basis: str
+    gate_index: int
+    track_id: str
+    source_camera_token: CameraFrameToken
+    current_camera_token: CameraFrameToken
+    source_wire_start_monotonic_ns: int
+    expires_monotonic_ns: int
+    missed_frame_count: int
+    requested_target_pitch_rad: float
+    retained_target_pitch_floor_rad: float
+    allocated_target_pitch_rad: float
+    requested_thrust: float
+    retained_thrust_floor: float
+    allocated_thrust: float
+    retained_through_missing_frame: bool
     forward_closure_authorized: bool
     steering_only: bool
     passage_authority: bool
@@ -1882,6 +1911,152 @@ def _retain_post_credit_top_fov_pitch_reference(
         "passage_authority": False,
         "advance_authority": False,
     }
+
+
+def _retain_fresh_top_censored_closure_recovery(
+    *,
+    authority: Mapping[str, Any],
+    fov_summary: Mapping[str, Any],
+    recovery_snapshot: Any,
+    current_gate_index: int,
+    now_monotonic_ns: int,
+    requested_target_pitch_rad: float,
+    requested_thrust: float,
+) -> Optional[_RetainedFreshTopCensoredClosureRecovery]:
+    """Keep an accepted exact-TOP brake through its retained-current gap.
+
+    The fresh boundary itself is not extrapolated.  This only retains the
+    already accepted non-forward pitch/collective allocation while the exact
+    authoritative current identity is invisible, its last track publication
+    remains the source boundary, and the existing post-credit steering lease
+    remains live.  A new association, ambiguity, identity change, or lease
+    expiry removes this authority.
+    """
+
+    if not isinstance(authority, Mapping) or not isinstance(
+        fov_summary,
+        Mapping,
+    ):
+        raise ValueError("retained fresh TOP recovery inputs are invalid")
+    source = fov_summary.get("last_exact_top_closure_recovery")
+    if source is None:
+        return None
+    if not isinstance(source, Mapping):
+        raise ValueError("retained fresh TOP recovery source is invalid")
+
+    source_token_fields = source.get("camera_token")
+    if not isinstance(source_token_fields, Mapping):
+        raise ValueError("retained fresh TOP recovery token is invalid")
+    try:
+        source_token = CameraFrameToken(**dict(source_token_fields))
+        current_token = recovery_snapshot.latest_camera_token
+        track = recovery_snapshot.current_track
+        source_wire_ns = int(source["source_wire_start_monotonic_ns"])
+        expires_ns = int(source["expires_monotonic_ns"])
+        pitch_floor = float(source["target_pitch_floor_rad"])
+        thrust_floor = float(source["thrust_floor"])
+        requested_pitch = float(requested_target_pitch_rad)
+        thrust = float(requested_thrust)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "retained fresh TOP recovery source is malformed"
+        ) from exc
+
+    authority_expires_ns = authority.get("expires_monotonic_ns")
+    missed_count = getattr(track, "missed_frame_count", None)
+    retained_current_loss = bool(
+        getattr(recovery_snapshot, "authority_usable", None) is False
+        and getattr(recovery_snapshot, "withholding_reason", None)
+        == "current_track_not_visible"
+        and getattr(track, "latest_token", None) == source_token
+        and getattr(track, "visible", None) is False
+        and getattr(track, "ambiguous", None) is False
+        and type(missed_count) is int
+        and missed_count > 0
+    )
+    if now_monotonic_ns >= expires_ns or not retained_current_loss:
+        return None
+    if (
+        source.get("basis")
+        != RETAINED_FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS
+        or source.get("source_basis")
+        != FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS
+        or source.get("gate_index") != current_gate_index
+        or source.get("track_id") != authority.get("reviewed_track_id")
+        or source.get("steering_only") is not True
+        or source.get("passage_authority") is not False
+        or source.get("advance_authority") is not False
+        or type(current_gate_index) is not int
+        or current_gate_index < 0
+        or type(now_monotonic_ns) is not int
+        or now_monotonic_ns < 0
+        or source_wire_ns < 0
+        or expires_ns <= source_wire_ns
+        or type(authority_expires_ns) is not int
+        or authority_expires_ns != expires_ns
+        or authority.get("to_gate_index") != current_gate_index
+        or authority.get("stream_generation") != source_token.generation
+        or authority.get("steering_available") is not True
+        or authority.get("steering_only") is not True
+        or authority.get("passage_authority") is not False
+        or authority.get("advance_authority") is not False
+        or getattr(recovery_snapshot, "current_gate_index", None)
+        != current_gate_index
+        or getattr(recovery_snapshot, "current_track_id", None)
+        != source.get("track_id")
+        or getattr(recovery_snapshot, "race_finished", None) is not False
+        or type(current_token) is not CameraFrameToken
+        or not _token_strictly_newer(current_token, source_token)
+        or getattr(track, "track_id", None) != source.get("track_id")
+        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
+        or getattr(track, "authoritative_gate_index", None)
+        != current_gate_index
+        or getattr(track, "clipping", None) is not FrameEdge.TOP
+        or getattr(track, "center_censored", None) is not True
+        or not all(
+            math.isfinite(value)
+            for value in (
+                pitch_floor,
+                thrust_floor,
+                requested_pitch,
+                thrust,
+            )
+        )
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= pitch_floor
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= requested_pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not MIN_VISUAL_THRUST <= thrust_floor <= MAX_VISUAL_THRUST
+        or not MIN_VISUAL_THRUST <= thrust <= MAX_VISUAL_THRUST
+    ):
+        raise ValueError("retained fresh TOP recovery authority is invalid")
+
+    allocated_pitch = max(requested_pitch, pitch_floor)
+    allocated_thrust = max(thrust, thrust_floor)
+    return _RetainedFreshTopCensoredClosureRecovery(
+        basis=RETAINED_FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS,
+        source_basis=FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS,
+        gate_index=current_gate_index,
+        track_id=str(source["track_id"]),
+        source_camera_token=source_token,
+        current_camera_token=current_token,
+        source_wire_start_monotonic_ns=source_wire_ns,
+        expires_monotonic_ns=expires_ns,
+        missed_frame_count=missed_count,
+        requested_target_pitch_rad=requested_pitch,
+        retained_target_pitch_floor_rad=pitch_floor,
+        allocated_target_pitch_rad=allocated_pitch,
+        requested_thrust=thrust,
+        retained_thrust_floor=thrust_floor,
+        allocated_thrust=allocated_thrust,
+        retained_through_missing_frame=True,
+        forward_closure_authorized=False,
+        steering_only=True,
+        passage_authority=False,
+        advance_authority=False,
+    )
 
 
 def _propose_retained_raw_top_fov_pitch_reference(
@@ -5636,6 +5811,9 @@ async def _run_visual_course_stage_impl(
         top_censored_closure_recovery: Optional[
             _FreshTopCensoredClosureRecovery
         ] = None
+        retained_top_censored_closure_recovery: Optional[
+            _RetainedFreshTopCensoredClosureRecovery
+        ] = None
         if (
             recovery_measurement_mode
             is PostCreditMeasurementMode.ONE_EDGE_CENSORED
@@ -5838,7 +6016,14 @@ async def _run_visual_course_stage_impl(
                         )
                         top_fov_guidance = {
                             **asdict(top_censored_closure_recovery),
+                            "gate_index": current_gate_index,
                             "track_id": authority["reviewed_track_id"],
+                            "camera_token": asdict(
+                                recovery_boundary.camera_token
+                            ),
+                            "expires_monotonic_ns": authority[
+                                "expires_monotonic_ns"
+                            ],
                             "source_target_pitch_rad": float(
                                 authority["target_pitch_rad"]
                             ),
@@ -5923,16 +6108,40 @@ async def _run_visual_course_stage_impl(
         ):
             fov_summary = segment["top_fov_pitch_protection"]
             try:
-                retained = _retain_post_credit_top_fov_pitch_reference(
-                    authority,
-                    fov_summary,
+                retained_top_censored_closure_recovery = (
+                    _retain_fresh_top_censored_closure_recovery(
+                        authority=authority,
+                        fov_summary=fov_summary,
+                        recovery_snapshot=recovery_snapshot,
+                        current_gate_index=current_gate_index,
+                        now_monotonic_ns=proposal_ns,
+                        requested_target_pitch_rad=target_pitch_rad,
+                        requested_thrust=thrust,
+                    )
                 )
+                retained = None
+                if retained_top_censored_closure_recovery is None:
+                    retained = _retain_post_credit_top_fov_pitch_reference(
+                        authority,
+                        fov_summary,
+                    )
             except (KeyError, TypeError, ValueError) as exc:
                 raise abort_type(
                     "visual-course retained post-credit TOP-FOV "
                     f"authority refused: {exc}"
                 ) from exc
-            if retained is not None:
+            if retained_top_censored_closure_recovery is not None:
+                target_pitch_rad = (
+                    retained_top_censored_closure_recovery
+                    .allocated_target_pitch_rad
+                )
+                thrust = (
+                    retained_top_censored_closure_recovery.allocated_thrust
+                )
+                top_fov_guidance = asdict(
+                    retained_top_censored_closure_recovery
+                )
+            elif retained is not None:
                 target_pitch_rad, top_fov_guidance = retained
         bounded_yaw = requested_yaw
         if requested_yaw != 0.0:
@@ -6065,6 +6274,44 @@ async def _run_visual_course_stage_impl(
                     top_fov_guidance
                 )
                 fov_summary = segment["top_fov_pitch_protection"]
+                if top_censored_closure_recovery is not None:
+                    fov_summary["last_exact_top_closure_recovery"] = {
+                        "basis": (
+                            RETAINED_FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS
+                        ),
+                        "source_basis": (
+                            FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS
+                        ),
+                        "gate_index": current_gate_index,
+                        "track_id": authority["reviewed_track_id"],
+                        "camera_token": dict(
+                            top_fov_guidance["camera_token"]
+                        ),
+                        "source_wire_start_monotonic_ns": call_start,
+                        "expires_monotonic_ns": int(
+                            authority["expires_monotonic_ns"]
+                        ),
+                        "target_pitch_floor_rad": target_pitch_rad,
+                        "thrust_floor": thrust,
+                        "steering_only": True,
+                        "passage_authority": False,
+                        "advance_authority": False,
+                    }
+                elif retained_top_censored_closure_recovery is not None:
+                    fov_summary[
+                        "retained_exact_top_closure_recovery_command_count"
+                    ] = int(
+                        fov_summary[
+                            "retained_exact_top_closure_recovery_command_count"
+                        ]
+                    ) + 1
+                    fov_summary[
+                        "last_retained_exact_top_closure_recovery"
+                    ] = asdict(
+                        retained_top_censored_closure_recovery
+                    )
+                elif recovery_measurement_mode is not None:
+                    fov_summary["last_exact_top_closure_recovery"] = None
                 if (
                     top_fov_proposal is not None
                     and top_fov_handoff is not None
@@ -6146,6 +6393,10 @@ async def _run_visual_course_stage_impl(
                             ),
                         }
                     )
+            elif recovery_measurement_mode is not None:
+                segment["top_fov_pitch_protection"][
+                    "last_exact_top_closure_recovery"
+                ] = None
             host.recorder.emit(
                 "visual_course_dynamic_post_credit_successor_steering",
                 gate_index=current_gate_index,
@@ -8557,6 +8808,9 @@ async def _run_visual_course_stage_impl(
                 "last_propagated_state_handoff": None,
                 "retained_raw_state_handoff_command_count": 0,
                 "last_retained_raw_state_handoff": None,
+                "retained_exact_top_closure_recovery_command_count": 0,
+                "last_retained_exact_top_closure_recovery": None,
+                "last_exact_top_closure_recovery": None,
                 "exact_raw_anchor": None,
                 "last_track_id": None,
                 "last_camera_token": None,
