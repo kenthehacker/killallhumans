@@ -1424,12 +1424,49 @@ def test_off_axis_outward_steering_does_not_wait_for_crossing_authority(
     assert recovered_decision.current_time_to_contact_s is None
     assert not recovered_decision.passage_committed
     assert (
-        0.0
-        < recovered_decision.proposed_command.target_roll_rad
-        < MAX_TARGET_ROLL_RAD
+        recovered_decision.proposed_command.target_roll_rad
+        == MAX_TARGET_ROLL_RAD
     )
     assert math.isfinite(
         recovered_decision.proposed_command.target_roll_rad
+    )
+
+    # One transient inward estimate must not unwind an accepted saturated
+    # bank while the fixed-reference error remains materially off axis.  Two
+    # additional fresh, actually improving observations complete the
+    # three-frame release dwell.
+    release_decisions = []
+    for sequence, x in ((10, 0.340), (11, 0.320)):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=x,
+                log_scale=-1.40,
+                aperture=(0.14, 0.11),
+            )
+        )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        release_decision = core.guide(round(decision_time * NS))
+        release_decisions.append(release_decision)
+        _commit_decision(
+            core,
+            decision_time,
+            release_decision.command,
+        )
+
+    assert (
+        release_decisions[0].proposed_command.target_roll_rad
+        == MAX_TARGET_ROLL_RAD
+    )
+    assert (
+        0.0
+        < release_decisions[1].proposed_command.target_roll_rad
+        < MAX_TARGET_ROLL_RAD
     )
 
 
