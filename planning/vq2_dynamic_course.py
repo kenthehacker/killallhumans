@@ -3429,7 +3429,7 @@ class DynamicCourseCore:
                     <= maximum_std + _EPSILON
                 ):
                     committed_successor_roll_authority = 1.0
-                    committed_successor_target_roll = _clamp(
+                    normal_successor_roll = _clamp(
                         self.config.roll_guidance_sign
                         * (
                             self.config.roll_gain
@@ -3441,6 +3441,31 @@ class DynamicCourseCore:
                         -MAX_TARGET_ROLL_RAD,
                         MAX_TARGET_ROLL_RAD,
                     )
+                    committed_successor_target_roll = normal_successor_roll
+                    committed_successor_outward_arrest = bool(
+                        abs(self.config.roll_guidance_sign) > _EPSILON
+                        and abs(normal_successor_roll) > _EPSILON
+                        and abs(successor_steering.stable_bearing_rad[0])
+                        >= self.config.off_axis_brake_rad
+                        and successor_steering.stable_bearing_rad[0]
+                        * successor_steering.stable_bearing_rate_rad_s[0]
+                        > 0.0
+                        and normal_successor_roll
+                        * self.config.roll_guidance_sign
+                        * successor_steering.stable_bearing_rad[0]
+                        > 0.0
+                    )
+                    if committed_successor_outward_arrest:
+                        # Passage commitment already owns the current-gate
+                        # crossing.  A reviewed successor that is meaningfully
+                        # off axis and still moving outward needs the full
+                        # accepted bank reference before promotion; recovering
+                        # rate releases immediately to the proportional law.
+                        committed_successor_target_roll = math.copysign(
+                            MAX_TARGET_ROLL_RAD,
+                            self.config.roll_guidance_sign
+                            * successor_steering.stable_bearing_rad[0],
+                        )
                     committed_successor_yaw_authority = 1.0
                     committed_successor_yaw_rate = _clamp(
                         -self.config.yaw_gain

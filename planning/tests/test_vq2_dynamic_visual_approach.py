@@ -28,6 +28,7 @@ from planning.vq2_dynamic_course import (
     MAX_YAW_RATE_RAD_S,
     MIN_TARGET_PITCH_RAD,
     MIN_THRUST,
+    TrackSteeringPrediction,
 )
 from planning.vq2_dynamic_visual_approach import (
     BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ,
@@ -168,6 +169,48 @@ def test_successor_pitch_reference_steers_from_predicted_vertical_geometry():
     assert recovered_error == 0.0
     assert recovered_rate == 0.0
     assert recovered_lead == 0.0
+
+
+def test_successor_steering_uses_full_bank_only_while_off_axis_and_outward():
+    session = _session(config=production_dynamic_course_config())
+    prediction = TrackSteeringPrediction(
+        track_id="gate-b",
+        stream_generation=1,
+        monotonic_ns=_BASE_NS,
+        source_state_monotonic_ns=_BASE_NS,
+        last_measurement_monotonic_ns=_BASE_NS,
+        measurement_age_s=0.0,
+        stable_bearing_rad=(0.40, 0.0),
+        stable_bearing_rate_rad_s=(0.10, 0.0),
+        camera_center_norm=(0.30, 0.0),
+        camera_center_rate_norm_s=(0.05, 0.0),
+        bearing_std_rad=(0.02, 0.02),
+        body_rates_rad_s=(0.0, 0.0, 0.0),
+    )
+
+    outward = session._successor_steering_targets(prediction)
+    recovered = session._successor_steering_targets(
+        replace(
+            prediction,
+            stable_bearing_rate_rad_s=(-0.10, 0.0),
+        )
+    )
+    unidentified = _session(
+        config=replace(
+            production_dynamic_course_config(),
+            roll_guidance_sign=0.0,
+        )
+    )._successor_steering_targets(prediction)
+
+    assert outward["target_roll_rad"] == pytest.approx(
+        MAX_TARGET_ROLL_RAD
+    )
+    assert (
+        0.0
+        < recovered["target_roll_rad"]
+        < MAX_TARGET_ROLL_RAD
+    )
+    assert unidentified["target_roll_rad"] == 0.0
 
 
 def _inner_aperture(

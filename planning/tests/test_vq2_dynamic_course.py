@@ -2789,6 +2789,107 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
     )
 
 
+def test_committed_off_axis_successor_uses_full_bank_then_releases(
+) -> None:
+    config = DynamicCourseConfig(
+        camera_delay_s=0.0,
+        bearing_alpha=1.0,
+        bearing_beta=1.0,
+        scale_alpha=1.0,
+        scale_beta=1.0,
+        roll_guidance_sign=1.0,
+        roll_gain=0.18,
+        lateral_rate_gain=0.045,
+    )
+    core = DynamicCourseCore(config)
+    core.record_applied_command(_command(0.90))
+    outward = None
+    for sequence in range(1, 8):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation("gate-a", sequence, observation_time)
+        )
+        successor = core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.35 + (sequence - 1) * 0.004,
+                log_scale=-0.80,
+            )
+        )
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        outward = core.guide(
+            round(decision_time * NS),
+            passage_committed=True,
+        )
+        _commit_decision(core, decision_time, outward.command)
+
+    assert outward is not None
+    assert successor.bearing_std_rad[0] <= (
+        config.successor_prediction_max_extrapolation_rad
+    )
+    assert abs(successor.bearing_rad[0]) >= config.off_axis_brake_rad
+    assert (
+        successor.bearing_rad[0]
+        * successor.bearing_rate_rad_s[0]
+        > 0.0
+    )
+    assert outward.committed_successor_roll_authority == 1.0
+    assert outward.committed_successor_target_roll_rad == pytest.approx(
+        MAX_TARGET_ROLL_RAD
+    )
+    assert outward.command.target_roll_rad == pytest.approx(
+        MAX_TARGET_ROLL_RAD
+    )
+
+    recovered = None
+    for sequence, x in ((8, 0.370), (9, 0.366)):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation("gate-a", sequence, observation_time)
+        )
+        successor = core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=x,
+                log_scale=-0.80,
+            )
+        )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        recovered = core.guide(
+            round(decision_time * NS),
+            passage_committed=True,
+        )
+        _commit_decision(core, decision_time, recovered.command)
+
+    assert recovered is not None
+    assert abs(successor.bearing_rad[0]) >= config.off_axis_brake_rad
+    assert successor.bearing_rate_rad_s[0] < 0.0
+    assert recovered.committed_successor_roll_authority == 1.0
+    assert recovered.committed_successor_target_roll_rad is not None
+    assert (
+        0.0
+        < recovered.committed_successor_target_roll_rad
+        < MAX_TARGET_ROLL_RAD
+    )
+    assert recovered.command.target_roll_rad == pytest.approx(
+        recovered.committed_successor_target_roll_rad
+    )
+
+
 def test_generic_authoritative_lifecycle_continues_past_gate_one() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     _imu(core, 1.0)
