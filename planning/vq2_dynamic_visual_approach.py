@@ -2879,7 +2879,6 @@ class DynamicVisualCourseSession:
                 and current.visible
                 and not current.ambiguous
                 and current.missed_count == 0
-                and not all(current.censored_axes)
                 and not decision.passage_committed
                 and decision.monotonic_ns <= wire_start_monotonic_ns
             )

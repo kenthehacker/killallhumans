@@ -2398,6 +2398,70 @@ def test_fresh_missing_publication_uses_wire_anchor_not_aperture_lease() -> None
     assert authority["passage_authority"] is False
     assert authority["advance_authority"] is False
 
+
+def test_full_frame_visible_wire_becomes_next_missing_steering_anchor() -> None:
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+
+    all_edges = (
+        FrameEdge.LEFT
+        | FrameEdge.TOP
+        | FrameEdge.RIGHT
+        | FrameEdge.BOTTOM
+    )
+    update = tracker.update(
+        _frame(
+            6,
+            include_successor=False,
+            current_center_x=0.0,
+            current_clipping=all_edges,
+            current_center_censored=True,
+            current_inner_aperture=None,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+    anchor = session._same_gate_steering_anchor  # noqa: SLF001
+    assert anchor is not None
+    assert anchor.camera_token == update.token
+
+    update = tracker.update(
+        replace(
+            _frame(7, include_successor=False),
+            detections=(),
+        )
+    )
+    snapshot = graph.observe(tracker)
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="withheld authoritative current-gate identity",
+    ):
+        _observe(planner, snapshot, tracker)
+    authority = session.propagated_current_visibility_gap_authority(
+        track=tracker.track(current_id),
+        camera_token=update.token,
+        now_monotonic_ns=update.observation_monotonic_ns + 5_000_000,
+    )
+
+    assert authority["steering_anchor_camera_token"] == asdict(
+        anchor.camera_token
+    )
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+
+
 def test_propagated_current_fov_gap_refuses_identity_and_frame_mismatch() -> None:
     session, track, token, now_ns = _propagated_vertical_fov_gap()
     sample = track.history[-1]
