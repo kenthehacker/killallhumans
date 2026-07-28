@@ -164,6 +164,9 @@ FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
 RETAINED_FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "retained-fresh-top-boundary-closure-recovery-v1"
 )
+POST_CREDIT_SUCCESSOR_HANDOFF_RETIREMENT_BASIS = (
+    "fresh-authoritative-current-successor-handoff-retirement-v1"
+)
 FRESH_HORIZONTAL_DIRECT_TOP_FOV_BASIS = (
     "fresh-horizontal-edge-direct-top-fov-steering-v1"
 )
@@ -225,6 +228,30 @@ _TOP_FOV_INNER_MODEL_PAIRS = frozenset(
     }
 )
 _YAW_PROFILE_ISSUER = object()
+
+
+def _post_credit_successor_handoff_required_after_command(
+    *,
+    required_before: bool,
+    measurement_mode: PostCreditMeasurementMode,
+    propagated_steering_applied: bool,
+) -> bool:
+    """Retire the required seam after one current-owned one-edge command."""
+
+    if (
+        type(required_before) is not bool
+        or type(measurement_mode) is not PostCreditMeasurementMode
+        or type(propagated_steering_applied) is not bool
+    ):
+        raise TypeError("post-credit successor handoff state is invalid")
+    return bool(
+        required_before
+        and not (
+            propagated_steering_applied
+            and measurement_mode
+            is PostCreditMeasurementMode.ONE_EDGE_CENSORED
+        )
+    )
 
 
 def _body_to_reference_pitch_rad(
@@ -8982,6 +9009,10 @@ async def _run_visual_course_stage_impl(
             post_credit_recovery is not None
         )
         recovery_refresh_receiver_snapshot = False
+        post_credit_successor_handoff_required = bool(
+            post_credit_recovery is not None
+            and post_credit_recovery.successor_steering_available
+        )
         recovery_first_clean_wire_token: Optional[
             CameraFrameToken
         ] = None
@@ -9085,6 +9116,10 @@ async def _run_visual_course_stage_impl(
             "recovery_propagated_state_command_count": 0,
             "recovery_zero_command_count": 0,
             "recovery_support_command_count": 0,
+            "post_credit_successor_handoff_required": (
+                post_credit_successor_handoff_required
+            ),
+            "post_credit_successor_handoff_retirement": None,
             "passage_authority_enabled": False,
             "passage_admission": None,
             "passage_command_seal": None,
@@ -9576,7 +9611,7 @@ async def _run_visual_course_stage_impl(
                 if (
                     type(runtime.dynamic_controller)
                     is DynamicVisualCourseSession
-                    and post_credit_recovery.successor_steering_available
+                    and post_credit_successor_handoff_required
                     and recovery_measurement_mode
                     in {
                         PostCreditMeasurementMode.ONE_EDGE_CENSORED,
@@ -9663,6 +9698,60 @@ async def _run_visual_course_stage_impl(
                         segment["recovery_one_edge_command_count"] = int(
                             segment["recovery_one_edge_command_count"]
                         ) + 1
+                        # The race/graph handoff is required only until one
+                        # exact fresh authoritative current publication has
+                        # driven an accepted steering-only command.  Keep the
+                        # lifecycle in PROMOTE_REACQUIRE, but let subsequent
+                        # one-edge publications use the normal current-owned
+                        # planner and let missing publications use its bounded
+                        # recovery support.  Passage and advance remain
+                        # unavailable until the existing two-clean-wire rule.
+                        post_credit_successor_handoff_required = (
+                            _post_credit_successor_handoff_required_after_command(
+                                required_before=(
+                                    post_credit_successor_handoff_required
+                                ),
+                                measurement_mode=recovery_measurement_mode,
+                                propagated_steering_applied=(
+                                    propagated_steering
+                                ),
+                            )
+                        )
+                        if post_credit_successor_handoff_required:
+                            raise abort_type(
+                                "visual-course accepted one-edge successor "
+                                "handoff did not retire"
+                            )
+                        retirement = {
+                            "basis": (
+                                POST_CREDIT_SUCCESSOR_HANDOFF_RETIREMENT_BASIS
+                            ),
+                            "gate_index": current_gate_index,
+                            "track_id": current_track_id,
+                            "source_camera_token": asdict(token),
+                            "measurement_mode": (
+                                recovery_measurement_mode.value
+                            ),
+                            "accepted_propagated_command_count": int(
+                                segment[
+                                    "recovery_propagated_state_command_count"
+                                ]
+                            ),
+                            "steering_only": True,
+                            "passage_authority": False,
+                            "advance_authority": False,
+                        }
+                        segment[
+                            "post_credit_successor_handoff_required"
+                        ] = False
+                        segment[
+                            "post_credit_successor_handoff_retirement"
+                        ] = retirement
+                        host.recorder.emit(
+                            "visual_course_post_credit_successor_handoff_retired",
+                            **retirement,
+                        )
+                        refresh_live_summary()
                     continue
                 if (
                     recovery_measurement_mode

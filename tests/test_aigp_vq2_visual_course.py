@@ -29,6 +29,7 @@ from planning.vq2_course_lifecycle import (
     LatchedMeasurementMode,
     NearPlaneEvidence,
     NearPlaneLatch,
+    PostCreditMeasurementMode,
 )
 from planning.vq2_dynamic_visual_approach import DynamicVisualCourseSession
 from planning.vq2_visual_approach import (
@@ -94,6 +95,57 @@ def _token(sequence: int) -> CameraFrameToken:
         frame_id=100 + sequence,
         publication_sequence=sequence,
         stream_id="camera-live",
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "required_before",
+        "measurement_mode",
+        "propagated_steering_applied",
+        "expected_required_after",
+    ),
+    (
+        (
+            True,
+            PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+            True,
+            False,
+        ),
+        (
+            True,
+            PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+            False,
+            True,
+        ),
+        (
+            True,
+            PostCreditMeasurementMode.REACQUIRE,
+            True,
+            True,
+        ),
+        (
+            False,
+            PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+            True,
+            False,
+        ),
+    ),
+)
+def test_post_credit_successor_handoff_retires_only_after_one_edge_wire(
+    required_before,
+    measurement_mode,
+    propagated_steering_applied,
+    expected_required_after,
+):
+    assert (
+        course_stage
+        ._post_credit_successor_handoff_required_after_command(
+            required_before=required_before,
+            measurement_mode=measurement_mode,
+            propagated_steering_applied=propagated_steering_applied,
+        )
+        is expected_required_after
     )
 
 
