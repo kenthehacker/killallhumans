@@ -4104,7 +4104,7 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
     )
     with pytest.raises(
         DynamicCourseError,
-        match="lacks clean current state",
+        match="lacks fresh observable current state",
     ):
         session.complete_post_credit_recovery(
             camera_token=dual_update.token,
@@ -4140,8 +4140,9 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
         camera_token=clean_update.token,
     )
     assert release["basis"] == (
-        "clean-current-post-credit-recovery-release-v1"
+        "fresh-current-post-credit-recovery-release-v2"
     )
+    assert release["measurement_mode"] == "clean"
     assert release["passage_authority"] is False
     assert release["advance_authority"] is False
     assert session.post_credit_successor_steering_active is False
@@ -4566,23 +4567,14 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
         <= MAX_THRUST
     )
 
-    clean_update = tracker.update(fresh_frame(24))
-    clean_snapshot = replace(
-        clipped_snapshot,
-        latest_camera_token=clean_update.token,
-        tracker_frame_sequence=clean_update.tracker_frame_sequence,
-        current_track=tracker.track(fresh_id),
-    )
-    session.stage_snapshot(
-        clean_snapshot,
-        tracker,
-        expected_gate_index=1,
-        expected_current_track_id=fresh_id,
-        adjacent_precredit=False,
-    )
     release = session.complete_post_credit_recovery(
-        camera_token=clean_update.token,
+        camera_token=clipped_update.token,
     )
+    assert release["basis"] == (
+        "fresh-current-post-credit-recovery-release-v2"
+    )
+    assert release["measurement_mode"] == "one_axis_censored"
+    assert release["current_censored_axes"] == [False, True]
     assert release["passage_authority"] is False
     assert release["advance_authority"] is False
     assert session.post_credit_successor_steering_active is False

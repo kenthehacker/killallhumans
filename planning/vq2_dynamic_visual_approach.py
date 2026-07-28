@@ -1391,7 +1391,7 @@ class DynamicVisualCourseSession:
         *,
         camera_token: CameraFrameToken,
     ) -> Mapping[str, Any]:
-        """Release steering memory only after exact clean current geometry."""
+        """Release predecessor steering after exact observable current control."""
 
         if type(camera_token) is not CameraFrameToken:
             raise DynamicCourseError(
@@ -1417,16 +1417,24 @@ class DynamicVisualCourseSession:
             or not current.visible
             or current.ambiguous
             or current.missed_count != 0
-            or any(current.censored_axes)
+            or all(current.censored_axes)
         ):
             raise DynamicCourseError(
-                "post-credit recovery completion lacks clean current state"
+                "post-credit recovery completion lacks fresh observable "
+                "current state"
             )
+        measurement_mode = (
+            "one_axis_censored"
+            if any(current.censored_axes)
+            else "clean"
+        )
         evidence = dict(self._post_credit_lease_evidence(lease))
         evidence.update(
             {
-                "basis": "clean-current-post-credit-recovery-release-v1",
+                "basis": "fresh-current-post-credit-recovery-release-v2",
                 "camera_token": asdict(camera_token),
+                "measurement_mode": measurement_mode,
+                "current_censored_axes": list(current.censored_axes),
                 "steering_only": False,
                 "passage_authority": False,
                 "advance_authority": False,

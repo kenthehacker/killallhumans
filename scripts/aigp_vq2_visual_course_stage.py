@@ -10629,17 +10629,6 @@ async def _run_visual_course_stage_impl(
                     f"visual-course gate {current_gate_index} segment expired"
                 )
             if (
-                lifecycle is CourseLifecycle.PROMOTE_REACQUIRE
-                and (
-                    recovery_deadline_s is None
-                    or now >= recovery_deadline_s
-                )
-            ):
-                raise abort_type(
-                    f"visual-course gate {current_gate_index} "
-                    "post-credit recovery timed out"
-                )
-            if (
                 passage_started_s is not None
                 and crossing_started_s is None
                 and now - passage_started_s > limits.passage_hard_duration_s
@@ -10953,6 +10942,40 @@ async def _run_visual_course_stage_impl(
                         host.recorder.emit(
                             "visual_course_post_credit_successor_handoff_retired",
                             **retirement,
+                        )
+                        try:
+                            current_release = (
+                                dynamic_controller
+                                .complete_post_credit_recovery(
+                                    camera_token=token,
+                                )
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise abort_type(
+                                "visual-course one-edge current release "
+                                f"refused: {exc}"
+                            ) from exc
+                        if not isinstance(current_release, Mapping):
+                            raise abort_type(
+                                "visual-course one-edge current release "
+                                "evidence is invalid"
+                            )
+                        lifecycle = CourseLifecycle.APPROACH
+                        mode = VisualApproachMode.APPROACH
+                        recovery_deadline_s = None
+                        post_credit_recovery = None
+                        segment["lifecycle"] = lifecycle.value
+                        host.recorder.emit(
+                            "visual_course_recovery_completed",
+                            gate_index=current_gate_index,
+                            camera_token=asdict(token),
+                            clean_command_count=0,
+                            completion_basis=(
+                                "accepted-one-edge-current-wire-v1"
+                            ),
+                            dynamic_recovery_release=dict(
+                                current_release
+                            ),
                         )
                         refresh_live_summary()
                     continue
