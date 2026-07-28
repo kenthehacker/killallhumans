@@ -4624,19 +4624,17 @@ def _latest_gate_one_top_pitch_arbitration_case():
     return boundary, fov_proposal, recovery
 
 
-def test_latest_nonrapid_off_axis_exact_top_keeps_fov_pitch_ownership():
+def test_latest_off_axis_exact_top_keeps_fov_pitch_ownership():
     boundary, fov_proposal, recovery = (
         _latest_gate_one_top_pitch_arbitration_case()
     )
 
     owns_pitch = (
-        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
+        course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.APPROACH,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
-            rapid_expansion_rate_s=0.45,
-            rapid_closure_ttc_s=2.2,
         )
     )
 
@@ -4651,7 +4649,7 @@ def test_latest_nonrapid_off_axis_exact_top_keeps_fov_pitch_ownership():
     "retained",
     (False, True),
 )
-def test_nonrapid_post_credit_top_recovery_keeps_fov_pitch_ownership(
+def test_post_credit_top_recovery_keeps_fov_pitch_ownership(
     retained,
 ):
     boundary, fov_proposal, recovery = (
@@ -4675,13 +4673,11 @@ def test_nonrapid_post_credit_top_recovery_keeps_fov_pitch_ownership(
     )
 
     assert (
-        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
+        course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.PROMOTE_REACQUIRE,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
-            rapid_expansion_rate_s=0.45,
-            rapid_closure_ttc_s=2.2,
             retained_raw_handoff=retained_handoff,
         )
         is True
@@ -4718,13 +4714,11 @@ def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
     )
 
     assert (
-        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
+        course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.PROMOTE_REACQUIRE,
             fov_proposal=propagated_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
-            rapid_expansion_rate_s=0.45,
-            rapid_closure_ttc_s=2.2,
             propagated_state_handoff=authority,
         )
         is True
@@ -4736,22 +4730,20 @@ def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
     )
     assert recovery.passage_authority is False
     assert recovery.advance_authority is False
-    ordinary_nonrapid = replace(
+    ordinary_off_axis = replace(
         recovery,
         expansion_rate_s=0.10,
         time_to_contact_s=3.0,
     )
     assert (
-        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
+        course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.APPROACH,
             fov_proposal=propagated_proposal,
             fresh_top_boundary=boundary,
-            closure_recovery=ordinary_nonrapid,
-            rapid_expansion_rate_s=0.45,
-            rapid_closure_ttc_s=2.2,
+            closure_recovery=ordinary_off_axis,
             propagated_state_handoff=authority,
         )
-        is False
+        is True
     )
 
 
@@ -4779,13 +4771,11 @@ def test_post_credit_top_fov_owns_pitch_during_aligned_or_rapid_closure(
         recovery = replace(recovery, **recovery_change)
 
     assert (
-        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
+        course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.PROMOTE_REACQUIRE,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
-            rapid_expansion_rate_s=0.45,
-            rapid_closure_ttc_s=2.2,
         )
         is True
     )
@@ -4795,42 +4785,61 @@ def test_post_credit_top_fov_owns_pitch_during_aligned_or_rapid_closure(
     assert recovery.advance_authority is False
 
 
+def test_exact_top_fov_yields_when_horizontally_aligned():
+    boundary, fov_proposal, recovery = (
+        _latest_gate_one_top_pitch_arbitration_case()
+    )
+    recovery = replace(
+        recovery,
+        stable_center_norm=(0.0, -0.7721254168759125),
+        horizontal_aligned=True,
+    )
+
+    assert (
+        course_stage._off_axis_top_fov_owns_pitch(
+            mode=VisualApproachMode.APPROACH,
+            fov_proposal=fov_proposal,
+            fresh_top_boundary=boundary,
+            closure_recovery=recovery,
+        )
+        is False
+    )
+    assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
+
+
 @pytest.mark.parametrize(
     "recovery_change",
     (
-        {"stable_center_norm": (0.0, -0.7721254168759125)},
         {"expansion_rate_s": 0.45},
         {"time_to_contact_s": 2.2},
         {"time_to_contact_s": None},
+        {
+            "expansion_rate_s": 0.6653443542428843,
+            "time_to_contact_s": 1.502981115903404,
+        },
     ),
 )
-def test_exact_top_fov_does_not_preempt_aligned_or_rapid_closure(
+def test_off_axis_top_fov_keeps_pitch_during_rapid_closure(
     recovery_change,
 ):
     boundary, fov_proposal, recovery = (
         _latest_gate_one_top_pitch_arbitration_case()
     )
-    if "stable_center_norm" in recovery_change:
-        recovery = replace(
-            recovery,
-            stable_center_norm=recovery_change["stable_center_norm"],
-            horizontal_aligned=True,
-        )
-    else:
-        recovery = replace(recovery, **recovery_change)
+    recovery = replace(recovery, **recovery_change)
 
     assert (
-        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
+        course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.APPROACH,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
-            rapid_expansion_rate_s=0.45,
-            rapid_closure_ttc_s=2.2,
         )
-        is False
+        is True
     )
-    assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
+    assert recovery.horizontal_aligned is False
+    assert fov_proposal.protected_target_pitch_rad < (
+        recovery.allocated_target_pitch_rad
+    )
 
 
 def test_fresh_top_boundary_command_still_uses_final_wire_governor():

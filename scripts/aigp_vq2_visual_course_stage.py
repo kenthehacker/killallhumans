@@ -170,8 +170,8 @@ FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
 FRESH_TOP_CORNER_CONTINUITY_BASIS = (
     "fresh-top-corner-inward-command-continuity-v1"
 )
-NONRAPID_OFF_AXIS_TOP_FOV_PRIORITY_BASIS = (
-    "current-top-nonrapid-off-axis-fov-priority-v2"
+OFF_AXIS_TOP_FOV_PRIORITY_BASIS = (
+    "current-top-off-axis-fov-priority-v3"
 )
 RETAINED_FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "retained-fresh-top-boundary-closure-recovery-v1"
@@ -1795,37 +1795,29 @@ def _allocate_fresh_top_censored_closure_recovery(
     )
 
 
-def _nonrapid_off_axis_top_fov_owns_pitch(
+def _off_axis_top_fov_owns_pitch(
     *,
     mode: VisualApproachMode,
     fov_proposal: _TopFovPitchProposal,
     fresh_top_boundary: _FreshCurrentTopBoundaryAuthority,
     closure_recovery: _FreshTopCensoredClosureRecovery,
-    rapid_expansion_rate_s: float,
-    rapid_closure_ttc_s: float,
     retained_raw_handoff: Optional[Mapping[str, Any]] = None,
     propagated_state_handoff: Optional[Mapping[str, Any]] = None,
 ) -> bool:
     """Arbitrate one fresh TOP frame without reviving urgent closure.
 
-    The full positive-pitch brake remains authoritative for aligned, rapid,
-    or ordinary contact-time-unknown APPROACH closure.  During an off-axis,
-    nonrapid approach, replacing the exact FOV-safe pitch reverses camera
-    observability before the horizontal intercept can take effect.
+    During an off-axis approach, replacing the FOV-safe pitch reverses camera
+    observability before the horizontal intercept can take effect.  Expansion
+    and contact-time classifications cannot override that geometric fact:
+    collective retains the closure brake while pitch keeps the gate in view.
 
-    Post-credit recovery may also consume the already-existing bounded
-    propagated-state or fixed, nonrenewing retained-raw FOV lease.  That mode
-    is itself bounded and needs a second clean accepted wire before release.
-    It has no passage or advance authority, so its FOV-safe pitch remains
-    authoritative even when the censored closure classifier reports aligned
-    or rapid closure; collective retains the positive closure brake.
-    Geometry-refusal paths never call this policy.
+    Exact, bounded propagated-state, and fixed nonrenewing retained-raw FOV
+    authority are admitted.  Post-credit recovery needs a second clean
+    accepted wire before release and therefore retains FOV pitch even when
+    horizontally aligned.  None of these paths has passage or advance
+    authority.  Geometry-refusal paths never call this policy.
     """
 
-    rapid_expansion, rapid_ttc = map(
-        float,
-        (rapid_expansion_rate_s, rapid_closure_ttc_s),
-    )
     retained = retained_raw_handoff is not None
     propagated = propagated_state_handoff is not None
     if (
@@ -1891,27 +1883,18 @@ def _nonrapid_off_axis_top_fov_owns_pitch(
             )
             <= 0.0
         )
-        or not all(
-            math.isfinite(value)
-            for value in (rapid_expansion, rapid_ttc)
-        )
-        or rapid_expansion <= 0.0
-        or rapid_ttc <= 0.0
     ):
         raise ValueError("TOP pitch arbitration inputs are invalid")
 
-    ttc = closure_recovery.time_to_contact_s
-    normal_exact_approach = bool(
+    ordinary_off_axis_approach = bool(
         mode is VisualApproachMode.APPROACH
-        and not retained
-        and not propagated
-        and ttc is not None
+        and not closure_recovery.horizontal_aligned
     )
     bounded_post_credit_recovery = bool(
         mode is VisualApproachMode.PROMOTE_REACQUIRE
     )
     return bool(
-        (normal_exact_approach or bounded_post_credit_recovery)
+        (ordinary_off_axis_approach or bounded_post_credit_recovery)
         and closure_recovery.fresh_boundary_current_authority
         and closure_recovery.steering_only
         and not closure_recovery.forward_closure_authorized
@@ -1933,14 +1916,6 @@ def _nonrapid_off_axis_top_fov_owns_pitch(
         )
         and fov_proposal.protected_target_pitch_rad
         < closure_recovery.allocated_target_pitch_rad - 1e-12
-        and (
-            bounded_post_credit_recovery
-            or (
-                not closure_recovery.horizontal_aligned
-                and closure_recovery.expansion_rate_s < rapid_expansion
-                and (ttc is None or ttc > rapid_ttc)
-            )
-        )
     )
 
 
@@ -8422,18 +8397,12 @@ async def _run_visual_course_stage_impl(
                     )
                     fov_owns_pitch = (
                         pitch_priority_proposal is not None
-                        and _nonrapid_off_axis_top_fov_owns_pitch(
+                        and _off_axis_top_fov_owns_pitch(
                             mode=proposal.mode,
                             fov_proposal=pitch_priority_proposal,
                             fresh_top_boundary=fresh_top_boundary,
                             closure_recovery=(
                                 top_censored_closure_recovery
-                            ),
-                            rapid_expansion_rate_s=float(
-                                recovery_config.rapid_expansion_rate_s
-                            ),
-                            rapid_closure_ttc_s=float(
-                                recovery_config.successor_lookahead_ttc_s
                             ),
                             retained_raw_handoff=(
                                 pitch_priority_retained_handoff
@@ -8447,7 +8416,7 @@ async def _run_visual_course_stage_impl(
                         assert pitch_priority_proposal is not None
                         top_censored_pitch_arbitration = {
                             "basis": (
-                                NONRAPID_OFF_AXIS_TOP_FOV_PRIORITY_BASIS
+                                OFF_AXIS_TOP_FOV_PRIORITY_BASIS
                             ),
                             "lifecycle_mode": proposal.mode.value,
                             "fov_authority_kind": (
@@ -8464,12 +8433,6 @@ async def _run_visual_course_stage_impl(
                             ),
                             "closure_recovery": asdict(
                                 top_censored_closure_recovery
-                            ),
-                            "rapid_expansion_rate_s": float(
-                                recovery_config.rapid_expansion_rate_s
-                            ),
-                            "rapid_closure_ttc_s": float(
-                                recovery_config.successor_lookahead_ttc_s
                             ),
                             "selected_target_pitch_rad": (
                                 pitch_priority_proposal

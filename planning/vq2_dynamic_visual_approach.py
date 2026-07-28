@@ -4007,9 +4007,11 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                 )
             # The dynamic core retains the unsaturated off-frame projection.
             # The legacy VisualTarget is only a bounded servo-shaped shell:
-            # clamp a censored axis at its representable boundary while
-            # preserving direction.  This does not create fresh geometry or
-            # change passage/advance authority.
+            # clamp every propagated coordinate at its representable
+            # boundary while preserving direction.  A degraded fitted inner
+            # can make the state formally uncensored without pulling the
+            # command-time camera reprojection back on frame.  This does not
+            # create fresh geometry or change passage/advance authority.
             bounded_shell_center = tuple(
                 max(
                     -MAX_VISUAL_TARGET_COORDINATE_NORM,
@@ -4018,8 +4020,6 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                         float(shell_center[axis]),
                     ),
                 )
-                if state.censored_axes[axis]
-                else float(shell_center[axis])
                 for axis in range(2)
             )
             return replace(

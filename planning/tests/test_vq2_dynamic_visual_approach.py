@@ -1901,6 +1901,84 @@ def test_degraded_inner_confidence_bounds_steering_from_clean_seed() -> None:
     assert proposal.passage_admission is None
 
 
+def test_degraded_inner_bounds_off_frame_propagated_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+
+    degraded = _inner_aperture(
+        0.01,
+        -0.80,
+        half_width=0.27,
+        half_height=0.30,
+        confidence=0.0015,
+        measurement_std=(0.52, 0.93, 8.0),
+        health_reason="outer_support_clipped_tracking_only",
+    )
+    tracker.update(
+        _frame(
+            6,
+            current_width=0.36,
+            current_height=0.38,
+            include_successor=False,
+            current_clipping=FrameEdge.TOP,
+            current_center_censored=True,
+            current_inner_aperture=degraded,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    projected_center = (1.40, -1.40)
+    decision_geometry = session.core._decision_geometry
+
+    def off_frame_decision_geometry(
+        track_id: str,
+        monotonic_ns: int,
+    ):
+        _, aperture = decision_geometry(track_id, monotonic_ns)
+        return projected_center, aperture
+
+    monkeypatch.setattr(
+        session.core,
+        "_decision_geometry",
+        off_frame_decision_geometry,
+    )
+
+    proposal = _observe(planner, snapshot, tracker)
+
+    state = session.core.course_state().current
+    assert state.censored_axes == (False, False)
+    assert state.aperture_propagated
+    assert (
+        proposal.current_target.normalized_x,
+        proposal.current_target.normalized_y_down,
+    ) == pytest.approx(
+        (
+            MAX_VISUAL_TARGET_COORDINATE_NORM,
+            -MAX_VISUAL_TARGET_COORDINATE_NORM,
+        )
+    )
+    assert session.last_decision is not None
+    assert session.last_decision.camera_current_center_norm == pytest.approx(
+        projected_center
+    )
+    assert proposal.servo_output.corridor_frames == 0
+    assert proposal.passage_admission is None
+
+
 def test_propagated_current_fov_gap_authority_is_exact_and_steering_only() -> None:
     session, track, token, now_ns = _propagated_vertical_fov_gap()
     decision = session.last_decision
