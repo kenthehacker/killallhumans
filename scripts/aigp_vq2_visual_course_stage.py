@@ -283,27 +283,29 @@ def _fresh_top_boundary_recovery_lifecycle_eligible(
     )
 
 
-def _promoted_fresh_top_boundary_brake_required(
+def _promoted_top_boundary_may_defer_missing_fov(
     *,
-    dynamic_controller_exact: bool,
     mode: VisualApproachMode,
     lifecycle: CourseLifecycle,
     recovery_measurement_mode: Optional[PostCreditMeasurementMode],
     successor_handoff_required: bool,
+    committed_crossing: bool,
     current_clipping: Any,
+    current_center_censored: Any,
 ) -> bool:
-    """Route post-handoff TOP frames through the bounded boundary brake."""
+    """Admit no-FOV recovery only for an exact post-handoff TOP frame."""
 
     return bool(
-        dynamic_controller_exact
-        and not successor_handoff_required
-        and current_clipping is FrameEdge.TOP
+        mode is VisualApproachMode.PROMOTE_REACQUIRE
         and _fresh_top_boundary_recovery_lifecycle_eligible(
             mode=mode,
             lifecycle=lifecycle,
             recovery_measurement_mode=recovery_measurement_mode,
         )
-        and mode is VisualApproachMode.PROMOTE_REACQUIRE
+        and not successor_handoff_required
+        and not committed_crossing
+        and current_clipping is FrameEdge.TOP
+        and current_center_censored is True
     )
 
 
@@ -7452,6 +7454,10 @@ async def _run_visual_course_stage_impl(
         top_fov_retained_raw_proposal: Optional[
             _TopFovPitchProposal
         ] = None
+        deferred_top_fov_error: Optional[BaseException] = None
+        fresh_top_boundary: Optional[
+            _FreshCurrentTopBoundaryAuthority
+        ] = None
         top_censored_closure_recovery: Optional[
             _FreshTopCensoredClosureRecovery
         ] = None
@@ -7549,12 +7555,42 @@ async def _run_visual_course_stage_impl(
                             TypeError,
                             ValueError,
                         ):
-                            raise abort_type(
-                                "visual-course top-FOV pitch guidance "
-                                f"refused: {exc}"
-                            ) from exc
+                            if (
+                                _promoted_top_boundary_may_defer_missing_fov(
+                                    mode=proposal.mode,
+                                    lifecycle=lifecycle,
+                                    recovery_measurement_mode=(
+                                        recovery_measurement_mode
+                                    ),
+                                    successor_handoff_required=(
+                                        post_credit_successor_handoff_required
+                                    ),
+                                    committed_crossing=(
+                                        committed_crossing_authority
+                                        is not None
+                                    ),
+                                    current_clipping=getattr(
+                                        target_track,
+                                        "clipping",
+                                        None,
+                                    ),
+                                    current_center_censored=getattr(
+                                        target_track,
+                                        "center_censored",
+                                        None,
+                                    ),
+                                )
+                            ):
+                                deferred_top_fov_error = exc
+                            else:
+                                raise abort_type(
+                                    "visual-course top-FOV pitch guidance "
+                                    f"refused: {exc}"
+                                ) from exc
                         target_pitch_rad = (
-                            top_fov_retained_raw_proposal
+                            target_pitch_rad
+                            if top_fov_retained_raw_proposal is None
+                            else top_fov_retained_raw_proposal
                             .protected_target_pitch_rad
                         )
                     if launch_evidence is not None:
@@ -7640,7 +7676,10 @@ async def _run_visual_course_stage_impl(
                 or top_fov_retained_raw_proposal
             )
             if (
-                fov_reference is not None
+                (
+                    fov_reference is not None
+                    or deferred_top_fov_error is not None
+                )
                 and committed_crossing_authority is None
                 and getattr(target_track, "clipping", None)
                 is FrameEdge.TOP
@@ -7686,14 +7725,15 @@ async def _run_visual_course_stage_impl(
                             "fresh TOP recovery differs from current lineage"
                         )
                     recovery_config = dynamic_controller.core.config
-                    fresh_top_boundary = (
-                        _fresh_current_top_boundary_authority(
-                            dynamic_controller,
-                            snapshot=snapshot,
-                            current_gate_index=current_gate_index,
-                            current_track_id=current_track_id,
+                    if fresh_top_boundary is None:
+                        fresh_top_boundary = (
+                            _fresh_current_top_boundary_authority(
+                                dynamic_controller,
+                                snapshot=snapshot,
+                                current_gate_index=current_gate_index,
+                                current_track_id=current_track_id,
+                            )
                         )
-                    )
                     top_censored_closure_recovery = (
                         _allocate_fresh_top_censored_closure_recovery(
                             raw_top_edge_image_down=(
@@ -7772,18 +7812,34 @@ async def _run_visual_course_stage_impl(
                                 recovery_current.time_to_contact_s
                             ),
                             requested_target_pitch_rad=(
-                                requested_pitch_before_top_fov
+                                float(recovery_config.brake_pitch_rad)
+                                if deferred_top_fov_error is not None
+                                else requested_pitch_before_top_fov
                             ),
                             fov_protected_target_pitch_rad=(
-                                fov_reference
+                                requested_pitch_before_top_fov
+                                if fov_reference is None
+                                else fov_reference
                                 .protected_target_pitch_rad
                             ),
-                            requested_thrust=command_thrust,
+                            requested_thrust=(
+                                float(limits.max_thrust)
+                                if deferred_top_fov_error is not None
+                                else command_thrust
+                            ),
                             fresh_boundary_current_authority=(
                                 fresh_top_boundary
                             ),
                         )
                     )
+                    if (
+                        deferred_top_fov_error is not None
+                        and top_censored_closure_recovery is None
+                    ):
+                        raise ValueError(
+                            "promoted fresh TOP boundary lacks bounded "
+                            "no-FOV recovery"
+                        )
                 except (
                     AttributeError,
                     TypeError,
@@ -10431,33 +10487,6 @@ async def _run_visual_course_stage_impl(
                 )
             )
             try:
-                if _promoted_fresh_top_boundary_brake_required(
-                    dynamic_controller_exact=(
-                        type(runtime.dynamic_controller)
-                        is DynamicVisualCourseSession
-                    ),
-                    mode=mode,
-                    lifecycle=lifecycle,
-                    recovery_measurement_mode=(
-                        recovery_measurement_mode
-                    ),
-                    successor_handoff_required=(
-                        post_credit_successor_handoff_required
-                    ),
-                    current_clipping=getattr(
-                        getattr(snapshot, "current_track", None),
-                        "clipping",
-                        None,
-                    ),
-                ):
-                    # The ordinary planner can steer from a fresh one-axis
-                    # outer shell even when a newly rebound current has never
-                    # seeded an aperture.  Its downstream raw-edge FOV path
-                    # cannot consume TOP censorship, so route the exact
-                    # boundary into the already-bounded steering-only brake.
-                    raise VisualApproachCurrentGeometryUnavailable(
-                        "promoted current TOP boundary requires bounded brake"
-                    )
                 proposal = planner.observe(
                     snapshot,
                     host.visual_tracker,
