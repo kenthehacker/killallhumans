@@ -3148,6 +3148,187 @@ def _fresh_post_credit_top_boundary_case():
     return state, decision, authority, snapshot
 
 
+def _fresh_post_credit_horizontal_boundary_case(clipping):
+    token = _token(50)
+    bbox_norm = (
+        (0.0, 0.09, 0.20, 0.36)
+        if clipping & FrameEdge.LEFT
+        else (0.80, 0.09, 1.0, 0.36)
+    )
+    sample = SimpleNamespace(
+        token=token,
+        tracker_frame_sequence=50,
+        clipping=clipping,
+        bbox_norm=bbox_norm,
+        center_censored=True,
+    )
+    track = SimpleNamespace(
+        track_id="track-1",
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=1,
+        latest_token=token,
+        history=(sample,),
+        visible=True,
+        ambiguous=False,
+        missed_frame_count=0,
+        clipping=clipping,
+        center_censored=True,
+    )
+    pitch = -0.100
+    current = SimpleNamespace(
+        track_id="track-1",
+        frame_sequence=50,
+        stream_generation=token.generation,
+        visible=True,
+        ambiguous=False,
+        missed_count=0,
+        censored_axes=(True, False),
+        body_to_reference_wxyz=(
+            math.cos(pitch / 2.0),
+            0.0,
+            math.sin(pitch / 2.0),
+            0.0,
+        ),
+    )
+    state = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="track-1",
+        current=current,
+    )
+    decision = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="track-1",
+    )
+    snapshot = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="track-1",
+        latest_camera_token=token,
+        current_track=track,
+        authority_usable=True,
+        withholding_reason=None,
+        race_finished=False,
+    )
+    authority = {
+        "reviewed_track_id": "track-1",
+        "steering_track_id": "track-1",
+        "to_gate_index": 1,
+        "stream_generation": token.generation,
+        "steering_available": True,
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+        "vertical_axis_censored": False,
+        "current_raw_clipping": int(clipping),
+        "retained_pitch_ceiling_rad": -0.265,
+    }
+    return state, decision, authority, snapshot
+
+
+@pytest.mark.parametrize("clipping", (FrameEdge.LEFT, FrameEdge.RIGHT))
+def test_fresh_horizontal_only_current_uses_direct_top_for_steering(clipping):
+    state, decision, authority, snapshot = (
+        _fresh_post_credit_horizontal_boundary_case(clipping)
+    )
+
+    proposal, evidence = (
+        course_stage
+        ._fresh_post_credit_horizontal_top_fov_pitch_reference(
+            DynamicVisualCourseSession(),
+            state=state,
+            decision=decision,
+            authority=authority,
+            recovery_snapshot=snapshot,
+            current_gate_index=1,
+            requested_target_pitch_rad=-0.265,
+        )
+    )
+
+    assert proposal.protected_target_pitch_rad <= -0.265
+    assert evidence["basis"] == (
+        course_stage.FRESH_HORIZONTAL_DIRECT_TOP_FOV_BASIS
+    )
+    assert evidence["clipping"] == int(clipping)
+    assert evidence["raw_top_edge_image_down"] == pytest.approx(-0.82)
+    assert evidence["propagated_aperture_available"] is False
+    assert evidence["aperture_authority"] is False
+    assert evidence["steering_only"] is True
+    assert evidence["passage_authority"] is False
+    assert evidence["advance_authority"] is False
+    assert evidence["cross_gap_identity_claimed"] is False
+
+
+@pytest.mark.parametrize(
+    "clipping",
+    (
+        FrameEdge.TOP,
+        FrameEdge.TOP | FrameEdge.RIGHT,
+        FrameEdge.BOTTOM,
+        FrameEdge.NONE,
+        FrameEdge.LEFT | FrameEdge.RIGHT,
+    ),
+)
+def test_fresh_horizontal_top_reference_refuses_non_horizontal_only_clipping(
+    clipping,
+):
+    state, decision, authority, snapshot = (
+        _fresh_post_credit_horizontal_boundary_case(clipping)
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="differs from credited current lineage",
+    ):
+        (
+            course_stage
+            ._fresh_post_credit_horizontal_top_fov_pitch_reference(
+                DynamicVisualCourseSession(),
+                state=state,
+                decision=decision,
+                authority=authority,
+                recovery_snapshot=snapshot,
+                current_gate_index=1,
+                requested_target_pitch_rad=-0.265,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("unusable", "ambiguous", "wrong_track", "stale_token"),
+)
+def test_fresh_horizontal_top_reference_requires_exact_current_lineage(
+    mutation,
+):
+    state, decision, authority, snapshot = (
+        _fresh_post_credit_horizontal_boundary_case(FrameEdge.RIGHT)
+    )
+    if mutation == "unusable":
+        snapshot.authority_usable = False
+    elif mutation == "ambiguous":
+        snapshot.current_track.ambiguous = True
+    elif mutation == "wrong_track":
+        decision.current_track_id = "wrong-track"
+    else:
+        snapshot.latest_camera_token = _token(51)
+
+    with pytest.raises(
+        ValueError,
+        match="differs from credited current lineage",
+    ):
+        (
+            course_stage
+            ._fresh_post_credit_horizontal_top_fov_pitch_reference(
+                DynamicVisualCourseSession(),
+                state=state,
+                decision=decision,
+                authority=authority,
+                recovery_snapshot=snapshot,
+                current_gate_index=1,
+                requested_target_pitch_rad=-0.265,
+            )
+        )
+
+
 def test_dd89_fresh_top_boundary_allocates_vertical_without_forward_closure():
     allocation = _dd89_top_censored_recovery()
 

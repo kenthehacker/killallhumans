@@ -158,6 +158,9 @@ APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS = (
 FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "fresh-top-boundary-imu-closure-recovery-v1"
 )
+FRESH_HORIZONTAL_DIRECT_TOP_FOV_BASIS = (
+    "fresh-horizontal-edge-direct-top-fov-steering-v1"
+)
 APPROACH_INNER_DROPOUT_MAX_DURATION_S = 0.120
 APPROACH_TOP_RECOVERY_ENDPOINT_SIGMA = 2.0
 APPROACH_TOP_RECOVERY_MIN_INWARD_Q_RATE_S = 0.25
@@ -649,6 +652,179 @@ def _fresh_post_credit_top_boundary_authority(
         track=track,
         sample=sample,
     )
+
+
+def _fresh_post_credit_horizontal_top_fov_pitch_reference(
+    session: DynamicVisualCourseSession,
+    *,
+    state: Any,
+    decision: Any,
+    authority: Mapping[str, Any],
+    recovery_snapshot: Any,
+    current_gate_index: int,
+    requested_target_pitch_rad: float,
+) -> tuple[_TopFovPitchProposal, Mapping[str, Any]]:
+    """Protect pitch from a fresh top edge during LEFT/RIGHT-only recovery.
+
+    Horizontal clipping leaves the outer support's top boundary directly
+    observable.  This path consumes only the already-authoritative current
+    identity and the existing post-credit steering envelope.  It cannot
+    create aperture, passage, advance, or cross-gap identity authority.
+    """
+
+    track = getattr(recovery_snapshot, "current_track", None)
+    token = getattr(recovery_snapshot, "latest_camera_token", None)
+    history = getattr(track, "history", None)
+    sample = (
+        None
+        if type(history) is not tuple or not history
+        else history[-1]
+    )
+    current = getattr(state, "current", None)
+    track_id = getattr(state, "current_track_id", None)
+    clipping = getattr(track, "clipping", None)
+    direct_top: Optional[float] = None
+    if sample is not None:
+        try:
+            direct_top = _raw_bbox_top_image_down(sample.bbox_norm)
+        except (AttributeError, TypeError, ValueError):
+            direct_top = None
+    if (
+        type(session) is not DynamicVisualCourseSession
+        or type(current_gate_index) is not int
+        or current_gate_index < 0
+        or not isinstance(authority, Mapping)
+        or type(token) is not CameraFrameToken
+        or sample is None
+        or current is None
+        or type(track_id) is not str
+        or not track_id
+        or type(clipping) is not FrameEdge
+        or clipping not in {FrameEdge.LEFT, FrameEdge.RIGHT}
+        or getattr(state, "current_gate_index", None)
+        != current_gate_index
+        or getattr(decision, "current_gate_index", None)
+        != current_gate_index
+        or getattr(decision, "current_track_id", None) != track_id
+        or authority.get("reviewed_track_id") != track_id
+        or authority.get("steering_track_id") != track_id
+        or authority.get("to_gate_index") != current_gate_index
+        or authority.get("stream_generation") != token.generation
+        or authority.get("steering_available") is not True
+        or authority.get("steering_only") is not True
+        or authority.get("passage_authority") is not False
+        or authority.get("advance_authority") is not False
+        or authority.get("vertical_axis_censored") is not False
+        or authority.get("current_raw_clipping") != int(clipping)
+        or getattr(recovery_snapshot, "current_gate_index", None)
+        != current_gate_index
+        or getattr(recovery_snapshot, "current_track_id", None)
+        != track_id
+        or getattr(recovery_snapshot, "authority_usable", None) is not True
+        or getattr(recovery_snapshot, "withholding_reason", None) is not None
+        or getattr(recovery_snapshot, "race_finished", None) is not False
+        or getattr(current, "track_id", None) != track_id
+        or getattr(track, "track_id", None) != track_id
+        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
+        or getattr(track, "authoritative_gate_index", None)
+        != current_gate_index
+        or getattr(track, "latest_token", None) != token
+        or getattr(sample, "token", None) != token
+        or getattr(current, "frame_sequence", None)
+        != getattr(sample, "tracker_frame_sequence", None)
+        or getattr(current, "stream_generation", None)
+        != token.generation
+        or not bool(getattr(current, "visible", False))
+        or bool(getattr(current, "ambiguous", True))
+        or getattr(current, "missed_count", None) != 0
+        or getattr(current, "censored_axes", None) != (True, False)
+        or not bool(getattr(track, "visible", False))
+        or bool(getattr(track, "ambiguous", True))
+        or getattr(track, "missed_frame_count", None) != 0
+        or getattr(sample, "clipping", None) != clipping
+        or getattr(track, "center_censored", None) is not True
+        or getattr(sample, "center_censored", None) is not True
+        or direct_top is None
+        or not -1.0 < direct_top <= 1.0
+    ):
+        raise ValueError(
+            "fresh post-credit horizontal top boundary differs from "
+            "credited current lineage"
+        )
+
+    config = session.core.config
+    requested_pitch = float(requested_target_pitch_rad)
+    retained_ceiling_value = authority.get(
+        "retained_pitch_ceiling_rad"
+    )
+    retained_ceiling = (
+        requested_pitch
+        if retained_ceiling_value is None
+        else float(retained_ceiling_value)
+    )
+    capture_pitch = _body_to_reference_pitch_rad(
+        current.body_to_reference_wxyz
+    )
+    vertical_scale = float(config.vertical_angle_scale_rad)
+    response_delay = float(config.pitch_command_delay_s)
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                requested_pitch,
+                retained_ceiling,
+                capture_pitch,
+                vertical_scale,
+                response_delay,
+            )
+        )
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= requested_pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= retained_ceiling
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or vertical_scale <= 0.0
+        or response_delay < 0.0
+    ):
+        raise ValueError(
+            "fresh post-credit horizontal top boundary inputs are invalid"
+        )
+    proposal = _propose_top_fov_pitch_reference(
+        capture_pitch_rad=capture_pitch,
+        raw_top_edge_image_down=direct_top,
+        raw_top_edge_rate_down_s=None,
+        requested_target_pitch_rad=requested_pitch,
+        prior_target_pitch_rad=min(requested_pitch, retained_ceiling),
+        vertical_angle_scale_rad=vertical_scale,
+        # This is a transition from a censored recovery state.  A fresh
+        # horizontal-only frame proves its top location but not a temporal
+        # recovery trend, so it may tighten and never loosen the prior bound.
+        active_before=True,
+        raw_top_edge_nonrotational_angle_rate_rad_s=None,
+        prediction_horizon_s=response_delay,
+    )
+    evidence = {
+        "basis": FRESH_HORIZONTAL_DIRECT_TOP_FOV_BASIS,
+        "gate_index": current_gate_index,
+        "track_id": track_id,
+        "camera_token": asdict(token),
+        "clipping": int(clipping),
+        "raw_top_edge_basis": TOP_FOV_OUTER_EDGE_FALLBACK_BASIS,
+        "raw_top_edge_image_down": direct_top,
+        "safe_top_edge_image_down": TOP_FOV_SAFE_EDGE_IMAGE_DOWN,
+        "capture_pitch_rad": capture_pitch,
+        "retained_pitch_ceiling_rad": retained_ceiling,
+        "source_target_pitch_rad": requested_pitch,
+        "propagated_aperture_available": False,
+        **asdict(proposal),
+        "aperture_authority": False,
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+        "cross_gap_identity_claimed": False,
+    }
+    return proposal, evidence
 
 
 def _allocate_fresh_top_censored_closure_recovery(
@@ -5210,129 +5386,158 @@ async def _run_visual_course_stage_impl(
                         "propagated FOV gap lacks a clean propagated aperture"
                     ):
                         raise
-                    recovery_boundary = (
-                        _fresh_post_credit_top_boundary_authority(
-                            state=state,
-                            decision=decision,
-                            authority=authority,
-                            recovery_snapshot=recovery_snapshot,
-                            current_gate_index=current_gate_index,
-                        )
+                    recovery_clipping = getattr(
+                        recovery_snapshot.current_track,
+                        "clipping",
+                        None,
                     )
-                    recovery_current = recovery_boundary.current
-                    recovery_track = recovery_boundary.track
-                    recovery_sample = recovery_boundary.sample
-                    recovery_config = dynamic_controller.core.config
-                    top_censored_closure_recovery = (
-                        _allocate_fresh_top_censored_closure_recovery(
-                            raw_top_edge_image_down=(
-                                _raw_bbox_top_image_down(
-                                    recovery_sample.bbox_norm
-                                )
-                            ),
-                            clipping=getattr(
-                                recovery_track,
-                                "clipping",
-                                FrameEdge.NONE,
-                            ),
-                            center_censored=bool(
-                                getattr(
+                    if recovery_clipping in {
+                        FrameEdge.LEFT,
+                        FrameEdge.RIGHT,
+                    }:
+                        (
+                            top_fov_proposal,
+                            top_fov_guidance,
+                        ) = (
+                            _fresh_post_credit_horizontal_top_fov_pitch_reference(
+                                dynamic_controller,
+                                state=state,
+                                decision=decision,
+                                authority=authority,
+                                recovery_snapshot=recovery_snapshot,
+                                current_gate_index=current_gate_index,
+                                requested_target_pitch_rad=(
+                                    target_pitch_rad
+                                ),
+                            )
+                        )
+                        target_pitch_rad = (
+                            top_fov_proposal.protected_target_pitch_rad
+                        )
+                    else:
+                        recovery_boundary = (
+                            _fresh_post_credit_top_boundary_authority(
+                                state=state,
+                                decision=decision,
+                                authority=authority,
+                                recovery_snapshot=recovery_snapshot,
+                                current_gate_index=current_gate_index,
+                            )
+                        )
+                        recovery_current = recovery_boundary.current
+                        recovery_track = recovery_boundary.track
+                        recovery_sample = recovery_boundary.sample
+                        recovery_config = dynamic_controller.core.config
+                        top_censored_closure_recovery = (
+                            _allocate_fresh_top_censored_closure_recovery(
+                                raw_top_edge_image_down=(
+                                    _raw_bbox_top_image_down(
+                                        recovery_sample.bbox_norm
+                                    )
+                                ),
+                                clipping=getattr(
                                     recovery_track,
-                                    "center_censored",
-                                    False,
-                                )
-                            ),
-                            current_visible=bool(
-                                recovery_current.visible
-                            ),
-                            current_ambiguous=bool(
-                                recovery_current.ambiguous
-                            ),
-                            current_missed_count=int(
-                                recovery_current.missed_count
-                            ),
-                            current_censored_axes=(
-                                recovery_current.censored_axes
-                            ),
-                            current_aperture_propagated=bool(
-                                recovery_current.aperture_propagated
-                            ),
-                            current_aperture_dynamics_qualified=bool(
-                                recovery_current
-                                .aperture_dynamics_qualified
-                            ),
-                            passage_committed=False,
-                            capture_pitch_rad=(
-                                _body_to_reference_pitch_rad(
+                                    "clipping",
+                                    FrameEdge.NONE,
+                                ),
+                                center_censored=bool(
+                                    getattr(
+                                        recovery_track,
+                                        "center_censored",
+                                        False,
+                                    )
+                                ),
+                                current_visible=bool(
+                                    recovery_current.visible
+                                ),
+                                current_ambiguous=bool(
+                                    recovery_current.ambiguous
+                                ),
+                                current_missed_count=int(
+                                    recovery_current.missed_count
+                                ),
+                                current_censored_axes=(
+                                    recovery_current.censored_axes
+                                ),
+                                current_aperture_propagated=bool(
+                                    recovery_current.aperture_propagated
+                                ),
+                                current_aperture_dynamics_qualified=bool(
                                     recovery_current
-                                    .body_to_reference_wxyz
-                                )
-                            ),
-                            body_pitch_rate_rad_s=float(
-                                recovery_current.body_rates_rad_s[1]
-                            ),
-                            pitch_response_delay_s=float(
-                                recovery_config.pitch_command_delay_s
-                            ),
-                            stable_center_norm=(
-                                decision.current_center_norm
-                            ),
-                            residual_rate_rad_s=(
-                                recovery_current
-                                .residual_translational_rate_rad_s
-                            ),
-                            horizontal_angle_scale_rad=float(
-                                recovery_config
-                                .horizontal_angle_scale_rad
-                            ),
-                            vertical_angle_scale_rad=float(
-                                recovery_config.vertical_angle_scale_rad
-                            ),
-                            off_axis_brake_rad=float(
-                                recovery_config.off_axis_brake_rad
-                            ),
-                            expansion_rate_s=float(
-                                recovery_current.expansion_rate_s
-                            ),
-                            time_to_contact_s=(
-                                recovery_current.time_to_contact_s
-                            ),
-                            requested_target_pitch_rad=float(
-                                recovery_config.brake_pitch_rad
-                            ),
-                            fov_protected_target_pitch_rad=(
-                                target_pitch_rad
-                            ),
-                            requested_thrust=float(limits.max_thrust),
-                            fresh_boundary_current_authority=(
-                                recovery_boundary
-                            ),
+                                    .aperture_dynamics_qualified
+                                ),
+                                passage_committed=False,
+                                capture_pitch_rad=(
+                                    _body_to_reference_pitch_rad(
+                                        recovery_current
+                                        .body_to_reference_wxyz
+                                    )
+                                ),
+                                body_pitch_rate_rad_s=float(
+                                    recovery_current.body_rates_rad_s[1]
+                                ),
+                                pitch_response_delay_s=float(
+                                    recovery_config.pitch_command_delay_s
+                                ),
+                                stable_center_norm=(
+                                    decision.current_center_norm
+                                ),
+                                residual_rate_rad_s=(
+                                    recovery_current
+                                    .residual_translational_rate_rad_s
+                                ),
+                                horizontal_angle_scale_rad=float(
+                                    recovery_config
+                                    .horizontal_angle_scale_rad
+                                ),
+                                vertical_angle_scale_rad=float(
+                                    recovery_config.vertical_angle_scale_rad
+                                ),
+                                off_axis_brake_rad=float(
+                                    recovery_config.off_axis_brake_rad
+                                ),
+                                expansion_rate_s=float(
+                                    recovery_current.expansion_rate_s
+                                ),
+                                time_to_contact_s=(
+                                    recovery_current.time_to_contact_s
+                                ),
+                                requested_target_pitch_rad=float(
+                                    recovery_config.brake_pitch_rad
+                                ),
+                                fov_protected_target_pitch_rad=(
+                                    target_pitch_rad
+                                ),
+                                requested_thrust=float(limits.max_thrust),
+                                fresh_boundary_current_authority=(
+                                    recovery_boundary
+                                ),
+                            )
                         )
-                    )
-                    if top_censored_closure_recovery is None:
-                        raise ValueError(
-                            "fresh post-credit TOP boundary lacks bounded "
-                            "closure-recovery authority"
-                        ) from propagated_fov_error
-                    target_pitch_rad = (
-                        top_censored_closure_recovery
-                        .allocated_target_pitch_rad
-                    )
-                    thrust = (
-                        top_censored_closure_recovery.allocated_thrust
-                    )
-                    top_fov_guidance = {
-                        **asdict(top_censored_closure_recovery),
-                        "track_id": authority["reviewed_track_id"],
-                        "source_target_pitch_rad": float(
-                            authority["target_pitch_rad"]
-                        ),
-                        "source_thrust": float(authority["thrust"]),
-                        "propagated_aperture_available": False,
-                        "steering_only": True,
-                        "passage_authority": False,
-                        "advance_authority": False,
-                    }
+                        if top_censored_closure_recovery is None:
+                            raise ValueError(
+                                "fresh post-credit TOP boundary lacks bounded "
+                                "closure-recovery authority"
+                            ) from propagated_fov_error
+                        target_pitch_rad = (
+                            top_censored_closure_recovery
+                            .allocated_target_pitch_rad
+                        )
+                        thrust = (
+                            top_censored_closure_recovery.allocated_thrust
+                        )
+                        top_fov_guidance = {
+                            **asdict(top_censored_closure_recovery),
+                            "track_id": authority["reviewed_track_id"],
+                            "source_target_pitch_rad": float(
+                                authority["target_pitch_rad"]
+                            ),
+                            "source_thrust": float(authority["thrust"]),
+                            "propagated_aperture_available": False,
+                            "steering_only": True,
+                            "passage_authority": False,
+                            "advance_authority": False,
+                        }
                 else:
                     if not isinstance(top_fov_handoff, Mapping):
                         raise ValueError(
@@ -5550,7 +5755,10 @@ async def _run_visual_course_stage_impl(
                     top_fov_guidance
                 )
                 fov_summary = segment["top_fov_pitch_protection"]
-                if top_fov_proposal is not None:
+                if (
+                    top_fov_proposal is not None
+                    and top_fov_handoff is not None
+                ):
                     assert top_fov_handoff is not None
                     assert top_fov_observation is not None
                     if top_fov_proposal.limited:
@@ -5595,6 +5803,29 @@ async def _run_visual_course_stage_impl(
                         authority=dict(top_fov_handoff),
                         pitch_guidance=dict(top_fov_guidance),
                         command=asdict(command),
+                    )
+                elif top_fov_proposal is not None:
+                    if top_fov_proposal.limited:
+                        fov_summary["limited_command_count"] += 1
+                    fov_summary.update(
+                        {
+                            "last_track_id": authority[
+                                "reviewed_track_id"
+                            ],
+                            "last_camera_token": dict(
+                                top_fov_guidance["camera_token"]
+                            ),
+                            "last_wire_start_monotonic_ns": call_start,
+                            "last_forecast_top_edge_image_down": (
+                                top_fov_proposal
+                                .forecast_top_edge_image_down
+                            ),
+                            "last_protected_target_pitch_rad": (
+                                top_fov_proposal
+                                .protected_target_pitch_rad
+                            ),
+                            "active": top_fov_proposal.active_after,
+                        }
                     )
                 else:
                     fov_summary.update(
