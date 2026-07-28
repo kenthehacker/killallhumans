@@ -4748,7 +4748,7 @@ def _latest_gate_one_top_pitch_arbitration_case():
     return boundary, fov_proposal, recovery
 
 
-def test_latest_off_axis_exact_top_yields_to_forward_brake():
+def test_latest_off_axis_exact_top_keeps_fov_pitch():
     boundary, fov_proposal, recovery = (
         _latest_gate_one_top_pitch_arbitration_case()
     )
@@ -4758,18 +4758,48 @@ def test_latest_off_axis_exact_top_yields_to_forward_brake():
             mode=VisualApproachMode.APPROACH,
             current_gate_index=1,
             initial_gate_index=0,
-            current_gate_brake_preempted=True,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
         )
     )
 
-    assert owns_pitch is False
+    assert owns_pitch is True
     assert fov_proposal.protected_target_pitch_rad == pytest.approx(-0.35)
     assert recovery.forward_closure_authorized is False
     assert recovery.passage_authority is False
     assert recovery.advance_authority is False
+
+
+@pytest.mark.parametrize(
+    (
+        "current_gate_index",
+        "continuity_pitch",
+        "brake_pitch",
+        "expected",
+    ),
+    (
+        (1, -0.23996546959183251, 0.12, -0.23996546959183251),
+        (0, -0.23996546959183251, 0.12, 0.12),
+        (1, 0.04, 0.12, 0.12),
+    ),
+)
+def test_fresh_top_boundary_fallback_preserves_later_gate_fov_pitch(
+    current_gate_index,
+    continuity_pitch,
+    brake_pitch,
+    expected,
+):
+    selected = (
+        course_stage._select_fresh_top_boundary_recovery_pitch(
+            current_gate_index=current_gate_index,
+            initial_gate_index=0,
+            continuity_target_pitch_rad=continuity_pitch,
+            allocated_brake_target_pitch_rad=brake_pitch,
+        )
+    )
+
+    assert selected == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(
@@ -4804,7 +4834,6 @@ def test_post_credit_top_recovery_keeps_fov_pitch_ownership(
             mode=VisualApproachMode.PROMOTE_REACQUIRE,
             current_gate_index=1,
             initial_gate_index=0,
-            current_gate_brake_preempted=False,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
@@ -4848,7 +4877,6 @@ def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
             mode=VisualApproachMode.PROMOTE_REACQUIRE,
             current_gate_index=1,
             initial_gate_index=0,
-            current_gate_brake_preempted=False,
             fov_proposal=propagated_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
@@ -4873,7 +4901,6 @@ def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
             mode=VisualApproachMode.APPROACH,
             current_gate_index=1,
             initial_gate_index=0,
-            current_gate_brake_preempted=False,
             fov_proposal=propagated_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=ordinary_off_axis,
@@ -4911,7 +4938,6 @@ def test_post_credit_top_fov_owns_pitch_during_aligned_or_rapid_closure(
             mode=VisualApproachMode.PROMOTE_REACQUIRE,
             current_gate_index=1,
             initial_gate_index=0,
-            current_gate_brake_preempted=False,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
@@ -4939,7 +4965,6 @@ def test_exact_top_fov_owns_pitch_when_horizontally_aligned():
             mode=VisualApproachMode.APPROACH,
             current_gate_index=1,
             initial_gate_index=0,
-            current_gate_brake_preempted=False,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
@@ -4961,7 +4986,7 @@ def test_exact_top_fov_owns_pitch_when_horizontally_aligned():
         },
     ),
 )
-def test_off_axis_top_fov_yields_during_rapid_closure(
+def test_off_axis_top_fov_keeps_pitch_during_rapid_closure(
     recovery_change,
 ):
     boundary, fov_proposal, recovery = (
@@ -4974,106 +4999,16 @@ def test_off_axis_top_fov_yields_during_rapid_closure(
             mode=VisualApproachMode.APPROACH,
             current_gate_index=1,
             initial_gate_index=0,
-            current_gate_brake_preempted=True,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
         )
-        is False
+        is True
     )
     assert recovery.horizontal_aligned is False
     assert fov_proposal.protected_target_pitch_rad < (
         recovery.allocated_target_pitch_rad
     )
-
-
-@pytest.mark.parametrize(
-    "urgent_closure",
-    (
-        {"expansion_rate_s": 0.45, "time_to_contact_s": None},
-        {"expansion_rate_s": 0.223, "time_to_contact_s": 2.2},
-    ),
-)
-def test_nonimproving_later_gate_brake_preempts_top_fov_for_urgent_closure(
-    urgent_closure,
-):
-    assert (
-        course_stage._current_gate_brake_preempts_top_fov(
-            current_gate_index=1,
-            initial_gate_index=0,
-            mode=VisualApproachMode.APPROACH,
-            requested_target_pitch_rad=0.12,
-            braking=True,
-            current_visible=True,
-            current_ambiguous=False,
-            horizontal_rate_qualified=True,
-            stable_center_x_norm=0.50,
-            residual_horizontal_rate_rad_s=0.10,
-            horizontal_angle_scale_rad=0.80,
-            off_axis_brake_rad=0.10,
-            rapid_expansion_rate_s=0.45,
-            rapid_closure_ttc_s=2.2,
-            **urgent_closure,
-        )
-        is True
-    )
-
-
-@pytest.mark.parametrize(
-    "change",
-    (
-        {"current_gate_index": 0},
-        {"requested_target_pitch_rad": -0.10},
-        {"braking": False},
-        {"current_visible": False},
-        {"current_ambiguous": True},
-        {"horizontal_rate_qualified": False},
-        {"residual_horizontal_rate_rad_s": -0.10},
-        {"stable_center_x_norm": 0.02},
-        {
-            "expansion_rate_s": 0.223,
-            "time_to_contact_s": 4.479,
-        },
-        {
-            "expansion_rate_s": -0.212,
-            "time_to_contact_s": None,
-        },
-        {
-            "expansion_rate_s": 0.44,
-            "time_to_contact_s": 2.2001,
-        },
-    ),
-)
-def test_current_gate_brake_preemption_requires_outward_urgent_closure(
-    change,
-):
-    arguments = {
-        "current_gate_index": 1,
-        "initial_gate_index": 0,
-        "mode": VisualApproachMode.APPROACH,
-        "requested_target_pitch_rad": 0.12,
-        "braking": True,
-        "current_visible": True,
-        "current_ambiguous": False,
-        "horizontal_rate_qualified": True,
-        "stable_center_x_norm": 0.50,
-        "residual_horizontal_rate_rad_s": 0.10,
-        "horizontal_angle_scale_rad": 0.80,
-        "off_axis_brake_rad": 0.10,
-        "expansion_rate_s": 0.45,
-        "time_to_contact_s": None,
-        "rapid_expansion_rate_s": 0.45,
-        "rapid_closure_ttc_s": 2.2,
-    }
-    arguments.update(change)
-
-    assert (
-        course_stage._current_gate_brake_preempts_top_fov(
-            **arguments,
-        )
-        is False
-    )
-
 
 def test_fresh_top_boundary_command_still_uses_final_wire_governor():
     session = DynamicVisualCourseSession()
@@ -6708,34 +6643,16 @@ def _fresh_search_track(
     )
 
 
-@pytest.mark.parametrize(
-    (
-        "clipping",
-        "expected_pitch",
-        "expected_thrust",
-    ),
-    (
-        (FrameEdge.TOP, 0.12, 0.32),
-        (FrameEdge.TOP | FrameEdge.RIGHT, 0.12, 0.32),
-        (FrameEdge.RIGHT, 0.12, 0.275),
-    ),
-)
-def test_expired_geometry_search_brakes_with_top_collective_support(
-    clipping,
-    expected_pitch,
-    expected_thrust,
-):
+def test_expired_geometry_search_uses_neutral_vertical_reference():
     pitch, thrust = (
         course_stage._approach_expired_geometry_search_vertical_reference(
-            current_clipping=clipping,
             brake_pitch_rad=0.12,
             brake_thrust=0.275,
-            support_thrust=0.32,
         )
     )
 
-    assert pitch == pytest.approx(expected_pitch)
-    assert thrust == pytest.approx(expected_thrust)
+    assert pitch == pytest.approx(0.12)
+    assert thrust == pytest.approx(0.275)
 
 
 def test_expired_geometry_search_uses_sole_fresh_horizontal_detection():
