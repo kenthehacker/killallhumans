@@ -27,11 +27,11 @@ Quaternion = tuple[float, float, float, float]
 Vector2 = tuple[float, float]
 Vector3 = tuple[float, float, float]
 
-# Run 0906c464 held the Gate-1 target at -0.20 rad on 31/36 post-credit
-# commands while its horizontal camera error reversed and diverged to RIGHT
-# clipping.  Exercise the prescribed final target-attitude step without
-# changing the independently calibrated 0.25-rad/s wire-rate envelope.
-MAX_TARGET_ROLL_RAD = 0.25
+# Run 3fa07588 held the Gate-1 target at -0.25 rad on all 55 post-credit
+# commands while the gate still accelerated through RIGHT clipping.  Use the
+# next bounded target-attitude tier while retaining the independently fixed
+# 0.25-rad/s wire-rate envelope and the host's 25-degree attitude watchdog.
+MAX_TARGET_ROLL_RAD = 0.35
 MIN_TARGET_PITCH_RAD = -0.35
 MAX_TARGET_PITCH_RAD = 0.15
 MAX_YAW_RATE_RAD_S = 0.15

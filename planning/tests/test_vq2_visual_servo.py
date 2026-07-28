@@ -1381,7 +1381,9 @@ def test_passage_retains_heading_through_vertical_scale_degradation() -> None:
     assert output.yaw_rate_rad_s < -0.05
     # The current-aperture projected demand is small, so successor yaw cannot
     # import full successor bank through the passage barrier.
-    assert abs(output.target_roll_rad) < 0.02
+    assert abs(output.target_roll_rad) < (
+        0.06 * MAX_VISUAL_TARGET_ROLL_RAD
+    )
     assert not output.advance_enabled
     assert not output.passage_preview_retired
     assert output.passage_preview_retirement_violations == ()
