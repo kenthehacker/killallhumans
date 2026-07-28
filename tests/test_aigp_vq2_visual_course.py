@@ -5098,6 +5098,7 @@ def test_current_ambiguity_quarantine_retains_one_fixed_raw_top_lease():
             gate_index=1,
             track_id="track-1",
             now_monotonic_ns=1_100_000_000,
+            maximum_hold_age_s=0.12,
             fov_summary=fov_summary,
             hold=hold,
             existing=None,
@@ -5120,6 +5121,7 @@ def test_current_ambiguity_quarantine_retains_one_fixed_raw_top_lease():
             gate_index=1,
             track_id="track-1",
             now_monotonic_ns=1_140_000_000,
+            maximum_hold_age_s=0.12,
             fov_summary=fov_summary,
             hold=None,
             existing=authority,
@@ -5133,6 +5135,102 @@ def test_current_ambiguity_quarantine_retains_one_fixed_raw_top_lease():
         == authority.anchor_wire_start_monotonic_ns
     )
     assert continued.expires_monotonic_ns == authority.expires_monotonic_ns
+
+
+def test_first_current_ambiguity_uses_adjacent_exact_raw_top_anchor():
+    snapshot = _current_top_ambiguity_snapshot(52)
+    fov_summary = _current_top_ambiguity_fov_summary()
+    clean_token = _token(51)
+    source_wire_ns = 1_060_000_000
+    fov_summary.update(
+        {
+            "last_retained_raw_state_handoff": None,
+            "exact_raw_anchor": {
+                "basis": course_stage.TOP_FOV_EXACT_RAW_ANCHOR_BASIS,
+                "gate_index": 1,
+                "track_id": "track-1",
+                "camera_token": asdict(clean_token),
+                "wire_start_monotonic_ns": source_wire_ns,
+                "active": True,
+                "steering_only": True,
+                "passage_authority": False,
+                "advance_authority": False,
+            },
+            "last_camera_token": asdict(clean_token),
+            "last_wire_start_monotonic_ns": source_wire_ns,
+        }
+    )
+    hold = {
+        "target_roll_rad": -0.25,
+        "target_pitch_rad": 0.12,
+        "yaw_rate_rad_s": -0.12,
+        "thrust": 0.301,
+        "source_wire_start_monotonic_ns": source_wire_ns,
+    }
+
+    authority = (
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=snapshot,
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=1_100_000_000,
+            maximum_hold_age_s=0.12,
+            fov_summary=fov_summary,
+            hold=hold,
+            existing=None,
+        )
+    )
+
+    assert authority.clean_camera_token == clean_token
+    assert authority.command.anchor_camera_token == clean_token
+    assert authority.command.target_pitch_rad == pytest.approx(0.12)
+    assert authority.expires_monotonic_ns == 1_180_000_000
+    assert authority.raw_top_handoff["basis"] == (
+        course_stage
+        .APPROACH_CURRENT_AMBIGUITY_EXACT_RAW_LEASE_BASIS
+    )
+    assert authority.raw_top_handoff["steering_only"] is True
+    assert authority.raw_top_handoff["passage_authority"] is False
+    assert authority.raw_top_handoff["advance_authority"] is False
+
+    continued = (
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=_current_top_ambiguity_snapshot(53),
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=1_140_000_000,
+            maximum_hold_age_s=0.12,
+            fov_summary=fov_summary,
+            hold=None,
+            existing=authority,
+        )
+    )
+    assert continued.latest_ambiguous_camera_token == _token(53)
+    assert continued.raw_top_handoff == authority.raw_top_handoff
+    assert continued.expires_monotonic_ns == authority.expires_monotonic_ns
+
+    with pytest.raises(ValueError, match="exact fixed raw TOP lease"):
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=_current_top_ambiguity_snapshot(53),
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=1_100_000_000,
+            maximum_hold_age_s=0.12,
+            fov_summary=fov_summary,
+            hold=hold,
+            existing=None,
+        )
+    with pytest.raises(ValueError, match="exact fixed raw TOP lease"):
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=snapshot,
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=1_180_000_000,
+            maximum_hold_age_s=0.12,
+            fov_summary=fov_summary,
+            hold=hold,
+            existing=None,
+        )
 
 
 def test_current_ambiguity_quarantine_refuses_renewal_and_bad_lineage():
@@ -5151,6 +5249,7 @@ def test_current_ambiguity_quarantine_refuses_renewal_and_bad_lineage():
             gate_index=1,
             track_id="track-1",
             now_monotonic_ns=1_100_000_000,
+            maximum_hold_age_s=0.12,
             fov_summary=fov_summary,
             hold=hold,
             existing=None,
@@ -5163,6 +5262,7 @@ def test_current_ambiguity_quarantine_refuses_renewal_and_bad_lineage():
             gate_index=1,
             track_id="track-1",
             now_monotonic_ns=1_140_000_000,
+            maximum_hold_age_s=0.12,
             fov_summary=fov_summary,
             hold=hold,
             existing=authority,
@@ -5173,6 +5273,7 @@ def test_current_ambiguity_quarantine_refuses_renewal_and_bad_lineage():
             gate_index=1,
             track_id="track-1",
             now_monotonic_ns=authority.expires_monotonic_ns,
+            maximum_hold_age_s=0.12,
             fov_summary=fov_summary,
             hold=None,
             existing=authority,
@@ -5191,6 +5292,7 @@ def test_current_ambiguity_quarantine_refuses_renewal_and_bad_lineage():
             gate_index=1,
             track_id="track-1",
             now_monotonic_ns=1_140_000_000,
+            maximum_hold_age_s=0.12,
             fov_summary=changed_fov,
             hold=None,
             existing=authority,
@@ -5203,6 +5305,7 @@ def test_current_ambiguity_quarantine_refuses_renewal_and_bad_lineage():
             gate_index=1,
             track_id="track-1",
             now_monotonic_ns=1_100_000_000,
+            maximum_hold_age_s=0.12,
             fov_summary=fov_summary,
             hold=hold,
             existing=None,

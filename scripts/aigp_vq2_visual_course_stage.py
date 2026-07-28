@@ -158,6 +158,9 @@ APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS = (
 APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS = (
     "same-current-identity-ambiguity-quarantine-v1"
 )
+APPROACH_CURRENT_AMBIGUITY_EXACT_RAW_LEASE_BASIS = (
+    "same-current-first-ambiguity-exact-raw-top-lease-v1"
+)
 FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "fresh-top-boundary-imu-closure-recovery-v1"
 )
@@ -4202,12 +4205,113 @@ class _ApproachCurrentAmbiguityQuarantineAuthority:
     raw_top_handoff: Mapping[str, Any]
 
 
+def _first_ambiguity_exact_raw_top_handoff(
+    *,
+    token: CameraFrameToken,
+    gate_index: int,
+    track_id: str,
+    now_monotonic_ns: int,
+    maximum_age_s: float,
+    fov_summary: Mapping[str, Any],
+    hold: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Freeze the immediately preceding accepted exact raw-TOP anchor.
+
+    The ordinary retained-raw projection is produced only after a clean
+    vertically clipped publication has already followed its exact anchor.
+    The first ambiguous publication has no such intermediate frame.  Admit
+    that one structural seam directly from the preceding accepted exact
+    anchor, with the caller-proved command-continuity horizon and no renewal,
+    passage, or advance authority.
+    """
+
+    anchor = fov_summary.get("exact_raw_anchor")
+    last_token_fields = fov_summary.get("last_camera_token")
+    if (
+        type(token) is not CameraFrameToken
+        or not isinstance(anchor, Mapping)
+        or not isinstance(last_token_fields, Mapping)
+        or not isinstance(hold, Mapping)
+    ):
+        raise ValueError(
+            "approach ambiguity quarantine lacks retained raw TOP authority"
+        )
+    try:
+        anchor_token = CameraFrameToken(
+            **dict(anchor["camera_token"])
+        )
+        last_token = CameraFrameToken(**dict(last_token_fields))
+        anchor_wire_ns = int(anchor["wire_start_monotonic_ns"])
+        source_wire_ns = int(hold["source_wire_start_monotonic_ns"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "approach ambiguity quarantine exact raw TOP anchor is malformed"
+        ) from exc
+
+    maximum_age = float(maximum_age_s)
+    expires_ns = anchor_wire_ns + round(
+        maximum_age * 1_000_000_000.0
+    )
+    remaining_s = (
+        expires_ns - anchor_wire_ns
+    ) / 1_000_000_000.0
+    if (
+        anchor.get("basis") != TOP_FOV_EXACT_RAW_ANCHOR_BASIS
+        or anchor.get("gate_index") != gate_index
+        or anchor.get("track_id") != track_id
+        or anchor.get("active") is not True
+        or anchor.get("steering_only") is not True
+        or anchor.get("passage_authority") is not False
+        or anchor.get("advance_authority") is not False
+        or fov_summary.get("active") is not True
+        or fov_summary.get("last_track_id") != track_id
+        or last_token != anchor_token
+        or not _token_strictly_newer(token, anchor_token)
+        or token.stream_id != anchor_token.stream_id
+        or token.generation != anchor_token.generation
+        or token.publication_sequence
+        - anchor_token.publication_sequence
+        != 1
+        or anchor_wire_ns < 0
+        or source_wire_ns != anchor_wire_ns
+        or fov_summary.get("last_wire_start_monotonic_ns")
+        != source_wire_ns
+        or not math.isfinite(maximum_age)
+        or maximum_age <= 0.0
+        or maximum_age > 0.12 + 1e-12
+        or now_monotonic_ns < source_wire_ns
+        or now_monotonic_ns >= expires_ns
+        or not math.isfinite(remaining_s)
+        or remaining_s <= 0.0
+    ):
+        raise ValueError(
+            "approach ambiguity quarantine lacks exact fixed raw TOP lease"
+        )
+    return {
+        "basis": (
+            APPROACH_CURRENT_AMBIGUITY_EXACT_RAW_LEASE_BASIS
+        ),
+        "gate_index": gate_index,
+        "track_id": track_id,
+        "anchor_camera_token": asdict(anchor_token),
+        "camera_token": asdict(anchor_token),
+        "anchor_wire_start_monotonic_ns": anchor_wire_ns,
+        "authority_monotonic_ns": anchor_wire_ns,
+        "maximum_age_s": maximum_age,
+        "prediction_horizon_remaining_s": remaining_s,
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+
+
 def _approach_current_ambiguity_quarantine_authority(
     *,
     snapshot: Any,
     gate_index: int,
     track_id: str,
     now_monotonic_ns: int,
+    maximum_hold_age_s: float,
     fov_summary: Mapping[str, Any],
     hold: Optional[Mapping[str, Any]],
     existing: Optional[_ApproachCurrentAmbiguityQuarantineAuthority],
@@ -4228,6 +4332,9 @@ def _approach_current_ambiguity_quarantine_authority(
         or not track_id
         or type(now_monotonic_ns) is not int
         or now_monotonic_ns < 0
+        or type(maximum_hold_age_s) not in {int, float}
+        or not math.isfinite(float(maximum_hold_age_s))
+        or not 0.0 < float(maximum_hold_age_s) <= 0.12 + 1e-12
         or not isinstance(fov_summary, Mapping)
         or (
             existing is not None
@@ -4275,9 +4382,23 @@ def _approach_current_ambiguity_quarantine_authority(
 
     raw_handoff = fov_summary.get("last_retained_raw_state_handoff")
     if not isinstance(raw_handoff, Mapping):
-        raise ValueError(
-            "approach ambiguity quarantine lacks retained raw TOP authority"
-        )
+        if existing is not None:
+            raw_handoff = existing.raw_top_handoff
+        elif isinstance(hold, Mapping):
+            raw_handoff = _first_ambiguity_exact_raw_top_handoff(
+                token=token,
+                gate_index=gate_index,
+                track_id=track_id,
+                now_monotonic_ns=now_monotonic_ns,
+                maximum_age_s=float(maximum_hold_age_s),
+                fov_summary=fov_summary,
+                hold=hold,
+            )
+        else:
+            raise ValueError(
+                "approach ambiguity quarantine lacks retained raw TOP "
+                "authority"
+            )
 
     if existing is not None:
         if (
@@ -4353,8 +4474,16 @@ def _approach_current_ambiguity_quarantine_authority(
     ) / 1_000_000_000.0
     clean_publication = clean_token.publication_sequence
     ambiguous_publication = token.publication_sequence
+    retained_projection_handoff = bool(
+        raw_handoff.get("basis")
+        == TOP_FOV_RETAINED_RAW_STATE_BASIS
+    )
+    direct_exact_handoff = bool(
+        raw_handoff.get("basis")
+        == APPROACH_CURRENT_AMBIGUITY_EXACT_RAW_LEASE_BASIS
+    )
     if (
-        raw_handoff.get("basis") != TOP_FOV_RETAINED_RAW_STATE_BASIS
+        not (retained_projection_handoff or direct_exact_handoff)
         or raw_handoff.get("gate_index") != gate_index
         or raw_handoff.get("track_id") != track_id
         or raw_handoff.get("steering_only") is not True
@@ -4376,7 +4505,17 @@ def _approach_current_ambiguity_quarantine_authority(
         or exact_raw_anchor.get("steering_only") is not True
         or exact_raw_anchor.get("passage_authority") is not False
         or exact_raw_anchor.get("advance_authority") is not False
-        or not _token_strictly_newer(clean_token, raw_anchor_token)
+        or (
+            retained_projection_handoff
+            and not _token_strictly_newer(
+                clean_token,
+                raw_anchor_token,
+            )
+        )
+        or (
+            direct_exact_handoff
+            and clean_token != raw_anchor_token
+        )
         or not _token_strictly_newer(token, clean_token)
         or clean_token.stream_id != token.stream_id
         or clean_token.generation != token.generation
@@ -10049,6 +10188,10 @@ async def _run_visual_course_stage_impl(
                             gate_index=current_gate_index,
                             track_id=current_track_id,
                             now_monotonic_ns=ambiguity_proposal_ns,
+                            maximum_hold_age_s=(
+                                runtime.yaw_profile
+                                .control_hold_horizon_s
+                            ),
                             fov_summary=segment[
                                 "top_fov_pitch_protection"
                             ],
