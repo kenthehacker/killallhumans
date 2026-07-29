@@ -34,6 +34,7 @@ _FRAGMENT_UNION_MAX_COMPONENT_ASPECT = 2.60
 _FRAGMENT_UNION_MIN_PRIOR_ASPECT_RATIO = 0.75
 _FRAGMENT_UNION_MAX_PRIOR_ASPECT_RATIO = 1.35
 _FRAGMENT_UNION_MIN_IOU = 0.75
+_FRAGMENT_UNION_MAX_ORDINARY_IOU = 0.75
 _FRAGMENT_UNION_MAX_CENTER_JUMP_PX = 32.0
 
 
@@ -1239,12 +1240,13 @@ class MultiTargetVisualTracker:
         plan: _AssignmentPlan,
         frame: VisualDetectionFrame,
     ) -> dict[int, _FragmentUnionAssignment]:
-        """Fuse the known build-3385 TOP-gate contour split before a miss.
+        """Fuse the known build-3385 diagonal gate-contour split.
 
-        The detector can split one top-clipped current gate into complementary
-        upper/right and lower/left contours.  Their tight union is guidance
-        geometry only: it preserves the already race-authoritative CURRENT
-        identity but carries no inner-aperture or passage authority.
+        The detector can split one current gate into complementary upper/right
+        and lower/left contours, both before and after the upper contour
+        reaches the TOP edge.  Their tight union is guidance geometry only: it
+        preserves the already race-authoritative CURRENT identity but carries
+        no inner-aperture or passage authority.
         """
 
         selected_detection_indexes = set(plan.selected_pairs.values())
@@ -1258,8 +1260,6 @@ class MultiTargetVisualTracker:
                 or state.missed_frame_count != 0
                 or state.ambiguous
                 or track_index in plan.ambiguous_track_indexes
-                or state.latest.clipping is not FrameEdge.TOP
-                or not state.latest.center_censored
             ):
                 continue
             own_selected_detection_index = plan.selected_pairs.get(
@@ -1312,6 +1312,8 @@ class MultiTargetVisualTracker:
                     ordinary_score is None
                     or assignment.pair_score.cost
                     >= ordinary_score.cost
+                    or ordinary_score.bbox_iou
+                    >= _FRAGMENT_UNION_MAX_ORDINARY_IOU
                 ):
                     continue
             assignments[track_index] = assignment
@@ -1336,7 +1338,10 @@ class MultiTargetVisualTracker:
         )
         prior_x, prior_y, prior_width, prior_height = prior_bbox_px
         if (
-            prior_y > _FRAGMENT_UNION_EDGE_MARGIN_PX
+            (
+                state.latest.clipping & FrameEdge.TOP
+                and prior_y > _FRAGMENT_UNION_EDGE_MARGIN_PX
+            )
             or prior_width < _FRAGMENT_UNION_MIN_DIMENSION_PX
             or prior_height < _FRAGMENT_UNION_MIN_DIMENSION_PX
         ):
@@ -1385,8 +1390,6 @@ class MultiTargetVisualTracker:
             upper_bbox,
         ) in valid:
             upper_x, upper_y, upper_width, upper_height = upper_bbox
-            if upper_y > _FRAGMENT_UNION_EDGE_MARGIN_PX:
-                continue
             upper_center_x = 0.5 * (
                 upper_x + upper_x + upper_width
             )
@@ -1532,7 +1535,10 @@ class MultiTargetVisualTracker:
                     ),
                     frame.image_size_px,
                 )
-                if clipping is not FrameEdge.TOP:
+                if (
+                    clipping & FrameEdge.TOP
+                    and upper_y > _FRAGMENT_UNION_EDGE_MARGIN_PX
+                ):
                     continue
                 composite = VisualDetection(
                     source_index=(
@@ -1555,7 +1561,7 @@ class MultiTargetVisualTracker:
                         lower.confidence,
                     ),
                     clipping=clipping,
-                    center_censored=True,
+                    center_censored=clipping != FrameEdge.NONE,
                     detection_method="vq2_tracked_fragment_union",
                     appearance=None,
                     inner_aperture=None,
