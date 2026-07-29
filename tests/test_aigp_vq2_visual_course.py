@@ -5010,6 +5010,71 @@ def test_off_axis_top_fov_keeps_pitch_during_rapid_closure(
         recovery.allocated_target_pitch_rad
     )
 
+
+def _exact_gate_one_outward_brake_priority_arguments():
+    return {
+        "current_gate_index": 1,
+        "initial_gate_index": 0,
+        "mode": VisualApproachMode.APPROACH,
+        "requested_target_pitch_rad": 0.12,
+        "brake_pitch_rad": 0.12,
+        "braking": True,
+        "current_visible": True,
+        "current_ambiguous": False,
+        "current_missed_count": 0,
+        "current_censored_axes": (False, False),
+        "clipping": FrameEdge.NONE,
+        "center_censored": False,
+        "horizontal_rate_qualified": True,
+        # Live c7 Gate-1 frame: exact current motion was already outward while
+        # the top-FOV layer replaced the core's +0.12 brake with forward pitch.
+        "stable_center_x_norm": 0.13142303411571318,
+        "residual_horizontal_rate_rad_s": 0.4225173366821159,
+        "horizontal_angle_scale_rad": 1.59,
+        "off_axis_brake_rad": 0.18,
+    }
+
+
+def test_exact_outward_gate_one_brake_preempts_top_fov_without_a_timer():
+    assert (
+        course_stage._exact_current_gate_brake_preempts_top_fov(
+            **_exact_gate_one_outward_brake_priority_arguments()
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        {"current_gate_index": 0},
+        {"mode": VisualApproachMode.PROMOTE_REACQUIRE},
+        {"requested_target_pitch_rad": 0.0},
+        {"braking": False},
+        {"current_visible": False},
+        {"current_ambiguous": True},
+        {"current_missed_count": 1},
+        {"current_censored_axes": (True, False)},
+        {"clipping": FrameEdge.RIGHT},
+        {"clipping": FrameEdge.TOP},
+        {"center_censored": True},
+        {"horizontal_rate_qualified": False},
+        {"residual_horizontal_rate_rad_s": -0.01},
+        {"stable_center_x_norm": 0.05},
+    ),
+)
+def test_exact_gate_brake_priority_requires_clean_outward_current(change):
+    arguments = _exact_gate_one_outward_brake_priority_arguments()
+    arguments.update(change)
+
+    assert (
+        course_stage._exact_current_gate_brake_preempts_top_fov(
+            **arguments
+        )
+        is False
+    )
+
+
 def test_fresh_top_boundary_command_still_uses_final_wire_governor():
     session = DynamicVisualCourseSession()
     seed_ns = 1_000_000_000
