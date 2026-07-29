@@ -396,7 +396,8 @@ def test_vz_governor_floors_collective_below_descent_floor():
     controller._vz_est_m_s = -0.5  # at the floor boundary: no effect
     assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT, abs=1e-9)
     controller._vz_est_m_s = -1.0  # 0.5 m/s below -> +0.03 + 0.025 feedforward
-    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.055, abs=1e-9)
+    # 0.275 + 0.055 = 0.33 raw saturates at max_thrust as well.
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
     # Deep sinks saturate at max_thrust (flight 039186c8: the unclamped
     # floor boost exceeded the runner's 0.35 envelope abort in SEARCH).
     controller._vz_est_m_s = -1.5  # 1.0 m/s below -> +0.06 + 0.025 = 0.36 raw
