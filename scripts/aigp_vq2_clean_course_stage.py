@@ -217,7 +217,11 @@ YAW_ERROR_SIGN = +1.0  # flip this one line if the first flight contradicts
 # not center a NEAR off-axis gate before translation parallax swept it to
 # the frame edge.  The 0.25 cap is reached at |ex| >= 0.5, well inside the
 # measured ~0.5 rad/s plant capability.
-YAW_ERROR_GAIN = 0.50
+# 0.50 -> 0.90 (F35, d25f23fe): the whole 4.5 s gate-1 leg ran with yaw
+# SATURATED at the 0.25 cap while the gate bearing grew +0.35 -> +0.95 —
+# maximum authority was still too little turn.  With the cap raised to the
+# measured 0.5 rad/s plant authority, 0.9 puts the cap on at |ex| >= 0.55.
+YAW_ERROR_GAIN = 0.90
 # Roll: the old saturated +/-0.25 roll oscillation never recentered either
 # (corr(roll_cmd, dx/dt)=+0.18 is too weak/saturated to identify the roll
 # channel), so the roll sign follows the yaw verdict: bank INTO the
@@ -239,7 +243,12 @@ MAX_TARGET_ROLL_RAD = 0.25  # coordinated-turn lateral translation cap
 # Bearing rates of near off-axis gates at surviving closure exceed 0.15 rad/s.
 # 0.25 sits at the runner's hard MAX_COMMAND_RATE_RAD_S wire clamp and inside
 # the measured-authority envelope the runner now checks against.
-MAX_COURSE_YAW_RATE_RAD_S = 0.25  # runner wire clamp is 0.25
+# 0.25 -> 0.50 (F35, d25f23fe): yaw saturated at the 0.25 cap for the entire
+# gate-1 leg and the gate still escaped right (+0.35 -> +0.95) — the turn
+# simply could not keep up with translation parallax.  0.50 is exactly the
+# calibrated profile's max_abs_measured_yaw_rate_rad_s, so the runner's
+# measured-authority guard still passes and the runtime cap becomes 0.50.
+MAX_COURSE_YAW_RATE_RAD_S = 0.50  # runner runtime cap = min(this, profile 0.5)
 
 # Softened -0.18 -> -0.12 (flight 4ba3922b), then -0.12 -> -0.08 (F29,
 # d8169633): fh is a SIGNLESS magnitude (hypot of world horizontal specific
@@ -262,7 +271,8 @@ NEAR_BRAKE_LOG_SCALE = -0.9  # close enough that closure is fully braked
 CROSSING_MIN_LOG_SCALE = -0.80  # retired stage crossing_arm_min_log_scale
 CROSSING_CREDIT_WAIT_S = 0.40  # July-18 safety contract item 9
 
-PREDICT_FRAME_GAP_S = 0.06  # ~2 camera frames without a measurement
+PREDICT_FRAME_GAP_S = 0.25  # ~8 camera frames; 0.06 (~2) flapped TRACK/SEARCH
+# 7 times in the 4.2 s F35 gate-1 leg, each flap dumping the pursuit fix.
 PREDICT_MAX_GAP_S = 0.50  # short-gap bound before SEARCH
 # Hard wall-clock cap on PREDICT (flight 20260729T112603Z-visual-course-
 # d5e89c2b): an engulfing anchor refreshed every fresh frame by a MISSED
@@ -374,8 +384,14 @@ FH_UNTRUSTED_VERTICAL_MARGIN = 0.05  # unqualified hold: support + margin
 # gate migrates UP, clips harder, and the track dies ~1.5 s post-credit in
 # every flight.  When the tracked gate is high, the unqualified hold must
 # CLIMB toward it, not hover: support + 0.065 ~= the 0.34 thrust clamp.
+# 0.065 -> 0.12 (F35, d25f23fe): the +0.065 "climb" margin only matched
+# fast-regime hover (~0.32) — alt pinned at 1.59 m for the whole gate-1 leg
+# while the gate sat at ey -0.9, and the drone flew LEVEL into the gate's
+# lower structure.  A top-clipped gate is a one-sided measurement: the ONLY
+# safe direction is up.  support + 0.12 ~= 0.40 is a real climb that also
+# un-clips the y-axis so the qualified PD can take over.
 HIGH_GATE_Y_NORM = -0.30  # hypothesis y below this counts as "gate is high"
-HIGH_GATE_CLIMB_MARGIN = 0.065  # unqualified hold margin while the gate is high
+HIGH_GATE_CLIMB_MARGIN = 0.12  # unqualified hold margin while the gate is high
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 # Real scan, not a wiggle (post-credit pursuit redesign): 0.12 rad/s with a
 # 1.2 s reversal made +-8 deg legs that could never reach gate 1's typical
@@ -389,7 +405,12 @@ SEARCH_MAX_EXCURSION_RAD = 0.80  # bounded sweep excursion before reversal
 SUCCESSOR_BLEND_MAX = 0.50  # continuous lookahead ceiling
 BLEND_FAR_LOG_SCALE = -1.6  # below this the successor gets no blend
 BLEND_NEAR_LOG_SCALE = -0.9  # at this closure the blend ceiling applies
-PROMOTE_MAX_STD_NORM = 0.30  # cached-successor credibility at promotion
+PROMOTE_MAX_STD_NORM = 0.60  # cached-successor credibility at promotion
+# 0.30 -> 0.60 (F35, d25f23fe): promotion dropped the fresh gate-1 successor
+# (std 0.14-0.34, age 0) into SEARCH, and the reacquisition churn that
+# followed flapped TRACK/SEARCH 7 times before impact.  The successor is the
+# best evidence of the next gate at the one moment the course geometry is
+# known — adopt it unless it is truly stale.
 PROMOTE_MAX_AGE_S = 0.50  # cached-successor freshness at promotion
 
 COLLECTIVE_DECAY_TAU_S = 0.25  # smooth decay toward support on vertical loss
@@ -1329,7 +1350,16 @@ class CleanCourseController:
             (closure_rate - cfg.closure_target_rate_s)
             / (cfg.closure_full_brake_rate_s - cfg.closure_target_rate_s)
         )
-        pre_cross_brake = closure_brake > 0.5
+        # Misalignment brake (F35, d25f23fe): a fully misaligned gate only
+        # suppressed ADVANCE, leaving the pitch law at brake_pitch (-0.02,
+        # still nose-down) — the gate-1 leg held yaw at the cap with pitch
+        # ~level while fh grew 4 -> 7.3 into gate-1-area structure.  Speed
+        # with no alignment is pure risk: blend toward the TRUE brake
+        # attitude with the same signal that suppresses advance.
+        angular_error = math.hypot(ex, ey)
+        align = _clamp01(1.0 - angular_error / cfg.angular_full_brake_norm)
+        brake_demand = max(closure_brake, 1.0 - align)
+        pre_cross_brake = brake_demand > 0.5
         self._pre_cross_brake_active = pre_cross_brake
         if vertical_qualified:
             bounded_error = _clamp(
@@ -1418,9 +1448,8 @@ class CleanCourseController:
 
         # Pitch controls closure continuously: advance when aligned and
         # confident, brake progressively with angular error, uncertainty,
-        # rapid expansion, or near-plane risk.
-        angular_error = math.hypot(ex, ey)
-        align = _clamp01(1.0 - angular_error / cfg.angular_full_brake_norm)
+        # rapid expansion, or near-plane risk.  (angular_error/align and the
+        # fused brake demand are computed with the closure governor above.)
         confidence = _clamp01(current.confidence)
         uncertainty = _clamp01(
             1.0 - current.position_std / cfg.search_covariance_std_norm
@@ -1435,14 +1464,16 @@ class CleanCourseController:
             / (cfg.near_brake_log_scale - cfg.near_free_log_scale)
         )
         advance = align * confidence * uncertainty * expansion * near_plane
-        # Closure-rate governor (F31): continuous blend toward the gentle
-        # brake attitude as the vision expansion rate rises past the target
-        # — speed is capped at every range, not just near the plane.
+        # Closure-rate governor (F31) + misalignment brake (F35): continuous
+        # blend toward the TRUE brake attitude as either the vision expansion
+        # rate rises past the target or the gate sits off-axis — speed is
+        # capped at every range, and never kept while not pointing at the
+        # gate.
         law_pitch = (
             cfg.brake_pitch_rad
             + (cfg.advance_pitch_rad - cfg.brake_pitch_rad) * advance
         )
-        target_pitch = law_pitch + closure_brake * (
+        target_pitch = law_pitch + brake_demand * (
             cfg.pre_cross_brake_pitch_rad - law_pitch
         )
 
@@ -1725,7 +1756,16 @@ class CleanCourseController:
         # the drone crossed at 1.07 m into the bottom bar — approach
         # geometry raises the gate's elevation the whole way in, so the
         # qualified PD keeps a small climb budget inside the band.
-        if self._pre_cross_brake_active:
+        # F36: the band only makes sense at the crossing — with the F36
+        # misalignment brake, _pre_cross_brake_active also fires FAR from
+        # the gate, where pinning the collective would kill the high-gate
+        # climb that must run while the gate is top-clipped (F35 flew level
+        # into the gate-1 lower structure at exactly that geometry).
+        near_gate = (
+            self.current is not None
+            and self.current.log_scale >= self.config.closure_min_log_scale
+        )
+        if self._pre_cross_brake_active and near_gate:
             governed = _clamp(
                 governed,
                 max(self.config.min_thrust, support - self.config.brake_ceiling_band),

@@ -1172,6 +1172,33 @@ def test_closure_governor_is_a_continuous_blend():
     assert -0.02 + 1e-9 < out.target_pitch_rad < 0.15 - 1e-9
 
 
+def test_misaligned_far_gate_brakes_and_climbs():
+    # F35 (d25f23fe): a far off-axis top-clipped gate suppressed only the
+    # advance law, leaving pitch ~level while speed built — and the
+    # unqualified vertical hold at support + 0.065 merely hovered, so the
+    # drone flew LEVEL and FAST into the high gate's lower structure.  The
+    # misalignment brake must command the TRUE brake attitude, and the
+    # high-gate climb margin must survive (the brake ceiling band only
+    # applies in the near/crossing regime).
+    controller = _tracked_controller(
+        _track("A", 0.50, -0.80, scale=0.05, clipping=FrameEdge.TOP)
+    )
+    now = 100.10
+    out = None
+    for _ in range(25):  # fast brake slew converges
+        now += 0.033
+        out = _command(controller, now)
+    assert controller._pre_cross_brake_active
+    assert out.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
+    # Top-clipped gate: y censored -> unqualified -> one-sided climb hold.
+    assert not out.vertical_qualified
+    # support + 0.12 exceeds the old +0.065 hover-equivalent margin even
+    # after the 0.34 thrust clamp, and the far brake must NOT band it.
+    assert out.thrust >= 0.33
+    # Raised yaw gain/cap: 0.9 * 0.50 pursuit, inside the 0.50 cap.
+    assert out.yaw_rate_rad_s == pytest.approx(0.45, abs=1e-9)
+
+
 def test_closure_governor_brakes_in_predict():
     # The governor applies in PREDICT too (the scale rate is filter state,
     # live even while the camera is briefly blind).
@@ -1182,12 +1209,12 @@ def test_closure_governor_brakes_in_predict():
         _update([_track("A", 0.20, 0.0, scale=0.10)], frame_id=39), now_s=now
     )  # fresh measurement so the dropout starts from TRACK
     controller.current.scale_axis.v = 0.7
-    for frame in range(3):  # ~0.1 s without a measurement -> PREDICT
+    for frame in range(9):  # ~0.3 s without a measurement -> PREDICT
         now += 0.033
         controller.observe(_update([], frame_id=40 + frame), now_s=now)
         out = _command(controller, now)
     assert controller.state is CleanCourseState.PREDICT
-    for _ in range(10):  # inside the 0.5 s PREDICT bound
+    for _ in range(4):  # converge the fast brake slew inside the 0.5 s bound
         now += 0.033
         out = _command(controller, now)
     assert controller.state is CleanCourseState.PREDICT
@@ -1358,7 +1385,8 @@ def test_clipping_increases_uncertainty_but_does_not_abort():
         )
     )
     # Clipping saturates corrective steering rather than aborting.
-    assert abs(output.yaw_rate_rad_s) <= 0.15 * 0.5 + 1e-9
+    # (F36 yaw gain 0.9: the clipped ex=0.10 pursuit commands 0.09.)
+    assert abs(output.yaw_rate_rad_s) <= 0.10 * 0.9 + 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -1371,16 +1399,21 @@ def test_predict_then_search_on_fresh_empty_frames():
     now = 100.06
     controller.observe(_update([], frame_id=5), now_s=now)
     assert controller.state is CleanCourseState.TRACK  # one missed frame
-    now += 0.05
-    controller.observe(_update([], frame_id=6), now_s=now)
+    # Fresh-but-empty frames are not staleness; with the F36 adoption
+    # hysteresis (0.25 s gap), ~8 missed frames drop TRACK to PREDICT.
+    for frame in range(6, 16):
+        now += 0.033
+        controller.observe(_update([], frame_id=frame), now_s=now)
+        if controller.state is CleanCourseState.PREDICT:
+            break
     assert controller.state is CleanCourseState.PREDICT
-    # Fresh-but-empty frames are not staleness; the same controller keeps
-    # producing finite bounded commands on the predicted state.
+    # The same controller keeps producing finite bounded commands on the
+    # predicted state.
     output = _command(controller, now + 0.02)
     assert output.thrust > 0.0
-    for _ in range(30):
+    for frame in range(16, 48):
         now += 0.033
-        controller.observe(_update([], frame_id=7), now_s=now)
+        controller.observe(_update([], frame_id=frame), now_s=now)
         if controller.state is CleanCourseState.SEARCH:
             break
     assert controller.state is CleanCourseState.SEARCH
@@ -1572,7 +1605,7 @@ def test_finite_bounded_output_across_states():
             output.thrust,
         )
         assert all(math.isfinite(value) for value in values)
-        assert abs(output.yaw_rate_rad_s) <= 0.25 + 1e-9
+        assert abs(output.yaw_rate_rad_s) <= 0.50 + 1e-9
         assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
         assert abs(output.target_roll_rad) <= 0.25 + 1e-9
         assert -0.35 <= output.target_pitch_rad <= 0.15 + 1e-9
