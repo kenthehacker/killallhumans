@@ -1137,18 +1137,6 @@ class _SuccessorPrediction:
     confidence: float
 
 
-@dataclass(frozen=True, slots=True)
-class _PrecommitSuccessorYawLatch:
-    current_gate_index: int
-    current_track_id: str
-    successor_track_id: str
-    stream_generation: int
-    target_yaw_rate_rad_s: float
-    heading_delta_rad: float
-    contribution_rad: float
-    admitted_monotonic_ns: int
-
-
 class DynamicCourseCore:
     """Per-track estimator plus an authority-neutral rolling course lifecycle."""
 
@@ -1169,9 +1157,6 @@ class DynamicCourseCore:
             tuple[int, str, str | None] | None
         ) = None
         self._successor_clearance_positive_since_ns: int | None = None
-        self._precommit_successor_yaw_latch: (
-            _PrecommitSuccessorYawLatch | None
-        ) = None
         self._last_applied_command: DynamicCourseCommand | None = None
 
     @property
@@ -2639,25 +2624,6 @@ class DynamicCourseCore:
         if ownership_key != self._successor_clearance_key:
             self._successor_clearance_key = None
             self._successor_clearance_positive_since_ns = None
-        latch = self._precommit_successor_yaw_latch
-        current_generation = self._tracks[
-            current_track_id
-        ].state.stream_generation
-        if (
-            latch is not None
-            and (
-                successor_track_id is None
-                or latch.current_gate_index != current_gate_index
-                or latch.current_track_id != current_track_id
-                or latch.successor_track_id != successor_track_id
-                or latch.stream_generation != current_generation
-                or self._tracks[
-                    successor_track_id
-                ].state.stream_generation
-                != current_generation
-            )
-        ):
-            self._precommit_successor_yaw_latch = None
         self._current_track_id = current_track_id
         self._current_gate_index = current_gate_index
         self._successor_track_id = successor_track_id
@@ -3159,7 +3125,6 @@ class DynamicCourseCore:
         self._successor_track_id = next_successor_track_id
         self._successor_clearance_key = None
         self._successor_clearance_positive_since_ns = None
-        self._precommit_successor_yaw_latch = None
         self._promotion_count += 1
         self._last_promotion_ns = monotonic_ns
         return self.course_state()
@@ -3505,115 +3470,13 @@ class DynamicCourseCore:
         precommit_current_horizontal_fov_clearance: float | None = None
         precommit_successor_roll_authority = 0.0
         precommit_successor_target_roll: float | None = None
-        exact_precommit_geometry = bool(
-            not passage_committed
-            and successor is not None
-            and successor_prediction is not None
-            and successor_prediction.confidence > 0.0
-            and current.visible
-            and not current.ambiguous
-            and not current.censored_axes[0]
-            and camera_current_aperture is not None
-            and successor.visible
-            and not successor.ambiguous
-            and not successor.censored_axes[0]
-            and successor.sample_count >= 4
-            and successor.stream_generation == current.stream_generation
-            and successor.bearing_std_rad[0]
-            <= (
-                self.config
-                .successor_prediction_max_extrapolation_rad
-            )
-            + _EPSILON
-        )
-        if exact_precommit_geometry:
-            assert successor is not None
-            assert successor_prediction is not None
-            successor_age_s = (
-                monotonic_ns
-                - successor.last_measurement_monotonic_ns
-            ) / _NS_PER_SECOND
-            precommit_current_horizontal_fov_clearance = (
-                1.0
-                - abs(camera_current_center[0])
-                - camera_current_aperture[0]
-                - 2.0 * current_std_norm[0]
-            )
-            strict_precommit_admission = bool(
-                current.bearing_rate_qualified[0]
-                and current.time_to_contact_s is not None
-                and self.config.minimum_ttc_s
-                <= current.time_to_contact_s
-                <= self.config.successor_lookahead_ttc_s
-                and abs(current_center[0]) + 2.0 * current_std_norm[0]
-                <= self.config.passage_margin_norm
-                and abs(residual_rate_norm[0])
-                <= self.config.vertical_settled_rate_norm_s
-                and precommit_current_horizontal_fov_clearance
-                > self.config.passage_margin_norm
-                and 0.0
-                <= successor_age_s
-                <= self.config.crossing_prediction_max_horizon_s
-            )
-            if strict_precommit_admission:
-                camera_current_heading = math.atan(
-                    camera_current_center[0]
-                    * self.config.horizontal_angle_scale_rad
-                )
-                heading_delta = (
-                    successor_prediction.measured_bearing_rad[0]
-                    - camera_current_heading
-                )
-                contribution = (
-                    successor_prediction.measured_bearing_rad[0]
-                )
-                target_yaw_rate = _clamp(
-                    -self.config.yaw_gain
-                    * successor_prediction.measured_bearing_rad[0],
-                    -MAX_YAW_RATE_RAD_S,
-                    MAX_YAW_RATE_RAD_S,
-                )
-                if abs(target_yaw_rate) > _EPSILON:
-                    self._precommit_successor_yaw_latch = (
-                        _PrecommitSuccessorYawLatch(
-                            current_gate_index=state.current_gate_index,
-                            current_track_id=current.track_id,
-                            successor_track_id=successor.track_id,
-                            stream_generation=current.stream_generation,
-                            target_yaw_rate_rad_s=target_yaw_rate,
-                            heading_delta_rad=heading_delta,
-                            contribution_rad=contribution,
-                            admitted_monotonic_ns=monotonic_ns,
-                        )
-                    )
-        latch = self._precommit_successor_yaw_latch
-        horizontal_edge_visible = bool(
-            current.visible
-            and current.clipping
-            & (FrameEdge.LEFT | FrameEdge.RIGHT)
-        )
-        if horizontal_edge_visible:
-            self._precommit_successor_yaw_latch = None
-            latch = None
-        if latch is not None:
-            # The centered, fresh two-gate publication admitted this bounded
-            # heading once. Keep that ownership coherent through center-band,
-            # TTC, vertical-FOV, and near-plane publication gaps. Rechecking
-            # those per-frame readiness predicates made the yaw wire reverse
-            # against Gate 1. Exact role/generation changes are cleared by
-            # bind(), a proved horizontal edge clears above, and race credit
-            # clears in promote_authoritative(). Roll, pitch, thrust, passage,
-            # and promotion remain owned by the current gate.
-            precommit_successor_yaw_authority = 1.0
-            precommit_successor_yaw_rate = latch.target_yaw_rate_rad_s
-            precommit_successor_yaw_heading_delta = (
-                latch.heading_delta_rad
-            )
-            precommit_successor_yaw_contribution = latch.contribution_rad
-            proposal = replace(
-                proposal,
-                yaw_rate_rad_s=precommit_successor_yaw_rate,
-            )
+        # Do not create a separate full-yaw owner before passage.  A prior
+        # one-frame TTC classification permanently latched successor yaw,
+        # rotating the body away from Gate 0 and making the next lateral bank
+        # ineffective.  The progressively admitted successor contribution in
+        # ``proposal`` remains available near a proved passage, and fresh
+        # current-gate geometry can revoke it on the next frame.  Keep the
+        # legacy precommit evidence fields empty.
         committed_successor_roll_authority = 0.0
         committed_successor_target_roll: float | None = None
         committed_successor_pitch_authority = 0.0

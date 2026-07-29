@@ -2010,120 +2010,6 @@ def _off_axis_top_fov_owns_pitch(
         and fov_proposal.protected_target_pitch_rad
         < closure_recovery.allocated_target_pitch_rad - 1e-12
     )
-
-
-def _exact_current_gate_brake_preempts_top_fov(
-    *,
-    current_gate_index: int,
-    initial_gate_index: int,
-    mode: VisualApproachMode,
-    requested_target_pitch_rad: float,
-    brake_pitch_rad: float,
-    braking: bool,
-    current_visible: bool,
-    current_ambiguous: bool,
-    current_missed_count: int,
-    current_censored_axes: tuple[bool, bool],
-    clipping: FrameEdge,
-    center_censored: bool,
-    horizontal_rate_qualified: bool,
-    stable_center_x_norm: float,
-    residual_horizontal_rate_rad_s: float,
-    horizontal_angle_scale_rad: float,
-    off_axis_brake_rad: float,
-) -> bool:
-    """Let an exact outward later-gate intercept use its bounded brake pitch.
-
-    The raw current remains fully visible and uncensored, so retaining a
-    top-FOV pitch limit cannot recover any missing geometry.  Once qualified
-    fixed-reference motion is stalled or outward, the dynamic controller's
-    nonforward brake owns pitch while roll and yaw continue the intercept.
-    Gate 0 and every clipped, ambiguous, missed, or propagated observation
-    retain the existing FOV policy.
-    """
-
-    if (
-        type(current_gate_index) is not int
-        or type(initial_gate_index) is not int
-        or type(mode) is not VisualApproachMode
-        or type(braking) is not bool
-        or type(current_visible) is not bool
-        or type(current_ambiguous) is not bool
-        or type(current_missed_count) is not int
-        or type(current_censored_axes) is not tuple
-        or len(current_censored_axes) != 2
-        or any(type(axis) is not bool for axis in current_censored_axes)
-        or type(clipping) is not FrameEdge
-        or type(center_censored) is not bool
-        or type(horizontal_rate_qualified) is not bool
-    ):
-        raise ValueError(
-            "exact current-gate brake priority structure is invalid"
-        )
-    (
-        requested,
-        brake_pitch,
-        stable_x,
-        residual_x,
-        angle_scale,
-        off_axis,
-    ) = map(
-        float,
-        (
-            requested_target_pitch_rad,
-            brake_pitch_rad,
-            stable_center_x_norm,
-            residual_horizontal_rate_rad_s,
-            horizontal_angle_scale_rad,
-            off_axis_brake_rad,
-        ),
-    )
-    if (
-        not all(
-            math.isfinite(value)
-            for value in (
-                requested,
-                brake_pitch,
-                stable_x,
-                residual_x,
-                angle_scale,
-                off_axis,
-            )
-        )
-        or not MIN_VISUAL_TARGET_PITCH_RAD
-        <= requested
-        <= MAX_VISUAL_TARGET_PITCH_RAD
-        or not MIN_VISUAL_TARGET_PITCH_RAD
-        <= brake_pitch
-        <= MAX_VISUAL_TARGET_PITCH_RAD
-        or current_missed_count < 0
-        or angle_scale <= 0.0
-        or off_axis <= 0.0
-    ):
-        raise ValueError("exact current-gate brake priority input is invalid")
-    return bool(
-        current_gate_index > initial_gate_index
-        and mode is VisualApproachMode.APPROACH
-        and math.isclose(
-            requested,
-            brake_pitch,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and requested >= 0.0
-        and braking
-        and current_visible
-        and not current_ambiguous
-        and current_missed_count == 0
-        and current_censored_axes == (False, False)
-        and clipping is FrameEdge.NONE
-        and not center_censored
-        and horizontal_rate_qualified
-        and abs(math.atan(stable_x * angle_scale)) >= off_axis
-        and stable_x * residual_x >= 0.0
-    )
-
-
 def _top_fov_propagated_observation(
     authority: Mapping[str, Any],
 ) -> _TopFovPropagatedObservation:
@@ -8807,7 +8693,6 @@ async def _run_visual_course_stage_impl(
         horizontal_fov_closure_brake: Optional[
             _FreshHorizontalFovClosureBrake
         ] = None
-        current_gate_brake_preemption: Optional[Dict[str, Any]] = None
         requested_pitch_before_top_fov = target_pitch_rad
         top_fov_track_id: Optional[str] = None
         dynamic_controller = runtime.dynamic_controller
@@ -9006,95 +8891,6 @@ async def _run_visual_course_stage_impl(
                     target_pitch_rad = (
                         top_fov_proposal.protected_target_pitch_rad
                     )
-                    brake_decision = dynamic_controller.last_decision
-                    brake_course = dynamic_controller.core.course_state()
-                    brake_current = brake_course.current
-                    try:
-                        brake_preempts_top_fov = (
-                            brake_decision is not None
-                            and _exact_current_gate_brake_preempts_top_fov(
-                                current_gate_index=current_gate_index,
-                                initial_gate_index=initial_gate_index,
-                                mode=proposal.mode,
-                                requested_target_pitch_rad=(
-                                    requested_pitch_before_top_fov
-                                ),
-                                brake_pitch_rad=float(
-                                    dynamic_controller.core.config
-                                    .brake_pitch_rad
-                                ),
-                                braking=bool(brake_decision.braking),
-                                current_visible=bool(brake_current.visible),
-                                current_ambiguous=bool(
-                                    brake_current.ambiguous
-                                ),
-                                current_missed_count=int(
-                                    brake_current.missed_count
-                                ),
-                                current_censored_axes=(
-                                    brake_current.censored_axes
-                                ),
-                                clipping=target_track.clipping,
-                                center_censored=(
-                                    target_track.center_censored
-                                ),
-                                horizontal_rate_qualified=bool(
-                                    brake_current
-                                    .bearing_rate_qualified[0]
-                                ),
-                                stable_center_x_norm=float(
-                                    brake_decision.current_center_norm[0]
-                                ),
-                                residual_horizontal_rate_rad_s=float(
-                                    brake_current
-                                    .residual_translational_rate_rad_s[0]
-                                ),
-                                horizontal_angle_scale_rad=float(
-                                    dynamic_controller.core.config
-                                    .horizontal_angle_scale_rad
-                                ),
-                                off_axis_brake_rad=float(
-                                    dynamic_controller.core.config
-                                    .off_axis_brake_rad
-                                ),
-                            )
-                        )
-                    except (IndexError, TypeError, ValueError) as exc:
-                        raise abort_type(
-                            "visual-course exact current-gate brake priority "
-                            f"refused: {exc}"
-                        ) from exc
-                    if (
-                        brake_preempts_top_fov
-                        and committed_crossing_authority is None
-                        and top_fov_proposal.limited
-                        and top_fov_proposal.protected_target_pitch_rad
-                        < requested_pitch_before_top_fov - 1e-12
-                    ):
-                        target_pitch_rad = requested_pitch_before_top_fov
-                        current_gate_brake_preemption = {
-                            "basis": (
-                                "fresh-exact-current-outward-brake-v3"
-                            ),
-                            "requested_target_pitch_rad": (
-                                requested_pitch_before_top_fov
-                            ),
-                            "fov_protected_target_pitch_rad": (
-                                top_fov_proposal
-                                .protected_target_pitch_rad
-                            ),
-                            "applied_target_pitch_rad": target_pitch_rad,
-                            "stable_center_x_norm": (
-                                brake_decision.current_center_norm[0]
-                            ),
-                            "residual_horizontal_rate_rad_s": (
-                                brake_current
-                                .residual_translational_rate_rad_s[0]
-                            ),
-                            "steering_only": True,
-                            "passage_authority": False,
-                            "advance_authority": False,
-                        }
                     if launch_evidence is not None:
                         launch_evidence[
                             "target_pitch_rad_before_top_fov"
@@ -9849,10 +9645,6 @@ async def _run_visual_course_stage_impl(
             accepted_dynamic_evidence["roll_yaw_transport_rate_rad_s"] = (
                 roll_yaw_transport_rate
             )
-            if current_gate_brake_preemption is not None:
-                accepted_dynamic_evidence[
-                    "current_gate_forward_brake_preemption"
-                ] = current_gate_brake_preemption
             if (
                 type(dynamic_controller)
                 is DynamicVisualCourseSession
