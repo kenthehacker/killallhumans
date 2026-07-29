@@ -161,6 +161,52 @@ def test_large_linear_acceleration_disables_false_tilt_correction():
     assert estimate.pitch == pytest.approx(0.0, abs=1e-12)
 
 
+def test_maneuver_horizontal_specific_force_zeroes_trust():
+    # F13 (trace 20260729T134958Z-visual-course-82d72cb5): sustained
+    # specific force 25-40 degrees off gravity with |f|-g inside the old
+    # 0.20-1.50 ramp band kept the gravity correction partially trusted
+    # (0.1-0.9) and converged the tilt estimate 0.3-0.6 rad toward a false
+    # gravity direction.  Here a steady 15-degree off-gravity sample keeps
+    # FULL magnitude and partial (0.625) innovation trust under the old
+    # rules; the horizontal-specific-force gate must zero the correction.
+    magnitude = 10.0
+    fh = 2.6  # ~15 degrees off gravity, above the 2.50 zero threshold
+    accel = (fh, 0.0, -math.sqrt(magnitude * magnitude - fh * fh))
+    estimator = ImuAttitudeEstimator(_fast_config(gyro_bias_ki=0.0))
+    _bootstrap(estimator)
+
+    estimate = None
+    for i in range(1, 101):
+        estimate = estimator.update(40_000 + i * 10_000, accel, (0.0, 0.0, 0.0))
+
+    assert estimate is not None and estimate.healthy
+    assert estimate.horizontal_specific_force_mps2 == pytest.approx(fh, abs=1e-9)
+    assert estimate.accel_magnitude_deviation_mps2 == pytest.approx(
+        magnitude - G, abs=1e-9
+    )
+    assert estimate.accel_trust == 0.0
+    # The correction must not drag the level estimate toward the false
+    # gravity direction no matter how long the maneuver lasts.
+    assert estimate.roll == pytest.approx(0.0, abs=1e-12)
+    assert estimate.pitch == pytest.approx(0.0, abs=1e-12)
+
+
+def test_vertical_acceleration_beyond_tightened_band_zeroes_trust():
+    # The |f|-g zero threshold tightened 1.50 -> 0.50 (F13): a sustained
+    # ~1 m/s^2 climb acceleration sits at deviation 1.0, which the old band
+    # still trusted at ~0.38.  It must now zero the correction.
+    estimator = ImuAttitudeEstimator(_fast_config(gyro_bias_ki=0.0))
+    _bootstrap(estimator)
+
+    estimate = estimator.update(50_000, (0.0, 0.0, -(G + 1.0)), (0.0, 0.0, 0.0))
+
+    assert estimate is not None and estimate.healthy
+    assert estimate.accel_magnitude_deviation_mps2 == pytest.approx(1.0, abs=1e-9)
+    assert estimate.accel_trust == 0.0
+    assert estimate.roll == pytest.approx(0.0, abs=1e-12)
+    assert estimate.pitch == pytest.approx(0.0, abs=1e-12)
+
+
 def test_gravity_feedback_recovers_from_spurious_gyro_rotation():
     estimator = ImuAttitudeEstimator(_fast_config(gyro_bias_ki=0.0))
     _bootstrap(estimator)

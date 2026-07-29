@@ -286,11 +286,14 @@ POST_CREDIT_BRAKE_SLEW_RAD_S = 1.0
 # credit.  The brake therefore STARTS before the plane: while TRACKing the
 # current gate inside the near window (log_scale at/past
 # NEAR_BRAKE_LOG_SCALE), or with the filtered expansion rate saying
-# time-to-contact below ~1.2 s, the stage commands a genuine nose-up
+# time-to-contact below ~2.5 s, the stage commands a genuine nose-up
 # attitude at the fast brake slew so the crossing happens at ~1-1.5 m/s
-# instead of 3+.  The expansion trigger is gated to the near field
-# (log_scale >= NEAR_FREE_LOG_SCALE) so far-field scale noise cannot stall
-# the approach.  Lateral pursuit and the vz governor stay fully active;
+# instead of 3+.  Timing (agent-10, F13): at 3 m/s closure TTC 1.2 s IS
+# log_scale -1.1, inside the old near field — the old trigger could never
+# create braking distance.  TTC 2.5 s fires at log_scale ~= -1.6...-1.8,
+# buying ~0.9-1.0 s of genuine brake, so the expansion trigger's near-field
+# gate moved out to -1.8 to let the earlier TTC actually bind.  Lateral
+# pursuit and the vz governor stay fully active;
 # the altitude floor and the exact-zero COAST latch still preempt.  The
 # near threshold stays below CROSSING_MIN_LOG_SCALE so apparent size keeps
 # growing through the crossing-arm scale and the engulfing/COAST detection
@@ -299,7 +302,8 @@ POST_CREDIT_BRAKE_SLEW_RAD_S = 1.0
 # post-credit brake window is unchanged and becomes the cleanup for
 # residual closure.
 PRE_CROSS_BRAKE_PITCH_RAD = 0.12  # genuine nose-up pre-plane brake attitude
-PRE_CROSS_BRAKE_TTC_S = 1.2  # expansion-rate time-to-contact trigger
+PRE_CROSS_BRAKE_TTC_S = 2.5  # expansion-rate time-to-contact trigger (F13)
+PRE_CROSS_BRAKE_NEAR_LOG_SCALE = -1.8  # near-field gate for the TTC trigger
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew, shared with the brake window
 # Pre-gate-1 altitude floor (terrain insurance; flights F10/F11/F12 all
 # flew their final 6-10 s below 0.7 m with thrust pinned at the clamp into
@@ -308,9 +312,21 @@ PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew, shared with the brake window
 # gate-0-credit -> gate-1-credit window.  Hysteresis: trigger below 0.7 m,
 # release above 1.2 m.  Inactive at gate_index 0 (takeoff/climb-out) and
 # once gate_index >= 2 — post-gate-1 reference re-anchoring is a follow-up.
+# F13 bounds (trace 20260729T134958Z-visual-course-82d72cb5): a biased
+# estimator (vz_est -3.8, alt_est -10.7 m, physically impossible) latched
+# the floor at t=5.16 and pinned the profile at full thrust into terrain
+# for 4.2 s.  The floor stays, but it can no longer pin the profile: an
+# episode releases unconditionally after ALT_FLOOR_MAX_LATCH_S and re-arms
+# only after alt_est has held above the release altitude for
+# ALT_FLOOR_REARM_S, and alt_est is clamped below at ALT_EST_MIN_M so a
+# biased integrator cannot push the floor deeper than its 0.7-1.2 m guard
+# band ever needs.
 ALT_FLOOR_TRIGGER_M = 0.7
 ALT_FLOOR_RELEASE_M = 1.2
 ALT_FLOOR_CLIMB_MARGIN = 0.05  # support + margin -> governed recovery climb
+ALT_FLOOR_MAX_LATCH_S = 2.5  # unconditional per-episode release (F13)
+ALT_FLOOR_REARM_S = 1.0  # alt_est must hold above release this long to re-arm
+ALT_EST_MIN_M = -2.0  # biased-integrator clamp on the altitude estimate
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 SEARCH_YAW_RATE_RAD_S = 0.12  # bounded sweep inside the 0.15 yaw cap
 SEARCH_SWEEP_PERIOD_S = 1.20  # bounded reversal schedule
@@ -571,10 +587,14 @@ class CleanCourseConfig:
     post_credit_brake_slew_rad_s: float = POST_CREDIT_BRAKE_SLEW_RAD_S
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
     pre_cross_brake_ttc_s: float = PRE_CROSS_BRAKE_TTC_S
+    pre_cross_brake_near_log_scale: float = PRE_CROSS_BRAKE_NEAR_LOG_SCALE
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
     alt_floor_release_m: float = ALT_FLOOR_RELEASE_M
     alt_floor_climb_margin: float = ALT_FLOOR_CLIMB_MARGIN
+    alt_floor_max_latch_s: float = ALT_FLOOR_MAX_LATCH_S
+    alt_floor_rearm_s: float = ALT_FLOOR_REARM_S
+    alt_est_min_m: float = ALT_EST_MIN_M
     search_covariance_std_norm: float = SEARCH_COVARIANCE_STD_NORM
     search_yaw_rate_rad_s: float = SEARCH_YAW_RATE_RAD_S
     search_sweep_period_s: float = SEARCH_SWEEP_PERIOD_S
@@ -668,10 +688,17 @@ class CleanCourseController:
         self._post_credit_deadline_s: Optional[float] = None
         self._post_credit_armed_s: Optional[float] = None
         # IMU altitude estimate (m) integrated from the governor's vz_est,
-        # seeded 0 at course start (takeoff pad reference).  Guards only the
+        # seeded 0 at course start (takeoff pad reference) and clamped below
+        # at alt_est_min_m (F13).  Guards only the
         # bounded pre-gate-1 window; see the ALT_FLOOR_* constant block.
         self._alt_est_m = 0.0
         self._alt_floor_active = False
+        # F13 latch bounds: the episode start for the unconditional release,
+        # the post-timeout cooldown, and the continuous-above-release timer
+        # that clears the cooldown (re-arm).
+        self._alt_floor_latch_s: Optional[float] = None
+        self._alt_floor_cooldown = False
+        self._alt_floor_above_release_since_s: Optional[float] = None
         self._active_climb_cap_m_s = VZ_CLIMB_CAP_M_S
         # Pre-crossing expansion brake latch for the tick trace; recomputed
         # every main-path tick (see the PRE_CROSS_BRAKE_* constant block).
@@ -948,10 +975,14 @@ class CleanCourseController:
             # IMU-fed so it stays alive in every state, including COAST.
             self._vz_est_m_s += float(world_up_accel_m_s2) * dt
             self._vz_est_m_s -= self._vz_est_m_s * dt / VZ_LEAK_TAU_S
-        # IMU altitude estimate from course start (takeoff pad = 0).  Feeds
-        # only the pre-gate-1 altitude floor; bounded drift is acceptable
-        # inside that short window (see the ALT_FLOOR_* constant block).
-        self._alt_est_m += self._vz_est_m_s * dt
+        # IMU altitude estimate from course start (takeoff pad = 0), clamped
+        # below (F13: a biased integrator reached -10.7 m, physically
+        # impossible, and drove the floor deeper than its guard band needs).
+        # Feeds only the pre-gate-1 altitude floor; bounded drift is
+        # acceptable inside that short window (see the ALT_FLOOR_* block).
+        self._alt_est_m = max(
+            cfg.alt_est_min_m, self._alt_est_m + self._vz_est_m_s * dt
+        )
 
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             assert self._coast_entry_s is not None
@@ -1011,17 +1042,51 @@ class CleanCourseController:
         # Pre-gate-1 altitude floor (F10/F11/F12: the final 6-10 s ran below
         # 0.7 m with thrust pinned into terrain).  Hysteresis 0.7 -> 1.2 m,
         # gate-1 window only; the exact-zero COAST latch above still wins.
+        # F13 bounds: an episode releases unconditionally after
+        # alt_floor_max_latch_s (a biased estimator pinned the F13 floor for
+        # 4.2 s into terrain) and re-arms only after alt_est has held above
+        # the release altitude for alt_floor_rearm_s.
         if self.gate_index == 1:
-            if self._alt_floor_active:
-                self._alt_floor_active = (
-                    self._alt_est_m <= cfg.alt_floor_release_m
-                )
+            if self._alt_est_m > cfg.alt_floor_release_m:
+                if self._alt_floor_above_release_since_s is None:
+                    self._alt_floor_above_release_since_s = now_s
             else:
-                self._alt_floor_active = (
-                    self._alt_est_m < cfg.alt_floor_trigger_m
+                self._alt_floor_above_release_since_s = None
+            if self._alt_floor_active:
+                if self._alt_floor_latch_s is None:
+                    self._alt_floor_latch_s = now_s
+                timed_out = (
+                    now_s - self._alt_floor_latch_s > cfg.alt_floor_max_latch_s
                 )
+                self._alt_floor_active = (
+                    self._alt_est_m <= cfg.alt_floor_release_m and not timed_out
+                )
+                if not self._alt_floor_active:
+                    self._alt_floor_latch_s = None
+                    if timed_out:
+                        # Only a timeout release needs the re-arm cooldown;
+                        # the plain hysteresis release re-arms immediately.
+                        self._alt_floor_cooldown = True
+            else:
+                self._alt_floor_latch_s = None
+                if self._alt_floor_cooldown:
+                    since = self._alt_floor_above_release_since_s
+                    if (
+                        since is not None
+                        and now_s - since >= cfg.alt_floor_rearm_s
+                    ):
+                        self._alt_floor_cooldown = False
+                if not self._alt_floor_cooldown:
+                    self._alt_floor_active = (
+                        self._alt_est_m < cfg.alt_floor_trigger_m
+                    )
+                    if self._alt_floor_active:
+                        self._alt_floor_latch_s = now_s
         else:
             self._alt_floor_active = False
+            self._alt_floor_latch_s = None
+            self._alt_floor_cooldown = False
+            self._alt_floor_above_release_since_s = None
         if self._alt_floor_active:
             # Terrain recovery override: level attitude, zero yaw, governed
             # climb collective.  Everything else yields; the governor keeps
@@ -1158,7 +1223,7 @@ class CleanCourseController:
             and (
                 current.log_scale >= cfg.near_brake_log_scale
                 or (
-                    current.log_scale >= cfg.near_free_log_scale
+                    current.log_scale >= cfg.pre_cross_brake_near_log_scale
                     and current.expansion_rate * cfg.pre_cross_brake_ttc_s > 1.0
                 )
             )

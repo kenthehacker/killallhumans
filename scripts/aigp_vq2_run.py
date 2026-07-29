@@ -8904,6 +8904,11 @@ class VQ2Runner:
         imu = telemetry.imu if telemetry is not None else None
         target = self.tracker.target
         estimate = self.estimate
+        # F13 (trace 20260729T134958Z-visual-course-82d72cb5) had to be
+        # diagnosed indirectly: log the estimator trust inputs and the
+        # actual actuator stream per tick.  Roll/pitch already ride in
+        # ``rpy`` above.
+        actuator_outputs = getattr(self.adapter, "actuator_outputs", None)
         fields: Dict[str, Any] = dict(
             stage=stage,
             elapsed_s=elapsed_s,
@@ -8914,6 +8919,25 @@ class VQ2Runner:
             gate_index=(race.active_gate_index if race else None),
             rpy=(list(estimate.orientation.to_euler()) if estimate else None),
             body_rates=(list(estimate.body_rates) if estimate else None),
+            estimator=(
+                {
+                    "accel_trust": getattr(estimate, "accel_trust", None),
+                    "accel_magnitude_deviation_mps2": getattr(
+                        estimate, "accel_magnitude_deviation_mps2", None
+                    ),
+                    "horizontal_specific_force_mps2": getattr(
+                        estimate, "horizontal_specific_force_mps2", None
+                    ),
+                    "healthy": getattr(estimate, "healthy", None),
+                }
+                if estimate is not None
+                else None
+            ),
+            actuators=(
+                dict(actuator_outputs)
+                if isinstance(actuator_outputs, Mapping)
+                else None
+            ),
             target=(asdict(target) if target else None),
             command=(asdict(command) if command else None),
         )

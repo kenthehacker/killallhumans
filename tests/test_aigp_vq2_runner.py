@@ -4968,6 +4968,51 @@ def test_sign_id_yaw_calibration_is_paired_isolated_and_measured(
     assert ticks[-1]["elapsed_s"] < vq2_module.SIGN_ID_HARD_EXPIRY_S
 
 
+def test_record_tick_carries_estimator_trust_and_actuator_stream(monkeypatch):
+    # F13 (trace 20260729T134958Z-visual-course-82d72cb5) had to be
+    # diagnosed indirectly; every tick now carries the estimator trust
+    # inputs and the actual actuator stream summary alongside rpy.
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(1_000, 0, -1, 0, -1)
+    adapter.actuator_outputs = {
+        "time_usec": 10_000,
+        "active": True,
+        "actuator": [0.30, 0.31, 0.29, 0.30],
+    }
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner.estimate = _estimate(roll=0.10, pitch=-0.20)
+    events = []
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **payload: events.append((event, payload)),
+    )
+    runner._record_tick("visual-course", 1.25, None)
+    assert events[-1][0] == "tick"
+    tick = events[-1][1]
+    assert tick["estimator"] == {
+        "accel_trust": 1.0,
+        "accel_magnitude_deviation_mps2": 0.0,
+        "horizontal_specific_force_mps2": 0.0,
+        "healthy": True,
+    }
+    assert tick["actuators"]["actuator"] == [0.30, 0.31, 0.29, 0.30]
+    assert tick["rpy"] == pytest.approx([0.10, -0.20, 0.0])
+    # Absent estimator/actuator streams degrade to None, never an error.
+    silent_adapter = _FakeAdapter()
+    silent_adapter.race_status = RaceStatus(1_000, 0, -1, 0, -1)
+    silent_runner = VQ2Runner(silent_adapter, _FakeVision())
+    monkeypatch.setattr(
+        silent_runner.recorder,
+        "emit",
+        lambda event, **payload: events.append((event, payload)),
+    )
+    silent_runner._record_tick("visual-course", 1.30, None)
+    silent_tick = events[-1][1]
+    assert silent_tick["actuators"] is None
+    assert silent_tick["estimator"] is None
+
+
 def test_sign_id_yaw_rejects_stationary_image_response(monkeypatch):
     runner, _adapter, events, _send_options = _configured_yaw_sign_id(
         monkeypatch,

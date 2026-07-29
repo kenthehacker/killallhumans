@@ -18,13 +18,15 @@ every authoritative promotion until the successor is accepted and
 vertically qualified (bounded by a 2.75 s timeout and a 2.0 s minimum
 hold, slewed in at a dedicated 1.0 rad/s) with a qualification-
 gated 0.5 m/s climb cap in the same window, a genuine nose-up pre-crossing
-expansion brake (near window or sub-1.2 s expansion TTC, near-field gated,
-fast slew, lateral pursuit and vz governor alive, crossing detection
-unsuppressed), a pre-gate-1 altitude floor
-(vz_est-integrated alt_est, 0.7 -> 1.2 m hysteresis) overriding everything
-but the exact-zero coast latch with a level attitude, zero yaw, and a
-governed climb collective, an exact-zero coast WIRE that bypasses the
-attitude PD so no rates leak at zero thrust, a raised 0.34 thrust envelope
+expansion brake (near window or sub-2.5 s expansion TTC, near-field gated
+at -1.8, fast slew, lateral pursuit and vz governor alive, crossing
+detection unsuppressed), a pre-gate-1 altitude floor
+(vz_est-integrated alt_est clamped at >= -2.0 m, 0.7 -> 1.2 m hysteresis)
+overriding everything but the exact-zero coast latch with a level
+attitude, zero yaw, and a governed climb collective, bounded to a 2.5 s
+latch with a 1.0 s above-release re-arm (F13), an exact-zero coast WIRE
+that bypasses the attitude PD so no rates leak at zero thrust, a raised
+0.34 thrust envelope
 under the runner's 0.35 hard abort,
 verified yaw/roll directions, clipping uncertainty (not abort),
 PREDICT->SEARCH on fresh empty frames, frozen-frame stalls that predict and
@@ -1026,6 +1028,89 @@ def test_altitude_floor_never_overrides_coast_exact_zero():
     assert _command(controller, 100.14).thrust == 0.0
 
 
+def test_altitude_floor_latch_releases_unconditionally_and_rearms_after_hold():
+    # F13 (trace 20260729T134958Z-visual-course-82d72cb5): a biased
+    # estimator (alt_est -10.7 m, physically impossible) latched the floor
+    # at t=5.16 and pinned the profile at full thrust for 4.2 s into
+    # terrain.  An episode now releases unconditionally after 2.5 s and
+    # re-arms only after alt_est has held above the release altitude for a
+    # full second.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 0.5  # below the trigger; vz = 0 holds it there
+    now = 100.10
+    frame = 10
+    _command(controller, now)
+    assert controller._alt_floor_active
+    # The latch must not pin the profile: it releases after 2.5 s even
+    # though alt_est is still below the trigger.
+    while now <= 100.10 + 2.6:
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
+            now_s=now,
+        )
+        _command(controller, now)
+        frame += 1
+    assert not controller._alt_floor_active
+    assert controller._alt_floor_cooldown
+    # Cooldown: still below the trigger, but no immediate re-trigger.
+    now += 0.033
+    _command(controller, now)
+    assert not controller._alt_floor_active
+    # Recover above the release altitude; the cooldown clears only after a
+    # full second of sustained recovery.
+    controller._vz_est_m_s = 1.0
+    while controller._alt_est_m <= 1.2:
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
+            now_s=now,
+        )
+        _command(controller, now)
+        frame += 1
+    assert controller._alt_floor_cooldown  # not yet: needs 1.0 s above
+    hold_start = now
+    while now - hold_start < 1.0:
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
+            now_s=now,
+        )
+        _command(controller, now)
+        frame += 1
+    assert not controller._alt_floor_cooldown
+    # Sink back below the trigger: the floor re-arms normally.
+    controller._vz_est_m_s = -1.0
+    out = None
+    while controller._alt_est_m >= 0.7:
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
+            now_s=now,
+        )
+        out = _command(controller, now)
+        frame += 1
+    assert controller._alt_floor_active
+    assert out.thrust > 0.0
+
+
+def test_alt_est_clamped_so_biased_integrator_cannot_deepen_floor():
+    # F13's alt_est reached -10.7 m (physically impossible).  The estimate
+    # is clamped below at -2.0 m: deeper than the 0.7-1.2 m guard band
+    # ever needs, never deeper.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 0.0
+    controller._vz_est_m_s = -10.0  # F13-scale biased sink
+    now = 100.10
+    for _ in range(10):  # unclamped integration would reach -3.3 m
+        now += 0.033
+        _command(controller, now)
+    assert controller._alt_est_m == -2.0
+    assert controller._alt_floor_active  # still guards inside the band
+
+
 def test_pre_cross_brake_engages_near_with_fast_slew_and_lateral_alive():
     # Codex F9-F11 analysis: even +0.12 rad pitch-back gives only
     # g*tan(0.12) ~= 1.18 m/s^2, so killing ~3 m/s needs ~2.5 s while the
@@ -1049,10 +1134,11 @@ def test_pre_cross_brake_engages_near_with_fast_slew_and_lateral_alive():
 
 
 def test_pre_cross_brake_does_not_engage_at_long_range():
-    # The brake must never stall the approach at long range: below the near
-    # field even a spurious fast expansion rate (TTC 0.5 s) leaves the
-    # normal advance law alone.
-    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    # The brake must never stall the approach at long range: outside the
+    # -1.8 near field even a spurious fast expansion rate (TTC 0.5 s)
+    # leaves the normal advance law alone.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.15))
+    # log(0.15) = -1.90 < PRE_CROSS_BRAKE_NEAR_LOG_SCALE (-1.8).
     controller.current.scale_axis.v = 2.0
     out = _command(controller, 100.10)
     assert not controller._pre_cross_brake_active
@@ -1060,11 +1146,14 @@ def test_pre_cross_brake_does_not_engage_at_long_range():
 
 
 def test_pre_cross_brake_expansion_ttc_trigger_in_near_field():
-    # Below the near-scale trigger but inside the near field, a filtered
-    # expansion rate saying time-to-contact < 1.2 s engages the brake.
-    controller = _tracked_controller(_track("A", 0.10, 0.0, scale=0.25))
-    # log(0.25) = -1.39 < NEAR_BRAKE_LOG_SCALE; expansion TTC = 1.0 s.
-    controller.current.scale_axis.v = 1.0
+    # F13 timing (agent-10): at 3 m/s closure TTC 1.2 s IS log_scale -1.1,
+    # so the old trigger could never create braking distance.  TTC 2.5 s
+    # binds at log_scale ~= -1.6...-1.8, buying ~0.9-1.0 s of genuine
+    # brake: this case (log -1.61, TTC 2.0 s) engages under the new timing
+    # but was outside BOTH the old near field (-1.5) and the old TTC (1.2).
+    controller = _tracked_controller(_track("A", 0.10, 0.0, scale=0.20))
+    # log(0.20) = -1.61 >= -1.8; expansion TTC = 2.0 s < 2.5 s.
+    controller.current.scale_axis.v = 0.5
     out = None
     now = 100.10
     for _ in range(15):

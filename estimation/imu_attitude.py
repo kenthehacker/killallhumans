@@ -20,7 +20,12 @@ Bootstrap uses that measured gravity direction instead of assuming zero tilt.
 
 The accelerometer is not a tilt sensor while the vehicle is accelerating.
 Consequently, gravity correction is smoothly suppressed when either the
-acceleration magnitude or its innovation is implausible.  A timestamp gap is
+acceleration magnitude or its innovation is implausible, and additionally
+when the world-frame horizontal specific force says the vehicle is
+maneuvering (flight F13, trace 20260729T134958Z-visual-course-82d72cb5:
+sustained 25-40 degree off-gravity specific force at |f|-g in the old ramp
+band kept the correction partially trusted and converged the tilt estimate
+0.3-0.6 rad toward a false gravity direction).  A timestamp gap is
 also surfaced as an unhealthy estimate rather than integrated across.  These
 guards favor a short conservative stabilization flight over aggressive but
 potentially false attitude corrections.
@@ -74,7 +79,17 @@ class ImuAttitudeConfig:
     # Smooth confidence ramps.  Correction has full confidence below the
     # ``full`` value, zero confidence at/above the ``zero`` value.
     accel_trust_full_deviation_mps2: float = 0.20
-    accel_trust_zero_deviation_mps2: float = 1.50
+    # Zero-deviation tightened 1.50 -> 0.50 (F13): |f|-g sat in the old ramp
+    # band (~0.9-1.4) throughout maneuvering, keeping the correction
+    # partially trusted while the vehicle was 25-40 degrees off gravity.
+    accel_trust_zero_deviation_mps2: float = 0.50
+    # Horizontal-specific-force maneuver gate (F13): the world-frame
+    # horizontal component of measured specific force is ~zero only in
+    # near-steady flight; sustained tilt or horizontal acceleration means
+    # the accelerometer is not measuring gravity and the correction must be
+    # OFF.  Full trust at/below ``full``, zero at/above ``zero``.
+    accel_trust_fh_full_mps2: float = 1.00
+    accel_trust_fh_zero_mps2: float = 2.50
     accel_innovation_full_rad: float = math.radians(6.0)
     accel_innovation_zero_rad: float = math.radians(30.0)
 
@@ -106,6 +121,10 @@ class AttitudeEstimate:
     propagated: bool
     yaw_observable: bool = False
     reason: Optional[str] = None
+    # Trust-ramp inputs, exported per sample for flight-trace diagnosis
+    # (F13 had to be inferred indirectly without them).
+    accel_magnitude_deviation_mps2: float = 0.0
+    horizontal_specific_force_mps2: float = 0.0
 
     @property
     def roll(self) -> float:
@@ -276,8 +295,9 @@ class ImuAttitudeEstimator:
         measured_up = _scale(accel_v, 1.0 / accel_norm) if accel_norm > 1e-9 else (0.0, 0.0, 0.0)
         predicted_up = _predicted_specific_force_direction(q_pred)
 
+        magnitude_deviation = abs(accel_norm - cfg.gravity_mps2)
         magnitude_trust = _descending_ramp(
-            abs(accel_norm - cfg.gravity_mps2),
+            magnitude_deviation,
             cfg.accel_trust_full_deviation_mps2,
             cfg.accel_trust_zero_deviation_mps2,
         )
@@ -287,7 +307,20 @@ class ImuAttitudeEstimator:
             cfg.accel_innovation_full_rad,
             cfg.accel_innovation_zero_rad,
         )
-        accel_trust = magnitude_trust * innovation_trust
+        # Maneuver gate (F13): world-frame horizontal specific force.  The
+        # innovation ramp alone could not catch sustained off-gravity flight
+        # because the correction converged predicted_up toward the false
+        # measurement; fh stays large for as long as the maneuver does.
+        specific_force_world = _rotate_body_to_world(q_pred, accel_v)
+        horizontal_specific_force = math.hypot(
+            specific_force_world[0], specific_force_world[1]
+        )
+        fh_trust = _descending_ramp(
+            horizontal_specific_force,
+            cfg.accel_trust_fh_full_mps2,
+            cfg.accel_trust_fh_zero_mps2,
+        )
+        accel_trust = magnitude_trust * innovation_trust * fh_trust
 
         # For q(body->NED), measured_up x predicted_up has the body-rate sign
         # that rotates the predicted gravity direction toward the measurement.
@@ -318,6 +351,8 @@ class ImuAttitudeEstimator:
             accel_trust=accel_trust,
             healthy=True,
             propagated=True,
+            accel_magnitude_deviation_mps2=magnitude_deviation,
+            horizontal_specific_force_mps2=horizontal_specific_force,
         )
         self._last_estimate = estimate
         return estimate
@@ -420,6 +455,8 @@ class ImuAttitudeEstimator:
         healthy: bool,
         propagated: bool,
         reason: Optional[str] = None,
+        accel_magnitude_deviation_mps2: float = 0.0,
+        horizontal_specific_force_mps2: float = 0.0,
     ) -> AttitudeEstimate:
         return AttitudeEstimate(
             timestamp_us=timestamp_us,
@@ -430,6 +467,8 @@ class ImuAttitudeEstimator:
             healthy=healthy,
             propagated=propagated,
             reason=reason,
+            accel_magnitude_deviation_mps2=float(accel_magnitude_deviation_mps2),
+            horizontal_specific_force_mps2=float(horizontal_specific_force_mps2),
         )
 
     def _clear_calibration_window(self) -> None:
@@ -461,6 +500,7 @@ def _validate_config(cfg: ImuAttitudeConfig) -> None:
         "gyro_bias_limit_rad_s": cfg.gyro_bias_limit_rad_s,
         "bias_learning_gyro_max_rad_s": cfg.bias_learning_gyro_max_rad_s,
         "accel_trust_full_deviation_mps2": cfg.accel_trust_full_deviation_mps2,
+        "accel_trust_fh_full_mps2": cfg.accel_trust_fh_full_mps2,
         "accel_innovation_full_rad": cfg.accel_innovation_full_rad,
     }
     if not math.isfinite(cfg.gravity_mps2) or cfg.gravity_mps2 <= 0.0:
@@ -480,6 +520,11 @@ def _validate_config(cfg: ImuAttitudeConfig) -> None:
         <= cfg.accel_trust_full_deviation_mps2
     ):
         raise ValueError("accel trust zero threshold must exceed full threshold")
+    if (
+        not math.isfinite(cfg.accel_trust_fh_zero_mps2)
+        or cfg.accel_trust_fh_zero_mps2 <= cfg.accel_trust_fh_full_mps2
+    ):
+        raise ValueError("accel trust fh zero threshold must exceed full threshold")
     if (
         not math.isfinite(cfg.accel_innovation_zero_rad)
         or cfg.accel_innovation_zero_rad <= cfg.accel_innovation_full_rad
@@ -518,6 +563,21 @@ def _predicted_specific_force_direction(q: _QuaternionTuple) -> Vector3:
         -2.0 * (x * z - w * y),
         -2.0 * (y * z + w * x),
         -(1.0 - 2.0 * (x * x + y * y)),
+    )
+
+
+def _rotate_body_to_world(q: _QuaternionTuple, v: Vector3) -> Vector3:
+    """Rotate a body-frame vector into the world frame by q(body->world)."""
+
+    w, x, y, z = q
+    # v' = v + 2*w*(q_vec x v) + 2*(q_vec x (q_vec x v)).
+    tx = 2.0 * (y * v[2] - z * v[1])
+    ty = 2.0 * (z * v[0] - x * v[2])
+    tz = 2.0 * (x * v[1] - y * v[0])
+    return (
+        v[0] + w * tx + (y * tz - z * ty),
+        v[1] + w * ty + (z * tx - x * tz),
+        v[2] + w * tz + (x * ty - y * tx),
     )
 
 
