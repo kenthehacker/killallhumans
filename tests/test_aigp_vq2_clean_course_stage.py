@@ -53,6 +53,7 @@ import pytest
 from competition.vq2_contracts import FrameEdge
 from competition.vq2_visual_tracker import CameraFrameToken
 from scripts.aigp_vq2_clean_course_stage import (
+    FH_UNTRUSTED_TRIGGER_MPS2,
     LAUNCH_BOOST_DURATION_S,
     LAUNCH_BOOST_THRUST,
     NEVER_MEASURED_S,
@@ -67,6 +68,10 @@ from scripts.aigp_vq2_clean_course_stage import (
 
 SUPPORT = 0.247  # F49: F48-measured hover support (was 0.275)
 SPAWN_PITCH = -0.31  # F49: default spawn-relative pitch base
+# Tilt-compensated support at the spawn attitude: command() divides the
+# support collective by cos(pitch), so the exact level base at the F49
+# neutral attitude (pitch=SPAWN_PITCH in the PD-law tests) is this value.
+SPAWN_SUPPORT = SUPPORT / math.cos(SPAWN_PITCH)
 
 
 def _config(**overrides):
@@ -221,15 +226,51 @@ def test_identical_global_vertical_sign_at_every_gate():
 
 
 def test_vertical_sign_is_the_gate0_minus_form_by_default():
+    # pitch=SPAWN_PITCH: the F49 neutral (level-flight) attitude, so the
+    # F50 attitude compensation is exactly zero in these PD-law checks;
+    # the exact base is the tilt-compensated SPAWN_SUPPORT.
     controller = _tracked_controller(_track("A", 0.0, 0.20))
-    output = _command(controller, 100.10)
+    output = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert output.thrust == pytest.approx(
-        SUPPORT - 0.080 * 0.20, abs=1e-9
+        SPAWN_SUPPORT - 0.080 * 0.20, abs=1e-9
     )
     controller = _tracked_controller(_track("A", 0.0, -0.20))
-    output = _command(controller, 100.10)
+    output = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert output.thrust == pytest.approx(
-        SUPPORT + 0.080 * 0.20, abs=1e-9
+        SPAWN_SUPPORT + 0.080 * 0.20, abs=1e-9
+    )
+
+
+def test_vertical_error_is_pitch_attitude_compensated():
+    # F50 (flight 20260729T222920Z-visual-course-3a8ed087): the vertical
+    # servo read image-y with NO attitude compensation, so the F49 nose-up
+    # brake (0.15 rad up from spawn) tilted the camera up and the world
+    # read ~0.24 norm LOW — the servo "centered" a gate that was really
+    # ~1.5-2 m below and held ceiling height into a truss.  (F32/F34/F36
+    # saw the same contamination with the opposite sign: nose-down dives
+    # read gates HIGH.)  Compensation is zero at the spawn attitude.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    assert controller._compensated_ey(0.0, SPAWN_PITCH) == pytest.approx(0.0)
+    # Nose-up 0.15 rad REDUCES the effective ey by 1.6 * 0.15 = 0.24.
+    assert controller._compensated_ey(
+        0.0, SPAWN_PITCH - 0.15
+    ) == pytest.approx(-0.24)
+    # Nose-down 0.15 rad raises it (the F32/F34/F36 "gate HIGH" sign).
+    assert controller._compensated_ey(
+        0.0, SPAWN_PITCH + 0.15
+    ) == pytest.approx(0.24)
+    # End to end: a gate reading 0.24 low while braked 0.15 rad nose-up is
+    # a LEVEL gate — the PD asks for the bare tilt-compensated support...
+    braked = _tracked_controller(_track("A", 0.0, 0.24))
+    out = _command(braked, 100.10, pitch=SPAWN_PITCH - 0.15)
+    assert out.thrust == pytest.approx(
+        SUPPORT / math.cos(SPAWN_PITCH - 0.15), abs=1e-9
+    )
+    # ...while the same reading at the spawn attitude really is low.
+    level = _tracked_controller(_track("A", 0.0, 0.24))
+    out = _command(level, 100.10, pitch=SPAWN_PITCH)
+    assert out.thrust == pytest.approx(
+        SPAWN_SUPPORT - 0.080 * 0.24, abs=1e-9
     )
 
 
@@ -311,13 +352,15 @@ def test_gate0_climb_vertical_offset_is_bounded_feedforward():
     # inside the thrust envelope and retires with the gate-0 phase.
     config = _config(gate0_climb_vertical_offset_norm=0.25)
     controller = _tracked_controller(_track("A", 0.0, -0.10), config=config)
-    output = _command(controller, 100.10)
+    output = _command(controller, 100.10, pitch=SPAWN_PITCH)
     # e = -0.10 - 0.25 = -0.35 -> full climb correction above support.
-    assert output.thrust == pytest.approx(SUPPORT + 0.080 * 0.35, abs=1e-9)
+    assert output.thrust == pytest.approx(
+        SPAWN_SUPPORT + 0.080 * 0.35, abs=1e-9
+    )
     assert 0.21 <= output.thrust <= 0.34
 
     high = _tracked_controller(_track("A", 0.0, -0.60), config=config)
-    assert _command(high, 100.10).thrust <= 0.34
+    assert _command(high, 100.10, pitch=SPAWN_PITCH).thrust <= 0.34
 
     controller.observe(
         _update(
@@ -334,10 +377,10 @@ def test_gate0_climb_vertical_offset_is_bounded_feedforward():
     assert promoted
     assert controller.state is CleanCourseState.TRACK
     controller._alt_est_m = 2.0  # honest altitude (floor quiet)
-    output = _command(controller, 100.16)
+    output = _command(controller, 100.16, pitch=SPAWN_PITCH)
     assert output.gate_index == 1
     # Same centered target after promotion: the unbiased law holds support.
-    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+    assert output.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
 
 
 def test_gate0_climb_offset_scales_with_closure():
@@ -350,22 +393,24 @@ def test_gate0_climb_offset_scales_with_closure():
     far = _tracked_controller(
         _track("A", 0.0, -0.10, scale=0.1667), config=config
     )
-    assert _command(far, 100.10).thrust == pytest.approx(
-        SUPPORT + 0.080 * (0.10 + 0.25), abs=1e-9
+    assert _command(far, 100.10, pitch=SPAWN_PITCH).thrust == pytest.approx(
+        SPAWN_SUPPORT + 0.080 * (0.10 + 0.25), abs=1e-9
     )
 
     mid = _tracked_controller(
         _track("A", 0.0, -0.10, scale=math.exp(-1.295)), config=config
     )
     mid_offset = 0.25 * (-1.295 - (-0.80)) / (-1.79 - (-0.80))
-    assert _command(mid, 100.10).thrust == pytest.approx(
-        SUPPORT + 0.080 * (0.10 + mid_offset), abs=1e-9
+    assert _command(mid, 100.10, pitch=SPAWN_PITCH).thrust == pytest.approx(
+        SPAWN_SUPPORT + 0.080 * (0.10 + mid_offset), abs=1e-9
     )
 
     crossing = _tracked_controller(
         _track("A", 0.0, 0.0, scale=math.exp(-0.80)), config=config
     )
-    assert _command(crossing, 100.10).thrust == pytest.approx(SUPPORT, abs=1e-9)
+    assert _command(
+        crossing, 100.10, pitch=SPAWN_PITCH
+    ).thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
 
 
 def test_gate0_climb_offset_never_lifts_aim_above_center():
@@ -379,15 +424,19 @@ def test_gate0_climb_offset_never_lifts_aim_above_center():
     centered = _tracked_controller(
         _track("A", 0.0, 0.0, scale=0.1667), config=config  # spawn scale
     )
-    assert _command(centered, 100.10).thrust == pytest.approx(SUPPORT, abs=1e-9)
+    assert _command(
+        centered, 100.10, pitch=SPAWN_PITCH
+    ).thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
 
     below = _tracked_controller(
         _track("A", 0.0, 0.10, scale=0.1667), config=config
     )
-    output = _command(below, 100.10)
+    output = _command(below, 100.10, pitch=SPAWN_PITCH)
     # Offset contributes nothing: only the plain e = +0.10 descent feedback.
-    assert output.thrust == pytest.approx(SUPPORT - 0.080 * 0.10, abs=1e-9)
-    assert output.thrust < SUPPORT
+    assert output.thrust == pytest.approx(
+        SPAWN_SUPPORT - 0.080 * 0.10, abs=1e-9
+    )
+    assert output.thrust < SPAWN_SUPPORT
 
 
 def test_vertical_rate_term_keeps_full_authority():
@@ -414,10 +463,12 @@ def test_vz_governor_caps_collective_above_climb_cap():
     # removes K_VZ per m/s over the 1.0 m/s cap from the collective.
     controller = _tracked_controller(_track("A", 0.0, 0.0))  # e = 0, vy ~ 0
     controller._vz_est_m_s = 0.5  # below the cap: no effect
-    assert _command(controller, 100.10).thrust == pytest.approx(SUPPORT, abs=1e-9)
+    assert _command(controller, 100.10, pitch=SPAWN_PITCH).thrust == pytest.approx(
+        SPAWN_SUPPORT, abs=1e-9
+    )
     controller._vz_est_m_s = 2.0  # 1.0 m/s over cap -> -0.03 collective
-    assert _command(controller, 100.14).thrust == pytest.approx(
-        SUPPORT - 0.03, abs=1e-9
+    assert _command(controller, 100.14, pitch=SPAWN_PITCH).thrust == pytest.approx(
+        SPAWN_SUPPORT - 0.03, abs=1e-9
     )
 
 
@@ -427,12 +478,12 @@ def test_vz_governor_applies_in_predict_and_search():
     controller.observe(_update([], frame_id=2), now_s=100.12)  # superseded
     assert controller.state is CleanCourseState.PREDICT
     controller._vz_est_m_s = 2.0
-    assert _command(controller, 100.16).thrust == pytest.approx(
-        SUPPORT - 0.03, abs=1e-9
+    assert _command(controller, 100.16, pitch=SPAWN_PITCH).thrust == pytest.approx(
+        SPAWN_SUPPORT - 0.03, abs=1e-9
     )
     controller._enter_search(100.20)
-    assert _command(controller, 100.22).thrust == pytest.approx(
-        SUPPORT - 0.03, abs=1e-9
+    assert _command(controller, 100.22, pitch=SPAWN_PITCH).thrust == pytest.approx(
+        SPAWN_SUPPORT - 0.03, abs=1e-9
     )
 
 
@@ -640,9 +691,11 @@ def test_engulfing_anchor_blocks_search_and_keeps_vertical_unqualified():
     output = None
     for frame in range(45):  # ~1.5 s of engulfed frames
         controller.observe(_update([engulfing], frame_id=10 + frame), now_s=now)
-        output = _command(controller, now + 0.005)
+        # pitch=SPAWN_PITCH: neutral attitude (zero F50 compensation); the
+        # exact hold is the tilt-compensated spawn support.
+        output = _command(controller, now + 0.005, pitch=SPAWN_PITCH)
         assert controller.state is not CleanCourseState.SEARCH
-        assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+        assert output.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
         now += 0.033
     assert controller.state is CleanCourseState.PREDICT
     # Bearing anchored to the engulfing center; vertical never qualified
@@ -1000,24 +1053,42 @@ def test_alt_est_clamped_so_biased_integrator_cannot_deepen_floor():
     assert controller._alt_floor_active  # still guards inside the band
 
 
+def test_fh_trigger_clears_the_brake_regime():
+    # F50 (flight 20260729T222920Z-visual-course-3a8ed087): the F49 TRUE
+    # brake reads fh 3.0-3.4 — a hard brake IS horizontal specific force —
+    # and the 3.0 trigger tripped on the brake itself, pinning the
+    # collective at the support + 0.05 floor for the whole gate-1 leg.
+    # The F14 biased regime measured 6.5-7.5; 5.0 separates them.
+    assert FH_UNTRUSTED_TRIGGER_MPS2 == 5.0
+    assert CleanCourseConfig().fh_untrusted_trigger_mps2 == 5.0
+
+
 def test_fh_gate_engages_only_after_sustained_excess_not_a_transient():
-    # F14: the regime gate latches only on fh > 3.0 SUSTAINED for 0.3 s; a
-    # transient excursion must never freeze the vertical estimate.
+    # F14: the regime gate latches only on fh above the trigger SUSTAINED
+    # for 0.3 s; a transient excursion must never freeze the vertical
+    # estimate.
+    # F50: trigger raised 3.0 -> 5.0 — the F49 hard brake reads fh 3.0-3.4
+    # (a hard brake IS horizontal specific force) and tripped its own
+    # distrust alarm; the F14 biased regime measured 6.5-7.5.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     now = 100.10
+    for _ in range(15):  # 0.5 s at brake-level fh 3.4: must NEVER latch
+        now += 0.033
+        _command(controller, now, fh=3.4)
+    assert not controller._fh_untrusted
     for _ in range(7):  # 0.23 s above the trigger: transient, no latch
         now += 0.033
-        _command(controller, now, fh=4.0)
+        _command(controller, now, fh=6.0)
     assert not controller._fh_untrusted
     now += 0.033
     _command(controller, now, fh=1.0)  # below the trigger: timer resets
     for _ in range(7):  # another 0.23 s: still only a transient
         now += 0.033
-        _command(controller, now, fh=4.0)
+        _command(controller, now, fh=6.0)
     assert not controller._fh_untrusted
     for _ in range(4):  # 0.36 s continuous: the gate latches
         now += 0.033
-        _command(controller, now, fh=4.0)
+        _command(controller, now, fh=6.0)
     assert controller._fh_untrusted
 
 
@@ -1026,9 +1097,9 @@ def test_fh_gate_releases_only_below_hysteresis_band():
     now = 100.10
     for _ in range(11):  # sustained: latch untrusted
         now += 0.033
-        _command(controller, now, fh=4.0)
+        _command(controller, now, fh=6.0)
     assert controller._fh_untrusted
-    # Inside the 2.0-3.0 hysteresis band the latch holds.
+    # Inside the 2.0-5.0 hysteresis band the latch holds.
     now += 0.033
     _command(controller, now, fh=2.5)
     assert controller._fh_untrusted
@@ -1049,12 +1120,12 @@ def test_fh_freeze_suspends_vz_integration_leaks_to_zero_holds_alt():
     now = 100.10
     for _ in range(11):  # latch untrusted (a_up=None: vz held)
         now += 0.033
-        _command(controller, now, fh=4.0)
+        _command(controller, now, fh=6.0)
     assert controller._fh_untrusted
     controller._alt_est_m = -1.0
     for _ in range(10):
         now += 0.033
-        _command(controller, now, fh=4.0, a_up=-2.5)  # biased regime sample
+        _command(controller, now, fh=6.0, a_up=-2.5)  # biased regime sample
     # Leak-only decay: -4.36 * (1 - dt/2.5)^10; integration would have
     # driven it to -5.19 instead.
     assert controller._vz_est_m_s == pytest.approx(
@@ -1081,7 +1152,7 @@ def test_alt_floor_never_arms_while_fh_untrusted_but_active_latch_times_out():
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
             now_s=now,
         )
-        _command(controller, now, fh=4.0)
+        _command(controller, now, fh=6.0)
         frame += 1
     assert controller._fh_untrusted
     assert controller._alt_floor_active
@@ -1092,13 +1163,13 @@ def test_alt_floor_never_arms_while_fh_untrusted_but_active_latch_times_out():
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
             now_s=now,
         )
-        _command(controller, now, fh=4.0)
+        _command(controller, now, fh=6.0)
         frame += 1
     assert not controller._alt_floor_active
     # With the regime still untrusted the floor cannot re-arm even though
     # alt_est is below the trigger.
     now += 0.033
-    _command(controller, now, fh=4.0)
+    _command(controller, now, fh=6.0)
     assert not controller._alt_floor_active
 
 
@@ -1113,12 +1184,12 @@ def test_unqualified_vertical_holds_support_plus_margin_while_fh_untrusted():
     now = 100.10
     for _ in range(11):
         now += 0.033
-        _command(controller, now, fh=4.0)
+        _command(controller, now, fh=6.0)
     assert controller._fh_untrusted
     out = None
     for _ in range(30):  # the decay converges onto the hold
         now += 0.033
-        out = _command(controller, now, fh=4.0)
+        out = _command(controller, now, fh=6.0)
     assert not out.vertical_qualified
     assert out.thrust == pytest.approx(SUPPORT + 0.05, abs=1e-3)
 
@@ -1134,13 +1205,13 @@ def test_descent_floor_cannot_fire_from_frozen_vz_est():
         controller.observe(
             _update([_track("A", 0.0, 0.0)], frame_id=10 + frame), now_s=now
         )
-        _command(controller, now, fh=4.0)
+        _command(controller, now, fh=6.0)
     assert controller._fh_untrusted
     now += 0.033
     controller.observe(
         _update([_track("A", 0.0, 0.0)], frame_id=21), now_s=now
     )
-    out = _command(controller, now, fh=4.0)
+    out = _command(controller, now, fh=6.0)
     assert out.vertical_qualified  # fresh camera y
     # Governor suppressed: centered target -> PD asks for bare support, NOT
     # the descent-floor boost that would clamp at 0.34.  But the F21
@@ -1371,6 +1442,53 @@ def test_search_level_pitch_held_from_the_first_tick():
         out = _command(controller, now)
     assert out.state is CleanCourseState.SEARCH
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+
+
+def test_search_descends_toward_remembered_low_bearing():
+    # F50 (flight 20260729T222920Z-visual-course-3a8ed087): F49's SEARCH
+    # held the support floor at ceiling height for 8 s while the gate sat
+    # ~1.5 m below — a search that cannot descend never re-acquires a gate
+    # that sank below the FOV.  With a reliable bearing memory, SEARCH
+    # servos the collective on the remembered attitude-compensated ey,
+    # bounded to a small band around support.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller._enter_search(100.10)
+    controller._set_reliable_bearing(0.0, 0.50)  # gate below center
+    out = _command(controller, 100.143, pitch=SPAWN_PITCH)
+    # Proportional descent: -0.080 * 0.50 = -0.04 around the level base.
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.080 * 0.50, abs=1e-9)
+    assert out.thrust < SPAWN_SUPPORT
+    # A remembered HIGH bearing climbs by the same term.
+    controller._set_reliable_bearing(0.0, -0.50)
+    out = _command(controller, 100.20, pitch=SPAWN_PITCH)
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.080 * 0.50, abs=1e-9)
+    # The correction is bounded to the band, and the min-thrust envelope
+    # still floors the result.
+    controller._set_reliable_bearing(0.0, 0.95)
+    out = _command(controller, 100.26, pitch=SPAWN_PITCH)
+    assert out.thrust == pytest.approx(0.21, abs=1e-9)
+
+
+def test_search_memory_descent_yields_to_fh_untrusted_floor():
+    # The memory servo still passes through _governed_collective: while
+    # vz/alt are known lies the support + margin floor overrides the
+    # descent correction (the F21 blind-sink protections win).
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller._enter_search(100.10)
+    controller._set_reliable_bearing(0.0, 0.50)
+    controller._fh_untrusted = True
+    out = _command(controller, 100.143, pitch=SPAWN_PITCH, fh=6.0)
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-9)
+
+
+def test_search_without_bearing_memory_holds_support():
+    # No bearing evidence yet: the vertical memory servo stays out and the
+    # search holds the plain support collective (pre-F50 behavior).
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller._enter_search(100.10)
+    controller._bearing_memory_valid = False
+    out = _command(controller, 100.143, pitch=SPAWN_PITCH)
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
 
 
 def test_lone_small_fragment_creeps_instead_of_advancing():

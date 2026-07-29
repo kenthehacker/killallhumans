@@ -58,10 +58,12 @@ Control-law constant sources:
   credit).
 - ``FH_UNTRUSTED_*``: the F14 inflow-regime gate.  vz_est is invalidated
   by REGIME (a smooth fh-proportional thrust deficit), not attitude or
-  vibration, so sustained fh > 3.0 freezes the vz/alt integrators, blocks
+  vibration, so sustained fh > 5.0 freezes the vz/alt integrators, blocks
   alt-floor arming, suppresses every vz-based governor floor/cap, and
   falls back to the camera-qualified vertical PD (support + margin when
-  unqualified); the latch releases below fh 2.0.
+  unqualified); the latch releases below fh 2.0.  (Trigger raised 3.0 ->
+  5.0 in F50: the F49 hard brake reads fh 3.0-3.4 and tripped its own
+  distrust alarm; the F14 biased regime measured 6.5-7.5.)
 - Thrust envelope ``[MIN_COURSE_THRUST, MAX_COURSE_THRUST]`` and yaw cap: the
   accepted v3 yaw profile and the visual-course thrust envelope from the
   July-18 safety contract (max raised 0.32 -> 0.34 under the 0.35 hard
@@ -456,7 +458,9 @@ ALT_EST_MIN_M = -2.0  # biased-integrator clamp on the altitude estimate
 # — vz_est is invalidated by REGIME, a smooth fh-proportional DC deficit
 # (~0.9*fh - 0.5), NOT vibration (accz std 0.19, the cleanest of the
 # flight) and NOT attitude (kp=0, gyro drift <= 0.2 rad).  Trusted fh <
-# ~2.0, biased fh > ~3.0.  While untrusted the stage freezes vz_est (the
+# ~2.0, biased fh 6.5-7.5; F49's hard brake reads 3.0-3.4 and must NOT
+# trip the gate, so the trigger sits at 5.0 (see below).  While untrusted
+# the stage freezes vz_est (the
 # leak relaxes it toward 0; the biased a_up is never integrated), holds
 # alt_est, blocks alt-floor arming (an active latch still times out
 # normally), falls back to the camera-qualified vertical PD (support +
@@ -465,7 +469,14 @@ ALT_EST_MIN_M = -2.0  # biased-integrator clamp on the altitude estimate
 # descent feedforward cannot fire from the frozen estimate.  This breaks
 # the F14 self-locking loop: governor pinned 0.34 on the phantom sink, the
 # floor flew biased-"level".
-FH_UNTRUSTED_TRIGGER_MPS2 = 3.0  # biased regime above this horizontal force
+# F50 (flight 20260729T222920Z-visual-course-3a8ed087): the F49 TRUE brake
+# reads fh 3.0-3.4 — a hard nose-up brake IS horizontal specific force — so
+# the 3.0 trigger tripped on the brake itself, latched _fh_untrusted, and
+# floored the collective at support + 0.05 for the whole gate-1 leg (pinned
+# ~0.31, ceiling height, truss graze).  The F14 pathological regime measured
+# 6.5-7.5; 5.0 separates braking from the biased regime with margin on both
+# sides.
+FH_UNTRUSTED_TRIGGER_MPS2 = 5.0  # biased regime above this horizontal force
 FH_TRUSTED_RELEASE_MPS2 = 2.0  # hysteresis release below this
 FH_UNTRUSTED_SUSTAIN_S = 0.3  # transients shorter than this never latch
 # 0.02 -> 0.05 (flight 20260729T151236Z-visual-course-99e093fa): the fh gate
@@ -489,6 +500,29 @@ FH_UNTRUSTED_VERTICAL_MARGIN = 0.05  # unqualified hold: support + margin
 # un-clips the y-axis so the qualified PD can take over.
 HIGH_GATE_Y_NORM = -0.30  # hypothesis y below this counts as "gate is high"
 HIGH_GATE_CLIMB_MARGIN = 0.12  # unqualified hold margin while the gate is high
+# F50 pitch-attitude compensation of the vertical error (flight
+# 20260729T222920Z-visual-course-3a8ed087): the vertical servo read the
+# aim's image-y with NO attitude compensation, so the F49 nose-up brake
+# (rpy_p -0.46, ~0.15 rad up from the -0.31 spawn attitude) tilted the
+# camera up and the world read LOW in frame — ey drifted +0.06 -> +0.68
+# while the servo "centered" a gate that was really ~1.5-2 m below, and
+# the leg held ceiling height into a truss.  (F32/F34/F36 saw the same
+# contamination with the opposite sign: nose-DOWN dives read gates HIGH at
+# ey -0.5..-0.7.)  With image-down-positive ey, a nose-up attitude (rpy_p
+# below spawn_pitch_rad) shifts the world DOWN in frame, so the effective
+# error is ey_true = ey_measured - (spawn_pitch_rad - rpy_p) * this gain;
+# it is zero at the spawn attitude.
+VERTICAL_PITCH_COMP_NORM_PER_RAD = 1.6  # image-norm vertical shift per rad
+# F50 SEARCH vertical memory: F49's SEARCH held the support floor at
+# ceiling height for 8 s while the gate sat ~1.5 m below — a search that
+# cannot descend never re-acquires a gate that sank out of the FOV.  With
+# a reliable bearing memory, SEARCH servos the collective on the
+# remembered attitude-compensated ey (the global vertical sign and the
+# qualified-PD error gain), bounded to this band around support; without
+# memory it holds support as before.  The output still passes through
+# _governed_collective, so the fh-untrusted floor and vz protections
+# override the memory descent.
+SEARCH_VERTICAL_MEMORY_BAND = 0.05  # collective band around support
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 # Real scan, not a wiggle (post-credit pursuit redesign): 0.12 rad/s with a
 # 1.2 s reversal made +-8 deg legs that could never reach gate 1's typical
@@ -808,6 +842,8 @@ class CleanCourseConfig:
     fh_untrusted_vertical_margin: float = FH_UNTRUSTED_VERTICAL_MARGIN
     high_gate_y_norm: float = HIGH_GATE_Y_NORM
     high_gate_climb_margin: float = HIGH_GATE_CLIMB_MARGIN
+    vertical_pitch_comp_norm_per_rad: float = VERTICAL_PITCH_COMP_NORM_PER_RAD
+    search_vertical_memory_band: float = SEARCH_VERTICAL_MEMORY_BAND
     search_covariance_std_norm: float = SEARCH_COVARIANCE_STD_NORM
     search_yaw_rate_rad_s: float = SEARCH_YAW_RATE_RAD_S
     search_sweep_period_s: float = SEARCH_SWEEP_PERIOD_S
@@ -870,6 +906,10 @@ class CleanCourseController:
         self.current: Optional[_Hypothesis] = None
         self.successor: Optional[_Hypothesis] = None
         self.last_reliable_bearing: Tuple[float, float] = (0.0, 0.0)
+        # F50: False until any real bearing evidence (track, engulfing
+        # anchor, successor, cache, or the initialize fallback) is recorded;
+        # the SEARCH vertical memory servo holds support without it.
+        self._bearing_memory_valid = False
         self.successor_bearing_cache: Dict[int, Tuple[float, float]] = {}
         self._track_first_seen_s: Dict[str, float] = {}
         self._track_last_seen_s: Dict[str, float] = {}
@@ -968,7 +1008,7 @@ class CleanCourseController:
         if current_track is not None:
             self.current = self._hypothesis_from_track(current_track, now_s)
             self.state = CleanCourseState.TRACK
-            self.last_reliable_bearing = (self.current.x, self.current.y)
+            self._set_reliable_bearing(self.current.x, self.current.y)
         else:
             self.current = _Hypothesis(
                 track_id=None,
@@ -979,7 +1019,7 @@ class CleanCourseController:
                 pos_var=SYNTHETIC_POS_VAR_NORM,
                 now_s=now_s,
             )
-            self.last_reliable_bearing = (
+            self._set_reliable_bearing(
                 float(fallback_center_norm[0]),
                 float(fallback_center_norm[1]),
             )
@@ -1053,7 +1093,7 @@ class CleanCourseController:
         ):
             self._last_engulfing_anchor_identity = identity
             self._last_engulfing_anchor_s = float(now_s)
-            self.last_reliable_bearing = (
+            self._set_reliable_bearing(
                 float(anchor.center_norm[0]),
                 self.last_reliable_bearing[1],
             )
@@ -1156,7 +1196,7 @@ class CleanCourseController:
 
         self._refresh_successor(tracks, now_s)
         if self.current is not None and match is not None:
-            self.last_reliable_bearing = (self.current.x, self.current.y)
+            self._set_reliable_bearing(self.current.x, self.current.y)
 
     # -- authoritative race authority ---------------------------------------
 
@@ -1215,7 +1255,7 @@ class CleanCourseController:
             self.current = successor
             self.successor = None
             self.state = CleanCourseState.TRACK
-            self.last_reliable_bearing = (self.current.x, self.current.y)
+            self._set_reliable_bearing(self.current.x, self.current.y)
         else:
             self.current = None
             # Off-by-one fix (codex review): _refresh_successor writes the
@@ -1223,9 +1263,9 @@ class CleanCourseController:
             # the newly-current gate's bearing lives under gate_index - 1.
             cached = self.successor_bearing_cache.get(self.gate_index - 1)
             if successor is not None:
-                self.last_reliable_bearing = (successor.x, successor.y)
+                self._set_reliable_bearing(successor.x, successor.y)
             elif cached is not None:
-                self.last_reliable_bearing = cached
+                self._set_reliable_bearing(cached[0], cached[1])
             self._enter_search(now_s)
         # Re-seed the collective tracker so a retained saturated sub-support
         # command can never survive into the next gate.
@@ -1427,17 +1467,37 @@ class CleanCourseController:
             )
 
         if self.state is CleanCourseState.SEARCH:
-            # F40: absolute-heading sweep around the course anchor — the old
-            # incremental sweep parked at the anchor cap (111 deg off course,
-            # ~7 blind seconds into gate 1).
+            # F49: absolute-heading sweep from the search-entry heading,
+            # first toward the last reliable bearing — the F40 anchor-
+            # centered sweep re-centered the scan on the course heading
+            # instead of where the target was last seen.
             sweep_yaw = self._search_yaw_heading(dt, yaw_rad)
             # Flight 25361816: the unqualified hold margin must apply here
             # too — SEARCH at bare support in the fh-untrusted regime sank
             # ~1 m/s for real into terrain (the margin only covered the
             # TRACK path).
-            search_hold = support + (
+            margin = (
                 cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
             )
+            # F50 vertical memory (see the SEARCH_VERTICAL_MEMORY_BAND
+            # block): servo the collective on the REMEMBERED bearing's
+            # attitude-compensated ey so a search can descend toward a gate
+            # that sank below the FOV — F49 held the support floor at
+            # ceiling height for 8 s over a gate ~1.5 m low.  Bounded to a
+            # small band around support; no memory -> bare support hold.
+            correction = 0.0
+            if self._bearing_memory_valid:
+                remembered_ey = self._compensated_ey(
+                    self.last_reliable_bearing[1], pitch_rad
+                )
+                correction = _clamp(
+                    cfg.vertical_feedback_sign
+                    * cfg.vertical_error_gain
+                    * remembered_ey,
+                    -cfg.search_vertical_memory_band,
+                    cfg.search_vertical_memory_band,
+                )
+            search_hold = support + correction + margin
             self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
             # F49: SEARCH always holds the LEVEL (spawn-attitude) pitch.
@@ -1491,6 +1551,13 @@ class CleanCourseController:
         blend = 0.0
         ex = current.x
         ey = current.y
+        # F50: the VERTICAL channel servos on the pitch-attitude-compensated
+        # error (nose-up brake attitude reads the world LOW in frame; see
+        # the VERTICAL_PITCH_COMP_NORM_PER_RAD block).  The angular-error
+        # brake below keeps the RAW ey: it measures camera pointing, and
+        # pitch attitude is itself the braking actuator, so compensating it
+        # there would release the brake while still pitched up.
+        ey_vertical = self._compensated_ey(ey, pitch_rad)
         # F40 (20260729T193134Z-visual-course-63ed6342): never steer on an
         # x-axis without a fresh accepted measurement — an unmeasured or
         # stale x (edge-clipped splinter, censored axis) is a garbage aim
@@ -1531,9 +1598,10 @@ class CleanCourseController:
             vertical_setpoint_offset = (
                 cfg.gate0_climb_vertical_offset_norm * closure
             )
-            if ey >= 0.0:
-                # Gate at/below image center: the climb bias may not lift the
-                # aim point above center (flight 9d430a40, see block comment).
+            if ey_vertical >= 0.0:
+                # Gate at/below center (attitude-compensated, F50): the
+                # climb bias may not lift the aim above center (flight
+                # 9d430a40, see block comment).
                 vertical_setpoint_offset = min(vertical_setpoint_offset, 0.0)
         vertical_qualified = (
             self.state is CleanCourseState.TRACK
@@ -1573,7 +1641,7 @@ class CleanCourseController:
         self._pre_cross_brake_active = pre_cross_brake
         if vertical_qualified:
             bounded_error = _clamp(
-                ey - vertical_setpoint_offset,
+                ey_vertical - vertical_setpoint_offset,
                 -cfg.vertical_max_abs_error_norm,
                 cfg.vertical_max_abs_error_norm,
             )
@@ -1605,7 +1673,10 @@ class CleanCourseController:
             margin = (
                 cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
             )
-            if current.y < cfg.high_gate_y_norm:
+            # Gate-high classification uses the compensated error too (F50):
+            # a nose-up brake attitude must not read a level gate as LOW,
+            # and the historical nose-down dives must not read it as HIGH.
+            if ey_vertical < cfg.high_gate_y_norm:
                 margin = max(margin, cfg.high_gate_climb_margin)
             hold = support + margin
             if self._collective is None:
@@ -1631,8 +1702,11 @@ class CleanCourseController:
         # IMU world-vertical-rate governor, after the PD law and the
         # feedforward boost, before the final clamp.  It caps what bearing
         # pursuit cannot (see the VZ_CLIMB_CAP_M_S constant block) and stays
-        # alive through TRACK, PREDICT, and SEARCH alike.
-        collective = self._governed_collective(collective, support)
+        # alive through TRACK, PREDICT, and SEARCH alike.  The brake-ceiling
+        # band inside classifies gate-high on the F50 compensated error.
+        collective = self._governed_collective(
+            collective, support, gate_y=ey_vertical
+        )
         thrust = _clamp(collective, cfg.min_thrust, cfg.max_thrust)
 
         # Lateral: per the 2026-07-29 crossing-geometry analysis, positive
@@ -1742,6 +1816,26 @@ class CleanCourseController:
 
     def _current_track_id(self) -> Optional[str]:
         return self.current.track_id if self.current is not None else None
+
+    def _set_reliable_bearing(self, x: float, y: float) -> None:
+        """Record real bearing evidence and validate the F50 memory servo."""
+
+        self.last_reliable_bearing = (float(x), float(y))
+        self._bearing_memory_valid = True
+
+    def _compensated_ey(self, ey: float, pitch_rad: float) -> float:
+        """F50 pitch-attitude-compensated vertical error (image-down +).
+
+        A nose-up attitude (rpy_p below spawn_pitch_rad) tilts the camera
+        up and shifts the world DOWN in frame, so the measured ey reads
+        high; zero at the spawn attitude.
+        """
+
+        cfg = self.config
+        return float(ey) - (
+            (cfg.spawn_pitch_rad - float(pitch_rad))
+            * cfg.vertical_pitch_comp_norm_per_rad
+        )
 
     def _successor_track_id(self) -> Optional[str]:
         return self.successor.track_id if self.successor is not None else None
@@ -2009,7 +2103,12 @@ class CleanCourseController:
         )
         return cfg.successor_blend_max * closure * trust
 
-    def _governed_collective(self, collective: float, support: float) -> float:
+    def _governed_collective(
+        self,
+        collective: float,
+        support: float,
+        gate_y: Optional[float] = None,
+    ) -> float:
         """IMU climb/descent-rate governor: bound collective by estimated vz.
 
         Applied wherever a nonzero collective is emitted (TRACK, PREDICT,
@@ -2095,7 +2194,12 @@ class CleanCourseController:
             band_lo = max(
                 self.config.min_thrust, support - self.config.brake_ceiling_band
             )
-            gate_high = self.current is not None and self.current.y < -0.10
+            # F50: the main path passes the attitude-compensated gate y;
+            # direct callers (tests) fall back to the raw hypothesis y.
+            band_gate_y = gate_y
+            if band_gate_y is None and self.current is not None:
+                band_gate_y = self.current.y
+            gate_high = band_gate_y is not None and band_gate_y < -0.10
             if gate_high:
                 governed = max(governed, band_lo)
             else:
