@@ -8803,15 +8803,16 @@ class VQ2Runner:
             update = self._visual_latest_tracker_update
             tracks = [] if update is None else list(update.tracks)
             for track in tracks:
+                # bbox_norm is (left, top, right, bottom) in the [0,1] unit
+                # image square with x mirror-corrected at ingestion —
+                # NOT the [-1,1] affine used for center_norm.
                 left, top, right, bottom = (
                     float(v) for v in track.bbox_norm
                 )
-                x1 = int(round((1.0 - left) * 0.5 * width_px))
-                x2 = int(round((1.0 - right) * 0.5 * width_px))
-                y1 = int(round((top + 1.0) * 0.5 * height_px))
-                y2 = int(round((bottom + 1.0) * 0.5 * height_px))
-                x_lo, x_hi = sorted((x1, x2))
-                y_lo, y_hi = sorted((y1, y2))
+                x_lo = int(round((1.0 - right) * width_px))
+                x_hi = int(round((1.0 - left) * width_px))
+                y_lo = int(round(top * height_px))
+                y_hi = int(round(bottom * height_px))
                 cv2.rectangle(
                     canvas, (x_lo, y_lo), (x_hi, y_hi), (0, 200, 255), 1
                 )
