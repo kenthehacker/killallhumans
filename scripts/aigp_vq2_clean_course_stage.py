@@ -55,9 +55,9 @@ Control-law constant sources:
   can never kill ~3 m/s inside the ~0.5 s post-credit visibility window),
   so TRACK inside the near/expansion window commands a genuine nose-up
   attitude at the fast brake slew while lateral pursuit and the vz
-  governor stay active.  The COAST latch also bypasses the runner's
-  attitude PD on the wire so coast sends are exact zeros (F11 sent nonzero
-  roll/pitch rates at zero thrust).
+  governor stay active.  The COAST latch holds level attitude at the
+  support collective through the normal PD (F25: the old exact-zero coast
+  made every crossing ballistic, vz -2.79 m/s by credit).
 - ``FH_UNTRUSTED_*``: the F14 inflow-regime gate.  vz_est is invalidated
   by REGIME (a smooth fh-proportional thrust deficit), not attitude or
   vibration, so sustained fh > 3.0 freezes the vz/alt integrators, blocks
@@ -324,24 +324,15 @@ POST_CREDIT_BRAKE_SLEW_RAD_S = 1.0
 # buying ~0.9-1.0 s of genuine brake, so the expansion trigger's near-field
 # gate moved out to -1.8 to let the earlier TTC actually bind.  Lateral
 # pursuit and the vz governor stay fully active;
-# the altitude floor and the exact-zero COAST latch still preempt.  The
+# the altitude floor and the COAST support-hold latch still preempt.  The
 # near threshold stays below CROSSING_MIN_LOG_SCALE so apparent size keeps
 # growing through the crossing-arm scale and the engulfing/COAST detection
 # fires unchanged under braking.  The continuous near/expansion derate
 # (advance -> brake_pitch_rad) remains as the far-field shaping; the
 # post-credit brake window is unchanged and becomes the cleanup for
 # residual closure.
-# TTC 2.5 -> 4.0 s and pitch 0.12 -> 0.18 (flights F19-F24, root-cause
-# chain): every post-credit kill since F19 is the same trap — cross gate 0
-# at fh ~= 2-3, enter the fast regime where the vertical deficit
-# (~0.9*fh - 0.5 m/s^2) exceeds the 0.325 floor, and the sink powers a
-# glide that worsens the deficit.  Post-gate physics has no headroom
-# (full deficit compensation needs >0.34 at fh 5.5+), so the crossing
-# itself must be slower: brake earlier and harder while still in the
-# trusted regime with working vz/alt/vision, targeting fh ~= 1 at the
-# plane instead of 2.0-2.2.
-PRE_CROSS_BRAKE_PITCH_RAD = 0.18  # genuine nose-up pre-plane brake attitude
-PRE_CROSS_BRAKE_TTC_S = 4.0  # expansion-rate time-to-contact trigger (F13)
+PRE_CROSS_BRAKE_PITCH_RAD = 0.12  # genuine nose-up pre-plane brake attitude
+PRE_CROSS_BRAKE_TTC_S = 2.5  # expansion-rate time-to-contact trigger (F13)
 PRE_CROSS_BRAKE_NEAR_LOG_SCALE = -1.8  # near-field gate for the TTC trigger
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew, shared with the brake window
 # Pre-gate-1 altitude floor (terrain insurance; flights F10/F11/F12 all
@@ -1112,14 +1103,31 @@ class CleanCourseController:
                 self._exit_coast()
                 self._enter_search(now_s)
             else:
-                # July-18 bounded credible-crossing wait: exact zero latch.
-                # Exact-zero thrust is reserved for this state, abort, and
-                # cleanup.
+                # July-18 bounded credible-crossing wait.  F25 (22ceaa6f)
+                # cost accounting: the 0.4 s EXACT-ZERO latch made every
+                # crossing ballistic — vz collapsed -0.15 -> -2.79 m/s and
+                # alt 1.81 -> 1.44 m during the wait (the per-flight az
+                # +11.8 "bar graze" at the coast is the drone dropping onto
+                # the bottom bar), so the post-credit phase always started
+                # in a dive inside the fast-regime deficit trap.  The coast
+                # now holds the tilt-compensated support collective with the
+                # same level attitude / zero yaw: no closure is added (the
+                # gate is engulfed and lateral/vertical steering is off),
+                # but no ballistic dive either.  It is deliberately NOT
+                # vz-governed: the engulfed window is blind, and a phantom
+                # sink must not pin a climb into the top bar.  Exact-zero
+                # thrust remains reserved for abort and cleanup.
+                coast_support = _clamp(
+                    cfg.support_collective
+                    / max(0.85, math.cos(roll_rad) * math.cos(pitch_rad)),
+                    cfg.min_thrust,
+                    cfg.max_thrust,
+                )
                 return NavigationOutput(
                     target_roll_rad=0.0,
                     target_pitch_rad=0.0,
                     yaw_rate_rad_s=0.0,
-                    thrust=0.0,
+                    thrust=coast_support,
                     state=self.state,
                     gate_index=self.gate_index,
                     current_track_id=self._current_track_id(),
@@ -1206,7 +1214,7 @@ class CleanCourseController:
 
         # Pre-gate-1 altitude floor (F10/F11/F12: the final 6-10 s ran below
         # 0.7 m with thrust pinned into terrain).  Hysteresis 0.7 -> 1.2 m,
-        # gate-1 window only; the exact-zero COAST latch above still wins.
+        # gate-1 window only; the COAST latch above still wins.
         # F13 bounds: an episode releases unconditionally after
         # alt_floor_max_latch_s (a biased estimator pinned the F13 floor for
         # 4.2 s into terrain) and re-arms only after alt_est has held above
@@ -1753,7 +1761,8 @@ class CleanCourseController:
 
         Applied wherever a nonzero collective is emitted (TRACK, PREDICT,
         SEARCH, and the defensive fallback) so vision loss never disables
-        it; the exact-zero COAST/abort latch bypasses it by construction.
+        it; the COAST support hold and the abort/cleanup zeros bypass it by
+        construction.
         Symmetric: caps collective above the climb cap and floors it below
         the descent floor (flight d52adcd4 sank ~-1.9 m/s^2 into a ground
         graze while the frozen frame suppressed SEARCH).  The climb cap is
@@ -2318,33 +2327,24 @@ async def run_clean_course_stage(
                     estimate, "horizontal_specific_force_mps2", None
                 ),
             )
-            if (
-                nav.state is CleanCourseState.COAST_FOR_CREDIT
-                and nav.thrust == 0.0
-            ):
-                # July-18 safety contract: the coast latch is exact zeros on
-                # the WIRE.  The attitude PD would trade the zero target
-                # attitude against the current attitude and emit NONZERO
-                # roll/pitch rates at zero thrust (flight F11: t=2.156 rates
-                # (-0.0663,+0.0388,0), t=2.203 (-0.0455,+0.0318,0)), so the
-                # genuine coast latch bypasses the PD entirely.  Only this
-                # latch qualifies; every other command keeps the PD path.
-                command = rt.attitude_rate_command_type(0.0, 0.0, 0.0, 0.0)
-            else:
-                # One attitude PD for roll/pitch; yaw stays an explicit
-                # channel.
-                pd_command = rt.attitude_rate_command(
-                    estimate,
-                    target_roll_rad=nav.target_roll_rad,
-                    target_pitch_rad=nav.target_pitch_rad,
-                    thrust=nav.thrust,
-                )
-                command = rt.attitude_rate_command_type(
-                    float(pd_command.roll_rate),
-                    float(pd_command.pitch_rate),
-                    float(nav.yaw_rate_rad_s),
-                    float(pd_command.thrust),
-                )
+            # One attitude PD for roll/pitch; yaw stays an explicit
+            # channel.  The coast latch also takes this path (F26: it holds
+            # level attitude at support thrust; the old exact-zero coast
+            # wire and its PD bypass were retired — every crossing went
+            # ballistic, flight 22ceaa6f: vz -2.79 m/s and -0.37 m by the
+            # end of the 0.4 s wait, and the per-flight bottom-bar graze).
+            pd_command = rt.attitude_rate_command(
+                estimate,
+                target_roll_rad=nav.target_roll_rad,
+                target_pitch_rad=nav.target_pitch_rad,
+                thrust=nav.thrust,
+            )
+            command = rt.attitude_rate_command_type(
+                float(pd_command.roll_rate),
+                float(pd_command.pitch_rate),
+                float(nav.yaw_rate_rad_s),
+                float(pd_command.thrust),
+            )
             command = clamp_final_command(command, runtime=rt)
             rt.validate_command(command)
             result = await host._send_flight_command(

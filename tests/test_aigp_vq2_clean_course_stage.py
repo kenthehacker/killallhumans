@@ -6,7 +6,7 @@ launch boost, a disabled-then-tested gate-0 climb bias that never lifts the
 aim point above image center, full-authority image-rate D bounded by a
 symmetric IMU world-vertical-rate climb/descent governor with a
 descent-regime hover feedforward (alive in TRACK, PREDICT, and SEARCH,
-bypassed only by the exact-zero coast latch), phantom
+bypassed only by the coast support-hold latch), phantom
 vertical rates zeroed when the accepted-y measurement
 ages out (reseeded only by real measurements, never seeded by censored or
 engulfing detections), degenerate engulfing detections rejected as
@@ -22,15 +22,16 @@ expansion brake (near window or sub-2.5 s expansion TTC, near-field gated
 at -1.8, fast slew, lateral pursuit and vz governor alive, crossing
 detection unsuppressed), a pre-gate-1 altitude floor
 (vz_est-integrated alt_est clamped at >= -2.0 m, 0.7 -> 1.2 m hysteresis)
-overriding everything but the exact-zero coast latch with a level
+overriding everything but the coast support-hold latch with a level
 attitude, zero yaw, and a governed climb collective, bounded to a 2.5 s
 latch with a 1.0 s above-release re-arm (F13), an fh inflow-regime gate
 (sustained fh > 3.0 for 0.3 s freezes vz/alt integration, blocks floor
 arming, suppresses the vz governor, holds support + 0.05 unqualified;
 hysteresis release below 2.0), an edge-parked advance-stall cap forcing
-SEARCH after 1.5 s without re-centering or approach progress, an
-exact-zero coast WIRE
-that bypasses the attitude PD so no rates leak at zero thrust, a raised
+SEARCH after 1.5 s without re-centering or approach progress, a coast
+latch that holds level attitude at the tilt-compensated support
+collective through the normal attitude PD (F26: the retired exact-zero
+coast made every crossing ballistic), a raised
 0.34 thrust envelope
 under the runner's 0.35 hard abort,
 verified yaw/roll directions, clipping uncertainty (not abort),
@@ -463,15 +464,22 @@ def test_vz_descent_floor_applies_in_predict_and_search():
     )
 
 
-def test_vz_descent_floor_bypassed_by_coast_exact_zero():
-    # The credit/abort latch emits exact zeros by construction; the descent
-    # floor must never resurrect thrust during the bounded coast wait.
+def test_vz_phantom_sink_cannot_move_coast_support_hold():
+    # The coast hold emits the tilt-compensated support collective,
+    # UNGOVERNED: a phantom sink must neither zero it (the old ballistic
+    # latch, flight 22ceaa6f) nor boost a climb into the top bar.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
     controller.observe(_update([], frame_id=3), now_s=100.12)  # fresh close loss
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     controller._vz_est_m_s = -1.0
-    assert _command(controller, 100.14).thrust == 0.0
+    out = _command(controller, 100.14)
+    assert out.thrust == pytest.approx(SUPPORT, abs=1e-9)
+    assert (out.target_roll_rad, out.target_pitch_rad, out.yaw_rate_rad_s) == (
+        0.0,
+        0.0,
+        0.0,
+    )
 
 
 def test_vz_leaky_integrator_integrates_and_decays():
@@ -1012,9 +1020,9 @@ def test_altitude_floor_respects_max_thrust():
     assert out.thrust == pytest.approx(controller.config.max_thrust, abs=1e-9)
 
 
-def test_altitude_floor_never_overrides_coast_exact_zero():
-    # The exact-zero credit/abort latch still wins over the floor: a fresh
-    # close loss inside the low-altitude window must not resurrect thrust.
+def test_altitude_floor_never_overrides_coast_support_hold():
+    # The coast support-hold latch still wins over the floor: a fresh close
+    # loss inside the low-altitude window keeps the coast's own collective.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.observe(
         _update(
@@ -1031,7 +1039,7 @@ def test_altitude_floor_never_overrides_coast_exact_zero():
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     controller._alt_est_m = 0.3
     controller._vz_est_m_s = -1.0
-    assert _command(controller, 100.14).thrust == 0.0
+    assert _command(controller, 100.14).thrust == pytest.approx(SUPPORT, abs=1e-9)
 
 
 def test_altitude_floor_latch_releases_unconditionally_and_rearms_after_hold():
@@ -1348,7 +1356,7 @@ def test_pre_cross_brake_engages_near_with_fast_slew_and_lateral_alive():
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
-    assert out.target_pitch_rad == pytest.approx(0.18, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
     assert now - 100.10 <= 0.5  # fast slew, not the generic 0.30 rad/s
     assert out.yaw_rate_rad_s > 0.0  # x=+0.20 pursuit stays alive
     assert out.thrust > 0.0  # the vz governor keeps the collective alive
@@ -1381,7 +1389,7 @@ def test_pre_cross_brake_expansion_ttc_trigger_in_near_field():
         now += 0.033
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(0.18, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
     assert out.yaw_rate_rad_s > 0.0  # lateral pursuit alive under braking
 
 
@@ -1412,8 +1420,8 @@ def test_pre_cross_brake_does_not_suppress_crossing_detection():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-        output.thrust,
-    ) == (0.0, 0.0, 0.0, 0.0)
+    ) == (0.0, 0.0, 0.0)
+    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():
@@ -1503,10 +1511,10 @@ def test_frozen_frame_stall_goes_to_predict_and_never_coasts():
         assert _command(controller, now + 0.005).thrust > 0.0
 
 
-def test_fresh_close_loss_still_coasts_and_latches_zero():
+def test_fresh_close_loss_still_coasts_and_holds_support():
     # The July-18 bounded credible-crossing wait is preserved: a genuine
-    # close-range loss on a FRESH frame (new frame id) still arms the
-    # exact-zero coast latch.
+    # close-range loss on a FRESH frame (new frame id) still arms the coast
+    # latch — now a level-attitude support hold, not a ballistic zero.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
     controller.observe(_update([], frame_id=3), now_s=100.12)  # fresh id
@@ -1516,8 +1524,8 @@ def test_fresh_close_loss_still_coasts_and_latches_zero():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-        output.thrust,
-    ) == (0.0, 0.0, 0.0, 0.0)
+    ) == (0.0, 0.0, 0.0)
+    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
 
 
 def test_search_issues_real_bounded_yaw_sweep():
@@ -1561,7 +1569,7 @@ def test_search_reacquisition_allows_same_track_id():
     assert controller.current.track_id == "A"
 
 
-def test_crossing_loss_latches_zero_and_waits_for_newer_race_packet():
+def test_crossing_loss_latches_coast_and_waits_for_newer_race_packet():
     config = _config()
     controller = _tracked_controller(
         _track("A", 0.0, 0.0, scale=0.50), config=config  # close crossing
@@ -1574,8 +1582,8 @@ def test_crossing_loss_latches_zero_and_waits_for_newer_race_packet():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-        output.thrust,
-    ) == (0.0, 0.0, 0.0, 0.0)
+    ) == (0.0, 0.0, 0.0)
+    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
     # A strictly newer race packet without credit ends the wait; vision never
     # declares the pass.
     controller.note_race(gate_index=0, race_boot_ms=2250, now_s=100.20)
@@ -1843,7 +1851,7 @@ def test_loop_skipped_send_promotes_and_finishes():
         assert abs(command.yaw_rate) <= 0.15 + 1e-9
 
 
-def test_loop_coast_sends_exact_zero_then_accepts_credit():
+def test_loop_coast_holds_support_then_accepts_credit():
     host = _Host(_update([_track("A", 0.0, 0.0, scale=0.50)]))
 
     def script(host):
@@ -1863,37 +1871,33 @@ def test_loop_coast_sends_exact_zero_then_accepts_credit():
     summary = asyncio.run(
         run_clean_course_stage(host, context, runtime=_test_runtime())
     )
-    zero_sends = [
+    # F26: the coast wait holds level attitude at the support collective —
+    # no ballistic zero, and the PD wire sends carry support thrust.
+    support_sends = [
         command
         for command, _index in host.sent
-        if command.thrust == 0.0
-        and command.roll_rate == 0.0
-        and command.pitch_rate == 0.0
+        if command.thrust == pytest.approx(0.275, abs=1e-6)
         and command.yaw_rate == 0.0
     ]
-    assert zero_sends  # exact-zero latch happened
-    assert summary["exact_zero_command_count"] == len(zero_sends)
+    assert support_sends  # the support-hold coast happened
     assert summary["final_gate_index"] == 1
 
 
-def test_loop_coast_wire_is_exact_zero_despite_nonzero_attitude():
-    # F11 safety-contract violation (codex-verified from the trace): in
-    # COAST_FOR_CREDIT the stage's exact-zero targets passed through the
-    # runner's attitude PD, which traded the zero target attitude against
-    # the current attitude and emitted NONZERO roll/pitch rates at zero
-    # thrust (t=2.156: (-0.0663,+0.0388,0); t=2.203: (-0.0455,+0.0318,0)).
-    # The genuine coast latch must bypass the PD entirely: exact zeros on
-    # the wire.  This host holds a nonzero attitude so the fake PD WOULD
-    # emit nonzero rates without the bypass.
+def test_loop_coast_levels_attitude_through_pd_at_support_thrust():
+    # F11 historically required exact-zero coast sends because the attitude
+    # PD leaked nonzero rates at zero thrust.  F26 retired the ballistic
+    # coast: the wait now goes through the PD with level targets at support
+    # thrust, so a nonzero attitude produces genuine LEVELING rates (that is
+    # the point — active attitude hold instead of a falling latch).
     host = _Host(_update([_track("A", 0.0, 0.0, scale=0.50)]))
     host.estimate = SimpleNamespace(
         orientation=SimpleNamespace(to_euler=lambda: (0.10, -0.08, 0.0)),
         body_rates=(0.0, 0.0, 0.0),
     )
     probe = _fake_pd(
-        host.estimate, target_roll_rad=0.0, target_pitch_rad=0.0, thrust=0.0
+        host.estimate, target_roll_rad=0.0, target_pitch_rad=0.0, thrust=0.275
     )
-    assert (probe.roll_rate, probe.pitch_rate) != (0.0, 0.0)  # PD would leak
+    assert (probe.roll_rate, probe.pitch_rate) != (0.0, 0.0)  # PD levels it
 
     def script(host):
         if host.ticks == 3:
@@ -1912,15 +1916,15 @@ def test_loop_coast_wire_is_exact_zero_despite_nonzero_attitude():
     summary = asyncio.run(
         run_clean_course_stage(host, context, runtime=_test_runtime())
     )
-    zero_thrust = [command for command, _index in host.sent if command.thrust == 0.0]
-    assert zero_thrust  # the bounded coast wait emitted wire commands
-    for command in zero_thrust:
-        assert (
-            command.roll_rate,
-            command.pitch_rate,
-            command.yaw_rate,
-        ) == (0.0, 0.0, 0.0)
-    # The exact-zero metric still counts the coast sends (all of them now).
-    assert summary["exact_zero_command_count"] == len(zero_thrust)
+    support_sends = [
+        command
+        for command, _index in host.sent
+        if command.thrust == pytest.approx(0.275, abs=5e-3)
+    ]
+    assert support_sends  # the bounded coast wait emitted support sends
+    for command in support_sends:
+        assert math.isfinite(command.roll_rate)
+        assert math.isfinite(command.pitch_rate)
+        assert command.yaw_rate == 0.0
     assert summary["final_gate_index"] == 1
     assert summary["success"] is True
