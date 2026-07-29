@@ -1,12 +1,14 @@
 """Behavior tests for the clean visual-course stage (architecture reset M2).
 
 These tests assert envelope and directional behavior only: one global
-vertical sign, decay-toward-support on vertical loss, verified yaw/roll
-directions, clipping uncertainty (not abort), PREDICT->SEARCH on fresh empty
-frames, a real bounded yaw sweep, finite bounded output, absolute race
-authority, the bounded crossing-coast wait, and one final clamp.  They never
-assert exact internal event dictionaries, mode sequences, or lineage
-identities.
+vertical sign, decay-toward-support on vertical loss, a closure-scaled
+gate-0 climb bias, a derivative term that never reverses the P-commanded
+direction, verified yaw/roll directions, clipping uncertainty (not abort),
+PREDICT->SEARCH on fresh empty frames, frozen-frame stalls that predict and
+never coast, a real bounded yaw sweep, finite bounded output, absolute race
+authority, the bounded crossing-coast wait on a fresh close loss, and one
+final clamp.  They never assert exact internal event dictionaries, mode
+sequences, or lineage identities.
 """
 
 from __future__ import annotations
@@ -244,6 +246,55 @@ def test_gate0_climb_vertical_offset_is_bounded_feedforward():
     assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
 
 
+def test_gate0_climb_offset_scales_with_closure():
+    # Flight 20260729T085719Z-visual-course-4455fd61: the fixed 0.25 climb
+    # offset built a ~2.5-3 m climb into gate 0's top bar.  The bias is now
+    # closure-scaled: full at the spawn detection scale (log -1.79), ramping
+    # linearly to zero at the crossing-arm scale (log -0.80).
+    config = _config(gate0_climb_vertical_offset_norm=0.25)
+    far = _tracked_controller(_track("A", 0.0, 0.0, scale=0.1667), config=config)
+    assert _command(far, 100.10).thrust == pytest.approx(
+        SUPPORT + 0.080 * 0.25, abs=1e-9
+    )
+
+    mid = _tracked_controller(
+        _track("A", 0.0, 0.0, scale=math.exp(-1.295)), config=config
+    )
+    mid_offset = 0.25 * (-1.295 - (-0.80)) / (-1.79 - (-0.80))
+    assert _command(mid, 100.10).thrust == pytest.approx(
+        SUPPORT + 0.080 * mid_offset, abs=1e-9
+    )
+
+    crossing = _tracked_controller(
+        _track("A", 0.0, 0.0, scale=math.exp(-0.80)), config=config
+    )
+    assert _command(crossing, 100.10).thrust == pytest.approx(SUPPORT, abs=1e-9)
+
+
+def test_vertical_rate_term_never_reverses_p_commanded_direction():
+    # Flight 20260729T085719Z-visual-course-4455fd61: during the gate-0 climb
+    # the vy derivative term overwhelmed the P restoring term and cut
+    # collective 0.32 -> 0.22 while the target was still below the climb
+    # setpoint (ey ran to +0.44 against the +0.25 setpoint).  D may damp but
+    # never reverse the P-commanded direction; agreeing P and D (true
+    # overshoot) keeps full D authority.
+    config = _config(gate0_climb_vertical_offset_norm=0.25)
+    controller = _tracked_controller(_track("A", 0.0, 0.10), config=config)
+    controller.current.y_axis.v = 1.0  # strong rate opposing the P correction
+    output = _command(controller, 100.10)
+    assert output.vertical_qualified
+    # e = 0.10 - 0.25 = -0.15 demands climb; D is clipped to exactly cancel,
+    # so the collective can never sag below support on the opposing rate.
+    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+
+    agreeing = _tracked_controller(_track("A", 0.0, 0.40), config=config)
+    agreeing.current.y_axis.v = 0.5
+    output = _command(agreeing, 100.10)
+    # e = +0.15 and vy = +0.5 agree on descent: D keeps full authority and
+    # the collective may sit below support.
+    assert output.thrust < SUPPORT - 0.05
+
+
 def test_clipping_increases_uncertainty_but_does_not_abort():
     clipped = _tracked_controller(
         _track("A", 0.10, 0.0, clipping=FrameEdge.RIGHT)
@@ -302,6 +353,50 @@ def test_predict_then_search_on_fresh_empty_frames():
         if controller.state is CleanCourseState.SEARCH:
             break
     assert controller.state is CleanCourseState.SEARCH
+
+
+def test_frozen_frame_stall_goes_to_predict_and_never_coasts():
+    # Flight 20260729T085719Z-visual-course-4455fd61: the camera froze for
+    # ~0.27 s (7 ticks, same frame id) at close scale and the tracker
+    # republished the frozen frame; the stale close-range loss armed
+    # COAST_FOR_CREDIT and latched zero thrust at the gate-0 top bar.  A
+    # superseded/frozen frame must go to PREDICT with covariance inflation
+    # and must never coast or zero the thrust.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    std_before = controller.current.position_std
+    now = 100.12
+    controller.observe(_update([], frame_id=2), now_s=now)  # superseded id
+    assert controller.state is CleanCourseState.PREDICT
+    assert controller.current.position_std > std_before
+    for _ in range(7):  # the frozen ~0.27 s republication stall
+        now += 0.033
+        controller.observe(_update([], frame_id=2), now_s=now)
+        assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
+        assert _command(controller, now + 0.005).thrust > 0.0
+    # Continued fresh empty frames from PREDICT still never coast.
+    for frame in range(3, 6):
+        now += 0.033
+        controller.observe(_update([], frame_id=frame), now_s=now)
+        assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
+        assert _command(controller, now + 0.005).thrust > 0.0
+
+
+def test_fresh_close_loss_still_coasts_and_latches_zero():
+    # The July-18 bounded credible-crossing wait is preserved: a genuine
+    # close-range loss on a FRESH frame (new frame id) still arms the
+    # exact-zero coast latch.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.observe(_update([], frame_id=3), now_s=100.12)  # fresh id
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    output = _command(controller, 100.14)
+    assert (
+        output.target_roll_rad,
+        output.target_pitch_rad,
+        output.yaw_rate_rad_s,
+        output.thrust,
+    ) == (0.0, 0.0, 0.0, 0.0)
 
 
 def test_search_issues_real_bounded_yaw_sweep():

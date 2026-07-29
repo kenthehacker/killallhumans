@@ -128,9 +128,11 @@ from scripts.aigp_vq2_visual_config import (
     validate_visual_config,
 )
 from scripts.aigp_vq2_clean_course_stage import (
+    CLEAN_COURSE_CONTROLLER_FAMILY,
     CleanCourseRuntime,
     DEFAULT_VISUAL_COURSE_LIMITS,
     VisualCourseYawProfile,
+    clean_course_controller_evidence,
     run_clean_course_stage,
 )
 
@@ -7843,22 +7845,32 @@ class VQ2Runner:
             raise ValueError(
                 f"visual navigation configuration refused: {exc}"
             ) from exc
-        expected_visual_controller = controller_config_evidence(
-            self.visual_config,
-            candidate_commit=(
-                None
-                if visual_controller_evidence is None
-                else visual_controller_evidence.get("git_commit")
-            ),
-        )
         if (
             visual_controller_evidence is not None
-            and dict(visual_controller_evidence) != expected_visual_controller
+            and visual_controller_evidence.get("controller_family")
+            == CLEAN_COURSE_CONTROLLER_FAMILY
         ):
-            raise ValueError(
-                "visual controller evidence does not match effective config"
+            # The clean course stage owns visual-course navigation; bind its
+            # evidence verbatim instead of deriving the retired
+            # VisualNavigationConfig parameters it never reads.
+            self.visual_controller_evidence = dict(visual_controller_evidence)
+        else:
+            expected_visual_controller = controller_config_evidence(
+                self.visual_config,
+                candidate_commit=(
+                    None
+                    if visual_controller_evidence is None
+                    else visual_controller_evidence.get("git_commit")
+                ),
             )
-        self.visual_controller_evidence = expected_visual_controller
+            if (
+                visual_controller_evidence is not None
+                and dict(visual_controller_evidence) != expected_visual_controller
+            ):
+                raise ValueError(
+                    "visual controller evidence does not match effective config"
+                )
+            self.visual_controller_evidence = expected_visual_controller
         if yaw_calibration_profile is None:
             if yaw_calibration_profile_evidence is not None:
                 raise ValueError(
@@ -13627,9 +13639,15 @@ async def run_live(
         effective_controller,
         candidate_commit=candidate_commit,
     )
-    visual_controller = controller_config_evidence(
-        effective_visual_controller,
-        candidate_commit=candidate_commit,
+    visual_controller = (
+        # Visual-course navigation is owned by the clean course stage; report
+        # its real named constants, not the retired visual servo config.
+        clean_course_controller_evidence(candidate_commit=candidate_commit)
+        if stage in VISUAL_POWERED_STAGES
+        else controller_config_evidence(
+            effective_visual_controller,
+            candidate_commit=candidate_commit,
+        )
     )
     controller = (
         visual_controller

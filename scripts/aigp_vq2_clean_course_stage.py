@@ -16,8 +16,11 @@ Authority model:
   number.
 - The July-18 bounded credible-crossing wait survives as the single
   ``COAST_FOR_CREDIT`` state: after a credible close crossing loses the
-  target, latch zero-rate/zero-thrust and wait at most 0.40 s for a strictly
-  newer race packet.
+  target on a FRESH camera frame, latch zero-rate/zero-thrust and wait at
+  most 0.40 s for a strictly newer race packet.  A superseded/frozen frame
+  (same camera-frame identity republished during a camera stall) must never
+  arm the coast; it goes to ``PREDICT`` with covariance inflation instead
+  (flight 20260729T085719Z-visual-course-4455fd61).
 
 Control-law constant sources:
 
@@ -31,7 +34,10 @@ Control-law constant sources:
   post-credit; see the comments at their definitions.  Magnitudes are the
   proved gate-1-recenter roll gain and the visual-align yaw gain.
 - ``GATE0_CLIMB_VERTICAL_OFFSET_NORM``: the 2026-07-29 analysis (Q1/Q4)
-  pre-crossing climb recommendation.
+  pre-crossing climb recommendation, closure-scaled between
+  ``GATE0_CLIMB_REFERENCE_LOG_SCALE`` and ``CROSSING_MIN_LOG_SCALE`` after
+  flight 20260729T085719Z-visual-course-4455fd61 climbed into the gate-0 top
+  bar under the fixed offset.
 - Thrust envelope ``[MIN_COURSE_THRUST, MAX_COURSE_THRUST]`` and yaw cap: the
   accepted v3 yaw profile and the visual-course thrust envelope from the
   July-18 safety contract.
@@ -43,8 +49,10 @@ mirroring the seam style of the retired stage module.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -104,7 +112,18 @@ LAUNCH_BOOST_DURATION_S = 0.75  # inside the validated 0.45..1.0 boost window
 # frame) crosses ~1-1.2 m higher, putting gate-1 first-seen near y=-0.3 and
 # roughly doubling the post-credit observability window.  Feedforward only,
 # gate-0 phase only, inside the thrust envelope (max +0.02 above support).
+# Flight 20260729T085719Z-visual-course-4455fd61 showed the FIXED offset held
+# the climb into gate 0's top bar (ey ran to +0.44 against the +0.25
+# setpoint), so the bias is closure-scaled: full at the spawn detection scale
+# and ramping linearly to zero at CROSSING_MIN_LOG_SCALE (see command()).
 GATE0_CLIMB_VERTICAL_OFFSET_NORM = 0.25
+
+# Reference (spawn) detection log scale for the closure-scaled gate-0 climb
+# bias.  Flight 20260729T085719Z-visual-course-4455fd61 spawned with gate 0
+# detected at bbox (282,134,80,80) in a 640x360 frame: apparent_scale =
+# sqrt((80/640)*(80/360)) = 0.1667, ln(0.1667) = -1.79.  Cross-referenced
+# with docs/aigp/2026-07-29-vq2-crossing-geometry-analysis.md.
+GATE0_CLIMB_REFERENCE_LOG_SCALE = -1.79
 
 # Lateral error signs, per the 2026-07-29 crossing-geometry analysis (Q5):
 # post-credit gate 1 sits at median x=+0.57 while the retired controller
@@ -174,6 +193,13 @@ ROTATION_COMP_FOCAL_NORM = 1.0  # normalized focal length for de-rotation
 ROTATION_COMP_UNCERTAINTY = 0.25  # fraction of comp drift added as variance
 
 CONTROL_PERIOD_S = 0.02  # 50 Hz pacing (runner-owned invariant)
+
+# Controller identity reported in result.json / recorder evidence for the
+# visual-course stage.  The retired VisualNavigationConfig evidence still in
+# the runner reports legacy servo/lifecycle parameters this stage never
+# reads; the clean stage binds its real named constants instead.
+CLEAN_COURSE_CONTROLLER_FAMILY = "aigp-vq2-clean-course/1"
+CLEAN_COURSE_CONFIG_SCHEMA = "aigp-vq2-clean-course-config/1"
 
 
 class CleanCourseState(str, Enum):
@@ -343,6 +369,7 @@ class CleanCourseConfig:
     launch_boost_thrust: float = LAUNCH_BOOST_THRUST
     launch_boost_duration_s: float = LAUNCH_BOOST_DURATION_S
     gate0_climb_vertical_offset_norm: float = GATE0_CLIMB_VERTICAL_OFFSET_NORM
+    gate0_climb_reference_log_scale: float = GATE0_CLIMB_REFERENCE_LOG_SCALE
     roll_error_sign: float = ROLL_ERROR_SIGN
     roll_error_gain: float = ROLL_ERROR_GAIN
     max_target_roll_rad: float = MAX_TARGET_ROLL_RAD
@@ -376,6 +403,37 @@ class CleanCourseConfig:
     control_period_s: float = CONTROL_PERIOD_S
 
 
+def clean_course_controller_evidence(
+    *, candidate_commit: Optional[str]
+) -> Dict[str, Any]:
+    """Bind the clean course controller identity to its exact source commit.
+
+    Same envelope shape as the runner's ``controller_config_evidence`` so it
+    can be recorded verbatim as the visual-course ``controller`` evidence.
+    ``effective_parameters`` are the real named constants of the default
+    :class:`CleanCourseConfig`, not the retired visual servo/lifecycle set.
+    """
+
+    if candidate_commit is not None and (
+        type(candidate_commit) is not str
+        or len(candidate_commit) != 40
+        or any(character not in "0123456789abcdef" for character in candidate_commit)
+    ):
+        raise ValueError("candidate_commit must be 40 lowercase hexadecimal characters")
+    parameters = {
+        field.name: getattr(CleanCourseConfig(), field.name)
+        for field in fields(CleanCourseConfig)
+    }
+    canonical = json.dumps(parameters, sort_keys=True, separators=(",", ":"))
+    return {
+        "git_commit": candidate_commit,
+        "config_schema": CLEAN_COURSE_CONFIG_SCHEMA,
+        "controller_family": CLEAN_COURSE_CONTROLLER_FAMILY,
+        "config_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "effective_parameters": parameters,
+    }
+
+
 class CleanCourseController:
     """Four-state selector/estimator/control-law owner for one course run."""
 
@@ -401,6 +459,9 @@ class CleanCourseController:
         self._search_direction = 1.0
         self._search_elapsed_s = 0.0
         self._search_excursion_rad = 0.0
+        # Underlying camera-frame identity of the last consumed update; a
+        # republished frozen frame (same identity) is never fresh evidence.
+        self._last_frame_identity: Optional[Tuple[Any, Any]] = None
 
     # -- initialization ----------------------------------------------------
 
@@ -422,6 +483,9 @@ class CleanCourseController:
         self.gate_index = int(gate_index)
         self.max_gate_index = int(gate_index)
         self._course_start_s = float(now_s)
+        identity = _frame_identity(update)
+        if identity is not None:
+            self._last_frame_identity = identity
         tracks = _visible_tracks(update)
         current_track = None
         if tracks:
@@ -479,6 +543,14 @@ class CleanCourseController:
             dt = _clamp(now_s - self._last_observe_s, 1e-3, 0.25)
         self._last_observe_s = float(now_s)
         tracks = _visible_tracks(update)
+        # Frame freshness: the tracker republishes during a camera stall with
+        # a new publication token but the SAME underlying camera-frame
+        # identity.  Only a new camera frame is new evidence; an update whose
+        # identity cannot be determined is conservatively treated as fresh.
+        identity = _frame_identity(update)
+        fresh = identity is None or identity != self._last_frame_identity
+        if identity is not None:
+            self._last_frame_identity = identity
 
         if self.current is not None:
             self._predict(self.current, dt, body_rates)
@@ -509,14 +581,25 @@ class CleanCourseController:
             gap = now_s - self.current.last_measurement_s
             if (
                 self.state is CleanCourseState.TRACK
+                and fresh
                 and self.current.outer_log_scale >= cfg.crossing_min_log_scale
             ):
-                # Credible close crossing lost the target: latch the single
-                # bounded credit wait from the July-18 contract.
+                # Credible close crossing lost the target on a FRESH frame:
+                # latch the single bounded credit wait from the July-18
+                # contract.  Flight 20260729T085719Z-visual-course-4455fd61:
+                # a ~0.27 s camera stall republished one frozen frame id and
+                # the stale close-range loss latched zero thrust at the
+                # gate-0 top bar, so a superseded frame must never arm this.
                 self.state = CleanCourseState.COAST_FOR_CREDIT
                 self._coast_entry_s = float(now_s)
                 self._coast_race_boot_ms = self._last_race_boot_ms
             else:
+                if not fresh and self.state is CleanCourseState.TRACK:
+                    # Frozen-frame stall: the republication carries no new
+                    # information, so predict (covariance inflates in
+                    # _predict) and let command() decay the collective toward
+                    # support instead of coasting or holding a stale fix.
+                    self.state = CleanCourseState.PREDICT
                 if gap > cfg.predict_frame_gap_s:
                     self.state = CleanCourseState.PREDICT
                 if self.state is CleanCourseState.PREDICT and (
@@ -679,15 +762,26 @@ class CleanCourseController:
         # a feedforward vertical setpoint offset so the vehicle crosses
         # higher and gate 1 is first seen with doubled top-edge margin;
         # the offset never changes the feedback sign and disappears on
-        # promotion.  Loss of qualified vertical state discards the
-        # derivative term and decays collective smoothly toward
-        # tilt-compensated support; a saturated sub-support collective is
-        # never retained.
-        vertical_setpoint_offset = (
-            cfg.gate0_climb_vertical_offset_norm
-            if self.gate_index == 0
-            else 0.0
-        )
+        # promotion.  The offset is closure-scaled: flight
+        # 20260729T085719Z-visual-course-4455fd61 held the fixed 0.25 bias
+        # into gate 0's top bar, so it ramps linearly from full at the spawn
+        # detection log scale to zero at the crossing-arm log scale.  Loss of
+        # qualified vertical state discards the derivative term and decays
+        # collective smoothly toward tilt-compensated support; a saturated
+        # sub-support collective is never retained.
+        vertical_setpoint_offset = 0.0
+        if self.gate_index == 0:
+            span = (
+                cfg.gate0_climb_reference_log_scale - cfg.crossing_min_log_scale
+            )
+            closure = (
+                _clamp01((current.log_scale - cfg.crossing_min_log_scale) / span)
+                if abs(span) > 1e-9
+                else 0.0
+            )
+            vertical_setpoint_offset = (
+                cfg.gate0_climb_vertical_offset_norm * closure
+            )
         vertical_qualified = (
             self.state is CleanCourseState.TRACK
             and now_s - current.last_y_measurement_s
@@ -705,9 +799,18 @@ class CleanCourseController:
                 -cfg.vertical_max_abs_rate_norm_s,
                 cfg.vertical_max_abs_rate_norm_s,
             )
+            p_term = cfg.vertical_error_gain * bounded_error
+            d_term = cfg.vertical_rate_gain * bounded_rate
+            # Flight 20260729T085719Z-visual-course-4455fd61: during the
+            # gate-0 climb the vy derivative term overwhelmed the P restoring
+            # term and cut collective 0.32 -> 0.22 while the target was still
+            # below the climb setpoint.  D may damp the P-commanded
+            # correction but never reverse its direction; when P and D agree
+            # (true overshoot) D keeps full authority.
+            if p_term * d_term < 0.0 and abs(d_term) > abs(p_term):
+                d_term = math.copysign(abs(p_term), d_term)
             collective = support + cfg.vertical_feedback_sign * (
-                cfg.vertical_error_gain * bounded_error
-                + cfg.vertical_rate_gain * bounded_rate
+                p_term + d_term
             )
             self._collective = collective
         else:
@@ -1004,6 +1107,29 @@ class CleanCourseController:
             self._prev_target_pitch + limit,
         )
         return self._prev_target_pitch
+
+
+def _frame_identity(update: Any) -> Optional[Tuple[Any, Any]]:
+    """Underlying camera-frame identity of one tracker update.
+
+    The production token is ``CameraFrameToken``: ``(generation, frame_id)``
+    is the camera-frame identity while ``publication_sequence`` strictly
+    advances on every republication — including republications of a FROZEN
+    frame during a camera stall — so it must never count as freshness.
+    Tests use plain ``(stream_id, frame_id)`` tuple tokens.  Returns None
+    when no usable identity exists (caller treats the update as fresh).
+    """
+
+    token = getattr(update, "token", None) if update is not None else None
+    if token is None:
+        return None
+    generation = getattr(token, "generation", None)
+    frame_id = getattr(token, "frame_id", None)
+    if generation is not None and frame_id is not None:
+        return (generation, frame_id)
+    if isinstance(token, (tuple, list)) and len(token) >= 2:
+        return (token[0], token[1])
+    return None
 
 
 def _visible_tracks(update: Any) -> List[Any]:
