@@ -2,14 +2,16 @@
 
 These tests assert envelope and directional behavior only: one global
 vertical sign, decay-toward-support on vertical loss, a cut 0.30 x 0.40 s
-launch boost, a closure-scaled gate-0 climb bias that never lifts the aim
-point above image center, a derivative term that never reverses the
-P-commanded direction, verified yaw/roll directions, clipping uncertainty
-(not abort), PREDICT->SEARCH on fresh empty frames, frozen-frame stalls
-that predict and never coast, a real bounded yaw sweep, finite bounded
-output, absolute race authority, the bounded crossing-coast wait on a fresh
-close loss, and one final clamp.  They never assert exact internal event
-dictionaries, mode sequences, or lineage identities.
+launch boost, a disabled-then-tested gate-0 climb bias that never lifts the
+aim point above image center, full-authority image-rate D bounded by an
+IMU world-vertical-rate climb governor (alive in TRACK, PREDICT, and
+SEARCH), degenerate engulfing detections rejected as measurements,
+verified yaw/roll directions, clipping uncertainty (not abort),
+PREDICT->SEARCH on fresh empty frames, frozen-frame stalls that predict and
+never coast, a real bounded yaw sweep, finite bounded output, absolute race
+authority, the bounded crossing-coast wait on a fresh close loss, and one
+final clamp.  They never assert exact internal event dictionaries, mode
+sequences, or lineage identities.
 """
 
 from __future__ import annotations
@@ -64,7 +66,15 @@ def _track(
     return SimpleNamespace(
         track_id=track_id,
         center_norm=(float(x), float(y)),
-        bbox_norm=(x - scale, y - scale, x + scale, y + scale),
+        # Real bbox semantics: apparent_scale ~= sqrt(w*h) of the normalized
+        # box, so the half-span is scale/2 (a scale-0.5 box spans half the
+        # frame, not the whole frame).
+        bbox_norm=(
+            x - scale / 2,
+            y - scale / 2,
+            x + scale / 2,
+            y + scale / 2,
+        ),
         apparent_scale=float(scale),
         confidence=float(confidence),
         association_confidence=float(association_confidence),
@@ -103,8 +113,13 @@ def _tracked_controller(track=None, *, config=None, now=100.0):
     return controller
 
 
-def _command(controller, now, *, roll=0.0, pitch=0.0):
-    return controller.command(now_s=now, roll_rad=roll, pitch_rad=pitch)
+def _command(controller, now, *, roll=0.0, pitch=0.0, a_up=None):
+    return controller.command(
+        now_s=now,
+        roll_rad=roll,
+        pitch_rad=pitch,
+        world_up_accel_m_s2=a_up,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,29 +328,89 @@ def test_gate0_climb_offset_never_lifts_aim_above_center():
     assert output.thrust < SUPPORT
 
 
-def test_vertical_rate_term_never_reverses_p_commanded_direction():
-    # Flight 20260729T085719Z-visual-course-4455fd61: during the gate-0 climb
-    # the vy derivative term overwhelmed the P restoring term and cut
-    # collective 0.32 -> 0.22 while the target was still below the climb
-    # setpoint (ey ran to +0.44 against the +0.25 setpoint).  D may damp but
-    # never reverse the P-commanded direction; agreeing P and D (true
-    # overshoot) keeps full D authority.
+def test_vertical_rate_term_keeps_full_authority():
+    # The flight-2 D-direction limiter was removed after flight
+    # 20260729T094736Z-...-4dbe4b8c: it pinned collective at exactly support
+    # through the decisive window (vz 2.7 m/s, t=1.31-1.72) because ey
+    # hovered near zero.  Opposing P/D now yields full D authority; honest
+    # climb-rate limiting is the IMU vz governor's job (tests below).
     config = _config(gate0_climb_vertical_offset_norm=0.25)
     controller = _tracked_controller(_track("A", 0.0, -0.10), config=config)
     controller.current.y_axis.v = 1.0  # strong rate opposing the P correction
     output = _command(controller, 100.10)
     assert output.vertical_qualified
-    # e = -0.10 - 0.25 = -0.35 demands climb; D is clipped to exactly cancel,
-    # so the collective can never sag below support on the opposing rate.
-    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
-
-    agreeing = _tracked_controller(_track("A", 0.0, 0.40), config=config)
-    agreeing.current.y_axis.v = 0.5
-    output = _command(agreeing, 100.10)
-    # ey >= 0 clamps the offset to 0, so e = +0.40 and vy = +0.5 agree on
-    # descent: D keeps full authority and the collective may sit below
-    # support.
+    # e = -0.35 (P demands climb) but vy = +1.0: D fully reverses the
+    # correction and the collective sags to the 0.21 floor.  Under the
+    # removed limiter this was pinned at exactly SUPPORT.
+    assert output.thrust == pytest.approx(0.21, abs=1e-9)
     assert output.thrust < SUPPORT - 0.05
+
+
+def test_vz_governor_caps_collective_above_climb_cap():
+    # Four gate-0 top-bar flights: bearing pursuit built unbounded vz
+    # (2.8-3.35 m/s peaks vs a ~0.9 m/s requirement).  The IMU governor
+    # removes K_VZ per m/s over the 1.0 m/s cap from the collective.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))  # e = 0, vy ~ 0
+    controller._vz_est_m_s = 0.5  # below the cap: no effect
+    assert _command(controller, 100.10).thrust == pytest.approx(SUPPORT, abs=1e-9)
+    controller._vz_est_m_s = 2.0  # 1.0 m/s over cap -> -0.03 collective
+    assert _command(controller, 100.14).thrust == pytest.approx(
+        SUPPORT - 0.03, abs=1e-9
+    )
+
+
+def test_vz_governor_applies_in_predict_and_search():
+    # The governor is IMU-based precisely so vision loss cannot disable it.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller.observe(_update([], frame_id=2), now_s=100.12)  # superseded
+    assert controller.state is CleanCourseState.PREDICT
+    controller._vz_est_m_s = 2.0
+    assert _command(controller, 100.16).thrust == pytest.approx(
+        SUPPORT - 0.03, abs=1e-9
+    )
+    controller._enter_search(100.20)
+    assert _command(controller, 100.22).thrust == pytest.approx(
+        SUPPORT - 0.03, abs=1e-9
+    )
+
+
+def test_vz_leaky_integrator_integrates_and_decays():
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _command(controller, 100.10, a_up=1.0)  # first call: dt = control period
+    first = controller._vz_est_m_s
+    assert first == pytest.approx(0.02 * (1.0 - 0.02 / 2.5), abs=1e-9)
+    _command(controller, 100.12, a_up=1.0)
+    assert controller._vz_est_m_s > first  # keeps integrating up
+    peak = controller._vz_est_m_s
+    for tick in range(5):  # zero accel: the leak pulls the estimate down
+        _command(controller, 100.14 + 0.02 * tick, a_up=0.0)
+    assert 0.0 < controller._vz_est_m_s < peak
+
+
+def test_engulfing_full_frame_bbox_is_not_a_measurement():
+    # Flights 95644bf5 / 4dbe4b8c ended with a degenerate near-full-frame
+    # bbox (640x360 / 640x347, every edge clipped) accepted as a gate
+    # measurement 46-48 ms before impact.  That is the gate engulfing the
+    # camera at the plane: treat it as no measurement (PREDICT semantics).
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    x_before = controller.current.x_axis.p
+    y_before = controller.current.y_axis.p
+    meas_before = controller.current.last_y_measurement_s
+    engulfing = _track(
+        "A",
+        0.30,
+        0.30,
+        scale=1.0,  # bbox spans the whole frame
+        clipping=(
+            FrameEdge.LEFT | FrameEdge.RIGHT | FrameEdge.TOP | FrameEdge.BOTTOM
+        ),
+    )
+    controller.observe(_update([engulfing], frame_id=5), now_s=100.05)
+    # Far-scale first miss stays TRACK, but no axis consumed the bogus box.
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.current.x_axis.p == x_before
+    assert controller.current.y_axis.p == y_before
+    assert controller.current.last_y_measurement_s == meas_before
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():

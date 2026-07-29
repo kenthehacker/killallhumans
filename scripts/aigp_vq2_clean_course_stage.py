@@ -38,6 +38,11 @@ Control-law constant sources:
   to and produces unrecoverable overshoot; see the comment at its
   definition.  The closure-scaling machinery remains tested for possible
   post-credit reuse.
+- ``VZ_CLIMB_CAP_M_S`` / ``VZ_GOVERNOR_GAIN`` / ``VZ_LEAK_TAU_S``: the
+  IMU-based world-vertical-rate climb governor added after the fourth
+  top-bar collision showed bearing pursuit builds unbounded vz; see the
+  comment at its definition.  It supersedes the removed flight-2
+  D-direction limiter as the honest rate-limit mechanism.
 - Thrust envelope ``[MIN_COURSE_THRUST, MAX_COURSE_THRUST]`` and yaw cap: the
   accepted v3 yaw profile and the visual-course thrust envelope from the
   July-18 safety contract.
@@ -100,6 +105,23 @@ VERTICAL_MAX_ABS_RATE_NORM_S = 5.0 / 3.0  # GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE
 
 MIN_COURSE_THRUST = 0.21  # MIN_VISUAL_THRUST (active visual-course envelope)
 MAX_COURSE_THRUST = 0.32  # MAX_VISUAL_THRUST
+
+# IMU-based world-vertical-rate governor (climb only).  Four consecutive
+# gate-0 top-bar collisions (flights 20260729T085719Z-visual-course-4455fd61,
+# 20260729T094736Z-visual-course-9d430a40, 95644bf5, and 4dbe4b8c) showed
+# bearing-pursuit vertical control necessarily builds UNBOUNDED vz: every
+# flight peaked at 2.8-3.35 m/s within 1.3 s against a required ~2 m climb
+# over ~2.2 s (~0.9 m/s average) and arrived at the gate plane with vz
+# +0.6..+1.0 m/s.  Measured plant (199 airborne samples, all four flights):
+# a_up = 66.7*thrust - 18.44 (residual sigma 0.59; hover at 0.277 ~=
+# support 0.275), so 0.01 collective ~= 0.67 m/s^2 and 2 m/s over the cap
+# costs -0.06 collective ~= -4 m/s^2, inside the 0.21 floor's authority.
+# The governor is IMU-based precisely so it stays alive when vision is
+# censored or stalled; there is no symmetric descent governor.
+VZ_CLIMB_CAP_M_S = 1.0  # generous bound vs the ~0.9 m/s average requirement
+VZ_GOVERNOR_GAIN = 0.03  # collective per m/s over the cap (see block above)
+VZ_LEAK_TAU_S = 2.5  # leaky-integrator time constant (bias/noise guard)
+GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
 
 # Launch boost is pure feedforward (it ignores ey).  Flight
 # 20260729T094736Z-visual-course-9d430a40: the 0.32 x 0.75 s boost alone
@@ -188,6 +210,16 @@ CLIPPED_STEERING_FRACTION = 0.5  # clipping saturates corrective steering
 
 APERTURE_MIN_CONFIDENCE = 0.20  # fitted inner-aperture acceptance floor
 OUTER_MEAS_STD_NORM = 0.06  # outer bbox center measurement std
+
+# Degenerate engulfing-detection rejection.  Flights 95644bf5 and 4dbe4b8c
+# both ended with a near-full-frame bbox (640x360 / 640x347, every edge
+# clipped) accepted as a gate measurement 46-48 ms before impact.  A box
+# covering most of the frame is the gate engulfing the camera at the plane,
+# not a usable measurement; it is treated as no measurement (PREDICT
+# semantics).  The observed all-edges-clipped boxes are caught by the span
+# rule (full-frame width).
+ENGULFING_BBOX_SPAN_FRACTION = 0.9  # bbox width/height vs the whole frame
+ENGULFING_BBOX_AREA_FRACTION = 0.7  # bbox area vs the whole frame
 SCALE_MEAS_STD = 0.10  # log-scale measurement std
 MIN_MEAS_CONFIDENCE = 0.05  # confidence noise floor divisor
 
@@ -472,6 +504,9 @@ class CleanCourseController:
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
+        # Leaky world-vertical-rate estimate (m/s, up positive) fed by IMU
+        # specific force; the stage starts on the pad, so zero is honest.
+        self._vz_est_m_s = 0.0
 
     # -- initialization ----------------------------------------------------
 
@@ -690,6 +725,7 @@ class CleanCourseController:
         now_s: float,
         roll_rad: float,
         pitch_rad: float,
+        world_up_accel_m_s2: Optional[float] = None,
     ) -> NavigationOutput:
         """Produce the single navigation request for one tick."""
 
@@ -699,6 +735,11 @@ class CleanCourseController:
         else:
             dt = _clamp(now_s - self._last_command_s, 1e-3, 0.10)
         self._last_command_s = float(now_s)
+        if world_up_accel_m_s2 is not None:
+            # Leaky world-vertical-rate integrator for the climb governor;
+            # IMU-fed so it stays alive in every state, including COAST.
+            self._vz_est_m_s += float(world_up_accel_m_s2) * dt
+            self._vz_est_m_s -= self._vz_est_m_s * dt / VZ_LEAK_TAU_S
 
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             assert self._coast_entry_s is not None
@@ -736,7 +777,9 @@ class CleanCourseController:
                 target_roll_rad=target_roll,
                 target_pitch_rad=target_pitch,
                 yaw_rate_rad_s=sweep_yaw,
-                thrust=support,
+                # The IMU climb governor applies here too: vision loss must
+                # never disable it.
+                thrust=self._governed_collective(support, support),
                 state=self.state,
                 gate_index=self.gate_index,
                 current_track_id=self._current_track_id(),
@@ -753,7 +796,7 @@ class CleanCourseController:
                 target_roll_rad=0.0,
                 target_pitch_rad=cfg.brake_pitch_rad,
                 yaw_rate_rad_s=0.0,
-                thrust=support,
+                thrust=self._governed_collective(support, support),
                 state=self.state,
                 gate_index=self.gate_index,
             )
@@ -819,18 +862,16 @@ class CleanCourseController:
                 -cfg.vertical_max_abs_rate_norm_s,
                 cfg.vertical_max_abs_rate_norm_s,
             )
-            p_term = cfg.vertical_error_gain * bounded_error
-            d_term = cfg.vertical_rate_gain * bounded_rate
-            # Flight 20260729T085719Z-visual-course-4455fd61: during the
-            # gate-0 climb the vy derivative term overwhelmed the P restoring
-            # term and cut collective 0.32 -> 0.22 while the target was still
-            # below the climb setpoint.  D may damp the P-commanded
-            # correction but never reverse its direction; when P and D agree
-            # (true overshoot) D keeps full authority.
-            if p_term * d_term < 0.0 and abs(d_term) > abs(p_term):
-                d_term = math.copysign(abs(p_term), d_term)
+            # Full D authority.  The flight-2 direction limiter (clip D to
+            # |P| on disagreement) was REMOVED after flight
+            # 20260729T094736Z-...-4dbe4b8c: with ey hovering near zero it
+            # zeroed the only vz feedback and pinned collective at exactly
+            # tilt-compensated support through the decisive t=1.31-1.72
+            # window at vz 2.7 m/s.  Honest climb-rate limiting now lives in
+            # the IMU vz governor below, which cannot go blind with vision.
             collective = support + cfg.vertical_feedback_sign * (
-                p_term + d_term
+                cfg.vertical_error_gain * bounded_error
+                + cfg.vertical_rate_gain * bounded_rate
             )
             self._collective = collective
         else:
@@ -848,6 +889,11 @@ class CleanCourseController:
             and now_s - self._course_start_s < cfg.launch_boost_duration_s
         ):
             collective = cfg.launch_boost_thrust
+        # IMU world-vertical-rate governor, after the PD law and the
+        # feedforward boost, before the final clamp.  It caps what bearing
+        # pursuit cannot (see the VZ_CLIMB_CAP_M_S constant block) and stays
+        # alive through TRACK, PREDICT, and SEARCH alike.
+        collective = self._governed_collective(collective, support)
         thrust = _clamp(collective, cfg.min_thrust, cfg.max_thrust)
 
         # Lateral: per the 2026-07-29 crossing-geometry analysis, positive
@@ -1082,6 +1128,20 @@ class CleanCourseController:
         )
         return cfg.successor_blend_max * closure * trust
 
+    def _governed_collective(self, collective: float, support: float) -> float:
+        """IMU climb-rate governor: cap collective by estimated world vz.
+
+        Applied wherever a nonzero collective is emitted (TRACK, PREDICT,
+        SEARCH, and the defensive fallback) so vision loss never disables
+        it; the exact-zero COAST/abort latch bypasses it by construction.
+        Climb-only: there is no symmetric descent governor this iteration.
+        """
+
+        excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
+        if excess <= 0.0:
+            return collective
+        return min(collective, support - VZ_GOVERNOR_GAIN * excess)
+
     def _search_yaw(self, dt: float) -> float:
         cfg = self.config
         self._search_elapsed_s += dt
@@ -1152,8 +1212,34 @@ def _frame_identity(update: Any) -> Optional[Tuple[Any, Any]]:
     return None
 
 
+def _is_engulfing_detection(track: Any) -> bool:
+    """True when a track bbox engulfs the camera (gate at the plane).
+
+    See the ENGULFING_BBOX_* constant block: a near-full-frame box is not a
+    usable gate measurement.  Conservatively False when the bbox shape is
+    missing or malformed.
+    """
+
+    bbox = getattr(track, "bbox_norm", None)
+    if bbox is None or len(bbox) < 4:
+        return False
+    width = float(bbox[2]) - float(bbox[0])
+    height = float(bbox[3]) - float(bbox[1])
+    if width <= 0.0 or height <= 0.0:
+        return False
+    return (
+        width >= ENGULFING_BBOX_SPAN_FRACTION
+        or height >= ENGULFING_BBOX_SPAN_FRACTION
+        or width * height >= ENGULFING_BBOX_AREA_FRACTION
+    )
+
+
 def _visible_tracks(update: Any) -> List[Any]:
-    """Duck-typed visible-track extraction from one tracker update."""
+    """Duck-typed visible-track extraction from one tracker update.
+
+    Degenerate engulfing boxes are dropped here, the single measurement
+    acceptance seam, so they can neither update nor be adopted anywhere.
+    """
 
     if update is None:
         return []
@@ -1164,9 +1250,34 @@ def _visible_tracks(update: Any) -> List[Any]:
         visible = getattr(track, "visible", None)
         if visible is None:
             visible = track.track_id in visible_ids if visible_ids else True
-        if visible:
+        if visible and not _is_engulfing_detection(track):
             result.append(track)
     return result
+
+
+def _world_up_accel_m_s2(
+    orientation: Any,
+    accel: Tuple[float, float, float],
+) -> float:
+    """World-up acceleration from FRD specific force rotated by attitude.
+
+    ``orientation`` is the estimator quaternion rotating FRD body vectors
+    into NED.  Accelerometers measure specific force, so with NED
+    down-positive ``a_up = -(R f_b).z - g``; hover therefore yields ~0 at
+    any attitude and a +2 m/s^2 climb yields +2.
+    """
+
+    w = float(orientation.w)
+    x = float(orientation.x)
+    y = float(orientation.y)
+    z = float(orientation.z)
+    ax, ay, az = (float(value) for value in accel)
+    ned_down = (
+        2.0 * (x * z - w * y) * ax
+        + 2.0 * (y * z + w * x) * ay
+        + (1.0 - 2.0 * (x * x + y * y)) * az
+    )
+    return -ned_down - GRAVITY_M_S2
 
 
 def _track_measurement(
@@ -1372,10 +1483,22 @@ async def run_clean_course_stage(
                     "visual-course lost the IMU attitude estimate"
                 )
             roll_rad, pitch_rad, _yaw = estimate.orientation.to_euler()
+            # IMU world-up acceleration for the climb governor: HIGHRES_IMU
+            # specific force (FRD) rotated by the estimator quaternion,
+            # minus gravity.  Same telemetry seam _record_tick already logs.
+            telemetry = getattr(host.adapter, "latest_telemetry", None)
+            imu = getattr(telemetry, "imu", None) if telemetry is not None else None
+            accel = getattr(imu, "accel", None) if imu is not None else None
+            world_up_accel = (
+                _world_up_accel_m_s2(estimate.orientation, accel)
+                if accel is not None
+                else None
+            )
             nav = controller.command(
                 now_s=now,
                 roll_rad=roll_rad,
                 pitch_rad=pitch_rad,
+                world_up_accel_m_s2=world_up_accel,
             )
             # One attitude PD for roll/pitch; yaw stays an explicit channel.
             pd_command = rt.attitude_rate_command(
