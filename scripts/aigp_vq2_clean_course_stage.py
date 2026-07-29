@@ -417,6 +417,17 @@ PRE_CROSS_BRAKE_PITCH_RAD = -0.15  # nose-up brake OFFSET from spawn (F49).
 # as an offset: with level flight at -0.31, the effective -0.46 roughly
 # doubles it so a misaligned approach actually stops.
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
+# F51 near-plane brake self-blinding guard (F50 t=15 episode): the brake
+# attitude (rpy_p ~-0.45, ~0.14 rad nose-up from spawn) pitches the camera
+# up, so near the plane the gate slides DOWN the frame — measured ey
+# reached +0.93 and bottom-censored out of view while the brake held for
+# 1.5 s.  Measurement compensation (F50) cannot extend the physical FOV:
+# while a FRESH measurement shows the gate at/past the relax bound the
+# pitch target relaxes toward level, and it resumes the brake target once
+# the gate recovers to the resume bound.  Vision custody of the gate
+# outranks deceleration at the plane.
+BRAKE_RELAX_EY_NORM = 0.55  # measured ey that relaxes the brake to level
+BRAKE_RELAX_RESUME_EY_NORM = 0.45  # measured ey that resumes the brake
 # Course-heading anchor (F31): after losing the gate-1 track the drone
 # search-swept and edge-chased its heading +2.63 rad off the course
 # bearing, then flew sideways/backwards at ~0.65g drag into structure it
@@ -828,6 +839,8 @@ class CleanCourseConfig:
     fragment_creep_pitch_rad: float = FRAGMENT_CREEP_PITCH_RAD
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
+    brake_relax_ey_norm: float = BRAKE_RELAX_EY_NORM
+    brake_relax_resume_ey_norm: float = BRAKE_RELAX_RESUME_EY_NORM
     brake_ceiling_band: float = BRAKE_CEILING_BAND
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
@@ -930,6 +943,8 @@ class CleanCourseController:
         # F49: SEARCH sweep base heading — the yaw measured at search entry,
         # not the leg anchor (see _search_yaw_heading).
         self._search_base_yaw_rad: Optional[float] = None
+        # F51: brake self-blinding relax latch (see BRAKE_RELAX_EY_NORM).
+        self._brake_vision_relax = False
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
@@ -1439,8 +1454,19 @@ class CleanCourseController:
                     # Arming is blocked while fh-untrusted (F14: a biased
                     # vz/alt estimate must never START a floor episode); an
                     # already-active latch still times out normally above.
+                    # F51: never arm over a LIVE gate — a fresh accepted
+                    # track is better altitude evidence than the sagged
+                    # integrator (the F50 promotion armed the floor on the
+                    # gate-0 brake sag while gate 1 was freshly visible);
+                    # terrain recovery matters when blind, not while
+                    # tracking.
                     self._alt_floor_active = (
                         self._alt_est_m < cfg.alt_floor_trigger_m
+                        and (
+                            self.current is None
+                            or now_s - self.current.last_measurement_s
+                            > cfg.promote_max_age_s
+                        )
                     )
                     if self._alt_floor_active:
                         self._alt_floor_latch_s = now_s
@@ -1450,13 +1476,39 @@ class CleanCourseController:
             self._alt_floor_cooldown = False
             self._alt_floor_above_release_since_s = None
         if self._alt_floor_active:
-            # Terrain recovery override: level attitude, zero yaw, governed
-            # climb collective.  Everything else yields; the governor keeps
-            # it inside the thrust envelope.
+            # Terrain recovery override: governed climb collective at the
+            # level (spawn) attitude.  F51: the override keeps LATERAL
+            # authority — the F50 gi 0->1 promotion latched the floor on
+            # the sagged gate-0 integrator and the old override parked
+            # yaw/roll for the whole 2.5 s latch while a fresh visible
+            # gate-1 track walked off the frame.  The floor now owns ONLY
+            # the collective and the level pitch; yaw/roll use the standard
+            # x-qualified pursuit (stale x -> heading hold, wings level).
+            floor_yaw = 0.0
+            floor_roll = 0.0
+            floor_current = self.current
+            if floor_current is not None and (
+                now_s - floor_current.last_x_measurement_s
+                <= cfg.x_steer_max_age_s
+            ):
+                floor_ex = floor_current.x
+                floor_yaw = _clamp(
+                    cfg.yaw_error_sign * cfg.yaw_error_gain * floor_ex,
+                    -cfg.max_yaw_rate_rad_s,
+                    cfg.max_yaw_rate_rad_s,
+                )
+                floor_yaw = self._anchor_clamped_yaw(floor_yaw, yaw_rad)
+                floor_roll = _clamp(
+                    cfg.roll_error_sign * cfg.roll_error_gain * floor_ex,
+                    -cfg.max_target_roll_rad,
+                    cfg.max_target_roll_rad,
+                )
             return NavigationOutput(
-                target_roll_rad=self._slew_roll(0.0, dt),
-                target_pitch_rad=self._slew_pitch(0.0, dt),
-                yaw_rate_rad_s=0.0,
+                target_roll_rad=self._slew_roll(floor_roll, dt),
+                # F51: level is the SPAWN attitude, not absolute 0.0 (which
+                # is +0.31 rad physical nose-down under the F49 convention).
+                target_pitch_rad=self._slew_pitch(cfg.spawn_pitch_rad, dt),
+                yaw_rate_rad_s=floor_yaw,
                 thrust=self._governed_collective(
                     support + cfg.alt_floor_climb_margin, support
                 ),
@@ -1778,6 +1830,25 @@ class CleanCourseController:
         target_pitch = law_pitch + brake_demand * (
             (cfg.spawn_pitch_rad + cfg.pre_cross_brake_pitch_rad) - law_pitch
         )
+        # F51 near-plane brake self-blinding guard (see the
+        # BRAKE_RELAX_EY_NORM block): the brake attitude pitches the camera
+        # up and the gate slides DOWN the physical FOV — compensation
+        # cannot extend it.  While the brake is active, a FRESH measurement
+        # at/past the relax bound drops the pitch target to level; the
+        # normal brake target resumes below the resume bound.  Hysteresis
+        # holds the last state between the bounds and on stale
+        # measurements; vision custody outranks deceleration at the plane.
+        if not pre_cross_brake:
+            self._brake_vision_relax = False
+        elif now_s - current.last_measurement_s <= CROSSING_MEAS_MAX_AGE_S:
+            if ey >= cfg.brake_relax_ey_norm:
+                self._brake_vision_relax = True
+            elif ey <= cfg.brake_relax_resume_ey_norm:
+                self._brake_vision_relax = False
+        if self._brake_vision_relax:
+            target_pitch = max(
+                target_pitch, cfg.spawn_pitch_rad + cfg.brake_pitch_rad
+            )
 
         return NavigationOutput(
             target_roll_rad=self._slew_roll(

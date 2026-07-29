@@ -176,6 +176,14 @@ def _command(controller, now, *, roll=0.0, pitch=0.0, yaw=None, a_up=None, fh=No
     )
 
 
+def _blind_current(controller, now, age=1.0):
+    """Age the current hypothesis's measurements past the F51 floor-arming
+    freshness (and the x-steer horizon) so floor-mechanics tests drive the
+    floor while blind — the F51 floor arms only without a live gate."""
+    controller.current.last_measurement_s = now - age
+    controller.current.last_x_measurement_s = now - age
+
+
 # ---------------------------------------------------------------------------
 # Vertical law
 # ---------------------------------------------------------------------------
@@ -868,8 +876,10 @@ def test_altitude_floor_triggers_and_releases_with_hysteresis():
     # F10/F11/F12: the final 6-10 s before gate 1 ran below 0.7 m with
     # thrust pinned into terrain.  The pre-gate-1 floor (alt_est integrated
     # from the governor's vz_est, seeded 0 at course start) overrides
-    # everything but the coast latch: level attitude, zero yaw, and a
-    # governed climb collective until the release hysteresis clears.
+    # everything but the coast latch: level (spawn) attitude and a governed
+    # climb collective until the release hysteresis clears.  F51: it arms
+    # only while blind (driven here with aged measurements) and keeps
+    # x-qualified lateral authority while active.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     _promote_to_gate_one(controller)
     controller._alt_est_m = 2.0
@@ -883,6 +893,7 @@ def test_altitude_floor_triggers_and_releases_with_hysteresis():
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
             now_s=now,
         )
+        _blind_current(controller, now)  # F51: the floor arms only blind
         out = _command(controller, now)
         frame += 1
     assert controller._alt_floor_active
@@ -897,6 +908,7 @@ def test_altitude_floor_triggers_and_releases_with_hysteresis():
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
             now_s=now,
         )
+        _blind_current(controller, now)
         out = _command(controller, now)
         frame += 1
     assert controller._alt_floor_active
@@ -924,11 +936,19 @@ def test_altitude_floor_is_gated_to_gate_one():
     assert not controller._alt_floor_active
     assert out.yaw_rate_rad_s > 0.0  # normal x=+0.30 pursuit at gate 0
     _promote_to_gate_one(controller, now_s=100.12)
+    # F51: the floor must NOT arm over the freshly promoted live gate — a
+    # fresh accepted track is better altitude evidence than the sagged
+    # integrator.
     out = _command(controller, 100.14)
-    assert controller._alt_floor_active  # the gate-1 window is live at 0.5 m
+    assert not controller._alt_floor_active
+    assert out.yaw_rate_rad_s > 0.0  # gate-1 pursuit keeps steering
+    # Blind at the same low altitude: the gate-1 window arms the floor.
+    _blind_current(controller, 100.16)
+    out = _command(controller, 100.16)
+    assert controller._alt_floor_active
     assert out.yaw_rate_rad_s == 0.0
-    assert controller.note_race(gate_index=2, race_boot_ms=3000, now_s=100.16)
-    _command(controller, 100.18)
+    assert controller.note_race(gate_index=2, race_boot_ms=3000, now_s=100.18)
+    _command(controller, 100.20)
     assert not controller._alt_floor_active
 
 
@@ -940,6 +960,7 @@ def test_altitude_floor_respects_max_thrust():
     _promote_to_gate_one(controller)
     controller._alt_est_m = 0.5
     controller._vz_est_m_s = -4.3
+    _blind_current(controller, 100.14)  # F51: the floor arms only blind
     out = _command(controller, 100.14)
     assert controller._alt_floor_active
     assert out.thrust == pytest.approx(controller.config.max_thrust, abs=1e-9)
@@ -982,6 +1003,7 @@ def test_altitude_floor_latch_releases_unconditionally_and_rearms_after_hold():
     controller._alt_est_m = 0.5  # below the trigger; vz = 0 holds it there
     now = 100.10
     frame = 10
+    _blind_current(controller, now)  # F51: the floor arms only blind
     _command(controller, now)
     assert controller._alt_floor_active
     # The latch must not pin the profile: it releases after 2.5 s even
@@ -1022,7 +1044,7 @@ def test_altitude_floor_latch_releases_unconditionally_and_rearms_after_hold():
         _command(controller, now)
         frame += 1
     assert not controller._alt_floor_cooldown
-    # Sink back below the trigger: the floor re-arms normally.
+    # Sink back below the trigger: the floor re-arms normally (blind, F51).
     controller._vz_est_m_s = -1.0
     out = None
     while controller._alt_est_m >= 0.7:
@@ -1031,6 +1053,7 @@ def test_altitude_floor_latch_releases_unconditionally_and_rearms_after_hold():
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
             now_s=now,
         )
+        _blind_current(controller, now)
         out = _command(controller, now)
         frame += 1
     assert controller._alt_floor_active
@@ -1046,6 +1069,7 @@ def test_alt_est_clamped_so_biased_integrator_cannot_deepen_floor():
     controller._alt_est_m = 0.0
     controller._vz_est_m_s = -10.0  # F13-scale biased sink
     now = 100.10
+    _blind_current(controller, now)  # F51: the floor arms only blind
     for _ in range(10):  # unclamped integration would reach -3.3 m
         now += 0.033
         _command(controller, now)
@@ -1143,6 +1167,7 @@ def test_alt_floor_never_arms_while_fh_untrusted_but_active_latch_times_out():
     controller._alt_est_m = 0.5
     now = 100.10
     frame = 10
+    _blind_current(controller, now)  # F51: the floor arms only blind
     _command(controller, now)  # trusted: the floor arms normally
     assert controller._alt_floor_active
     # Going fh-untrusted must not clear the active latch...
@@ -1171,6 +1196,53 @@ def test_alt_floor_never_arms_while_fh_untrusted_but_active_latch_times_out():
     now += 0.033
     _command(controller, now, fh=6.0)
     assert not controller._alt_floor_active
+
+
+def test_alt_floor_override_keeps_lateral_authority():
+    # F51: the floor owns ONLY the collective and the level pitch — while
+    # blind-armed, a fresh x measurement still steers yaw/roll toward the
+    # gate (F50 parked lateral authority for the whole 2.5 s latch and the
+    # gate-1 track walked off the frame).
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller)  # current = B at x=+0.30
+    controller._alt_est_m = 0.5
+    _blind_current(controller, 100.10)  # F51: the floor arms only blind
+    out = _command(controller, 100.10)
+    assert controller._alt_floor_active
+    # x aged with the rest: stale x -> heading hold, wings level.
+    assert out.yaw_rate_rad_s == 0.0
+    assert out.target_roll_rad == 0.0
+    # A fresh x measurement under the active floor restores the standard
+    # x-qualified pursuit gains (yaw 0.90, roll 0.50 on ex=+0.30).
+    now = 100.10
+    for _ in range(20):  # slew the roll target out to its 0.15 command
+        now += 0.033
+        controller.current.last_x_measurement_s = now
+        out = _command(controller, now)
+    assert controller._alt_floor_active
+    assert out.yaw_rate_rad_s == pytest.approx(0.27, abs=1e-9)
+    assert out.target_roll_rad == pytest.approx(0.15, abs=1e-9)
+    # The collective stays the governed recovery climb, above bare support.
+    assert out.thrust > SUPPORT
+
+
+def test_alt_floor_override_pitches_to_spawn_not_absolute_zero():
+    # F51: "level" under the F49 spawn-relative convention is SPAWN_PITCH;
+    # an absolute 0.0 target is +0.31 rad physical nose-down.  The floor
+    # pitch target is the spawn attitude, slewed in from any prior target.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 0.5
+    _blind_current(controller, 100.10)  # F51: the floor arms only blind
+    controller._prev_target_pitch = SPAWN_PITCH - 0.15  # braking attitude
+    now = 100.10
+    out = None
+    for _ in range(20):
+        now += 0.033
+        out = _command(controller, now)
+    assert controller._alt_floor_active
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    assert out.target_pitch_rad != 0.0
 
 
 def test_unqualified_vertical_holds_support_plus_margin_while_fh_untrusted():
@@ -1626,6 +1698,55 @@ def test_pre_cross_brake_does_not_suppress_crossing_detection():
         output.yaw_rate_rad_s,
     ) == (0.0, SPAWN_PITCH + 0.05, 0.0)
     assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+
+
+def test_pre_cross_brake_relaxes_near_bottom_censor_with_hysteresis():
+    # F51: the pre-cross brake attitude pitches the camera up and walks the
+    # gate DOWN the physical FOV — the brake self-blinds at the near plane.
+    # A fresh measurement at/past the 0.55 relax bound drops the pitch
+    # target to level (vision custody outranks deceleration); the brake
+    # resumes only below the 0.45 resume bound, and hysteresis holds the
+    # last state between the bounds.
+    controller = _tracked_controller(_track("A", 0.0, 0.60, scale=0.10))
+    controller.current.scale_axis.v = 0.7  # rapid expansion too: full brake
+    now = 100.10
+    out = None
+    for _ in range(15):
+        now += 0.033
+        controller.current.last_measurement_s = now
+        controller.current.last_x_measurement_s = now
+        out = _command(controller, now)
+    assert controller._pre_cross_brake_active  # ey=0.60: fully misaligned
+    assert controller._brake_vision_relax
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    # Between the bounds (0.45 < ey < 0.55) the relaxed state holds.
+    controller.current.y_axis.p = 0.50
+    for _ in range(5):
+        now += 0.033
+        controller.current.last_measurement_s = now
+        controller.current.last_x_measurement_s = now
+        out = _command(controller, now)
+    assert controller._brake_vision_relax
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    # Below the resume bound the brake target (spawn - 0.15) resumes.
+    controller.current.y_axis.p = 0.40
+    for _ in range(15):
+        now += 0.033
+        controller.current.last_measurement_s = now
+        controller.current.last_x_measurement_s = now
+        out = _command(controller, now)
+    assert not controller._brake_vision_relax
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
+    # From the braking state, re-entering the band does NOT relax — the
+    # brake holds through the hysteresis gap in both directions.
+    controller.current.y_axis.p = 0.50
+    for _ in range(15):
+        now += 0.033
+        controller.current.last_measurement_s = now
+        controller.current.last_x_measurement_s = now
+        out = _command(controller, now)
+    assert not controller._brake_vision_relax
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():
