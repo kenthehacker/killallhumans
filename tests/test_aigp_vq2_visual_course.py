@@ -292,6 +292,16 @@ def test_fresh_top_corner_continuity_has_only_exact_lifecycle_seams(
             True,
         ),
         (
+            VisualApproachMode.APPROACH,
+            CourseLifecycle.APPROACH,
+            None,
+            True,
+            False,
+            FrameEdge.TOP,
+            True,
+            True,
+        ),
+        (
             VisualApproachMode.PROMOTE_REACQUIRE,
             CourseLifecycle.PROMOTE_REACQUIRE,
             PostCreditMeasurementMode.CLEAN,

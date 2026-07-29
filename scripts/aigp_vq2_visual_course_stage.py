@@ -346,7 +346,17 @@ def _promoted_top_boundary_may_defer_missing_fov(
                 )
             )
         )
-        and not successor_handoff_required
+        # Once the lifecycle is ordinary APPROACH, a still-pending
+        # post-credit handoff is bookkeeping rather than ownership of the
+        # fresh authoritative current.  It cannot turn an exact TOP boundary
+        # into a flight abort; the recovery below remains steering-only.
+        and (
+            not successor_handoff_required
+            or (
+                mode is VisualApproachMode.APPROACH
+                and lifecycle is CourseLifecycle.APPROACH
+            )
+        )
         and not committed_crossing
         and current_clipping is FrameEdge.TOP
         and current_center_censored is True
