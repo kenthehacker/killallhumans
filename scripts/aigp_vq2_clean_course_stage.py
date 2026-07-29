@@ -398,6 +398,12 @@ FH_UNTRUSTED_SUSTAIN_S = 0.3  # transients shorter than this never latch
 # biased-regime deficit at ~0.05 collective, so the margin must cover all of
 # it, not part of it.
 FH_UNTRUSTED_VERTICAL_MARGIN = 0.05  # unqualified hold: support + margin
+# FH closure governor (F28, 732904b4): engage the pre-cross brake on speed
+# alone, before the near-field log_scale/TTC triggers — the approach may
+# never outrun the regime the post-credit floor can hold (~0.9*fh - 0.5
+# deficit vs the 0.34 clamp).  2.5 m/s^2 leaves the F26-style crossing
+# (fh ~2.2, estimates live) achievable; 3.0 is the untrusted latch.
+FH_BRAKE_ENGAGE_MPS2 = 2.5
 # High-gate climb bias (post-credit pursuit redesign, agent-10 F26/F27/L13/
 # L18 trace analysis): gate 1 is handed off HIGH (ey ~ -0.69, 20% already
 # top-clipped at credit), and a censored/unqualified y-axis decays the
@@ -801,6 +807,8 @@ class CleanCourseController:
         self._fh_mps2 = 0.0
         self._fh_untrusted = False
         self._fh_above_since_s: Optional[float] = None
+        # FH closure-governor hysteresis flag (see FH_BRAKE_ENGAGE_MPS2).
+        self._fh_brake_active = False
 
     # -- initialization ----------------------------------------------------
 
@@ -1397,15 +1405,34 @@ class CleanCourseController:
         # post-credit window owns the post-plane phase.  The expansion
         # (time-to-contact) trigger is gated to the near field so far-range
         # scale noise cannot stall the approach.
-        pre_cross_brake = (
-            self.state is CleanCourseState.TRACK
-            and not post_credit_brake
-            and (
-                current.log_scale >= cfg.near_brake_log_scale
-                or (
-                    current.log_scale >= cfg.pre_cross_brake_near_log_scale
-                    and current.expansion_rate * cfg.pre_cross_brake_ttc_s > 1.0
+        # FH closure governor (F28, 732904b4): the log_scale/TTC triggers
+        # release through the advance blend as the gate engulfs, and F28
+        # re-accelerated to fh 3.4 across the plane — fh untrusted BEFORE
+        # credit, frozen vz/alt for the whole gate-1 leg, and a real
+        # -2.5 m/s^2 sink into terrain at the threshold.  Speed itself now
+        # brakes: engaged above 2.5 m/s^2, released below the trust
+        # hysteresis (2.0), in TRACK and PREDICT alike (fh is live IMU even
+        # when the camera is engulfed/blind).
+        if self._fh_mps2 > FH_BRAKE_ENGAGE_MPS2:
+            self._fh_brake_active = True
+        elif self._fh_mps2 < cfg.fh_trusted_release_mps2:
+            self._fh_brake_active = False
+        pre_cross_brake = not post_credit_brake and (
+            (
+                self.state is CleanCourseState.TRACK
+                and (
+                    current.log_scale >= cfg.near_brake_log_scale
+                    or (
+                        current.log_scale >= cfg.pre_cross_brake_near_log_scale
+                        and current.expansion_rate * cfg.pre_cross_brake_ttc_s
+                        > 1.0
+                    )
                 )
+            )
+            or (
+                self._fh_brake_active
+                and self.state
+                in (CleanCourseState.TRACK, CleanCourseState.PREDICT)
             )
         )
         self._pre_cross_brake_active = pre_cross_brake

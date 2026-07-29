@@ -1328,6 +1328,50 @@ def test_pre_cross_brake_expansion_ttc_trigger_in_near_field():
     assert out.yaw_rate_rad_s > 0.0  # lateral pursuit alive under braking
 
 
+def test_fh_closure_governor_brakes_on_speed_alone_with_hysteresis():
+    # F28 (732904b4): the log_scale/TTC triggers released through the
+    # advance blend at engulf and the drone re-accelerated to fh 3.4 across
+    # the plane — fh untrusted BEFORE credit, frozen vz/alt for the whole
+    # gate-1 leg, terrain at the threshold.  Speed alone must now brake:
+    # engaged above 2.5 m/s^2, held through 2.2, released below 2.0, and
+    # active in PREDICT (fh is live IMU even when the camera is blind).
+    controller = _tracked_controller(_track("A", 0.20, 0.0, scale=0.10))
+    now = 100.10
+    out = _command(controller, now, fh=1.0)
+    assert not controller._pre_cross_brake_active
+    assert out.target_pitch_rad < 0.0  # far field: the advance law closes
+    out = None
+    for _ in range(15):  # ~0.5 s: the fast slew attains the brake attitude
+        now += 0.033
+        out = _command(controller, now, fh=3.0)
+    assert controller._pre_cross_brake_active
+    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    now += 0.033
+    out = _command(controller, now, fh=2.2)  # hysteresis: still braking
+    assert controller._pre_cross_brake_active
+    for _ in range(20):  # release below 2.0 and slew back to the law
+        now += 0.033
+        out = _command(controller, now, fh=1.0)
+    assert not controller._pre_cross_brake_active
+    assert out.target_pitch_rad < 0.12 - 1e-9
+    # PREDICT (camera blind, fh live): the governor still brakes.
+    now += 0.033
+    controller.observe(
+        _update([_track("A", 0.20, 0.0, scale=0.10)], frame_id=39), now_s=now
+    )  # fresh measurement so the dropout starts from TRACK
+    for frame in range(3):  # ~0.1 s without a measurement -> PREDICT
+        now += 0.033
+        controller.observe(_update([], frame_id=40 + frame), now_s=now)
+        out = _command(controller, now, fh=1.0)
+    assert controller.state is CleanCourseState.PREDICT
+    for _ in range(10):  # inside the 0.5 s PREDICT bound
+        now += 0.033
+        out = _command(controller, now, fh=3.0)
+    assert controller.state is CleanCourseState.PREDICT
+    assert controller._pre_cross_brake_active
+    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+
+
 def test_pre_cross_brake_does_not_suppress_crossing_detection():
     # Replay the shape of a normal crossing under braking: the apparent
     # size keeps growing through crossing_min_log_scale while the brake is
