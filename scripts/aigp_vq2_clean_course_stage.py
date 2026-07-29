@@ -224,9 +224,19 @@ YAW_ERROR_GAIN = 0.30
 ROLL_ERROR_SIGN = +1.0  # flip this one line if the first flight contradicts
 ROLL_ERROR_GAIN = 0.24
 MAX_TARGET_ROLL_RAD = 0.12  # GATE1_RECENTER_ROLL cap
-MAX_COURSE_YAW_RATE_RAD_S = 0.15  # accepted v3 profile production cap
+# Raised 0.15 -> 0.30 (flights 4ba3922b/89a175a9/d058b8a0): accepted gate-1
+# tracks repeatedly slid to the x ~= 0.95 frame edge with yaw pinned at the
+# cap while the v3 authority profile measured ~0.5 rad/s of plant capability
+# (3x headroom).  Bearing rates of near off-axis gates at surviving closure
+# exceed 0.15 rad/s; 0.30 stays inside the calibrated envelope.
+MAX_COURSE_YAW_RATE_RAD_S = 0.30  # accepted v3 profile production cap
 
-ADVANCE_PITCH_RAD = -0.18  # nose-down closure target when aligned/confident
+# Softened -0.18 -> -0.12 (flight 4ba3922b): the whole gate-0 transit is
+# ~2 s, so the advance attitude builds most of the closure the pre-cross
+# brake must then kill, and it arrives too late to kill it all (crossing
+# span grew 0.72 -> 0.89 in 0.14 s).  A gentler advance trades ~1 s of
+# approach time for a crossing speed the brake can actually manage.
+ADVANCE_PITCH_RAD = -0.12  # nose-down closure target when aligned/confident
 BRAKE_PITCH_RAD = -0.02  # near-level braking target
 ANGULAR_FULL_BRAKE_NORM = 0.60  # angular error that fully suppresses advance
 EXPANSION_BRAKE_FREE_S = 1.5  # expansion rate below which no braking applies
