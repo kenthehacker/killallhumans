@@ -392,15 +392,19 @@ def test_vz_governor_floors_collective_below_descent_floor():
     # estimate is below the floor.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     helper = controller._governed_collective
+    max_thrust = controller.config.max_thrust
     controller._vz_est_m_s = -0.5  # at the floor boundary: no effect
     assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT, abs=1e-9)
     controller._vz_est_m_s = -1.0  # 0.5 m/s below -> +0.03 + 0.025 feedforward
     assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.055, abs=1e-9)
-    controller._vz_est_m_s = -1.5  # 1.0 m/s below -> +0.06 + 0.025
-    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.085, abs=1e-9)
-    # The floor only raises collective; it never lowers a higher command.
-    controller._vz_est_m_s = -1.0  # floor target 0.33 here
-    assert helper(0.34, SUPPORT) == pytest.approx(0.34, abs=1e-9)
+    # Deep sinks saturate at max_thrust (flight 039186c8: the unclamped
+    # floor boost exceeded the runner's 0.35 envelope abort in SEARCH).
+    controller._vz_est_m_s = -1.5  # 1.0 m/s below -> +0.06 + 0.025 = 0.36 raw
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
+    # The floor only raises collective, but the governed output is still
+    # clamped: a higher command saturates at max_thrust as well.
+    controller._vz_est_m_s = -1.0
+    assert helper(0.34, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
 
 
 def test_vz_descent_floor_raises_command_thrust():

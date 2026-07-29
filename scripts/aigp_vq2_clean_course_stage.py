@@ -1267,7 +1267,12 @@ class CleanCourseController:
                 + VZ_DESCENT_GOVERNOR_GAIN * descent_excess
                 + VZ_DESCENT_HOVER_FEEDFORWARD,
             )
-        return collective
+        # Hard clamp here, not only at the main-path call site: the SEARCH
+        # and defensive-fallback returns emit the governed value directly,
+        # and an unclamped deep-sink floor boost (support + gain*excess +
+        # feedforward) exceeded the runner's 0.35 envelope abort in flight
+        # 20260729T115619Z-visual-course-039186c8.
+        return _clamp(collective, self.config.min_thrust, self.config.max_thrust)
 
     def _search_yaw(self, dt: float) -> float:
         cfg = self.config
