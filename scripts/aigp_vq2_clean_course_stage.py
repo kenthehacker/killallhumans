@@ -229,14 +229,27 @@ YAW_ERROR_GAIN = 0.90
 # the positive yaw, translating the vehicle toward the gate's lateral
 # position so the target bearing moves toward center.
 ROLL_ERROR_SIGN = +1.0  # flip this one line if the first flight contradicts
-ROLL_ERROR_GAIN = 0.24
+# 0.24 -> 0.50 (F39b, 4a4b7792): the gate-1 pursuit yawed at the 0.5 rad/s
+# cap while the close gate's bearing STILL escaped +0.44 -> +0.95 — pure
+# yaw cannot hold a close off-axis gate against translation parallax;
+# lateral translation (bank) is what bends the path.  The old gain built
+# only ~2.4 m/s^2 and the 0.30 rad/s generic slew never attained even
+# that inside the 0.7 s window.
+ROLL_ERROR_GAIN = 0.50
 # 0.12 -> 0.25 rad (post-credit pursuit redesign): yaw alone cannot center a
 # near off-axis gate — the trace shows ex GROWING (+0.19 -> +0.95) while the
 # drone yawed +0.5 rad toward it, because momentum keeps the path straight
 # (nose != path).  Lateral translation is what bends the path; 0.12 rad
 # (6.9 deg, ~1.2 m/s^2) was too weak.  0.25 rad (14.3 deg, ~2.5 m/s^2) stays
 # far inside the runner's 25 deg roll abort.
-MAX_TARGET_ROLL_RAD = 0.25  # coordinated-turn lateral translation cap
+# 0.25 -> 0.35 rad (F39b): 20 deg bank ~= 3.4 m/s^2 lateral, still inside
+# the runner's 25 deg roll abort with margin.
+MAX_TARGET_ROLL_RAD = 0.35  # coordinated-turn lateral translation cap
+# The generic 0.30 rad/s target slew made even the OLD roll cap
+# unattainable inside a pursuit window; large pursuit errors get the fast
+# slew (same value as the brake pitch slew).
+ROLL_PURSUIT_SLEW_RAD_S = 1.0  # fast roll slew while |ex| is large
+ROLL_PURSUIT_FAST_EX_NORM = 0.30  # |ex| above this engages the fast slew
 # Raised 0.15 -> 0.25 (flights 4ba3922b/89a175a9/d058b8a0): accepted gate-1
 # tracks repeatedly slid to the x ~= 0.95 frame edge with yaw pinned at the
 # cap while the v3 authority profile measured ~0.5 rad/s of plant capability.
@@ -347,7 +360,12 @@ SEARCH_FH_BRAKE_MPS2 = 1.5
 # from the leg anchor (initial yaw, re-anchored on every authoritative
 # promotion) can never exceed this; only return steering is allowed at
 # the cap.
-COURSE_HEADING_ANCHOR_CAP_RAD = 0.9
+# 0.9 -> 1.5 (F39b, 4a4b7792): the gate-1 handoff sits 0.45-0.6 rad off the
+# leg start; the pursuit plus the SEARCH recovery legitimately needed
+# ~1.0-1.3 rad, and the 0.9 cap PARKED the blind recovery (yaw frozen at
+# 1.33 for 2.4 s until a soft gate-1 graze).  1.5 still blocks F31's 2.63
+# rad wander with margin.
+COURSE_HEADING_ANCHOR_CAP_RAD = 1.5
 # Pre-gate-1 altitude floor (terrain insurance; flights F10/F11/F12 all
 # flew their final 6-10 s below 0.7 m with thrust pinned at the clamp into
 # terrain hits).  alt_est integrates the governor's IMU vz_est from course
@@ -658,6 +676,8 @@ class CleanCourseConfig:
     roll_error_sign: float = ROLL_ERROR_SIGN
     roll_error_gain: float = ROLL_ERROR_GAIN
     max_target_roll_rad: float = MAX_TARGET_ROLL_RAD
+    roll_pursuit_slew_rad_s: float = ROLL_PURSUIT_SLEW_RAD_S
+    roll_pursuit_fast_ex_norm: float = ROLL_PURSUIT_FAST_EX_NORM
     yaw_error_sign: float = YAW_ERROR_SIGN
     yaw_error_gain: float = YAW_ERROR_GAIN
     max_yaw_rate_rad_s: float = MAX_COURSE_YAW_RATE_RAD_S
@@ -1501,7 +1521,15 @@ class CleanCourseController:
         )
 
         return NavigationOutput(
-            target_roll_rad=self._slew_roll(target_roll, dt),
+            target_roll_rad=self._slew_roll(
+                target_roll,
+                dt,
+                slew_rad_s=(
+                    cfg.roll_pursuit_slew_rad_s
+                    if abs(ex) > cfg.roll_pursuit_fast_ex_norm
+                    else None
+                ),
+            ),
             # The braking regime gets the dedicated fast slew (F12: the
             # generic 0.30 rad/s slew never attained the brake attitude
             # inside the hold); normal steering keeps the transparent slew.
@@ -1862,8 +1890,13 @@ class CleanCourseController:
         self._coast_entry_s = None
         self._coast_race_boot_ms = None
 
-    def _slew_roll(self, target: float, dt: float) -> float:
-        limit = self.config.target_slew_rad_s * dt
+    def _slew_roll(
+        self,
+        target: float,
+        dt: float,
+        slew_rad_s: Optional[float] = None,
+    ) -> float:
+        limit = (slew_rad_s or self.config.target_slew_rad_s) * dt
         self._prev_target_roll = _clamp(
             target, self._prev_target_roll - limit, self._prev_target_roll + limit
         )

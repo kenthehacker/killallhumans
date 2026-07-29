@@ -1226,17 +1226,17 @@ def test_heading_anchor_clamps_outward_yaw_only():
     # F31: post-loss search/edge-chase wound the heading +2.63 rad off the
     # course bearing, then the drone flew sideways into structure it never
     # saw.  The anchor is captured lazily on the first yaw tick; outward
-    # steering past the 0.9 rad cap is blocked, return steering is free.
+    # steering past the 1.5 rad cap is blocked, return steering is free.
     controller = _tracked_controller(_track("A", 0.30, 0.0, scale=0.10))
     out = _command(controller, 100.10, yaw=0.0)  # lazy anchor = 0.0
     assert controller._course_anchor_yaw_rad == pytest.approx(0.0)
     assert out.yaw_rate_rad_s > 0.0  # x=+0.30 pursuit steers freely
     # Heading wound past the cap: the same positive pursuit is blocked.
-    out = _command(controller, 100.143, yaw=1.0)
+    out = _command(controller, 100.143, yaw=1.6)
     assert out.yaw_rate_rad_s <= 0.0
     # Return steering (target left of center) is always free at the cap.
     controller.current.x_axis.p = -0.30
-    out = _command(controller, 100.176, yaw=1.0)
+    out = _command(controller, 100.176, yaw=1.6)
     assert out.yaw_rate_rad_s < 0.0
     # Wrapped excursion: yaw just past -pi relative to a +pi anchor is a
     # small positive excursion, not a full revolution.
@@ -1625,7 +1625,7 @@ def test_finite_bounded_output_across_states():
         assert all(math.isfinite(value) for value in values)
         assert abs(output.yaw_rate_rad_s) <= 0.50 + 1e-9
         assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
-        assert abs(output.target_roll_rad) <= 0.25 + 1e-9
+        assert abs(output.target_roll_rad) <= 0.35 + 1e-9
         assert -0.35 <= output.target_pitch_rad <= 0.35
         if output.thrust == 0.0:
             assert output.state is CleanCourseState.COAST_FOR_CREDIT
