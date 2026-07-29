@@ -49,50 +49,40 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
         "post_gate_observation_duration_s": (
             runner.POST_GATE_OBSERVATION_TIMEOUT_S
         ),
-        "gate1_recenter_duration_s": runner.GATE1_RECENTER_DURATION_S,
+        "gate1_recenter_duration_s": 0.60,
     }
     assert mapping["turn_cue"] == {
         "preturn_enabled": True,
         "exit_counterroll_enabled": True,
-        "min_gate_area_scale": runner.COURSE_LINE_PRETURN_MIN_GATE_AREA_SCALE,
-        "min_abs_score": runner.COURSE_LINE_PRETURN_MIN_SCORE,
-        "preturn_gain": runner.COURSE_LINE_PRETURN_GAIN,
-        "preturn_roll_cap_rad": runner.COURSE_LINE_PRETURN_LIMIT_RAD,
-        "preturn_taper_area_scale": (
-            runner.COURSE_LINE_PRETURN_TAPER_AREA_SCALE
-        ),
-        "exit_counterroll_onset_area_scale": (
-            runner.COURSE_LINE_EXIT_COUNTERROLL_ONSET_AREA_SCALE
-        ),
-        "exit_counterroll_cap_rad": runner.COURSE_LINE_EXIT_COUNTERROLL_RAD,
+        "min_gate_area_scale": 1.30,
+        "min_abs_score": 0.04,
+        "preturn_gain": 0.80,
+        "preturn_roll_cap_rad": 0.13,
+        "preturn_taper_area_scale": 8.0,
+        "exit_counterroll_onset_area_scale": 3.5,
+        "exit_counterroll_cap_rad": 0.08,
     }
     assert mapping["roll_control"] == {
         "gate0_centering_gain": 0.15,
         "gate0_target_cap_rad": 0.08,
-        "gate1_error_gain": runner.GATE1_RECENTER_ROLL_GAIN,
-        "gate1_error_rate_gain": runner.GATE1_RECENTER_ROLL_RATE_GAIN,
-        "gate1_target_cap_rad": runner.GATE1_RECENTER_MAX_ROLL_RAD,
-        "command_rate_cap_rad_s": (
-            runner.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
-        ),
+        "gate1_error_gain": -0.24,
+        "gate1_error_rate_gain": 0.0,
+        "gate1_target_cap_rad": 0.12,
+        "command_rate_cap_rad_s": 0.12,
     }
     assert mapping["yaw_control"] == {
         "gate0_turn_score_gain": 0.0,
         "gate0_command_rate_cap_rad_s": 0.0,
         "gate1_error_gain": 0.0,
-        "gate1_deadband_normalized_x": (
-            runner.GATE1_RECENTER_CORRIDOR_NORMALIZED_X
-        ),
+        "gate1_deadband_normalized_x": 0.35,
         "command_rate_cap_rad_s": 0.0,
     }
     assert mapping["forward_braking"] == {
         "gate0_turn_pitch_rad": 0.0,
         "gate0_turn_thrust_cap": 0.32,
-        "gate1_target_pitch_rad": runner.GATE1_RECENTER_TARGET_PITCH_RAD,
-        "pitch_command_rate_cap_rad_s": (
-            runner.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
-        ),
-        "gate1_forward_thrust": runner.GATE1_RECENTER_THRUST,
+        "gate1_target_pitch_rad": 0.10,
+        "pitch_command_rate_cap_rad_s": 0.12,
+        "gate1_forward_thrust": 0.275,
     }
 
 

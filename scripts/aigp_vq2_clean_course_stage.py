@@ -49,6 +49,26 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from competition.vq2_contracts import FrameEdge
+from scripts.aigp_vq2_yaw_profile import (
+    DEFAULT_YAW_CALIBRATION_PROFILE_PATH,
+    YAW_CALIBRATION_PLAN_ID,
+    YAW_CALIBRATION_PLAN_SHA256,
+    YAW_CALIBRATION_PROFILE_ID,
+    YAW_CALIBRATION_PROFILE_SCHEMA,
+    YAW_CALIBRATION_PROFILE_SHA256,
+    YAW_CALIBRATION_SOURCE_COMMIT,
+    YAW_CONTROLLER_TO_BODY_SIGN,
+    YAW_CONTROLLER_TO_IMAGE_SIGN,
+    YAW_CONTROL_HOLD_HORIZON_S,
+    YAW_MAX_CALIBRATION_ATTITUDE_EXCURSION_RAD,
+    YAW_MAX_CALIBRATION_MEASURED_RATE_RAD_S,
+    YAW_MAX_COMMAND_RATE_RAD_S,
+    YAW_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S,
+    YAW_MAX_GYRO_RESPONSE_DELAY_S,
+    YAW_OBSERVED_MAX_MEASURED_RATE_RAD_S,
+    load_yaw_calibration_profile,
+    yaw_calibration_profile_evidence,
+)
 
 # ---------------------------------------------------------------------------
 # Control-law constants (see module docstring for sources).
@@ -1311,3 +1331,218 @@ def _course_summary(
         "exact_zero_command_count": int(zero_command_count),
         "yaw_calibration_profile": host.yaw_calibration_profile_evidence,
     }
+
+
+# --- Runner-facing stage authority (moved from the retired coordinator) ---
+
+
+@dataclass(frozen=True, slots=True)
+class VisualCourseStageLimits:
+    """Code-owned bounds for the clean course stage envelope."""
+
+    control_period_s: float = CONTROL_PERIOD_S
+    course_hard_duration_s: float = 120.0
+    max_command_rate_rad_s: float = 0.25
+    max_yaw_rate_rad_s: float = MAX_COURSE_YAW_RATE_RAD_S
+    max_measured_yaw_rate_rad_s: float = 0.50
+    min_thrust: float = MIN_COURSE_THRUST
+    max_thrust: float = MAX_COURSE_THRUST
+
+    def __post_init__(self) -> None:
+        numeric = (
+            self.control_period_s,
+            self.course_hard_duration_s,
+            self.max_command_rate_rad_s,
+            self.max_yaw_rate_rad_s,
+            self.max_measured_yaw_rate_rad_s,
+            self.min_thrust,
+            self.max_thrust,
+        )
+        if not all(
+            type(value) in {int, float} and math.isfinite(float(value))
+            for value in numeric
+        ):
+            raise ValueError("visual-course limits must be finite")
+
+
+DEFAULT_VISUAL_COURSE_LIMITS = VisualCourseStageLimits()
+
+
+_YAW_PROFILE_ISSUER = object()
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class VisualCourseYawProfile:
+    """Module-issued identity of the exact tracked three-run yaw profile."""
+
+    schema: str
+    profile_id: str
+    profile_sha256: str
+    source_commit: str
+    plan_id: str
+    plan_sha256: str
+    controller_to_body_sign: int
+    controller_to_image_sign: int
+    max_abs_yaw_rate_command_rad_s: float
+    max_gyro_response_delay_s: float
+    max_first_image_observation_delay_s: float
+    max_attitude_excursion_rad: float
+    max_abs_measured_yaw_rate_rad_s: float
+    observed_max_abs_measured_yaw_rate_rad_s: float
+    control_hold_horizon_s: float
+
+    def __init__(
+        self,
+        *,
+        issuer: object,
+        schema: str,
+        profile_id: str,
+        profile_sha256: str,
+        source_commit: str,
+        plan_id: str,
+        plan_sha256: str,
+        controller_to_body_sign: int,
+        controller_to_image_sign: int,
+        max_abs_yaw_rate_command_rad_s: float,
+        max_gyro_response_delay_s: float,
+        max_first_image_observation_delay_s: float,
+        max_attitude_excursion_rad: float,
+        max_abs_measured_yaw_rate_rad_s: float,
+        observed_max_abs_measured_yaw_rate_rad_s: float,
+        control_hold_horizon_s: float,
+    ) -> None:
+        if issuer is not _YAW_PROFILE_ISSUER:
+            raise TypeError(
+                "visual-course yaw profiles must come from the tracked loader"
+            )
+        if (
+            schema != YAW_CALIBRATION_PROFILE_SCHEMA
+            or profile_id != YAW_CALIBRATION_PROFILE_ID
+            or profile_sha256 != YAW_CALIBRATION_PROFILE_SHA256
+            or source_commit != YAW_CALIBRATION_SOURCE_COMMIT
+            or plan_id != YAW_CALIBRATION_PLAN_ID
+            or plan_sha256 != YAW_CALIBRATION_PLAN_SHA256
+        ):
+            raise ValueError("visual-course yaw profile identity is not frozen")
+        if (
+            controller_to_body_sign != YAW_CONTROLLER_TO_BODY_SIGN
+            or controller_to_image_sign != YAW_CONTROLLER_TO_IMAGE_SIGN
+            or max_abs_yaw_rate_command_rad_s
+            != YAW_MAX_COMMAND_RATE_RAD_S
+            or max_gyro_response_delay_s
+            != YAW_MAX_GYRO_RESPONSE_DELAY_S
+            or max_first_image_observation_delay_s
+            != YAW_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S
+            or max_attitude_excursion_rad
+            != YAW_MAX_CALIBRATION_ATTITUDE_EXCURSION_RAD
+            or max_abs_measured_yaw_rate_rad_s
+            != YAW_MAX_CALIBRATION_MEASURED_RATE_RAD_S
+            or observed_max_abs_measured_yaw_rate_rad_s
+            != YAW_OBSERVED_MAX_MEASURED_RATE_RAD_S
+            or control_hold_horizon_s != YAW_CONTROL_HOLD_HORIZON_S
+        ):
+            raise ValueError("visual-course yaw authority is not frozen")
+        for name, value in (
+            ("schema", schema),
+            ("profile_id", profile_id),
+            ("profile_sha256", profile_sha256),
+            ("source_commit", source_commit),
+            ("plan_id", plan_id),
+            ("plan_sha256", plan_sha256),
+            ("controller_to_body_sign", controller_to_body_sign),
+            ("controller_to_image_sign", controller_to_image_sign),
+            (
+                "max_abs_yaw_rate_command_rad_s",
+                max_abs_yaw_rate_command_rad_s,
+            ),
+            ("max_gyro_response_delay_s", max_gyro_response_delay_s),
+            (
+                "max_first_image_observation_delay_s",
+                max_first_image_observation_delay_s,
+            ),
+            ("max_attitude_excursion_rad", max_attitude_excursion_rad),
+            (
+                "max_abs_measured_yaw_rate_rad_s",
+                max_abs_measured_yaw_rate_rad_s,
+            ),
+            (
+                "observed_max_abs_measured_yaw_rate_rad_s",
+                observed_max_abs_measured_yaw_rate_rad_s,
+            ),
+            ("control_hold_horizon_s", control_hold_horizon_s),
+        ):
+            object.__setattr__(self, name, value)
+
+    @classmethod
+    def load_tracked(
+        cls,
+        path: Any = DEFAULT_YAW_CALIBRATION_PROFILE_PATH,
+    ) -> "VisualCourseYawProfile":
+        """Load and validate the tracked sign-plus-capability authority."""
+
+        profile = load_yaw_calibration_profile(path)
+        evidence = yaw_calibration_profile_evidence(profile)
+        authority = evidence["authority"]
+        return cls(
+            issuer=_YAW_PROFILE_ISSUER,
+            schema=YAW_CALIBRATION_PROFILE_SCHEMA,
+            profile_id=evidence["profile_id"],
+            profile_sha256=evidence["sha256"],
+            source_commit=evidence["source_commit"],
+            plan_id=evidence["plan_id"],
+            plan_sha256=evidence["plan_sha256"],
+            controller_to_body_sign=authority["controller_to_body_sign"],
+            controller_to_image_sign=authority[
+                "controller_to_image_sign"
+            ],
+            max_abs_yaw_rate_command_rad_s=authority[
+                "max_abs_yaw_rate_command_rad_s"
+            ],
+            max_gyro_response_delay_s=authority[
+                "max_gyro_response_delay_s"
+            ],
+            max_first_image_observation_delay_s=authority[
+                "max_first_image_observation_delay_s"
+            ],
+            max_attitude_excursion_rad=authority[
+                "max_attitude_excursion_rad"
+            ],
+            max_abs_measured_yaw_rate_rad_s=authority[
+                "max_abs_measured_yaw_rate_rad_s"
+            ],
+            observed_max_abs_measured_yaw_rate_rad_s=(
+                profile["capability"]["max_abs_body_rate_rad_s"]
+            ),
+            control_hold_horizon_s=authority["control_hold_horizon_s"],
+        )
+
+    def to_evidence(self) -> Dict[str, Any]:
+        """Match the strict manifest identity emitted by the profile module."""
+
+        return {
+            "profile_id": self.profile_id,
+            "sha256": self.profile_sha256,
+            "source_commit": self.source_commit,
+            "plan_id": self.plan_id,
+            "plan_sha256": self.plan_sha256,
+            "authority": {
+                "controller_to_body_sign": self.controller_to_body_sign,
+                "controller_to_image_sign": self.controller_to_image_sign,
+                "max_abs_yaw_rate_command_rad_s": (
+                    self.max_abs_yaw_rate_command_rad_s
+                ),
+                "max_gyro_response_delay_s": (
+                    self.max_gyro_response_delay_s
+                ),
+                "max_first_image_observation_delay_s": (
+                    self.max_first_image_observation_delay_s
+                ),
+                "max_attitude_excursion_rad": (
+                    self.max_attitude_excursion_rad
+                ),
+                "max_abs_measured_yaw_rate_rad_s": (
+                    self.max_abs_measured_yaw_rate_rad_s
+                ),
+                "control_hold_horizon_s": self.control_hold_horizon_s,
+            },
+        }

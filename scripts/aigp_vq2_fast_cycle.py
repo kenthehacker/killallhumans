@@ -51,20 +51,13 @@ SIMULATOR_MODE = "Training"
 DEFAULT_ADDRESS = "udpin:127.0.0.1:14550"
 ISOLATION_FLAGS = ("-E", "-s", "-B")
 VISUAL_POWERED_STAGES = (
-    "visual-shadow",
-    "visual-align",
     "visual-course",
-)
-VISUAL_REPLAY_STAGES = (
-    "visual-shadow",
-    "visual-align",
 )
 FAST_POWERED_STAGES = (
     "sign-id",
     "hover",
     "gate0",
     "gate0-observe",
-    "gate1-recenter",
     *VISUAL_POWERED_STAGES,
     "calibration-excite",
 )
@@ -75,8 +68,6 @@ _RUNTIME_SOURCE_PATHS = (
     "scripts/aigp_vq2_clean_course_stage.py",
     "scripts/aigp_vq2_controller_config.py",
     "scripts/aigp_vq2_visual_config.py",
-    "scripts/aigp_vq2_visual_alignment_stage.py",
-    "scripts/aigp_vq2_visual_course_stage.py",
     "scripts/aigp_vq2_yaw_capability.py",
     "scripts/aigp_vq2_yaw_calibration.py",
     "scripts/aigp_vq2_yaw_profile.py",
@@ -95,14 +86,6 @@ _RUNTIME_SOURCE_PATHS = (
     "estimation/imu_attitude.py",
     "gate_detection/src/gate_detector.py",
     "gate_detection/src/vq2_detector.py",
-    "planning/vq2_course_lifecycle.py",
-    "planning/vq2_dynamic_course.py",
-    "planning/vq2_dynamic_visual_approach.py",
-    "planning/vq2_gate_graph.py",
-    "planning/vq2_visual_approach.py",
-    "planning/vq2_visual_alignment.py",
-    "planning/vq2_visual_recovery.py",
-    "planning/vq2_visual_servo.py",
 )
 
 ControllerConfigValue = VQ2ControllerConfig | VisualNavigationConfig
@@ -110,14 +93,6 @@ ControllerConfigValue = VQ2ControllerConfig | VisualNavigationConfig
 
 class FastCycleError(RuntimeError):
     """The compact admission or execution boundary failed closed."""
-
-
-def _visual_replay_filename(stage: str) -> str | None:
-    if stage == "visual-shadow":
-        return "shadow.vq2replay"
-    if stage == "visual-align":
-        return "alignment.vq2replay"
-    return None
 
 
 class _CaptureLeaseRelease:
@@ -323,7 +298,7 @@ def _validate_controller_config_for_stage(
 def _load_controller_config(
     path: Path | None,
     *,
-    stage: str = "gate1-recenter",
+    stage: str = "hover",
 ) -> ControllerConfigValue:
     if path is None:
         return _default_controller_config_for_stage(stage)
@@ -451,11 +426,7 @@ def build_manifest(
             "directory": str(run_directory),
             "manifest": str(run_directory / "run-manifest.json"),
             "trace": str(run_directory / "session.jsonl.gz"),
-            "replay_bundle": (
-                str(run_directory / replay_name)
-                if (replay_name := _visual_replay_filename(stage))
-                else None
-            ),
+            "replay_bundle": None,
             "result": str(run_directory / "result.json"),
             "live_lease": str(run_directory / "live-lease.json"),
         },
@@ -533,13 +504,12 @@ def _execute_fast_cycle(
         raise FastCycleError(f"controller configuration refused: {exc}") from exc
     if (
         stage not in VISUAL_POWERED_STAGES
-        and stage != "gate1-recenter"
         and effective_controller.effective_config_sha256
         != default_controller_config().effective_config_sha256
     ):
         raise FastCycleError(
             "custom controller configurations are admitted only for "
-            "gate1-recenter"
+            "visual-course"
         )
     repo_root = Path(__file__).resolve().parents[1]
     root = _require_external_path(
@@ -651,15 +621,8 @@ def _execute_fast_cycle(
                         if stage == "visual-course"
                         else None
                     ),
-                    replay_bundle=(
-                        str(run_directory / replay_name)
-                        if (
-                            replay_name
-                            := _visual_replay_filename(stage)
-                        )
-                        else None
-                    ),
-                    recording_approved=(stage in VISUAL_REPLAY_STAGES),
+                    replay_bundle=None,
+                    recording_approved=False,
                 )
             )
             result_value = {

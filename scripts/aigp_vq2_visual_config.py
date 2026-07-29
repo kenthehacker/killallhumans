@@ -14,12 +14,106 @@ import json
 import math
 from typing import Any, Mapping
 
-from planning.vq2_visual_servo import (
-    MAX_NEXT_GATE_BLEND,
-    MAX_VISUAL_SEGMENT_DURATION_S,
-    VisualServoRefusal,
-    VisualServoTuning,
-)
+MAX_VISUAL_SEGMENT_DURATION_S = 120.0
+MIN_VISUAL_THRUST = 0.21
+MAX_VISUAL_THRUST = 0.32
+MAX_NEXT_GATE_BLEND = 0.35
+
+
+class VisualServoRefusal(ValueError):
+    """The observation or requested tuning cannot safely produce authority."""
+
+
+@dataclass(frozen=True)
+class VisualServoTuning:
+    """Bounded controller choices below immutable runtime authority ceilings."""
+
+    horizontal_corridor: float = 0.16
+    vertical_corridor: float = 0.18
+    edge_brake_x: float = 0.72
+    edge_brake_y: float = 0.76
+    stable_rate_norm_s: float = 0.30
+    stable_scale_rate_s: float = 1.10
+    brake_scale_rate_s: float = 2.00
+    # The first two exact Gate-0 -> Gate-1 handoffs showed that a 0.15 gain
+    # behind a 0.25 bearing blend produced only about 0.012 rad/s of preview
+    # yaw and left the promoted track moving outward at 0.304-0.349 norm/s.
+    # Use the reviewed tuning ceiling so the generic servo can exploit the
+    # separately immutable yaw-rate and course-turn heading envelopes.
+    yaw_error_gain: float = 0.30
+    yaw_rate_gain: float = 0.035
+    # Gate-1 live recovery saturated yaw while horizontal error grew from
+    # 0.625 to 0.750.  Use materially stronger coordinated bank inside the
+    # separately enforced 0.18-rad measured stage corridor.
+    roll_error_gain: float = 0.20
+    roll_rate_gain: float = 0.05
+    # Retained in the serialized v1 configuration for manifest compatibility.
+    # Vertical image feedback is no longer applied to pitch; collective is its
+    # single control owner.
+    vertical_error_gain: float = 0.16
+    vertical_rate_gain: float = 0.035
+    collective_error_gain: float = 0.060
+    collective_rate_gain: float = 0.080
+    advance_pitch_rad: float = -0.105
+    brake_pitch_rad: float = 0.035
+    # Repeated credited Gate-0 runs establish 0.275 as the generic
+    # flight-support collective basis.  Forward closure is allocated through
+    # pitch and the small continuous interpolation toward advance collective;
+    # cutting airborne alignment to the 0.21 envelope minimum caused measured
+    # vertical image divergence and top censorship.
+    align_thrust: float = 0.275
+    advance_thrust: float = 0.295
+    brake_thrust: float = 0.275
+    required_corridor_frames: int = 3
+
+    def __post_init__(self) -> None:
+        numeric = {
+            name: float(value)
+            for name, value in vars(self).items()
+            if name != "required_corridor_frames"
+        }
+        if not all(math.isfinite(value) for value in numeric.values()):
+            raise VisualServoRefusal("visual-servo tuning must be finite")
+        if not 0.08 <= self.horizontal_corridor <= 0.25:
+            raise VisualServoRefusal("horizontal corridor is outside bounds")
+        if not 0.08 <= self.vertical_corridor <= 0.28:
+            raise VisualServoRefusal("vertical corridor is outside bounds")
+        if not 0.55 <= self.edge_brake_x <= 0.85:
+            raise VisualServoRefusal("horizontal edge brake is outside bounds")
+        if not 0.55 <= self.edge_brake_y <= 0.85:
+            raise VisualServoRefusal("vertical edge brake is outside bounds")
+        if not 0.10 <= self.stable_rate_norm_s <= 0.60:
+            raise VisualServoRefusal("stable image-rate bound is outside bounds")
+        if not 0.50 <= self.stable_scale_rate_s <= 1.50:
+            raise VisualServoRefusal("stable scale-rate bound is outside bounds")
+        if not self.stable_scale_rate_s < self.brake_scale_rate_s <= 3.0:
+            raise VisualServoRefusal("scale-rate braking bounds are invalid")
+        if not 0.05 <= self.yaw_error_gain <= 0.30:
+            raise VisualServoRefusal("yaw error gain is outside bounds")
+        if not 0.0 <= self.yaw_rate_gain <= 0.08:
+            raise VisualServoRefusal("yaw rate gain is outside bounds")
+        if not 0.0 <= self.roll_error_gain <= 0.20:
+            raise VisualServoRefusal("roll error gain is outside bounds")
+        if not 0.0 <= self.roll_rate_gain <= 0.05:
+            raise VisualServoRefusal("roll rate gain is outside bounds")
+        if not 0.0 <= self.collective_error_gain <= 0.08:
+            raise VisualServoRefusal("collective error gain is outside bounds")
+        if not 0.0 <= self.collective_rate_gain <= 0.13:
+            raise VisualServoRefusal("collective rate gain is outside bounds")
+        if not -0.16 <= self.advance_pitch_rad <= -0.06:
+            raise VisualServoRefusal("advance pitch is outside bounds")
+        if not 0.0 <= self.brake_pitch_rad <= 0.08:
+            raise VisualServoRefusal("brake pitch is outside bounds")
+        if not MIN_VISUAL_THRUST <= self.align_thrust <= 0.29:
+            raise VisualServoRefusal("alignment thrust is outside bounds")
+        if not 0.27 <= self.advance_thrust <= MAX_VISUAL_THRUST:
+            raise VisualServoRefusal("advance thrust is outside bounds")
+        if not MIN_VISUAL_THRUST <= self.brake_thrust <= 0.29:
+            raise VisualServoRefusal("brake thrust is outside bounds")
+        if type(self.required_corridor_frames) is not int or not (
+            3 <= self.required_corridor_frames <= 8
+        ):
+            raise VisualServoRefusal("required corridor frames are outside bounds")
 
 
 VISUAL_CONFIG_SCHEMA = "aigp-vq2-visual-navigation-config/1"

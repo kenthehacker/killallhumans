@@ -126,16 +126,7 @@ interactive confirmation.
                 'competition/tests',
                 'estimation/tests',
                 'gate_detection/tests',
-                'planning/tests/test_vq2_course_lifecycle.py',
-                'planning/tests/test_vq2_dynamic_course.py',
-                'planning/tests/test_vq2_dynamic_visual_approach.py',
-                'planning/tests/test_vq2_gate_reacquisition.py',
                 'planning/tests/test_vq2_guidance.py',
-                'planning/tests/test_vq2_recorded_gate_promotion.py',
-                'planning/tests/test_vq2_visual_alignment.py',
-                'planning/tests/test_vq2_visual_approach.py',
-                'planning/tests/test_vq2_visual_recovery.py',
-                'planning/tests/test_vq2_visual_servo.py',
                 'tests/test_aigp_live_lease.py',
                 'tests/test_aigp_vq2_course_cohort.py',
                 'tests/test_aigp_vq2_build_reference.py',
@@ -151,16 +142,6 @@ interactive confirmation.
                 'tests/test_aigp_vq2_powered_cleanup.py',
                 'tests/test_aigp_vq2_runner.py',
                 'tests/test_aigp_vq2_visual_config.py',
-                'tests/test_aigp_vq2_visual_course.py',
-                'tests/test_aigp_vq2_visual_course_attempt3_recorded_facts.py',
-                'tests/test_aigp_vq2_visual_course_attempt4_stage.py',
-                'tests/test_aigp_vq2_visual_course_coordinator_replay.py',
-                'tests/test_aigp_vq2_visual_course_preview_recorded_facts.py',
-                'tests/test_aigp_vq2_visual_course_reacquisition.py',
-                'tests/test_aigp_vq2_visual_course_recorded_facts.py',
-                'tests/test_aigp_vq2_visual_reacquisition_integration.py',
-                'tests/test_aigp_vq2_visual_reacquisition_runner.py',
-                'tests/test_aigp_vq2_visual_shadow.py',
                 'tests/test_aigp_vq2_yaw_calibration.py',
                 'tests/test_aigp_vq2_yaw_profile.py',
                 'tests/test_vision_udp.py',
@@ -213,8 +194,7 @@ interactive confirmation.
                 throw 'flight-cycle accepts only --controller-config after stage.'
             }
             $allowed = @(
-                'sign-id', 'hover', 'gate0', 'gate0-observe', 'gate1-recenter',
-                'visual-shadow', 'visual-align', 'visual-course',
+                'sign-id', 'hover', 'gate0', 'gate0-observe', 'visual-course',
                 'calibration-excite'
             )
             if ($stage -notin $allowed) {

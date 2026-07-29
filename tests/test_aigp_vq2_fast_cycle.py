@@ -67,13 +67,9 @@ def test_visual_course_manifest_binds_reviewed_yaw_profile():
             "authority"
         ],
     }
-    assert fast_cycle._yaw_profile_identity("visual-align") is None
+    assert fast_cycle._yaw_profile_identity("hover") is None
     assert (
-        "scripts/aigp_vq2_visual_course_stage.py"
-        in fast_cycle._RUNTIME_SOURCE_PATHS
-    )
-    assert (
-        "planning/vq2_course_lifecycle.py"
+        "scripts/aigp_vq2_clean_course_stage.py"
         in fast_cycle._RUNTIME_SOURCE_PATHS
     )
     assert (
@@ -170,19 +166,21 @@ def test_full_lap_is_quarantined_from_fast_powered_stages():
         fast_cycle.build_argument_parser().parse_args(["full-lap"])
 
 
-def test_gate1_recenter_is_admitted_as_the_bounded_position_only_stage():
-    assert "gate1-recenter" in fast_cycle.FAST_POWERED_STAGES
-    arguments = fast_cycle.build_argument_parser().parse_args(
-        ["gate1-recenter"]
-    )
-    assert arguments.stage == "gate1-recenter"
+@pytest.mark.parametrize(
+    "removed_stage",
+    ["gate1-recenter", "visual-shadow", "visual-align"],
+)
+def test_retired_stages_are_quarantined_from_fast_powered_stages(
+    removed_stage,
+):
+    assert removed_stage not in fast_cycle.FAST_POWERED_STAGES
+    with pytest.raises(SystemExit):
+        fast_cycle.build_argument_parser().parse_args([removed_stage])
 
 
 @pytest.mark.parametrize(
     ("requested_stage", "expected_replay_name"),
     [
-        ("visual-shadow", "shadow.vq2replay"),
-        ("visual-align", "alignment.vq2replay"),
         ("visual-course", None),
     ],
 )
@@ -259,9 +257,7 @@ def test_visual_stage_is_admitted_with_stage_scoped_compact_evidence(
         if requested_stage == "visual-course"
         else None
     )
-    assert kwargs["recording_approved"] is (
-        requested_stage in fast_cycle.VISUAL_REPLAY_STAGES
-    )
+    assert kwargs["recording_approved"] is False
     assert kwargs["preflight_before_powered_stage"] is False
     assert kwargs["write_diagnostic_pngs"] is False
     replay_path = (
@@ -289,7 +285,7 @@ def test_visual_stage_is_admitted_with_stage_scoped_compact_evidence(
 
 @pytest.mark.parametrize(
     "requested_stage",
-    ["visual-shadow", "visual-align", "visual-course"],
+    ["visual-course"],
 )
 def test_visual_stage_refuses_dirty_candidate_before_live_contact(
     tmp_path,
@@ -570,7 +566,7 @@ def test_controller_config_cli_and_loader_require_one_complete_document(tmp_path
         encoding="utf-8",
     )
     parsed = fast_cycle.build_argument_parser().parse_args(
-        ["gate1-recenter", "--controller-config", str(path)]
+        ["hover", "--controller-config", str(path)]
     )
     assert parsed.controller_config == path
     assert (
@@ -600,7 +596,7 @@ def test_custom_controller_is_rejected_for_unrelated_stage_before_lease(tmp_path
 
     with pytest.raises(
         fast_cycle.FastCycleError,
-        match="only for gate1-recenter",
+        match="only for visual-course",
     ):
         fast_cycle._execute_fast_cycle(
             "hover",
