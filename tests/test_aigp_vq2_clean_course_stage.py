@@ -1,14 +1,15 @@
 """Behavior tests for the clean visual-course stage (architecture reset M2).
 
 These tests assert envelope and directional behavior only: one global
-vertical sign, decay-toward-support on vertical loss, a closure-scaled
-gate-0 climb bias, a derivative term that never reverses the P-commanded
-direction, verified yaw/roll directions, clipping uncertainty (not abort),
-PREDICT->SEARCH on fresh empty frames, frozen-frame stalls that predict and
-never coast, a real bounded yaw sweep, finite bounded output, absolute race
-authority, the bounded crossing-coast wait on a fresh close loss, and one
-final clamp.  They never assert exact internal event dictionaries, mode
-sequences, or lineage identities.
+vertical sign, decay-toward-support on vertical loss, a cut 0.30 x 0.40 s
+launch boost, a closure-scaled gate-0 climb bias that never lifts the aim
+point above image center, a derivative term that never reverses the
+P-commanded direction, verified yaw/roll directions, clipping uncertainty
+(not abort), PREDICT->SEARCH on fresh empty frames, frozen-frame stalls
+that predict and never coast, a real bounded yaw sweep, finite bounded
+output, absolute race authority, the bounded crossing-coast wait on a fresh
+close loss, and one final clamp.  They never assert exact internal event
+dictionaries, mode sequences, or lineage identities.
 """
 
 from __future__ import annotations
@@ -21,6 +22,8 @@ import pytest
 
 from competition.vq2_contracts import FrameEdge
 from scripts.aigp_vq2_clean_course_stage import (
+    LAUNCH_BOOST_DURATION_S,
+    LAUNCH_BOOST_THRUST,
     CleanCourseConfig,
     CleanCourseController,
     CleanCourseRuntime,
@@ -170,6 +173,19 @@ def test_gate0_takeoff_boost_is_feedforward_only():
     assert after.thrust < SUPPORT  # closed-loop sign resumes unchanged
 
 
+def test_launch_boost_constants_are_the_cut_values():
+    # Flight 20260729T094736Z-visual-course-9d430a40: the 0.32 x 0.75 s boost
+    # alone built vz ~= +2.3 m/s by t=0.75 (~70% of peak climb velocity) and
+    # the trajectory overshot the ~1.8-2 m required climb into the top bar.
+    # Cut to 0.30 x 0.40 s; 0.30 stays inside the historically validated
+    # 0.30..0.32 launch-thrust range.
+    assert LAUNCH_BOOST_THRUST == 0.30
+    assert LAUNCH_BOOST_DURATION_S == 0.40
+    config = CleanCourseConfig()
+    assert config.launch_boost_thrust == 0.30
+    assert config.launch_boost_duration_s == 0.40
+
+
 def test_vertical_loss_decays_toward_support_not_saturation_retention():
     # Start with a saturated sub-support collective (target below center).
     controller = _tracked_controller(_track("A", 0.0, 0.30))
@@ -216,13 +232,14 @@ def test_verified_yaw_and_roll_directions():
 
 def test_gate0_climb_vertical_offset_is_bounded_feedforward():
     # 2026-07-29 analysis (Q1/Q4): cross gate 0 higher so gate 1 is first
-    # seen with doubled top-edge margin.  A centered gate-0 target yields
-    # collective above support; the bias stays inside the thrust envelope
-    # and retires with the gate-0 phase.
+    # seen with doubled top-edge margin.  A gate-0 target still ABOVE center
+    # (ey < 0, image-down) yields collective above support; the bias stays
+    # inside the thrust envelope and retires with the gate-0 phase.
     config = _config(gate0_climb_vertical_offset_norm=0.25)
-    controller = _tracked_controller(_track("A", 0.0, 0.0), config=config)
+    controller = _tracked_controller(_track("A", 0.0, -0.10), config=config)
     output = _command(controller, 100.10)
-    assert output.thrust == pytest.approx(SUPPORT + 0.080 * 0.25, abs=1e-9)
+    # e = -0.10 - 0.25 = -0.35 -> full climb correction above support.
+    assert output.thrust == pytest.approx(SUPPORT + 0.080 * 0.35, abs=1e-9)
     assert 0.21 <= output.thrust <= 0.32
 
     high = _tracked_controller(_track("A", 0.0, -0.60), config=config)
@@ -250,25 +267,50 @@ def test_gate0_climb_offset_scales_with_closure():
     # Flight 20260729T085719Z-visual-course-4455fd61: the fixed 0.25 climb
     # offset built a ~2.5-3 m climb into gate 0's top bar.  The bias is now
     # closure-scaled: full at the spawn detection scale (log -1.79), ramping
-    # linearly to zero at the crossing-arm scale (log -0.80).
+    # linearly to zero at the crossing-arm scale (log -0.80).  Tracks sit
+    # above center (ey < 0) so the never-above-center clamp does not engage.
     config = _config(gate0_climb_vertical_offset_norm=0.25)
-    far = _tracked_controller(_track("A", 0.0, 0.0, scale=0.1667), config=config)
+    far = _tracked_controller(
+        _track("A", 0.0, -0.10, scale=0.1667), config=config
+    )
     assert _command(far, 100.10).thrust == pytest.approx(
-        SUPPORT + 0.080 * 0.25, abs=1e-9
+        SUPPORT + 0.080 * (0.10 + 0.25), abs=1e-9
     )
 
     mid = _tracked_controller(
-        _track("A", 0.0, 0.0, scale=math.exp(-1.295)), config=config
+        _track("A", 0.0, -0.10, scale=math.exp(-1.295)), config=config
     )
     mid_offset = 0.25 * (-1.295 - (-0.80)) / (-1.79 - (-0.80))
     assert _command(mid, 100.10).thrust == pytest.approx(
-        SUPPORT + 0.080 * mid_offset, abs=1e-9
+        SUPPORT + 0.080 * (0.10 + mid_offset), abs=1e-9
     )
 
     crossing = _tracked_controller(
         _track("A", 0.0, 0.0, scale=math.exp(-0.80)), config=config
     )
     assert _command(crossing, 100.10).thrust == pytest.approx(SUPPORT, abs=1e-9)
+
+
+def test_gate0_climb_offset_never_lifts_aim_above_center():
+    # Flight 20260729T094736Z-visual-course-9d430a40: the ramped climb
+    # setpoint stayed positive (~+0.1..0.2) past center through t=1.5,
+    # holding collective >= support until the climb could not be erased.
+    # With the gate at/below image center (ey >= 0) the effective offset is
+    # clamped to <= 0 regardless of the closure ramp: the bias may push the
+    # aim point UP toward center, never above it.
+    config = _config(gate0_climb_vertical_offset_norm=0.25)
+    centered = _tracked_controller(
+        _track("A", 0.0, 0.0, scale=0.1667), config=config  # spawn scale
+    )
+    assert _command(centered, 100.10).thrust == pytest.approx(SUPPORT, abs=1e-9)
+
+    below = _tracked_controller(
+        _track("A", 0.0, 0.10, scale=0.1667), config=config
+    )
+    output = _command(below, 100.10)
+    # Offset contributes nothing: only the plain e = +0.10 descent feedback.
+    assert output.thrust == pytest.approx(SUPPORT - 0.080 * 0.10, abs=1e-9)
+    assert output.thrust < SUPPORT
 
 
 def test_vertical_rate_term_never_reverses_p_commanded_direction():
@@ -279,19 +321,20 @@ def test_vertical_rate_term_never_reverses_p_commanded_direction():
     # never reverse the P-commanded direction; agreeing P and D (true
     # overshoot) keeps full D authority.
     config = _config(gate0_climb_vertical_offset_norm=0.25)
-    controller = _tracked_controller(_track("A", 0.0, 0.10), config=config)
+    controller = _tracked_controller(_track("A", 0.0, -0.10), config=config)
     controller.current.y_axis.v = 1.0  # strong rate opposing the P correction
     output = _command(controller, 100.10)
     assert output.vertical_qualified
-    # e = 0.10 - 0.25 = -0.15 demands climb; D is clipped to exactly cancel,
+    # e = -0.10 - 0.25 = -0.35 demands climb; D is clipped to exactly cancel,
     # so the collective can never sag below support on the opposing rate.
     assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
 
     agreeing = _tracked_controller(_track("A", 0.0, 0.40), config=config)
     agreeing.current.y_axis.v = 0.5
     output = _command(agreeing, 100.10)
-    # e = +0.15 and vy = +0.5 agree on descent: D keeps full authority and
-    # the collective may sit below support.
+    # ey >= 0 clamps the offset to 0, so e = +0.40 and vy = +0.5 agree on
+    # descent: D keeps full authority and the collective may sit below
+    # support.
     assert output.thrust < SUPPORT - 0.05
 
 

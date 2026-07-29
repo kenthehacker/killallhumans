@@ -101,8 +101,16 @@ VERTICAL_MAX_ABS_RATE_NORM_S = 5.0 / 3.0  # GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE
 MIN_COURSE_THRUST = 0.21  # MIN_VISUAL_THRUST (active visual-course envelope)
 MAX_COURSE_THRUST = 0.32  # MAX_VISUAL_THRUST
 
-LAUNCH_BOOST_THRUST = 0.32  # proved 0.32-thrust launch (feedforward only)
-LAUNCH_BOOST_DURATION_S = 0.75  # inside the validated 0.45..1.0 boost window
+# Launch boost is pure feedforward (it ignores ey).  Flight
+# 20260729T094736Z-visual-course-9d430a40: the 0.32 x 0.75 s boost alone
+# built vz ~= +2.3 m/s by t=0.75 (~70% of the +3.2 m/s peak climb velocity)
+# and the trajectory overshot the ~1.8-2 m required climb into gate 0's top
+# bar.  Cut to 0.30 x 0.40 s: 0.30 stays inside the historically validated
+# 0.30..0.32 launch-thrust range (aigp_vq2_visual_config); the shorter
+# duration is the main lever and deliberately departs from the retired
+# visual config's 0.45..0.60 lifecycle window, which never bound this stage.
+LAUNCH_BOOST_THRUST = 0.30
+LAUNCH_BOOST_DURATION_S = 0.40
 
 # Gate-0-phase feedforward vertical setpoint offset (image-down norm).  The
 # 2026-07-29 crossing-geometry analysis (Q1/Q4) shows gate 1 first appears at
@@ -765,10 +773,16 @@ class CleanCourseController:
         # promotion.  The offset is closure-scaled: flight
         # 20260729T085719Z-visual-course-4455fd61 held the fixed 0.25 bias
         # into gate 0's top bar, so it ramps linearly from full at the spawn
-        # detection log scale to zero at the crossing-arm log scale.  Loss of
-        # qualified vertical state discards the derivative term and decays
-        # collective smoothly toward tilt-compensated support; a saturated
-        # sub-support collective is never retained.
+        # detection log scale to zero at the crossing-arm log scale.  And it
+        # may only push the aim point UP toward image center, never above
+        # it: flight 20260729T094736Z-visual-course-9d430a40 kept a positive
+        # (~+0.1..0.2) setpoint past center through t=1.5, holding collective
+        # >= support and delaying the descent until the climb could no
+        # longer be erased, so the offset is clamped to <= 0 whenever the
+        # gate is at/below center (ey >= 0).  Loss of qualified vertical
+        # state discards the derivative term and decays collective smoothly
+        # toward tilt-compensated support; a saturated sub-support collective
+        # is never retained.
         vertical_setpoint_offset = 0.0
         if self.gate_index == 0:
             span = (
@@ -782,6 +796,10 @@ class CleanCourseController:
             vertical_setpoint_offset = (
                 cfg.gate0_climb_vertical_offset_norm * closure
             )
+            if ey >= 0.0:
+                # Gate at/below image center: the climb bias may not lift the
+                # aim point above center (flight 9d430a40, see block comment).
+                vertical_setpoint_offset = min(vertical_setpoint_offset, 0.0)
         vertical_qualified = (
             self.state is CleanCourseState.TRACK
             and now_s - current.last_y_measurement_s
