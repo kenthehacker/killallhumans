@@ -285,6 +285,11 @@ POST_CREDIT_BRAKE_PITCH_RAD = 0.18  # nose-up brake attitude (see block above)
 # gate-1 candidates can never grow their span without advance — F18/F19
 # both died in that window before the 2.75 s timeout could release.
 POST_CREDIT_BRAKE_TIMEOUT_S = 1.5  # bounded brake even with no reacquisition
+# F22 (97450705): while fh is untrusted neither release may fire — the brake
+# is the only tool that buys the slow regime back, and the fh-untrusted
+# collective floor keeps the extended window safe.  The hard bound caps that
+# persistence so a stuck-fast regime cannot brake forever.
+POST_CREDIT_BRAKE_HARD_S = 4.0  # absolute cap on the post-credit brake window
 POST_CREDIT_CLIMB_CAP_M_S = 0.5  # climb cap while post-credit unqualified
 # Minimum brake hold (flight 20260729T125400Z-visual-course-4480d0a6): gate 1
 # is often already accepted AND vertically qualified at the credit tick, so
@@ -641,6 +646,7 @@ class CleanCourseConfig:
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
     post_credit_brake_pitch_rad: float = POST_CREDIT_BRAKE_PITCH_RAD
     post_credit_brake_timeout_s: float = POST_CREDIT_BRAKE_TIMEOUT_S
+    post_credit_brake_hard_s: float = POST_CREDIT_BRAKE_HARD_S
     post_credit_climb_cap_m_s: float = POST_CREDIT_CLIMB_CAP_M_S
     post_credit_brake_min_hold_s: float = POST_CREDIT_BRAKE_MIN_HOLD_S
     post_credit_brake_slew_rad_s: float = POST_CREDIT_BRAKE_SLEW_RAD_S
@@ -1159,11 +1165,23 @@ class CleanCourseController:
         # here (a lost gate cannot brake forever); the qualification release
         # happens in the main path where vertical_qualified is computed.
         # The tighter climb cap applies for the whole unqualified window.
-        if (
-            self._post_credit_deadline_s is not None
-            and now_s >= self._post_credit_deadline_s
-        ):
-            self._post_credit_deadline_s = None
+        # F22 (97450705): the 1.5 s timeout discarded the brake right when it
+        # started to bite — fh grew 2.9 -> 4.8 THROUGH the window, and fh > 3
+        # is the blind regime (frozen vz/alt, no accepted vision, sub-hover
+        # floor).  The brake's job is to buy the slow regime back, so while
+        # fh is untrusted NEITHER the timeout nor the qualification release
+        # may fire; only the hard bound can (the fh-untrusted collective
+        # floor keeps the extended window safe).
+        if self._post_credit_deadline_s is not None:
+            hard_bound_s = (
+                self._post_credit_armed_s + cfg.post_credit_brake_hard_s
+                if self._post_credit_armed_s is not None
+                else self._post_credit_deadline_s
+            )
+            if now_s >= hard_bound_s or (
+                now_s >= self._post_credit_deadline_s and not self._fh_untrusted
+            ):
+                self._post_credit_deadline_s = None
         self._active_climb_cap_m_s = (
             cfg.post_credit_climb_cap_m_s
             if self._post_credit_deadline_s is not None
@@ -1354,9 +1372,12 @@ class CleanCourseController:
         # Qualification release for the post-credit brake, but only after the
         # minimum hold (flight 4480d0a6): gate 1 is often already qualified at
         # the credit tick, and an instant release made the brake a no-op while
-        # the gate-0 attack closure was still carried.
+        # the gate-0 attack closure was still carried.  F22: it must also not
+        # fire while fh-untrusted — releasing the brake into the blind fast
+        # regime discards the only tool that buys the slow regime back.
         if (
             vertical_qualified
+            and not self._fh_untrusted
             and self._post_credit_deadline_s is not None
             and self._post_credit_armed_s is not None
             and now_s - self._post_credit_armed_s
