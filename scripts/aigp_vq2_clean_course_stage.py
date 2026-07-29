@@ -214,7 +214,13 @@ GATE0_CLIMB_REFERENCE_LOG_SCALE = -1.79
 # closure also drifts off-axis features radially outward), but the rotational
 # contribution of the old yaw was independently away-from-center.
 YAW_ERROR_SIGN = +1.0  # flip this one line if the first flight contradicts
-YAW_ERROR_GAIN = 0.30
+# 0.30 -> 0.50 (post-credit pursuit redesign, F26/F27/L13/L18 trace
+# analysis): the initial post-credit yaw direction was already correct, but
+# 0.3*ex = 0.17 rad/s at the typical x ~= +0.57 gate-1 handoff bearing could
+# not center a NEAR off-axis gate before translation parallax swept it to
+# the frame edge.  The 0.25 cap is reached at |ex| >= 0.5, well inside the
+# measured ~0.5 rad/s plant capability.
+YAW_ERROR_GAIN = 0.50
 # Roll: the old saturated +/-0.25 roll oscillation never recentered either
 # (corr(roll_cmd, dx/dt)=+0.18 is too weak/saturated to identify the roll
 # channel), so the roll sign follows the yaw verdict: bank INTO the
@@ -223,7 +229,13 @@ YAW_ERROR_GAIN = 0.30
 # position so the target bearing moves toward center.
 ROLL_ERROR_SIGN = +1.0  # flip this one line if the first flight contradicts
 ROLL_ERROR_GAIN = 0.24
-MAX_TARGET_ROLL_RAD = 0.12  # GATE1_RECENTER_ROLL cap
+# 0.12 -> 0.25 rad (post-credit pursuit redesign): yaw alone cannot center a
+# near off-axis gate — the trace shows ex GROWING (+0.19 -> +0.95) while the
+# drone yawed +0.5 rad toward it, because momentum keeps the path straight
+# (nose != path).  Lateral translation is what bends the path; 0.12 rad
+# (6.9 deg, ~1.2 m/s^2) was too weak.  0.25 rad (14.3 deg, ~2.5 m/s^2) stays
+# far inside the runner's 25 deg roll abort.
+MAX_TARGET_ROLL_RAD = 0.25  # coordinated-turn lateral translation cap
 # Raised 0.15 -> 0.25 (flights 4ba3922b/89a175a9/d058b8a0): accepted gate-1
 # tracks repeatedly slid to the x ~= 0.95 frame edge with yaw pinned at the
 # cap while the v3 authority profile measured ~0.5 rad/s of plant capability.
@@ -386,19 +398,23 @@ FH_UNTRUSTED_SUSTAIN_S = 0.3  # transients shorter than this never latch
 # biased-regime deficit at ~0.05 collective, so the margin must cover all of
 # it, not part of it.
 FH_UNTRUSTED_VERTICAL_MARGIN = 0.05  # unqualified hold: support + margin
-# Edge-parked advance stall (F14, agent-10 Q5): a track parked at the frame
-# edge (angular error at/past angular_full_brake_norm) forces align = 0 ->
-# advance = 0 -> perpetual near-level pitch.  F14 chased edge-parked tracks
-# for its last 4 s, never resumed advance, and held fh ~= 6 with the regime
-# gate latched.  Cap the dwell: parked this long without the track
-# re-centering (angular error back below 0.5*norm) or log_scale growing
-# (approach progress) forces SEARCH so the sweep reacquires a centered
-# track.  The align/advance law itself is unchanged.
-EDGE_PARK_MAX_DWELL_S = 1.5
-EDGE_PARK_PROGRESS_LOG_SCALE = 0.05  # log_scale growth that re-anchors dwell
+# High-gate climb bias (post-credit pursuit redesign, agent-10 F26/F27/L13/
+# L18 trace analysis): gate 1 is handed off HIGH (ey ~ -0.69, 20% already
+# top-clipped at credit), and a censored/unqualified y-axis decays the
+# collective to support + margin — a real sink in the biased regime — so the
+# gate migrates UP, clips harder, and the track dies ~1.5 s post-credit in
+# every flight.  When the tracked gate is high, the unqualified hold must
+# CLIMB toward it, not hover: support + 0.065 ~= the 0.34 thrust clamp.
+HIGH_GATE_Y_NORM = -0.30  # hypothesis y below this counts as "gate is high"
+HIGH_GATE_CLIMB_MARGIN = 0.065  # unqualified hold margin while the gate is high
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
-SEARCH_YAW_RATE_RAD_S = 0.12  # bounded sweep inside the 0.15 yaw cap
-SEARCH_SWEEP_PERIOD_S = 1.20  # bounded reversal schedule
+# Real scan, not a wiggle (post-credit pursuit redesign): 0.12 rad/s with a
+# 1.2 s reversal made +-8 deg legs that could never reach gate 1's typical
+# ~26-35 deg handoff bearing, and the reversal actively undid turn progress
+# (L18: 6.3 s of +-0.12 sweep achieving nothing).  0.20 rad/s with the 0.8
+# rad excursion bound gives ~46 deg legs, first leg toward the last bearing.
+SEARCH_YAW_RATE_RAD_S = 0.20  # bounded sweep rate
+SEARCH_SWEEP_PERIOD_S = 6.00  # reversal backstop; the excursion bound fires first
 SEARCH_MAX_EXCURSION_RAD = 0.80  # bounded sweep excursion before reversal
 
 SUCCESSOR_BLEND_MAX = 0.50  # continuous lookahead ceiling
@@ -669,8 +685,8 @@ class CleanCourseConfig:
     fh_trusted_release_mps2: float = FH_TRUSTED_RELEASE_MPS2
     fh_untrusted_sustain_s: float = FH_UNTRUSTED_SUSTAIN_S
     fh_untrusted_vertical_margin: float = FH_UNTRUSTED_VERTICAL_MARGIN
-    edge_park_max_dwell_s: float = EDGE_PARK_MAX_DWELL_S
-    edge_park_progress_log_scale: float = EDGE_PARK_PROGRESS_LOG_SCALE
+    high_gate_y_norm: float = HIGH_GATE_Y_NORM
+    high_gate_climb_margin: float = HIGH_GATE_CLIMB_MARGIN
     search_covariance_std_norm: float = SEARCH_COVARIANCE_STD_NORM
     search_yaw_rate_rad_s: float = SEARCH_YAW_RATE_RAD_S
     search_sweep_period_s: float = SEARCH_SWEEP_PERIOD_S
@@ -785,9 +801,6 @@ class CleanCourseController:
         self._fh_mps2 = 0.0
         self._fh_untrusted = False
         self._fh_above_since_s: Optional[float] = None
-        # Edge-parked advance-stall dwell (see the EDGE_PARK_* block).
-        self._edge_park_since_s: Optional[float] = None
-        self._edge_park_log_scale: Optional[float] = None
 
     # -- initialization ----------------------------------------------------
 
@@ -1025,7 +1038,10 @@ class CleanCourseController:
             self.last_reliable_bearing = (self.current.x, self.current.y)
         else:
             self.current = None
-            cached = self.successor_bearing_cache.get(self.gate_index)
+            # Off-by-one fix (codex review): _refresh_successor writes the
+            # cache under the gate being ATTACKED (pre-promotion index), so
+            # the newly-current gate's bearing lives under gate_index - 1.
+            cached = self.successor_bearing_cache.get(self.gate_index - 1)
             if successor is not None:
                 self.last_reliable_bearing = (successor.x, successor.y)
             elif cached is not None:
@@ -1152,57 +1168,24 @@ class CleanCourseController:
         ):
             self._enter_search(now_s)
 
-        # Edge-parked advance stall (F14, agent-10 Q5; see the EDGE_PARK_*
-        # constant block): a track parked at the frame edge forces
-        # align = 0 -> advance = 0 -> perpetual near-level pitch.  A dwell
-        # this long without re-centering (angular error back below
-        # 0.5*norm) or log_scale growth (approach progress) forces SEARCH
-        # so the sweep reacquires a centered track.  The align/advance law
-        # itself is unchanged.
-        if self.state is CleanCourseState.TRACK and self.current is not None:
-            edge_angular_error = math.hypot(self.current.x, self.current.y)
-            if edge_angular_error >= cfg.angular_full_brake_norm:
-                if self._edge_park_since_s is None:
-                    self._edge_park_since_s = now_s
-                    self._edge_park_log_scale = self.current.log_scale
-                elif (
-                    self.current.log_scale
-                    > self._edge_park_log_scale + cfg.edge_park_progress_log_scale
-                ):
-                    # Approach progress: re-anchor the dwell window.
-                    self._edge_park_since_s = now_s
-                    self._edge_park_log_scale = self.current.log_scale
-                elif now_s - self._edge_park_since_s > cfg.edge_park_max_dwell_s:
-                    self._edge_park_since_s = None
-                    self._edge_park_log_scale = None
-                    self._enter_search(now_s)
-            elif edge_angular_error < 0.5 * cfg.angular_full_brake_norm:
-                self._edge_park_since_s = None
-                self._edge_park_log_scale = None
-        else:
-            self._edge_park_since_s = None
-            self._edge_park_log_scale = None
-
         # Post-credit brake window (flights 039186c8/F10): timeout release
         # here (a lost gate cannot brake forever); the qualification release
         # happens in the main path where vertical_qualified is computed.
         # The tighter climb cap applies for the whole unqualified window.
-        # F22 (97450705): the 1.5 s timeout discarded the brake right when it
-        # started to bite — fh grew 2.9 -> 4.8 THROUGH the window, and fh > 3
-        # is the blind regime (frozen vz/alt, no accepted vision, sub-hover
-        # floor).  The brake's job is to buy the slow regime back, so while
-        # fh is untrusted NEITHER the timeout nor the qualification release
-        # may fire; only the hard bound can (the fh-untrusted collective
-        # floor keeps the extended window safe).
+        # F22 (97450705) blocked the timeout release while fh-untrusted, but
+        # the F26/F27/L13/L18 traces refute the premise: fh GREW through the
+        # latched brake in every flight (the brake never bought the slow
+        # regime back), and the 4 s pinned-pitch latch is exactly the window
+        # where gate 1 escapes — yaw alone cannot center a near off-axis
+        # gate while the path never bends (nose != path).  The timeout now
+        # releases unconditionally; only the hard bound remains as backstop.
         if self._post_credit_deadline_s is not None:
             hard_bound_s = (
                 self._post_credit_armed_s + cfg.post_credit_brake_hard_s
                 if self._post_credit_armed_s is not None
                 else self._post_credit_deadline_s
             )
-            if now_s >= hard_bound_s or (
-                now_s >= self._post_credit_deadline_s and not self._fh_untrusted
-            ):
+            if now_s >= hard_bound_s or now_s >= self._post_credit_deadline_s:
                 self._post_credit_deadline_s = None
         self._active_climb_cap_m_s = (
             cfg.post_credit_climb_cap_m_s
@@ -1394,12 +1377,12 @@ class CleanCourseController:
         # Qualification release for the post-credit brake, but only after the
         # minimum hold (flight 4480d0a6): gate 1 is often already qualified at
         # the credit tick, and an instant release made the brake a no-op while
-        # the gate-0 attack closure was still carried.  F22: it must also not
-        # fire while fh-untrusted — releasing the brake into the blind fast
-        # regime discards the only tool that buys the slow regime back.
+        # the gate-0 attack closure was still carried.  The F22 fh-untrusted
+        # block was removed with the timeout block above: the brake never
+        # bought the slow regime back, and a qualified vertical track is the
+        # best available evidence — release and pursue.
         if (
             vertical_qualified
-            and not self._fh_untrusted
             and self._post_credit_deadline_s is not None
             and self._post_credit_armed_s is not None
             and now_s - self._post_credit_armed_s
@@ -1454,9 +1437,15 @@ class CleanCourseController:
             # channel; when it is unqualified, hold support + margin instead
             # of bare support, which historically sinks for real (-0.8...
             # -1.9 m/s against the biased-regime thrust deficit).
-            hold = support + (
+            # High-gate climb bias (see the HIGH_GATE_* block): a censored
+            # y-axis must not sink the drone below a gate that sits HIGH —
+            # the hypothesis y is still the best evidence of that.
+            margin = (
                 cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
             )
+            if current.y < cfg.high_gate_y_norm:
+                margin = max(margin, cfg.high_gate_climb_margin)
+            hold = support + margin
             if self._collective is None:
                 self._collective = hold
             # Flight bc8c6003: a phantom vy (+0.38 norm/s, seeded as the gate

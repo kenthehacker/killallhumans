@@ -1275,71 +1275,6 @@ def test_descent_floor_cannot_fire_from_frozen_vz_est():
     assert out.thrust == pytest.approx(SUPPORT + 0.05, abs=1e-9)
 
 
-def test_edge_parked_stall_forces_search_after_dwell_without_progress():
-    # F14 (agent-10 Q5): a track parked at the frame edge forces align = 0
-    # -> advance = 0 -> perpetual near-level pitch; F14 never resumed
-    # advance for its last 4 s.  The dwell is capped at 1.5 s: without
-    # re-centering or approach progress the stage forces SEARCH so the
-    # sweep reacquires a centered track.
-    controller = _tracked_controller(_track("A", 0.70, 0.10, scale=0.10))
-    now = 100.10
-    states = []
-    for frame in range(60):  # ~2.0 s parked, frozen apparent size
-        now += 0.033
-        controller.observe(
-            _update([_track("A", 0.70, 0.10, scale=0.10)], frame_id=10 + frame),
-            now_s=now,
-        )
-        _command(controller, now)
-        states.append(controller.state)
-    assert CleanCourseState.SEARCH in states
-    first_search = states.index(CleanCourseState.SEARCH)
-    assert 1.5 < (first_search + 1) * 0.033 < 1.8
-
-
-def test_edge_park_dwell_resets_on_recentering():
-    # Re-centering below 0.5*angular_full_brake_norm clears the dwell: a
-    # pursuit that keeps recovering the gate must never be forced to
-    # SEARCH.
-    controller = _tracked_controller(_track("A", 0.70, 0.0, scale=0.10))
-    now = 100.10
-    states = []
-    frame = 10
-    for x, ticks in ((0.70, 30), (0.20, 5), (0.70, 40)):
-        for _ in range(ticks):
-            now += 0.033
-            controller.observe(
-                _update([_track("A", x, 0.0, scale=0.10)], frame_id=frame),
-                now_s=now,
-            )
-            _command(controller, now)
-            states.append(controller.state)
-            frame += 1
-    # 2.2 s parked in total, but split by a genuine re-centering: no
-    # forced SEARCH.
-    assert CleanCourseState.SEARCH not in states
-    assert controller.state is CleanCourseState.TRACK
-
-
-def test_edge_park_dwell_reanchors_on_approach_progress():
-    # Growing log_scale IS approach progress even at the frame edge: the
-    # dwell re-anchors and the stage keeps tracking toward the crossing.
-    controller = _tracked_controller(_track("A", 0.70, 0.0, scale=0.10))
-    now = 100.10
-    states = []
-    for frame in range(60):  # log_scale grows 0.10 -> 0.25 over ~2 s
-        now += 0.033
-        scale = 0.10 * math.exp(math.log(2.5) * frame / 60)
-        controller.observe(
-            _update([_track("A", 0.70, 0.0, scale=scale)], frame_id=10 + frame),
-            now_s=now,
-        )
-        _command(controller, now)
-        states.append(controller.state)
-    assert CleanCourseState.SEARCH not in states
-    assert controller.state is CleanCourseState.TRACK
-
-
 def test_pre_cross_brake_engages_near_with_fast_slew_and_lateral_alive():
     # Codex F9-F11 analysis: even +0.12 rad pitch-back gives only
     # g*tan(0.12) ~= 1.18 m/s^2, so killing ~3 m/s needs ~2.5 s while the
@@ -1545,8 +1480,8 @@ def test_search_issues_real_bounded_yaw_sweep():
         now += 0.02
         yaws.append(_command(controller, now).yaw_rate_rad_s)
     # Real sweep: nonzero, at the bounded sweep rate, inside the yaw cap.
-    assert all(abs(value) == pytest.approx(0.12) for value in yaws)
-    assert all(abs(value) <= 0.15 for value in yaws)
+    assert all(abs(value) == pytest.approx(0.20) for value in yaws)
+    assert all(abs(value) <= 0.25 for value in yaws)
     # Initialized from the last image-right bearing under the measured
     # 2026-07-29 convention: positive yaw recenters a right-side target.
     assert yaws[0] > 0.0
@@ -1670,9 +1605,9 @@ def test_finite_bounded_output_across_states():
             output.thrust,
         )
         assert all(math.isfinite(value) for value in values)
-        assert abs(output.yaw_rate_rad_s) <= 0.15 + 1e-9
+        assert abs(output.yaw_rate_rad_s) <= 0.25 + 1e-9
         assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
-        assert abs(output.target_roll_rad) <= 0.12 + 1e-9
+        assert abs(output.target_roll_rad) <= 0.25 + 1e-9
         assert -0.35 <= output.target_pitch_rad <= 0.15 + 1e-9
         if output.thrust == 0.0:
             assert output.state is CleanCourseState.COAST_FOR_CREDIT
@@ -1852,7 +1787,7 @@ def test_loop_skipped_send_promotes_and_finishes():
     assert host._visual_course_summary is summary
     for command, _wire_index in host.sent:
         _validate(command)
-        assert abs(command.yaw_rate) <= 0.15 + 1e-9
+        assert abs(command.yaw_rate) <= 0.25 + 1e-9
 
 
 def test_loop_coast_holds_support_then_accepts_credit():
