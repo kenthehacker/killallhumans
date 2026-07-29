@@ -16222,30 +16222,13 @@ async def _run_visual_course_stage_impl(
                 )
                 continue
 
-            if (
-                crossing_commitment_deadline_s is not None
-                and now >= crossing_commitment_deadline_s
-            ):
-                # The expired current-gate state no longer owns geometry.
-                # A fresh, unique, exact-lineage successor above may still
-                # provide steering-only control while authoritative race
-                # ingress catches up.  Exact zero remains the fallback when
-                # that independently bounded authority is unavailable; it
-                # never fabricates passage or promotion.
-                last_planned_token = token
-                await send_zero(
-                    (
-                        f"{VISUAL_COURSE_STAGE}/gate"
-                        f"{current_gate_index}/credit-wait-zero"
-                    ),
-                    now - segment_started_s,
-                    yaw_reference_rad=yaw_reference_rad,
-                )
-                segment["crossing_wait_zero_command_count"] = int(
-                    segment["crossing_wait_zero_command_count"]
-                ) + 1
-                continue
-
+            # Expiry of the near-plane geometry ends fresh steering updates;
+            # it must not remove lift from an armed vehicle.  Run 26 sent two
+            # exact-zero commands here while 4 Hz race ingress caught up and
+            # reversed vertical velocity before Gate 1 could take control.
+            # With no independently admitted adjacent steering above, retain
+            # the already sealed, bounded passage attitude/thrust until the
+            # authoritative crossing-status timeout.
             try:
                 coast_command = await send_censored_passage_coast(
                     snapshot=snapshot,

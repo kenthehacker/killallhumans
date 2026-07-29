@@ -1395,13 +1395,13 @@ def _atomic_crossing_runtime(host, *, safe_clearance, limits=None):
     )
 
 
-def test_dynamic_latch_without_admission_atomically_coasts_to_finish():
+def test_dynamic_latch_expiry_retains_sealed_lift_until_credit():
     host = _CadencedCoordinatorHost(
         credit_policy="delayed",
         finish_gate=1,
         # Later than the accepted command/state lease: committed crossing
-        # reaches predicted contact, then exact zero preserves a separate
-        # bounded authoritative-status ingress window.
+        # reaches predicted contact, then the sealed bounded command retains
+        # lift through the authoritative-status ingress window.
         credit_delay_s=1.15,
     )
 
@@ -1426,7 +1426,25 @@ def test_dynamic_latch_without_admission_atomically_coasts_to_finish():
     assert segment["near_plane_latch"]["commitment_horizon_s"] < 1.15
     assert segment["censored_passage_coast_command_count"] >= 2
     assert segment["crossing_wait_coast_command_count"] >= 1
-    assert segment["crossing_wait_zero_command_count"] >= 1
+    assert segment["crossing_wait_zero_command_count"] == 0
+    commitment_deadline_s = segment["near_plane_latch"][
+        "commitment_deadline_monotonic_s"
+    ]
+    post_expiry_wires = [
+        wire
+        for wire in host.navigation_wires
+        if (
+            wire["gate_index"] == 1
+            and commitment_deadline_s
+            <= wire["wire_start_s"]
+            < host.credit_publish_times[1]
+        )
+    ]
+    assert post_expiry_wires
+    assert all(
+        wire["command"].thrust > 0.0
+        for wire in post_expiry_wires
+    )
     assert [
         event
         for event, _payload in host.recorder.events
@@ -1474,7 +1492,7 @@ class _ExpiredCurrentWithSuccessorHost(_CadencedCoordinatorHost):
         )
 
 
-def test_expired_current_state_uses_fresh_successor_before_zero():
+def test_expired_current_state_prefers_fresh_successor_over_sealed_hold():
     host = _ExpiredCurrentWithSuccessorHost()
     runtime = replace(
         _cadenced_runtime(host),

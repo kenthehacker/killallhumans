@@ -2599,6 +2599,13 @@ def test_latched_crossing_without_authoritative_credit_times_out_bounded():
         <= segment["crossing_wait_coast_command_count"]
         <= max_crossing_commands
     )
+    credit_wait_commands = [
+        command
+        for stage, _elapsed, command in host.ticks
+        if stage == "visual-course/gate6/credit-wait"
+    ]
+    assert credit_wait_commands
+    assert all(command.thrust > 0.0 for command in credit_wait_commands)
     assert host.race.active_gate_index == 6
     assert host.race.race_finished is False
 
