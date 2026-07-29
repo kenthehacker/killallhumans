@@ -1315,7 +1315,7 @@ def test_negative_clearance_near_center_cannot_invent_full_bank() -> None:
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
 
-def test_off_axis_outward_steering_retains_bounded_intercept_bank(
+def test_off_axis_steering_holds_intercept_bank_until_position_corridor(
 ) -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
@@ -1411,17 +1411,16 @@ def test_off_axis_outward_steering_retains_bounded_intercept_bank(
     assert recovered.time_to_contact_s is None
     assert recovered_decision.current_time_to_contact_s is None
     assert not recovered_decision.passage_committed
-    assert 0.0 < recovered_decision.proposed_command.target_roll_rad
-    assert (
-        recovered_decision.proposed_command.target_roll_rad
-        < MAX_TARGET_ROLL_RAD
+    assert recovered_decision.proposed_command.target_roll_rad == pytest.approx(
+        MAX_TARGET_ROLL_RAD
     )
     assert math.isfinite(
         recovered_decision.proposed_command.target_roll_rad
     )
 
-    # Further fresh inward motion continuously reduces the proportional
-    # reference; there is no hidden full-bank dwell.
+    # Inward image motion alone cannot unload the bank while fresh position
+    # remains well outside the corridor.  The controller retains no timer or
+    # latch: a centered publication releases this position-owned authority.
     improving_decisions = []
     for sequence, x in ((10, 0.340), (11, 0.320)):
         observation_time = 1.0 + (sequence - 1) * 0.040
@@ -1446,10 +1445,44 @@ def test_off_axis_outward_steering_retains_bounded_intercept_bank(
             improving_decision.command,
         )
 
+    assert all(
+        item.proposed_command.target_roll_rad
+        == pytest.approx(MAX_TARGET_ROLL_RAD)
+        for item in improving_decisions
+    )
+
+    centered_decision = None
+    for sequence, x in ((12, 0.20), (13, 0.10), (14, 0.05)):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=x,
+                log_scale=-1.40,
+                aperture=(0.14, 0.11),
+            )
+        )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        centered_decision = core.guide(round(decision_time * NS))
+        _commit_decision(
+            core,
+            decision_time,
+            centered_decision.command,
+        )
+
+    assert centered_decision is not None
+    centered_bearing_rad = math.atan(
+        core.config.horizontal_angle_scale_rad
+        * centered_decision.passage_error_norm[0]
+    )
+    assert abs(centered_bearing_rad) < core.config.off_axis_brake_rad
     assert (
-        0.0
-        < improving_decisions[-1].proposed_command.target_roll_rad
-        < recovered_decision.proposed_command.target_roll_rad
+        abs(centered_decision.proposed_command.target_roll_rad)
+        < MAX_TARGET_ROLL_RAD
     )
 
 

@@ -661,7 +661,7 @@ def _bound_post_credit_successor() -> tuple[
     return session, successor_id
 
 
-def _activated_zero_precredit_proportional_postcredit_transition(
+def _activated_zero_precredit_position_bank_postcredit_transition(
 ) -> tuple[DynamicVisualCourseSession, object, str, float]:
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
@@ -762,17 +762,15 @@ def _activated_zero_precredit_proportional_postcredit_transition(
     )
     assert session.post_credit_roll_reference_handoff_active is False
     source = session.core.guide(activation_ns + 1_000_000)
-    assert (
-        0.0
-        < abs(source.command.target_roll_rad)
-        < MAX_TARGET_ROLL_RAD
+    assert abs(source.command.target_roll_rad) == pytest.approx(
+        MAX_TARGET_ROLL_RAD
     )
     return session, source, successor_id, source.command.target_roll_rad
 
 
-def test_outward_post_credit_demand_uses_fresh_proportional_roll_without_latch():
+def test_outward_post_credit_demand_uses_fresh_position_bank_without_latch():
     session, source, successor_id, fresh_roll = (
-        _activated_zero_precredit_proportional_postcredit_transition()
+        _activated_zero_precredit_position_bank_postcredit_transition()
     )
     estimate = session.core._tracks[successor_id]  # noqa: SLF001
     estimate.state = replace(
@@ -814,7 +812,7 @@ def test_outward_post_credit_demand_uses_fresh_proportional_roll_without_latch()
 
 def test_unqualified_post_credit_rate_cannot_arm_roll_handoff():
     session, source, successor_id, fresh_roll = (
-        _activated_zero_precredit_proportional_postcredit_transition()
+        _activated_zero_precredit_position_bank_postcredit_transition()
     )
     estimate = session.core._tracks[successor_id]  # noqa: SLF001
     estimate.state = replace(
@@ -848,9 +846,9 @@ def test_unqualified_post_credit_rate_cannot_arm_roll_handoff():
     assert session.post_credit_roll_reference_handoff_active is False
 
 
-def test_qualified_inward_rate_preserves_fresh_proportional_roll():
+def test_qualified_inward_rate_preserves_fresh_position_bank():
     session, source, successor_id, fresh_roll = (
-        _activated_zero_precredit_proportional_postcredit_transition()
+        _activated_zero_precredit_position_bank_postcredit_transition()
     )
     estimate = session.core._tracks[successor_id]  # noqa: SLF001
     estimate.state = replace(
@@ -906,7 +904,7 @@ def test_opposite_or_near_center_recovery_never_arms_roll_handoff(
     current_center_x: float,
 ):
     session, source, successor_id, fresh_roll = (
-        _activated_zero_precredit_proportional_postcredit_transition()
+        _activated_zero_precredit_position_bank_postcredit_transition()
     )
     estimate = session.core._tracks[successor_id]  # noqa: SLF001
     estimate.state = replace(
