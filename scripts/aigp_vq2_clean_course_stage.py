@@ -313,6 +313,13 @@ PREDICT_MAX_GAP_S = 0.50  # short-gap bound before SEARCH
 # that a genuine engulfed crossing keeps its SEARCH suppression, short
 # enough to end a blind park before the ground does.
 PREDICT_STALL_FORCE_SEARCH_S = 1.50
+# X-axis steering freshness (F40, 20260729T193134Z-visual-course-63ed6342):
+# at the gate-1 promotion the controller adopted an edge-clipped splinter of
+# the just-crossed gate's frame whose x-axis had NEVER been measured
+# (seeded pos_var 0.01) and steered yaw at full authority on the garbage
+# point — 0.5 s of max yaw the wrong way threw the real gate off-frame.  An
+# x measurement older than this (or never taken) may not command yaw/roll.
+X_STEER_MAX_AGE_S = 0.5
 # Closure-rate governor (F31 redesign after F26/F28/F29/F30 all died the
 # same way — terrain at the gate-1 threshold in the high-drag regime with
 # frozen estimates): vision expansion rate is the ONLY honest closure
@@ -353,6 +360,12 @@ PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
 # attitude instead of the near-level one.  Takeoff SEARCH (fh ~ 0) is
 # unaffected.
 SEARCH_FH_BRAKE_MPS2 = 1.5
+# F40 (20260729T193134Z-visual-course-63ed6342): the shared -0.15 pre-cross
+# brake never killed the blind-at-speed drift — SEARCH held fh 3-4 mps2 for
+# the whole ~7 s parked sweep into gate 1.  The blind SEARCH brake gets its
+# own stronger nose-up attitude; pre_cross_brake_pitch_rad stays for the
+# vision-guided brake.
+SEARCH_BLIND_BRAKE_PITCH_RAD = -0.22
 # Course-heading anchor (F31): after losing the gate-1 track the drone
 # search-swept and edge-chased its heading +2.63 rad off the course
 # bearing, then flew sideways/backwards at ~0.65g drag into structure it
@@ -436,6 +449,14 @@ SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 SEARCH_YAW_RATE_RAD_S = 0.20  # bounded sweep rate
 SEARCH_SWEEP_PERIOD_S = 6.00  # reversal backstop; the excursion bound fires first
 SEARCH_MAX_EXCURSION_RAD = 0.80  # bounded sweep excursion before reversal
+# F40 (20260729T193134Z-visual-course-63ed6342): the SEARCH sweep integrated
+# the COMMANDED yaw rate, not the actual heading — at the course-anchor cap
+# (anchor 0.417 + 1.5) the sweep parked at yaw 1.94 rad, 111 deg off course,
+# for ~7 blind seconds into gate 1, never scanning the cone where the gate
+# actually was.  The sweep now sweeps an absolute desired heading around
+# the leg anchor so a parked airframe still scans the band.
+SEARCH_SWEEP_RATE_RAD_S = 0.5  # absolute-heading sweep rate around the anchor
+SEARCH_SWEEP_GAIN = 2.0  # heading-error gain to the bounded yaw rate
 
 SUCCESSOR_BLEND_MAX = 0.50  # continuous lookahead ceiling
 BLEND_FAR_LOG_SCALE = -1.6  # below this the successor gets no blend
@@ -693,6 +714,7 @@ class CleanCourseConfig:
     coast_advance_pitch_rad: float = COAST_ADVANCE_PITCH_RAD
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
+    x_steer_max_age_s: float = X_STEER_MAX_AGE_S
     closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
     closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
     closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
@@ -700,6 +722,7 @@ class CleanCourseConfig:
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     brake_ceiling_band: float = BRAKE_CEILING_BAND
     search_fh_brake_mps2: float = SEARCH_FH_BRAKE_MPS2
+    search_blind_brake_pitch_rad: float = SEARCH_BLIND_BRAKE_PITCH_RAD
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
     alt_floor_release_m: float = ALT_FLOOR_RELEASE_M
@@ -717,6 +740,8 @@ class CleanCourseConfig:
     search_yaw_rate_rad_s: float = SEARCH_YAW_RATE_RAD_S
     search_sweep_period_s: float = SEARCH_SWEEP_PERIOD_S
     search_max_excursion_rad: float = SEARCH_MAX_EXCURSION_RAD
+    search_sweep_rate_rad_s: float = SEARCH_SWEEP_RATE_RAD_S
+    search_sweep_gain: float = SEARCH_SWEEP_GAIN
     successor_blend_max: float = SUCCESSOR_BLEND_MAX
     blend_far_log_scale: float = BLEND_FAR_LOG_SCALE
     blend_near_log_scale: float = BLEND_NEAR_LOG_SCALE
@@ -1053,6 +1078,12 @@ class CleanCourseController:
             and successor.position_std <= self.config.promote_max_std_norm
             and now_s - successor.last_measurement_s
             <= self.config.promote_max_age_s
+            # F40: the promoted successor must have a real measured x-axis —
+            # NEVER_MEASURED_S (-1e9) fails every horizon check, so an
+            # edge-clipped splinter with an unmeasured x can never be
+            # adopted as the aim point.
+            and now_s - successor.last_x_measurement_s
+            <= self.config.promote_max_age_s
         )
         if credible:
             self.current = successor
@@ -1268,7 +1299,10 @@ class CleanCourseController:
             )
 
         if self.state is CleanCourseState.SEARCH:
-            sweep_yaw = self._anchor_clamped_yaw(self._search_yaw(dt), yaw_rad)
+            # F40: absolute-heading sweep around the course anchor — the old
+            # incremental sweep parked at the anchor cap (111 deg off course,
+            # ~7 blind seconds into gate 1).
+            sweep_yaw = self._search_yaw_heading(dt, yaw_rad)
             # Flight 25361816: the unqualified hold margin must apply here
             # too — SEARCH at bare support in the fh-untrusted regime sank
             # ~1 m/s for real into terrain (the margin only covered the
@@ -1281,8 +1315,10 @@ class CleanCourseController:
             # Blind-at-speed brake (F31): the closure governor cannot run
             # in SEARCH (no expansion signal), so above the fh threshold a
             # blind leg commands the brake attitude instead of near level.
+            # F40: the dedicated blind brake — the shared -0.15 pre-cross
+            # brake never killed the blind fh 3-4 mps2 drift into gate 1.
             search_pitch = (
-                cfg.pre_cross_brake_pitch_rad
+                cfg.search_blind_brake_pitch_rad
                 if self._fh_mps2 > cfg.search_fh_brake_mps2
                 else cfg.brake_pitch_rad
             )
@@ -1332,6 +1368,14 @@ class CleanCourseController:
         blend = 0.0
         ex = current.x
         ey = current.y
+        # F40 (20260729T193134Z-visual-course-63ed6342): never steer on an
+        # x-axis without a fresh accepted measurement — an unmeasured or
+        # stale x (edge-clipped splinter, censored axis) is a garbage aim
+        # point.  The y/vertical path is deliberately untouched (F35 servos
+        # on censored-y by design).
+        x_qualified = (
+            now_s - current.last_x_measurement_s <= cfg.x_steer_max_age_s
+        )
 
         # Vertical: ONE GLOBAL SIGN at every gate (empirically confirmed by
         # the 2026-07-29 crossing-geometry analysis).  The gate-0 phase adds
@@ -1488,6 +1532,12 @@ class CleanCourseController:
             -cfg.max_target_roll_rad * steer_cap,
             cfg.max_target_roll_rad * steer_cap,
         )
+        if not x_qualified:
+            # F40: no fresh x measurement -> no yaw/roll authority; hold
+            # heading and wings level (slewing toward 0) instead of chasing
+            # a phantom bearing off the frame.
+            yaw_rate = 0.0
+            target_roll = 0.0
 
         # Pitch controls closure continuously: advance when aligned and
         # confident, brake progressively with angular error, uncertainty,
@@ -1689,7 +1739,20 @@ class CleanCourseController:
             ):
                 self.successor = None
             return
-        best = max(others, key=lambda track: float(track.confidence))
+        # F40: prefer a successor whose x-axis is observable — a
+        # center-censored or LEFT/RIGHT-clipped track is the splinter-
+        # fragment geometry that promoted onto a never-measured x-axis.
+        eligible = []
+        for track in others:
+            clipping = getattr(track, "clipping", FrameEdge.NONE)
+            if type(clipping) is not FrameEdge:
+                clipping = FrameEdge.NONE
+            center_censored = bool(getattr(track, "center_censored", False))
+            if not center_censored and not bool(
+                clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
+            ):
+                eligible.append(track)
+        best = max(eligible or others, key=lambda track: float(track.confidence))
         if (
             self.successor is not None
             and self.successor.track_id == best.track_id
@@ -1874,6 +1937,39 @@ class CleanCourseController:
             self._search_elapsed_s = 0.0
             self._search_excursion_rad = 0.0
         return self._search_direction * cfg.search_yaw_rate_rad_s
+
+    def _search_yaw_heading(self, dt: float, yaw_rad: Optional[float]) -> float:
+        """Absolute-heading sweep around the course anchor (F40).
+
+        ``_search_yaw`` integrates the COMMANDED sweep, so a clamped or
+        parked airframe stopped scanning — F40 parked at yaw 1.94 rad, 111
+        deg off course, for ~7 blind seconds into gate 1.  Here the
+        excursion sweeps a desired HEADING around the leg anchor and the
+        heading error commands the rate, so the scan survives a park.
+        Falls back to the legacy incremental sweep without a live yaw
+        measurement or an anchor.
+        """
+
+        cfg = self.config
+        if yaw_rad is None or self._course_anchor_yaw_rad is None:
+            return self._search_yaw(dt)
+        self._search_excursion_rad += (
+            self._search_direction * cfg.search_sweep_rate_rad_s * dt
+        )
+        if abs(self._search_excursion_rad) >= cfg.search_max_excursion_rad:
+            self._search_direction *= -1.0
+            self._search_excursion_rad = _clamp(
+                self._search_excursion_rad,
+                -cfg.search_max_excursion_rad,
+                cfg.search_max_excursion_rad,
+            )
+        desired = self._course_anchor_yaw_rad + self._search_excursion_rad
+        return _clamp(
+            cfg.search_sweep_gain
+            * math.remainder(desired - float(yaw_rad), 2.0 * math.pi),
+            -cfg.max_yaw_rate_rad_s,
+            cfg.max_yaw_rate_rad_s,
+        )
 
     def _enter_search(self, now_s: float) -> None:
         self.state = CleanCourseState.SEARCH

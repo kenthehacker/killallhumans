@@ -55,6 +55,7 @@ from competition.vq2_visual_tracker import CameraFrameToken
 from scripts.aigp_vq2_clean_course_stage import (
     LAUNCH_BOOST_DURATION_S,
     LAUNCH_BOOST_THRUST,
+    NEVER_MEASURED_S,
     CleanCourseConfig,
     CleanCourseController,
     CleanCourseRuntime,
@@ -1125,6 +1126,9 @@ def test_closure_governor_full_brake_at_high_expansion_rate():
     out = None
     for _ in range(15):  # ~0.5 s: the fast slew attains the attitude
         now += 0.033
+        # Fresh x measurements keep arriving (the F40 x-freshness gate
+        # otherwise zeroes steering after 0.5 s without one).
+        controller.current.last_x_measurement_s = now
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
@@ -1187,6 +1191,9 @@ def test_misaligned_far_gate_brakes_and_climbs():
     out = None
     for _ in range(25):  # fast brake slew converges
         now += 0.033
+        # Fresh x measurements keep arriving (the F40 x-freshness gate
+        # otherwise zeroes steering after 0.5 s without one).
+        controller.current.last_x_measurement_s = now
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
     assert out.target_pitch_rad == pytest.approx(-0.15, abs=1e-9)
@@ -1253,6 +1260,9 @@ def test_search_commands_brake_attitude_when_blind_and_fast():
     # F31: blind legs were where speed ran away (the closure governor has
     # no expansion signal in SEARCH).  Above fh 1.5 SEARCH commands the
     # brake attitude; slow (takeoff) SEARCH stays near level.
+    # F40 (20260729T193134Z-visual-course-63ed6342): the shared -0.15
+    # pre-cross brake never killed the blind fh 3-4 mps2 drift into gate 1,
+    # so the blind SEARCH brake is the dedicated stronger -0.22 attitude.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller._enter_search(100.10)
     controller._fh_mps2 = 0.5  # slow: near-level target
@@ -1260,11 +1270,11 @@ def test_search_commands_brake_attitude_when_blind_and_fast():
     assert out.target_pitch_rad >= 0.0  # near-level brake pitch (+0.02)
     controller._fh_mps2 = 3.0  # blind and fast: brake
     now = 100.143
-    for _ in range(20):  # generic slew converges to the brake attitude
+    for _ in range(40):  # generic slew converges to the brake attitude
         now += 0.033
         out = _command(controller, now)
     assert out.state is CleanCourseState.SEARCH
-    assert out.target_pitch_rad == pytest.approx(-0.15, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(-0.22, abs=1e-9)
     assert abs(out.yaw_rate_rad_s) > 0.0  # the sweep stays alive
 
 
@@ -1507,6 +1517,33 @@ def test_search_issues_real_bounded_yaw_sweep():
     assert any(value < 0.0 for value in yaws)
 
 
+def test_search_heading_sweep_returns_from_park_and_stays_alive():
+    # F40 (20260729T193134Z-visual-course-63ed6342): the old incremental
+    # sweep integrated the COMMANDED yaw, so at the anchor cap it parked at
+    # yaw 1.94 rad — 111 deg off course — for ~7 blind seconds into gate 1.
+    # The absolute-heading sweep around the course anchor must steer BACK
+    # toward the band from outside it and keep sweeping (sign changes), never
+    # park.
+    controller = _tracked_controller(_track("A", 0.40, 0.0, scale=0.10))
+    controller._enter_search(100.10)
+    controller._course_anchor_yaw_rad = 0.4
+    yaw = 1.9  # well outside the old park cap (anchor 0.4 + 1.5)
+    now = 100.10
+    yaws = []
+    for _ in range(400):  # ~8 s at 50 Hz, first-order heading plant
+        now += 0.02
+        out = _command(controller, now, yaw=yaw)
+        yaws.append(out.yaw_rate_rad_s)
+        yaw += out.yaw_rate_rad_s * 0.02
+    # From outside the band the command steers back toward the anchor.
+    assert yaws[0] < 0.0
+    # The sweep stays alive: the command changes sign at least twice.
+    flips = sum(1 for a, b in zip(yaws, yaws[1:]) if a * b < 0.0)
+    assert flips >= 2
+    # And the heading left the park: back inside the old 1.5 rad cap.
+    assert abs(math.remainder(yaw - 0.4, 2.0 * math.pi)) < 1.5
+
+
 def test_search_reacquisition_allows_same_track_id():
     controller = _tracked_controller(_track("A", 0.20, 0.0, scale=0.10))
     now = 100.10
@@ -1587,6 +1624,51 @@ def test_authoritative_promotion_event_never_vetoed_by_vision():
     )
     assert promoted
     assert controller.state is CleanCourseState.SEARCH
+
+
+def test_track_never_steers_on_unmeasured_x_axis():
+    # F40 (20260729T193134Z-visual-course-63ed6342): the adopted aim point
+    # was an edge-clipped splinter whose x-axis had never been measured, and
+    # command() steered yaw at full authority on it — 0.5 s of max yaw the
+    # wrong way threw the real gate off-frame.  An unmeasured/stale x must
+    # command zero yaw and wings level (slewing toward 0, not snapping).
+    controller = _tracked_controller(_track("A", 0.40, 0.0, scale=0.10))
+    controller.current.last_x_measurement_s = NEVER_MEASURED_S
+    controller._prev_target_roll = 0.20  # pre-wound bank to unwind
+    out = _command(controller, 100.10)
+    assert out.state is CleanCourseState.TRACK
+    assert out.yaw_rate_rad_s == 0.0
+    assert 0.0 < out.target_roll_rad < 0.20  # slewing toward level
+    # A fresh x measurement restores normal steering.
+    controller.current.last_x_measurement_s = 100.10
+    out = _command(controller, 100.12)
+    assert out.yaw_rate_rad_s > 0.0
+
+
+def test_promotion_rejects_successor_with_unmeasured_x_axis():
+    # F40: the promoted successor was a left-edge-clipped splinter of the
+    # just-crossed gate's frame whose x-axis had never been measured
+    # (NEVER_MEASURED_S fails every freshness horizon).  Promotion must
+    # refuse it and fall to SEARCH instead of adopting a garbage aim point.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller.observe(
+        _update(
+            [
+                _track("A", 0.0, 0.0),
+                _track("B", 0.30, 0.05, scale=0.05, clipping=FrameEdge.LEFT),
+            ],
+            frame_id=3,
+        ),
+        now_s=100.08,
+    )
+    assert controller.successor is not None
+    assert controller.successor.last_x_measurement_s == NEVER_MEASURED_S
+    promoted = controller.note_race(
+        gate_index=1, race_boot_ms=2500, now_s=100.10
+    )
+    assert promoted  # the gate increment is still authoritative
+    assert controller.state is CleanCourseState.SEARCH
+    assert controller.current is None
 
 
 # ---------------------------------------------------------------------------
