@@ -363,7 +363,12 @@ ALT_EST_MIN_M = -2.0  # biased-integrator clamp on the altitude estimate
 FH_UNTRUSTED_TRIGGER_MPS2 = 3.0  # biased regime above this horizontal force
 FH_TRUSTED_RELEASE_MPS2 = 2.0  # hysteresis release below this
 FH_UNTRUSTED_SUSTAIN_S = 0.3  # transients shorter than this never latch
-FH_UNTRUSTED_VERTICAL_MARGIN = 0.02  # unqualified hold: support + margin
+# 0.02 -> 0.05 (flight 20260729T151236Z-visual-course-99e093fa): the fh gate
+# froze vz/alt at t=2.83 post-credit and the unqualified hold at support+0.02
+# sank for real ~1 m in 1.5 s into gentle terrain contacts — F14 measured the
+# biased-regime deficit at ~0.05 collective, so the margin must cover all of
+# it, not part of it.
+FH_UNTRUSTED_VERTICAL_MARGIN = 0.05  # unqualified hold: support + margin
 # Edge-parked advance stall (F14, agent-10 Q5): a track parked at the frame
 # edge (angular error at/past angular_full_brake_norm) forces align = 0 ->
 # advance = 0 -> perpetual near-level pitch.  F14 chased edge-parked tracks

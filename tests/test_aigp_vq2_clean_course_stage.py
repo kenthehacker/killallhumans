@@ -26,7 +26,7 @@ overriding everything but the exact-zero coast latch with a level
 attitude, zero yaw, and a governed climb collective, bounded to a 2.5 s
 latch with a 1.0 s above-release re-arm (F13), an fh inflow-regime gate
 (sustained fh > 3.0 for 0.3 s freezes vz/alt integration, blocks floor
-arming, suppresses the vz governor, holds support + 0.02 unqualified;
+arming, suppresses the vz governor, holds support + 0.05 unqualified;
 hysteresis release below 2.0), an edge-parked advance-stall cap forcing
 SEARCH after 1.5 s without re-centering or approach progress, an
 exact-zero coast WIRE
@@ -1221,8 +1221,10 @@ def test_alt_floor_never_arms_while_fh_untrusted_but_active_latch_times_out():
 
 def test_unqualified_vertical_holds_support_plus_margin_while_fh_untrusted():
     # While fh-untrusted the camera is the only honest vertical channel;
-    # when it is unqualified the hold is support + 0.02 — bare support
-    # historically sinks for real at -0.8...-1.9 m/s.
+    # when it is unqualified the hold is support + 0.05 — bare support
+    # historically sinks for real at -0.8...-1.9 m/s, and F14 measured the
+    # biased-regime deficit at ~0.05 collective (flight 99e093fa sank ~1 m
+    # in 1.5 s on the old +0.02 hold).
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     controller.current.last_y_measurement_s = 99.0  # vertical unqualified
     now = 100.10
@@ -1235,7 +1237,7 @@ def test_unqualified_vertical_holds_support_plus_margin_while_fh_untrusted():
         now += 0.033
         out = _command(controller, now, fh=4.0)
     assert not out.vertical_qualified
-    assert out.thrust == pytest.approx(SUPPORT + 0.02, abs=1e-3)
+    assert out.thrust == pytest.approx(SUPPORT + 0.05, abs=1e-3)
 
 
 def test_descent_floor_cannot_fire_from_frozen_vz_est():
