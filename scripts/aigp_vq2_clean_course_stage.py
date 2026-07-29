@@ -1268,14 +1268,17 @@ class CleanCourseController:
                 gate_index=self.gate_index,
             )
 
-        # Continuous successor lookahead: a weak successor reduces the blend,
-        # it never zeroes it through a binary authority product.
-        blend = self._successor_blend(current, self.successor)
+        # Successor blending REMOVED from the lateral/vertical aim (flight
+        # ab6252b2): track 07 (gate 1) was centered and approached to span
+        # 0.34/conf 0.87, then slid left to x=-0.95 while the yaw command
+        # sat at ~0 — the blend toward a far successor at x=+0.6 cancelled
+        # the pursuit error exactly when the close gate escaped (codex:
+        # "remove unproved successor blending").  The aim is always the
+        # current gate; the successor hypothesis machinery stays for
+        # promotion only.
+        blend = 0.0
         ex = current.x
         ey = current.y
-        if blend > 0.0 and self.successor is not None:
-            ex = (1.0 - blend) * current.x + blend * self.successor.x
-            ey = (1.0 - blend) * current.y + blend * self.successor.y
 
         # Vertical: ONE GLOBAL SIGN at every gate (empirically confirmed by
         # the 2026-07-29 crossing-geometry analysis).  The gate-0 phase adds
@@ -1413,10 +1416,10 @@ class CleanCourseController:
         # camera left and pushes a right-side target further right) and a
         # coordinated positive bank toward the target.  Both signs are
         # one-line flippable named constants pending first-flight
-        # confirmation.  Clipping saturates corrective steering.
-        steer_cap = (
-            cfg.clipped_steering_fraction if current.clipped else 1.0
-        )
+        # confirmation.  Clipping no longer saturates corrective steering
+        # (codex, flights 4480d0a6/ab6252b2): the clip penalty halves yaw
+        # exactly when the target is escaping at the frame edge.
+        steer_cap = 1.0
         yaw_rate = _clamp(
             cfg.yaw_error_sign * cfg.yaw_error_gain * ex,
             -cfg.max_yaw_rate_rad_s * steer_cap,

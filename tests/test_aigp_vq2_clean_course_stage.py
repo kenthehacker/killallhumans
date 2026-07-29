@@ -1623,36 +1623,6 @@ def test_authoritative_promotion_event_never_vetoed_by_vision():
     assert controller.state is CleanCourseState.SEARCH
 
 
-def test_successor_lookahead_blend_is_continuous():
-    strong = _tracked_controller(_track("A", 0.0, 0.0, scale=0.42))
-    weak = _tracked_controller(_track("A", 0.0, 0.0, scale=0.42))
-    strong.observe(
-        _update(
-            [
-                _track("A", 0.0, 0.0, scale=0.42),
-                _track("B", 0.30, 0.0, scale=0.10, confidence=0.95),
-            ],
-            frame_id=3,
-        ),
-        now_s=100.08,
-    )
-    weak.observe(
-        _update(
-            [
-                _track("A", 0.0, 0.0, scale=0.42),
-                _track("B", 0.30, 0.0, scale=0.10, confidence=0.25),
-            ],
-            frame_id=3,
-        ),
-        now_s=100.08,
-    )
-    blend_strong = _command(strong, 100.10).successor_blend
-    blend_weak = _command(weak, 100.10).successor_blend
-    # A weak successor reduces the blend; it never zeroes it via a binary
-    # authority product.
-    assert 0.0 < blend_weak < blend_strong
-
-
 # ---------------------------------------------------------------------------
 # Envelope
 # ---------------------------------------------------------------------------
