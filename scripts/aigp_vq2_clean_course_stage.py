@@ -293,6 +293,22 @@ NEAR_FREE_LOG_SCALE = -1.5  # far enough that near-plane risk does not brake
 NEAR_BRAKE_LOG_SCALE = -0.9  # close enough that closure is fully braked
 
 CROSSING_MIN_LOG_SCALE = -0.80  # retired stage crossing_arm_min_log_scale
+# F45 (20260729T210351Z-visual-course-b1f5e89f): the crossing coast is
+# ballistic (yaw 0, support collective), so arming it on an OFF-CENTER
+# close loss preserves the offset — the last measured bearing (-0.39,-0.28)
+# slid -0.69 -> -0.93 censored and out of frame, no authoritative credit
+# came, and the leg fell into blind-search churn (impulse 4.91).  Race
+# credit is authoritative and arrives via race packet whenever the drone
+# truly passes the plane — the stage does not need the coast to OBTAIN
+# credit, so the coast may only own the 0.4 s wait of an ALIGNED crossing:
+# the last freshly MEASURED bearing must sit inside these bounds.
+CROSSING_MAX_ABS_EX_NORM = 0.20  # |ex| bound to arm the crossing coast
+CROSSING_MAX_ABS_EY_NORM = 0.25  # |ey| bound to arm the crossing coast
+# The alignment check reads the last MEASURED bearing, never a long-
+# predicted one; the horizon matches the engulfing anchor freshness (the
+# engulfed plane is blind, so a genuine centered crossing's last accepted
+# measurement can be this old at the loss).
+CROSSING_MEAS_MAX_AGE_S = 0.50
 CROSSING_CREDIT_WAIT_S = 0.40  # July-18 safety contract item 9
 # F38 (18c0b35c): with the true (nose-up) brake the drone arrives at the
 # engulfed plane SLOW; a level coast ran out of residual closure and the
@@ -741,6 +757,8 @@ class CleanCourseConfig:
     near_free_log_scale: float = NEAR_FREE_LOG_SCALE
     near_brake_log_scale: float = NEAR_BRAKE_LOG_SCALE
     crossing_min_log_scale: float = CROSSING_MIN_LOG_SCALE
+    crossing_max_abs_ex_norm: float = CROSSING_MAX_ABS_EX_NORM
+    crossing_max_abs_ey_norm: float = CROSSING_MAX_ABS_EY_NORM
     crossing_credit_wait_s: float = CROSSING_CREDIT_WAIT_S
     coast_advance_pitch_rad: float = COAST_ADVANCE_PITCH_RAD
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
@@ -1041,6 +1059,22 @@ class CleanCourseController:
                 self.state is CleanCourseState.TRACK
                 and fresh
                 and self.current.outer_log_scale >= cfg.crossing_min_log_scale
+                # F45 (20260729T210351Z-visual-course-b1f5e89f): the coast is
+                # ballistic, so an OFF-CENTER close loss must not arm it —
+                # the (-0.39,-0.28) last bearing slid out of frame
+                # uncredited.  Credit is authoritative (it arrives by race
+                # packet on a true pass); the coast only owns the wait of an
+                # ALIGNED crossing.  The bearing must come from a fresh
+                # MEASUREMENT, not a long prediction; an off-center or
+                # stale-bearing loss falls through to PREDICT so the
+                # derotated hypothesis carries the pursuit and TRACK can
+                # resume on re-acquisition.
+                and now_s - self.current.last_x_measurement_s
+                <= CROSSING_MEAS_MAX_AGE_S
+                and now_s - self.current.last_y_measurement_s
+                <= CROSSING_MEAS_MAX_AGE_S
+                and abs(self.current.x) <= cfg.crossing_max_abs_ex_norm
+                and abs(self.current.y) <= cfg.crossing_max_abs_ey_norm
             ):
                 # Credible close crossing lost the target on a FRESH frame:
                 # latch the single bounded credit wait from the July-18

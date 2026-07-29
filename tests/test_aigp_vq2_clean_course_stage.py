@@ -878,7 +878,8 @@ def test_altitude_floor_never_overrides_coast_support_hold():
         _update(
             [
                 _track("A", 0.0, 0.0, scale=0.50),
-                _track("B", 0.30, 0.05, scale=0.50),
+                # Aligned (F45): the crossing coast arms only near center.
+                _track("B", 0.10, 0.05, scale=0.50),
             ],
             frame_id=3,
         ),
@@ -1616,6 +1617,35 @@ def test_search_reacquisition_allows_same_track_id():
     controller.observe(_update([_track("A", 0.30, 0.0)], frame_id=50), now_s=now)
     assert controller.state is CleanCourseState.TRACK
     assert controller.current.track_id == "A"
+
+
+def test_off_center_close_loss_goes_to_predict_not_coast():
+    # F45 (20260729T210351Z-visual-course-b1f5e89f): the close-range track
+    # was lost point-blank with the last measured bearing (-0.39,-0.28) and
+    # the ballistic coast preserved the offset — the gate slid out of frame
+    # uncredited and the leg fell into blind-search churn.  Credit is
+    # authoritative; an off-center close loss must NOT arm the coast.  The
+    # normal loss path (PREDICT) carries the pursuit for re-acquisition.
+    controller = _tracked_controller(_track("A", -0.39, -0.28, scale=0.50))
+    controller.observe(_update([], frame_id=5), now_s=100.12)
+    assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
+    now = 100.12
+    for frame in range(6, 16):
+        now += 0.033
+        controller.observe(_update([], frame_id=frame), now_s=now)
+        assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
+        if controller.state is CleanCourseState.PREDICT:
+            break
+    assert controller.state is CleanCourseState.PREDICT
+
+
+def test_centered_close_loss_still_arms_coast():
+    # The aligned case keeps the July-18 bounded credible-crossing wait: a
+    # near-center fresh close loss arms COAST_FOR_CREDIT (the wait itself
+    # is covered by the bounded/coast tests below).
+    controller = _tracked_controller(_track("A", 0.10, -0.15, scale=0.50))
+    controller.observe(_update([], frame_id=5), now_s=100.12)
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
 
 
 def test_crossing_loss_latches_coast_and_waits_for_newer_race_packet():
