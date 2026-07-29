@@ -117,7 +117,10 @@ from scripts.aigp_vq2_yaw_profile import (
 # only and does not change it.
 VERTICAL_FEEDBACK_SIGN = -1.0
 
-SUPPORT_COLLECTIVE = 0.275  # GATE0_PROVED_COLLECTIVE_BASE (proved hover support)
+# F49 (20260730 flight-48 measurement): the true hover support in the clean
+# pre-credit condition is 0.247, not the 0.275 carried from gate-0 proving —
+# at 0.275 every "level" hold climbed ~+0.3 m/s into the top-bar geometry.
+SUPPORT_COLLECTIVE = 0.247  # F48-measured hover support collective
 VERTICAL_ERROR_GAIN = 0.080  # GATE0_PROVED_COLLECTIVE_ERROR_GAIN
 VERTICAL_RATE_GAIN = 0.126  # GATE0_PROVED_COLLECTIVE_RATE_GAIN
 VERTICAL_MAX_ABS_ERROR_NORM = 0.50  # GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR
@@ -272,9 +275,9 @@ MAX_COURSE_YAW_RATE_RAD_S = 0.50  # runner runtime cap = min(this, profile 0.5)
 # (az -7.9 at full collective) — terrain at the gate while braking at full
 # throttle.  (Written under the INVERTED pre-F38 pitch convention: the
 # "brake stack" was in truth a powered dive; see the F38 block below.)
-# --- F38 VERIFIED PITCH CONVENTION (build 3385) ----------------------------
+# --- F38/F49 VERIFIED PITCH CONVENTION (build 3385) ------------------------
 # The controller long assumed POSITIVE pitch target = nose-up (brake) and
-# NEGATIVE = nose-down (advance).  The F37 trace (62bc5772) disproves it:
+# NEGATIVE = nose-down (advance).  The F37 trace (62bc5772) disproved it:
 # (1) the spawn attitude is -0.31 with the gate span FLAT (0.13 for 0.38 s)
 #     — negative pitch holds the drone nearly stationary;
 # (2) the "brake" target +0.15 was fully attained and closure ACCELERATED
@@ -284,8 +287,19 @@ MAX_COURSE_YAW_RATE_RAD_S = 0.50  # runner runtime cap = min(this, profile 0.5)
 # nose-UP (brake).  Every pre-F38 "brake" episode (F29/F31/F32/F34/F36/F37)
 # was a powered dive into the gate — this is why the brake "never worked"
 # and why fh (thrust-tilt magnitude) always "grew through the brake".
-ADVANCE_PITCH_RAD = 0.08  # nose-down closure target when aligned/confident
-BRAKE_PITCH_RAD = 0.02  # near-level braking target
+# --- F49 SPAWN-RELATIVE PITCH TARGETS --------------------------------------
+# F48 then showed the F38 targets were still wrong in ABSOLUTE terms: level
+# flight is the SPAWN attitude spawn_pitch ~= -0.31 rad, not 0.  Every
+# absolute target below (brake 0.02, advance 0.08, pre-cross -0.28) was
+# therefore ~0.3 rad nose-down of intent — the "near-level brake" was a
+# sustained dive.  The constants are now OFFSETS from the measured spawn
+# attitude: effective target = spawn_pitch_rad + offset, so a POSITIVE
+# offset is nose-down (advance) relative to level and a NEGATIVE offset is
+# nose-up (brake).  The runner passes the real spawn pitch; the default is
+# the measured -0.31.
+SPAWN_PITCH_RAD_DEFAULT = -0.31  # measured build-3385 level-flight attitude
+ADVANCE_PITCH_RAD = 0.08  # nose-down closure OFFSET when aligned/confident
+BRAKE_PITCH_RAD = 0.00  # near-level braking OFFSET (spawn attitude = level)
 ANGULAR_FULL_BRAKE_NORM = 0.35  # angular error that fully suppresses advance
 # F46 (20260729T211439Z-visual-course-4356c153): err ~0.5 gave brake demand
 # ~0.85 -> target pitch -0.11, attained, but the approach still closed
@@ -320,6 +334,7 @@ CROSSING_CREDIT_WAIT_S = 0.40  # July-18 safety contract item 9
 # engulfed plane SLOW; a level coast ran out of residual closure and the
 # bounded wait expired into SEARCH without credit.  A small nose-down
 # (positive, per the F38 convention) nudge carries it through the plane.
+# F49: an OFFSET from the spawn attitude (effective target ~-0.26).
 COAST_ADVANCE_PITCH_RAD = 0.05
 
 PREDICT_FRAME_GAP_S = 0.25  # ~8 camera frames; 0.06 (~2) flapped TRACK/SEARCH
@@ -380,7 +395,7 @@ CLOSURE_MIN_LOG_SCALE = -2.6
 # ~-1.76) — log -2.0 separates them with margin on both sides.  Below it
 # the leg creeps while centering instead of advancing at full pitch.
 FRAGMENT_ADVANCE_MIN_LOG_SCALE = -2.0  # lone-fragment span bound (log apparent)
-FRAGMENT_CREEP_PITCH_RAD = 0.03  # creep while centering a lone fragment
+FRAGMENT_CREEP_PITCH_RAD = 0.03  # creep OFFSET from spawn while centering a lone fragment
 # Brake ceiling band (F33/F34): while the governor brakes, the collective
 # is confined to support +/- this band.  F33's hard pin AT support removed
 # all vertical centering authority and F34 crossed at 1.07 m into the
@@ -389,31 +404,17 @@ FRAGMENT_CREEP_PITCH_RAD = 0.03  # creep while centering a lone fragment
 # climb budget; F32's climb-into-frame came from the fh floor and the
 # high-gate bias, which this band still caps.
 BRAKE_CEILING_BAND = 0.04
-PRE_CROSS_BRAKE_PITCH_RAD = -0.28  # TRUE nose-up brake attitude under the
-# verified F38 convention.  (Pre-F38 this was +0.15 — a powered DIVE into
-# the gate; F31's "5x too weak brake" was the sign error, not the
-# magnitude.)  F46: -0.15 (~1.5 m/s^2 + drag) could not kill the approach
-# speed inside the last 1.2 s to the gate-1 plane — the drone crossed the
-# threshold still fast and 0.37 norm off-center.  -0.28 roughly doubles
-# the deceleration authority so a misaligned approach actually stops.
+PRE_CROSS_BRAKE_PITCH_RAD = -0.15  # nose-up brake OFFSET from spawn (F49).
+# TRUE nose-up brake attitude under the verified F38 convention; as an
+# offset from the -0.31 spawn attitude the effective target is ~-0.46.
+# (Pre-F38 this was +0.15 absolute — a powered DIVE into the gate; F31's
+# "5x too weak brake" was the sign error, not the magnitude.)  F46: -0.15
+# absolute (~1.5 m/s^2 + drag) could not kill the approach speed inside the
+# last 1.2 s to the gate-1 plane — the drone crossed the threshold still
+# fast and 0.37 norm off-center.  F49 restores that deceleration authority
+# as an offset: with level flight at -0.31, the effective -0.46 roughly
+# doubles it so a misaligned approach actually stops.
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
-# Blind-at-speed brake (F31): SEARCH has no expansion signal, so the
-# governor cannot run there — and F31's blind legs were where the speed
-# ran away.  Above this fh (drag ~ speed proxy) SEARCH commands the brake
-# attitude instead of the near-level one.  Takeoff SEARCH (fh ~ 0) is
-# unaffected.
-SEARCH_FH_BRAKE_MPS2 = 1.5
-# F40 (20260729T193134Z-visual-course-63ed6342): the shared -0.15 pre-cross
-# brake never killed the blind-at-speed drift — SEARCH held fh 3-4 mps2 for
-# the whole ~7 s parked sweep into gate 1.  The blind SEARCH brake gets its
-# own stronger nose-up attitude; pre_cross_brake_pitch_rad stays for the
-# vision-guided brake.
-SEARCH_BLIND_BRAKE_PITCH_RAD = -0.22
-# F43 (20260729T202844Z-visual-course-ee8fd1e5): the blind brake relearned
-# the F12 lesson — searches last 0.35-0.8 s, and the generic 0.30 rad/s
-# slew only reached ~-0.04 of the -0.22 attitude before TRACK resumed, so
-# the brake never actually engaged.  It gets the same dedicated fast slew.
-SEARCH_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the blind SEARCH brake runs
 # Course-heading anchor (F31): after losing the gate-1 track the drone
 # search-swept and edge-chased its heading +2.63 rad off the course
 # bearing, then flew sideways/backwards at ~0.65g drag into structure it
@@ -524,6 +525,16 @@ PROMOTE_MAX_AGE_S = 0.50  # cached-successor freshness at promotion
 # ranking, promotion credibility, and re-acquisition all prefer track age.
 SUCCESSOR_MIN_AGE_S = 0.5  # persistence required of a promoted successor
 REACQUIRE_MIN_AGE_S = 0.3  # persistence preferred at SEARCH re-acquisition
+# F49 newborn suspicious-geometry adoption gate (terminal F48 failure): the
+# gate-1 promotion adopted a NEWBORN top-censored extreme-aspect ceiling
+# truss (span 0.50 x 0.23, aspect ~2.17) over the persistent real gate.
+# Persistence alone could not reject it inside the 0.3/0.5 s age windows,
+# so a track whose bbox geometry is impossible for a gate (extreme aspect,
+# or a wide top-censored slab) may not be adopted until it has persisted
+# past the re-acquisition age window.
+SUSPICIOUS_ASPECT_MAX = 2.0  # width/height above this is not gate geometry
+SUSPICIOUS_ASPECT_MIN = 0.5  # height/width above this is not gate geometry
+SUSPICIOUS_TOP_CENSORED_ASPECT = 1.0  # wide slab censored at the frame top
 
 COLLECTIVE_DECAY_TAU_S = 0.25  # smooth decay toward support on vertical loss
 # Qualified vertical measurement horizon.  The bound applies to the last
@@ -758,6 +769,9 @@ class CleanCourseConfig:
     yaw_error_sign: float = YAW_ERROR_SIGN
     yaw_error_gain: float = YAW_ERROR_GAIN
     max_yaw_rate_rad_s: float = MAX_COURSE_YAW_RATE_RAD_S
+    # F49: measured build-3385 level-flight attitude; every *_pitch_rad
+    # below is an OFFSET from this base (effective = spawn + offset).
+    spawn_pitch_rad: float = SPAWN_PITCH_RAD_DEFAULT
     advance_pitch_rad: float = ADVANCE_PITCH_RAD
     brake_pitch_rad: float = BRAKE_PITCH_RAD
     angular_full_brake_norm: float = ANGULAR_FULL_BRAKE_NORM
@@ -781,9 +795,6 @@ class CleanCourseConfig:
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     brake_ceiling_band: float = BRAKE_CEILING_BAND
-    search_fh_brake_mps2: float = SEARCH_FH_BRAKE_MPS2
-    search_blind_brake_pitch_rad: float = SEARCH_BLIND_BRAKE_PITCH_RAD
-    search_brake_slew_rad_s: float = SEARCH_BRAKE_SLEW_RAD_S
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
     alt_floor_release_m: float = ALT_FLOOR_RELEASE_M
@@ -867,13 +878,18 @@ class CleanCourseController:
         self._last_command_s: Optional[float] = None
         self._collective: Optional[float] = None
         self._prev_target_roll = 0.0
-        self._prev_target_pitch = BRAKE_PITCH_RAD
+        self._prev_target_pitch = (
+            self.config.spawn_pitch_rad + self.config.brake_pitch_rad
+        )
         self._coast_entry_s: Optional[float] = None
         self._coast_race_boot_ms: Optional[int] = None
         self._last_race_boot_ms: Optional[int] = None
         self._search_direction = 1.0
         self._search_elapsed_s = 0.0
         self._search_excursion_rad = 0.0
+        # F49: SEARCH sweep base heading — the yaw measured at search entry,
+        # not the leg anchor (see _search_yaw_heading).
+        self._search_base_yaw_rad: Optional[float] = None
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
@@ -1311,7 +1327,9 @@ class CleanCourseController:
                 )
                 return NavigationOutput(
                     target_roll_rad=0.0,
-                    target_pitch_rad=cfg.coast_advance_pitch_rad,
+                    target_pitch_rad=(
+                        cfg.spawn_pitch_rad + cfg.coast_advance_pitch_rad
+                    ),
                     yaw_rate_rad_s=0.0,
                     thrust=coast_support,
                     state=self.state,
@@ -1422,27 +1440,14 @@ class CleanCourseController:
             )
             self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
-            # Blind-at-speed brake (F31): the closure governor cannot run
-            # in SEARCH (no expansion signal), so above the fh threshold a
-            # blind leg commands the brake attitude instead of near level.
-            # F40: the dedicated blind brake — the shared -0.15 pre-cross
-            # brake never killed the blind fh 3-4 mps2 drift into gate 1.
-            search_pitch = (
-                cfg.search_blind_brake_pitch_rad
-                if self._fh_mps2 > cfg.search_fh_brake_mps2
-                else cfg.brake_pitch_rad
-            )
+            # F49: SEARCH always holds the LEVEL (spawn-attitude) pitch.
+            # The F31/F40 blind-at-speed brake was built on absolute pitch
+            # targets ~0.3 rad nose-down of intent (level flight is the
+            # -0.31 spawn attitude, not 0), so the "brake" never braked;
+            # under the spawn-relative convention the honest blind posture
+            # is level — the gentle sweep and the vz governor carry the leg.
             target_pitch = self._slew_pitch(
-                search_pitch,
-                dt,
-                # F43: the blind brake gets the F12 dedicated fast slew too —
-                # at the generic 0.30 rad/s a typical 0.35-0.8 s search never
-                # attained -0.22 (pitch reached ~-0.04 before TRACK resumed).
-                slew_rad_s=(
-                    cfg.search_brake_slew_rad_s
-                    if self._fh_mps2 > cfg.search_fh_brake_mps2
-                    else None
-                ),
+                cfg.spawn_pitch_rad + cfg.brake_pitch_rad, dt
             )
             return NavigationOutput(
                 target_roll_rad=target_roll,
@@ -1468,7 +1473,7 @@ class CleanCourseController:
             self._collective = fallback_hold
             return NavigationOutput(
                 target_roll_rad=0.0,
-                target_pitch_rad=cfg.brake_pitch_rad,
+                target_pitch_rad=cfg.spawn_pitch_rad + cfg.brake_pitch_rad,
                 yaw_rate_rad_s=0.0,
                 thrust=self._governed_collective(fallback_hold, support),
                 state=self.state,
@@ -1680,7 +1685,7 @@ class CleanCourseController:
         # rate rises past the target or the gate sits off-axis — speed is
         # capped at every range, and never kept while not pointing at the
         # gate.
-        law_pitch = (
+        law_pitch = cfg.spawn_pitch_rad + (
             cfg.brake_pitch_rad
             + (cfg.advance_pitch_rad - cfg.brake_pitch_rad) * advance
         )
@@ -1693,9 +1698,11 @@ class CleanCourseController:
         # the closure governor and the brake blends above are untouched, and
         # a fused union or whole gate (span above the bound) advances fully.
         if current.log_scale < cfg.fragment_advance_min_log_scale:
-            law_pitch = min(law_pitch, cfg.fragment_creep_pitch_rad)
+            law_pitch = min(
+                law_pitch, cfg.spawn_pitch_rad + cfg.fragment_creep_pitch_rad
+            )
         target_pitch = law_pitch + brake_demand * (
-            cfg.pre_cross_brake_pitch_rad - law_pitch
+            (cfg.spawn_pitch_rad + cfg.pre_cross_brake_pitch_rad) - law_pitch
         )
 
         return NavigationOutput(
@@ -1870,6 +1877,19 @@ class CleanCourseController:
     def _refresh_successor(self, tracks: List[Any], now_s: float) -> None:
         current_id = self._current_track_id()
         others = [track for track in tracks if track.track_id != current_id]
+        # F49: a newborn suspicious-geometry track (extreme aspect or a
+        # wide top-censored slab — ceiling truss, never gate geometry) may
+        # not be adopted until it has persisted; the terminal F48 promotion
+        # took exactly such a newborn truss over the persistent real gate.
+        others = [
+            track
+            for track in others
+            if not (
+                _suspicious_adoption_geometry(track)
+                and self._track_age_s(track.track_id, now_s)
+                < REACQUIRE_MIN_AGE_S
+            )
+        ]
         if not others:
             if (
                 self.successor is not None
@@ -1937,16 +1957,30 @@ class CleanCourseController:
             same = self._find(tracks, self.current.track_id)
             if same is not None:
                 return same
+        # F49: newborn suspicious-geometry tracks (ceiling-truss slabs,
+        # extreme aspects) are ineligible until they persist — the terminal
+        # F48 re-acquisition adopted one over the persistent real gate.
+        eligible = [
+            track
+            for track in tracks
+            if not (
+                _suspicious_adoption_geometry(track)
+                and self._track_age_s(track.track_id, now_s)
+                < REACQUIRE_MIN_AGE_S
+            )
+        ]
+        if not eligible:
+            return None
         bx, by = self.last_reliable_bearing
         # F42: prefer persistent tracks for the nearest-to-bearing pick —
         # debris is newborn every frame while the real gate stays
         # associated.  Fall back to all tracks when nothing has persisted.
         persistent = [
             track
-            for track in tracks
+            for track in eligible
             if self._track_age_s(track.track_id, now_s) >= REACQUIRE_MIN_AGE_S
         ]
-        candidates = persistent or tracks
+        candidates = persistent or eligible
         return min(
             candidates,
             key=lambda track: (
@@ -2111,20 +2145,26 @@ class CleanCourseController:
         return self._search_direction * cfg.search_yaw_rate_rad_s
 
     def _search_yaw_heading(self, dt: float, yaw_rad: Optional[float]) -> float:
-        """Absolute-heading sweep around the course anchor (F40).
+        """Absolute-heading sweep from the search-entry heading (F49).
 
         ``_search_yaw`` integrates the COMMANDED sweep, so a clamped or
         parked airframe stopped scanning — F40 parked at yaw 1.94 rad, 111
-        deg off course, for ~7 blind seconds into gate 1.  Here the
-        excursion sweeps a desired HEADING around the leg anchor and the
-        heading error commands the rate, so the scan survives a park.
+        deg off course, for ~7 blind seconds into gate 1.  F40 swept the
+        excursion around the LEG ANCHOR, which re-centered the scan on the
+        course heading instead of looking where the target was last seen;
+        F49 sweeps from the heading measured at search entry, with the
+        first sweep direction still seeded from the last reliable bearing
+        (``_enter_search``), so the scan starts toward the lost target.
+        The heading error commands the rate, so the scan survives a park.
         Falls back to the legacy incremental sweep without a live yaw
-        measurement or an anchor.
+        measurement.
         """
 
         cfg = self.config
-        if yaw_rad is None or self._course_anchor_yaw_rad is None:
+        if yaw_rad is None:
             return self._search_yaw(dt)
+        if self._search_base_yaw_rad is None:
+            self._search_base_yaw_rad = float(yaw_rad)
         self._search_excursion_rad += (
             self._search_direction * cfg.search_sweep_rate_rad_s * dt
         )
@@ -2135,7 +2175,7 @@ class CleanCourseController:
                 -cfg.search_max_excursion_rad,
                 cfg.search_max_excursion_rad,
             )
-        desired = self._course_anchor_yaw_rad + self._search_excursion_rad
+        desired = self._search_base_yaw_rad + self._search_excursion_rad
         return _clamp(
             cfg.search_sweep_gain
             * math.remainder(desired - float(yaw_rad), 2.0 * math.pi),
@@ -2153,6 +2193,10 @@ class CleanCourseController:
         self._search_direction = 1.0 if bearing_x >= 0.0 else -1.0
         self._search_elapsed_s = 0.0
         self._search_excursion_rad = 0.0
+        # F49: the sweep base is re-seeded from the live yaw on the first
+        # _search_yaw_heading call of this search, so each search starts
+        # scanning from the CURRENT heading, not the leg anchor.
+        self._search_base_yaw_rad = None
 
     def _exit_coast(self) -> None:
         self._coast_entry_s = None
@@ -2234,6 +2278,35 @@ def _is_engulfing_detection(track: Any) -> bool:
         width >= ENGULFING_BBOX_SPAN_FRACTION
         or height >= ENGULFING_BBOX_SPAN_FRACTION
         or width * height >= ENGULFING_BBOX_AREA_FRACTION
+    )
+
+
+def _suspicious_adoption_geometry(track: Any) -> bool:
+    """True when a track bbox geometry is impossible for a gate (F49).
+
+    The terminal F48 promotion adopted a newborn top-censored extreme-
+    aspect ceiling truss (span 0.50 x 0.23, aspect ~2.17) over the
+    persistent real gate; neither confidence nor the sub-second persistence
+    windows could reject it.  Suspicious = extreme aspect ratio, or a wide
+    slab censored at the frame TOP (ceiling structure, never a gate).
+    Conservatively False when the bbox shape is missing or malformed.
+    """
+
+    bbox = getattr(track, "bbox_norm", None)
+    if bbox is None or len(bbox) < 4:
+        return False
+    width = float(bbox[2]) - float(bbox[0])
+    height = float(bbox[3]) - float(bbox[1])
+    if width <= 0.0 or height <= 0.0:
+        return False
+    aspect = width / height
+    if aspect > SUSPICIOUS_ASPECT_MAX or aspect < SUSPICIOUS_ASPECT_MIN:
+        return True
+    clipping = getattr(track, "clipping", FrameEdge.NONE)
+    if type(clipping) is not FrameEdge:
+        clipping = FrameEdge.NONE
+    return bool(clipping & FrameEdge.TOP) and (
+        aspect > SUSPICIOUS_TOP_CENSORED_ASPECT
     )
 
 
@@ -2395,6 +2468,9 @@ class CleanCourseRuntime:
     max_command_rate_rad_s: float
     min_thrust: float
     max_thrust: float
+    # F49: measured level-flight attitude from the GO/start context; every
+    # controller pitch offset is relative to this base.
+    spawn_pitch_rad: float = SPAWN_PITCH_RAD_DEFAULT
 
 
 def clamp_final_command(
@@ -2541,6 +2617,7 @@ async def run_clean_course_stage(
             max_thrust=rt.max_thrust,
             max_yaw_rate_rad_s=rt.max_yaw_rate_rad_s,
             control_period_s=rt.control_period_s,
+            spawn_pitch_rad=rt.spawn_pitch_rad,
         )
     controller = CleanCourseController(config)
 

@@ -65,7 +65,8 @@ from scripts.aigp_vq2_clean_course_stage import (
     run_clean_course_stage,
 )
 
-SUPPORT = 0.275
+SUPPORT = 0.247  # F49: F48-measured hover support (was 0.275)
+SPAWN_PITCH = -0.31  # F49: default spawn-relative pitch base
 
 
 def _config(**overrides):
@@ -123,6 +124,22 @@ def _update(tracks, frame_id=1):
         visible_track_ids=tuple(t.track_id for t in tracks if t.visible),
         token=("test-stream", frame_id),
     )
+
+
+def _truss(track_id, x, y, *, width=0.50, height=0.23, confidence=0.90):
+    """F48 ceiling-truss geometry: top-censored extreme-aspect slab."""
+
+    track = _track(
+        track_id, x, y, confidence=confidence, clipping=FrameEdge.TOP
+    )
+    track.bbox_norm = (
+        x - width / 2,
+        y - height / 2,
+        x + width / 2,
+        y + height / 2,
+    )
+    track.apparent_scale = math.sqrt(width * height)
+    return track
 
 
 def _tracked_controller(track=None, *, config=None, now=100.0):
@@ -217,9 +234,13 @@ def test_vertical_sign_is_the_gate0_minus_form_by_default():
 
 
 def test_gate0_takeoff_boost_is_feedforward_only():
-    # Boost-window behavior isolated from the gate-0 climb offset.
+    # Boost-window behavior isolated from the gate-0 climb offset.  A far
+    # track keeps the brake ceiling band out of the window (with the F49
+    # 0.247 support the band top 0.287 would cap the 0.30 boost).
     config = CleanCourseConfig(gate0_climb_vertical_offset_norm=0.0)
-    controller = _tracked_controller(_track("A", 0.0, 0.20), config=config)
+    controller = _tracked_controller(
+        _track("A", 0.0, 0.20, scale=0.05), config=config
+    )
     boosted = _command(controller, 100.10)
     assert boosted.thrust == pytest.approx(config.launch_boost_thrust)
     after = _command(controller, 100.0 + config.launch_boost_duration_s + 0.05)
@@ -384,7 +405,7 @@ def test_vertical_rate_term_keeps_full_authority():
     # correction and the collective sags to the 0.21 floor.  Under the
     # removed limiter this was pinned at exactly SUPPORT.
     assert output.thrust == pytest.approx(0.21, abs=1e-9)
-    assert output.thrust < SUPPORT - 0.05
+    assert output.thrust < SUPPORT - 0.03
 
 
 def test_vz_governor_caps_collective_above_climb_cap():
@@ -428,12 +449,12 @@ def test_vz_governor_floors_collective_below_descent_floor():
     controller._vz_est_m_s = -0.5  # at the floor boundary: no effect
     assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT, abs=1e-9)
     controller._vz_est_m_s = -1.0  # 0.5 m/s below -> +0.03 + 0.025 feedforward
-    # 0.275 + 0.055 = 0.33 raw: inside the raised 0.34 envelope (F9/F10
-    # headroom restoration; the old 0.32 clamp clipped exactly this case).
+    # support + 0.055: inside the raised 0.34 envelope (F9/F10 headroom
+    # restoration; the old 0.32 clamp clipped exactly this case).
     assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.055, abs=1e-9)
     # Deep sinks saturate at max_thrust (flight 039186c8: the unclamped
     # floor boost exceeded the runner's 0.35 envelope abort in SEARCH).
-    controller._vz_est_m_s = -1.5  # 1.0 m/s below -> +0.06 + 0.025 = 0.36 raw
+    controller._vz_est_m_s = -1.7  # 1.2 m/s below -> +0.072 + 0.025 raw
     assert helper(SUPPORT, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
     # The floor only raises collective, but the governed output is still
     # clamped: a higher command saturates at max_thrust as well.
@@ -486,7 +507,8 @@ def test_vz_phantom_sink_cannot_move_coast_support_hold():
     assert out.thrust == pytest.approx(SUPPORT, abs=1e-9)
     assert (out.target_roll_rad, out.target_pitch_rad, out.yaw_rate_rad_s) == (
         0.0,
-        0.05,  # F38 coast advance nudge: carry through the engulfed plane
+        SPAWN_PITCH + 0.05,  # F38/F49 coast advance nudge (spawn-relative):
+        # carry through the engulfed plane
         0.0,
     )
 
@@ -812,8 +834,8 @@ def test_altitude_floor_triggers_and_releases_with_hysteresis():
         frame += 1
     assert controller._alt_floor_active
     assert out.yaw_rate_rad_s == 0.0
-    # Sinking at -1.0 m/s: support + 0.06 * 0.5 + 0.025 feedforward = 0.33.
-    assert out.thrust == pytest.approx(0.33, abs=1e-9)
+    # Sinking at -1.0 m/s: support + 0.06 * 0.5 + 0.025 feedforward.
+    assert out.thrust == pytest.approx(SUPPORT + 0.055, abs=1e-9)
     # Hysteresis: climbing between 0.7 and 1.2 m keeps the floor active.
     controller._vz_est_m_s = 1.0
     while controller._alt_est_m < 1.0:
@@ -1146,7 +1168,11 @@ def test_closure_governor_full_brake_at_high_expansion_rate():
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
     assert out.target_pitch_rad == pytest.approx(
-            controller.config.pre_cross_brake_pitch_rad, abs=1e-9
+            # F49: spawn-relative — the -0.15 offset from the -0.31 spawn
+            # attitude gives the effective -0.46 TRUE brake.
+            controller.config.spawn_pitch_rad
+            + controller.config.pre_cross_brake_pitch_rad,
+            abs=1e-9,
         )
     assert now - 100.10 <= 0.5  # fast slew, not the generic 0.30 rad/s
     assert out.yaw_rate_rad_s > 0.0  # x=+0.20 pursuit stays alive
@@ -1160,7 +1186,8 @@ def test_closure_governor_does_not_brake_below_target_rate():
     controller.current.scale_axis.v = 0.1
     out = _command(controller, 100.10)
     assert not controller._pre_cross_brake_active
-    assert out.target_pitch_rad > 0.0  # advance law still closes
+    # Advance law still closes: above the level (spawn) brake base.
+    assert out.target_pitch_rad > SPAWN_PITCH
 
 
 def test_closure_governor_distrusts_tiny_track_expansion():
@@ -1173,13 +1200,14 @@ def test_closure_governor_distrusts_tiny_track_expansion():
     controller.current.scale_axis.v = 0.9  # noise-level expansion
     out = _command(controller, 100.10)
     assert not controller._pre_cross_brake_active
-    assert out.target_pitch_rad > 0.0  # advance law still closes
+    # Advance law still closes: above the level (spawn) brake base.
+    assert out.target_pitch_rad > SPAWN_PITCH
 
 
 def test_closure_governor_is_a_continuous_blend():
     # Mid-band rate (0.475/s -> closure 0.5): the pitch target blends
-    # halfway from the advance law (<= -0.02) toward the +0.15 brake
-    # attitude, without latching the fast-slew brake flag.
+    # halfway from the advance law (spawn base) toward the spawn-0.15
+    # pre-cross brake attitude, without latching the fast-slew brake flag.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller.current.scale_axis.v = 0.475
     now = 100.10
@@ -1188,7 +1216,11 @@ def test_closure_governor_is_a_continuous_blend():
         now += 0.033
         out = _command(controller, now)
     assert not controller._pre_cross_brake_active
-    assert -0.15 + 1e-9 < out.target_pitch_rad < 0.02 - 1e-9
+    assert (
+        SPAWN_PITCH - 0.15 + 1e-9
+        < out.target_pitch_rad
+        < SPAWN_PITCH - 1e-9
+    )
 
 
 def test_misaligned_far_gate_brakes_and_climbs():
@@ -1212,7 +1244,11 @@ def test_misaligned_far_gate_brakes_and_climbs():
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
     assert out.target_pitch_rad == pytest.approx(
-            controller.config.pre_cross_brake_pitch_rad, abs=1e-9
+            # F49: spawn-relative — the -0.15 offset from the -0.31 spawn
+            # attitude gives the effective -0.46 TRUE brake.
+            controller.config.spawn_pitch_rad
+            + controller.config.pre_cross_brake_pitch_rad,
+            abs=1e-9,
         )
     # Top-clipped gate: y censored -> unqualified -> one-sided climb hold.
     assert not out.vertical_qualified
@@ -1244,8 +1280,31 @@ def test_closure_governor_brakes_in_predict():
     assert controller.state is CleanCourseState.PREDICT
     assert controller._pre_cross_brake_active
     assert out.target_pitch_rad == pytest.approx(
-            controller.config.pre_cross_brake_pitch_rad, abs=1e-9
+            # F49: spawn-relative — the -0.15 offset from the -0.31 spawn
+            # attitude gives the effective -0.46 TRUE brake.
+            controller.config.spawn_pitch_rad
+            + controller.config.pre_cross_brake_pitch_rad,
+            abs=1e-9,
         )
+
+
+def test_pitch_offsets_follow_the_configured_spawn_attitude():
+    # F49: every pitch target is spawn + offset, so a measured spawn
+    # attitude other than the -0.31 default shifts all targets together.
+    config = _config(spawn_pitch_rad=-0.20)
+    controller = _tracked_controller(
+        _track("A", 0.20, 0.0, scale=0.10), config=config
+    )
+    controller.current.scale_axis.v = 0.7  # full closure brake
+    now = 100.10
+    out = None
+    for _ in range(15):  # fast slew attains the brake attitude
+        now += 0.033
+        controller.current.last_x_measurement_s = now
+        out = _command(controller, now)
+    assert controller._pre_cross_brake_active
+    # -0.20 spawn + (-0.15) pre-cross offset = -0.35 effective brake.
+    assert out.target_pitch_rad == pytest.approx(-0.35, abs=1e-9)
 
 
 def test_heading_anchor_clamps_outward_yaw_only():
@@ -1275,33 +1334,33 @@ def test_heading_anchor_clamps_outward_yaw_only():
     assert controller._course_anchor_yaw_rad is None
 
 
-def test_search_commands_brake_attitude_when_blind_and_fast():
-    # F31: blind legs were where speed ran away (the closure governor has
-    # no expansion signal in SEARCH).  Above fh 1.5 SEARCH commands the
-    # brake attitude; slow (takeoff) SEARCH stays near level.
-    # F40 (20260729T193134Z-visual-course-63ed6342): the shared -0.15
-    # pre-cross brake never killed the blind fh 3-4 mps2 drift into gate 1,
-    # so the blind SEARCH brake is the dedicated stronger -0.22 attitude.
+def test_search_holds_level_pitch_even_when_blind_and_fast():
+    # F49: the F31/F40 blind-at-speed brake was built on ABSOLUTE pitch
+    # targets ~0.3 rad nose-down of intent — level flight is the -0.31
+    # spawn attitude, not 0, so the "-0.22 blind brake" was in truth a
+    # slight dive and never killed the drift.  Under the spawn-relative
+    # convention SEARCH always holds the level (spawn) pitch at any fh;
+    # the gentle sweep and the vz governor carry the blind leg.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller._enter_search(100.10)
-    controller._fh_mps2 = 0.5  # slow: near-level target
+    controller._fh_mps2 = 0.5  # slow: level
     out = _command(controller, 100.143)
-    assert out.target_pitch_rad >= 0.0  # near-level brake pitch (+0.02)
-    controller._fh_mps2 = 3.0  # blind and fast: brake
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    controller._fh_mps2 = 3.0  # blind and fast: still level, no brake pitch
     now = 100.143
-    for _ in range(40):  # generic slew converges to the brake attitude
+    for _ in range(40):  # the slew never leaves the level attitude
         now += 0.033
         out = _command(controller, now)
     assert out.state is CleanCourseState.SEARCH
-    assert out.target_pitch_rad == pytest.approx(-0.22, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
     assert abs(out.yaw_rate_rad_s) > 0.0  # the sweep stays alive
 
 
-def test_search_blind_brake_slew_attains_attitude_in_short_search():
-    # F43 (20260729T202844Z-visual-course-ee8fd1e5): searches last 0.35-0.8 s
-    # and the generic 0.30 rad/s slew only reached ~-0.04 of the -0.22 blind
-    # brake before TRACK resumed — the brake never actually engaged.  The
-    # dedicated fast slew (the F12 lesson) attains it inside a short search.
+def test_search_level_pitch_held_from_the_first_tick():
+    # F49: the slew state is seeded at spawn + brake offset, so the level
+    # attitude is held from the first tick of even a typical 0.35-0.8 s
+    # search — no dedicated fast slew is needed (the F43 slew problem
+    # existed only because the blind brake target was far from level).
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller._enter_search(100.10)
     controller._fh_mps2 = 3.0  # blind and fast
@@ -1311,7 +1370,7 @@ def test_search_blind_brake_slew_attains_attitude_in_short_search():
         now += 0.033
         out = _command(controller, now)
     assert out.state is CleanCourseState.SEARCH
-    assert out.target_pitch_rad == pytest.approx(-0.22, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
 
 
 def test_lone_small_fragment_creeps_instead_of_advancing():
@@ -1327,8 +1386,9 @@ def test_lone_small_fragment_creeps_instead_of_advancing():
         now += 0.033
         fragment.current.last_x_measurement_s = now
         out = _command(fragment, now)
-    # Never +0.08 on fragment evidence: capped at the creep pitch.
-    assert out.target_pitch_rad == pytest.approx(0.03, abs=1e-9)
+    # Never the full advance offset on fragment evidence: capped at the
+    # creep offset (spawn + 0.03) while centering.
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.03, abs=1e-9)
     # Centering authority (yaw) is untouched on a fragment.
     offset = _tracked_controller(_track("A", 0.30, 0.0, scale=0.06))
     offset.current.last_x_measurement_s = 100.10
@@ -1341,7 +1401,7 @@ def test_lone_small_fragment_creeps_instead_of_advancing():
         now += 0.033
         whole.current.last_x_measurement_s = now
         out = _command(whole, now)
-    assert out.target_pitch_rad > 0.04  # full advance law, no creep cap
+    assert out.target_pitch_rad > SPAWN_PITCH + 0.04  # full advance, no creep cap
 
 
 def test_crossing_loss_latches_coast_even_while_fh_untrusted():
@@ -1382,9 +1442,11 @@ def test_brake_ceiling_band_bounds_collective_while_braking():
     assert controller._governed_collective(SUPPORT + 0.03, SUPPORT) == pytest.approx(
         SUPPORT + 0.03, abs=1e-9
     )
-    # Deep sub-support demands are lifted to the band bottom:
+    # Deep sub-support demands are lifted to the band bottom (with the F49
+    # 0.247 support the band bottom support-0.04 sits below the 0.21
+    # min-thrust clamp, so the clamp is the effective floor):
     assert controller._governed_collective(0.20, SUPPORT) == pytest.approx(
-        SUPPORT - 0.04, abs=1e-9
+        0.21, abs=1e-9
     )
     controller._fh_untrusted = True
     # fh floor (support + 0.05) is capped at the band top:
@@ -1394,9 +1456,10 @@ def test_brake_ceiling_band_bounds_collective_while_braking():
     assert controller._governed_collective(0.34, SUPPORT) == pytest.approx(
         SUPPORT + 0.04, abs=1e-9
     )
-    # Released: the fh-untrusted floor applies again.
+    # Released: the fh-untrusted floor applies again (a demand below the
+    # support+0.05 floor is lifted to it).
     controller._pre_cross_brake_active = False
-    assert controller._governed_collective(0.30, SUPPORT) == pytest.approx(
+    assert controller._governed_collective(0.28, SUPPORT) == pytest.approx(
         SUPPORT + 0.05, abs=1e-9
     )
 
@@ -1412,7 +1475,7 @@ def test_brake_ceiling_band_bounds_collective_while_braking():
         SUPPORT + 0.06, abs=1e-9
     )
     assert high._governed_collective(0.20, SUPPORT) == pytest.approx(
-        SUPPORT - 0.04, abs=1e-9
+        0.21, abs=1e-9  # band bottom below the 0.21 clamp (F49 support)
     )
 
 
@@ -1443,7 +1506,7 @@ def test_pre_cross_brake_does_not_suppress_crossing_detection():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-    ) == (0.0, 0.05, 0.0)
+    ) == (0.0, SPAWN_PITCH + 0.05, 0.0)
     assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
 
 
@@ -1553,7 +1616,7 @@ def test_fresh_close_loss_still_coasts_and_holds_support():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-    ) == (0.0, 0.05, 0.0)
+    ) == (0.0, SPAWN_PITCH + 0.05, 0.0)
     assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
 
 
@@ -1583,31 +1646,42 @@ def test_search_issues_real_bounded_yaw_sweep():
     assert any(value < 0.0 for value in yaws)
 
 
-def test_search_heading_sweep_returns_from_park_and_stays_alive():
+def test_search_heading_sweep_starts_at_entry_heading_and_stays_alive():
     # F40 (20260729T193134Z-visual-course-63ed6342): the old incremental
     # sweep integrated the COMMANDED yaw, so at the anchor cap it parked at
     # yaw 1.94 rad — 111 deg off course — for ~7 blind seconds into gate 1.
-    # The absolute-heading sweep around the course anchor must steer BACK
-    # toward the band from outside it and keep sweeping (sign changes), never
-    # park.
+    # F49: F40's absolute-heading sweep re-centered the scan on the LEG
+    # ANCHOR instead of looking where the target was last seen.  The sweep
+    # now starts from the heading measured at search entry, first moves
+    # toward the last reliable bearing, keeps sweeping (sign changes) from
+    # a parked heading, and stays bounded — it never re-centers on the
+    # anchor.
     controller = _tracked_controller(_track("A", 0.40, 0.0, scale=0.10))
     controller._enter_search(100.10)
-    controller._course_anchor_yaw_rad = 0.4
-    yaw = 1.9  # well outside the old park cap (anchor 0.4 + 1.5)
+    controller._course_anchor_yaw_rad = 0.4  # deliberately NOT the entry heading
+    yaw = 1.9  # parked heading, 1.5 rad off the anchor
     now = 100.10
     yaws = []
+    headings = []
     for _ in range(400):  # ~8 s at 50 Hz, first-order heading plant
         now += 0.02
         out = _command(controller, now, yaw=yaw)
         yaws.append(out.yaw_rate_rad_s)
         yaw += out.yaw_rate_rad_s * 0.02
-    # From outside the band the command steers back toward the anchor.
-    assert yaws[0] < 0.0
+        headings.append(yaw)
+    # First motion is toward the last image-right bearing (positive yaw).
+    assert yaws[0] > 0.0
     # The sweep stays alive: the command changes sign at least twice.
     flips = sum(1 for a, b in zip(yaws, yaws[1:]) if a * b < 0.0)
     assert flips >= 2
-    # And the heading left the park: back inside the old 1.5 rad cap.
-    assert abs(math.remainder(yaw - 0.4, 2.0 * math.pi)) < 1.5
+    # The scan stays centered on the entry heading (bounded by the 0.80
+    # excursion cap plus plant lag), never returning to the 0.4 anchor.
+    worst = max(
+        abs(math.remainder(heading - 1.9, 2.0 * math.pi))
+        for heading in headings
+    )
+    assert worst < 1.20
+    assert abs(math.remainder(headings[-1] - 0.4, 2.0 * math.pi)) > 0.3
 
 
 def test_search_reacquisition_allows_same_track_id():
@@ -1623,6 +1697,45 @@ def test_search_reacquisition_allows_same_track_id():
     controller.observe(_update([_track("A", 0.30, 0.0)], frame_id=50), now_s=now)
     assert controller.state is CleanCourseState.TRACK
     assert controller.current.track_id == "A"
+
+
+def test_newborn_suspicious_truss_not_adopted_in_search_reacquisition():
+    # F49 (terminal F48 failure): the gate-1 re-acquisition adopted a
+    # NEWBORN top-censored extreme-aspect ceiling truss (span 0.50 x 0.23)
+    # over the persistent real gate.  A suspicious-geometry track is
+    # ineligible until it persists past the re-acquisition age window.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller._enter_search(100.10)
+    controller.last_reliable_bearing = (0.10, 0.0)
+    gate = _track("G", 0.15, 0.05, scale=0.10, confidence=0.60)
+    truss = _truss("T", 0.10, 0.0)  # right at the last bearing
+    now = 100.20
+    controller._track_first_seen_s["G"] = now - 2.0  # persistent real gate
+    controller._track_first_seen_s["T"] = now - 0.05  # newborn truss
+    pick = controller._select_search_reacquisition([gate, truss], now)
+    assert pick.track_id == "G"
+    # Aged past the window the same truss is eligible again: geometry never
+    # permanently bans a track, only the newborn adoption.
+    controller._track_first_seen_s["T"] = now - 1.0
+    pick = controller._select_search_reacquisition([gate, truss], now)
+    assert pick.track_id == "T"
+
+
+def test_newborn_suspicious_truss_not_adopted_as_successor():
+    # Same gate on the successor seam: a higher-confidence newborn truss
+    # must not outrank the plain gate candidate.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    gate = _track("G", 0.30, 0.0, scale=0.10, confidence=0.50)
+    truss = _truss("T", 0.10, -0.60)  # confidence 0.90
+    now = 100.20
+    controller._track_first_seen_s["G"] = now - 0.10  # newborn too: no aged
+    controller._track_first_seen_s["T"] = now - 0.05
+    controller._refresh_successor([gate, truss], now)
+    assert controller.successor.track_id == "G"
+    # Aged past the window the truss is eligible and wins on persistence.
+    controller._track_first_seen_s["T"] = now - 1.0
+    controller._refresh_successor([gate, truss], now)
+    assert controller.successor.track_id == "T"
 
 
 def test_off_center_close_loss_goes_to_predict_not_coast():
@@ -1667,7 +1780,7 @@ def test_crossing_loss_latches_coast_and_waits_for_newer_race_packet():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-    ) == (0.0, 0.05, 0.0)
+    ) == (0.0, SPAWN_PITCH + 0.05, 0.0)
     assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
     # A strictly newer race packet without credit ends the wait; vision never
     # declares the pass.
@@ -1938,7 +2051,13 @@ def test_finite_bounded_output_across_states():
         assert abs(output.yaw_rate_rad_s) <= 0.50 + 1e-9
         assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
         assert abs(output.target_roll_rad) <= 0.35 + 1e-9
-        assert -0.35 <= output.target_pitch_rad <= 0.35
+        # F49: pitch targets are offsets from the spawn attitude, so the
+        # envelope is spawn-relative (pre-cross reaches spawn - 0.15).
+        assert (
+            SPAWN_PITCH - 0.35
+            <= output.target_pitch_rad
+            <= SPAWN_PITCH + 0.35
+        )
         if output.thrust == 0.0:
             assert output.state is CleanCourseState.COAST_FOR_CREDIT
 
@@ -2145,7 +2264,7 @@ def test_loop_coast_holds_support_then_accepts_credit():
     support_sends = [
         command
         for command, _index in host.sent
-        if command.thrust == pytest.approx(0.275, abs=1e-6)
+        if command.thrust == pytest.approx(SUPPORT, abs=1e-6)
         and command.yaw_rate == 0.0
     ]
     assert support_sends  # the support-hold coast happened
@@ -2164,7 +2283,7 @@ def test_loop_coast_levels_attitude_through_pd_at_support_thrust():
         body_rates=(0.0, 0.0, 0.0),
     )
     probe = _fake_pd(
-        host.estimate, target_roll_rad=0.0, target_pitch_rad=0.0, thrust=0.275
+        host.estimate, target_roll_rad=0.0, target_pitch_rad=0.0, thrust=SUPPORT
     )
     assert (probe.roll_rate, probe.pitch_rate) != (0.0, 0.0)  # PD levels it
 
@@ -2188,7 +2307,7 @@ def test_loop_coast_levels_attitude_through_pd_at_support_thrust():
     support_sends = [
         command
         for command, _index in host.sent
-        if command.thrust == pytest.approx(0.275, abs=5e-3)
+        if command.thrust == pytest.approx(SUPPORT, abs=5e-3)
     ]
     assert support_sends  # the bounded coast wait emitted support sends
     for command in support_sends:

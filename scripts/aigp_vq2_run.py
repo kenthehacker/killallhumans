@@ -13102,6 +13102,7 @@ class VQ2Runner:
                     max_command_rate_rad_s=MAX_COMMAND_RATE_RAD_S,
                     min_thrust=DEFAULT_VISUAL_COURSE_LIMITS.min_thrust,
                     max_thrust=DEFAULT_VISUAL_COURSE_LIMITS.max_thrust,
+                    spawn_pitch_rad=float(context.spawn_pitch_rad),
                 ),
             )
             if not isinstance(summary, Mapping):
