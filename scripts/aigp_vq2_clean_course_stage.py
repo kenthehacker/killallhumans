@@ -1749,28 +1749,44 @@ class CleanCourseController:
             )
         # F33/F34 brake ceiling band: while the closure governor brakes,
         # the collective is confined to support +/- brake_ceiling_band.
-        # F32 stopped horizontally short of gate 0 while the vertical
-        # channel (qualified PD, high-gate bias, fh-untrusted floor)
-        # carried it UP at +1.0 m/s into the gate's lower structure; but
-        # F34's hard pin AT support removed all centering authority and
-        # the drone crossed at 1.07 m into the bottom bar — approach
-        # geometry raises the gate's elevation the whole way in, so the
-        # qualified PD keeps a small climb budget inside the band.
+        # F34's hard pin AT support removed all centering authority and the
+        # drone crossed at 1.07 m into the bottom bar.
         # F36: the band only makes sense at the crossing — with the F36
         # misalignment brake, _pre_cross_brake_active also fires FAR from
         # the gate, where pinning the collective would kill the high-gate
         # climb that must run while the gate is top-clipped (F35 flew level
         # into the gate-1 lower structure at exactly that geometry).
+        # F37 (82306488 + F32 8cc53db2 re-analysis): the band is ONE-SIDED.
+        # F32, F34, and F36 ALL died at gate 0 the same way — the gate sat
+        # HIGH (ey -0.5..-0.7, top-clipped) through the final approach and
+        # the drone never centered vertically.  In F36 the band was the
+        # direct cause: it capped the qualified PD's climb at support+0.04
+        # from t=0.19 on.  The F32 "climb into structure" the band was
+        # built against was misdiagnosed — F32's gate was high too
+        # (ey -0.71 at span 0.24).  A gate above image center needs the
+        # climb uncapped; the ceiling only applies when the gate is NOT
+        # above center (the only geometry where climbing is overshoot).
+        # The sink floor applies either way.
         near_gate = (
             self.current is not None
             and self.current.log_scale >= self.config.closure_min_log_scale
         )
         if self._pre_cross_brake_active and near_gate:
-            governed = _clamp(
-                governed,
-                max(self.config.min_thrust, support - self.config.brake_ceiling_band),
-                min(self.config.max_thrust, support + self.config.brake_ceiling_band),
+            band_lo = max(
+                self.config.min_thrust, support - self.config.brake_ceiling_band
             )
+            gate_high = self.current is not None and self.current.y < -0.10
+            if gate_high:
+                governed = max(governed, band_lo)
+            else:
+                governed = _clamp(
+                    governed,
+                    band_lo,
+                    min(
+                        self.config.max_thrust,
+                        support + self.config.brake_ceiling_band,
+                    ),
+                )
         return governed
 
     def _anchor_clamped_yaw(

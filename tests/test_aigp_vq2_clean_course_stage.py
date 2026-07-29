@@ -1294,6 +1294,9 @@ def test_brake_ceiling_band_bounds_collective_while_braking():
     # collective is confined to support +/- 0.04: the qualified PD keeps a
     # small climb budget, but the fh floor and high-gate bias cannot push
     # past the band top.
+    # F37: ONE-SIDED — F32/F34/F36 all died with the gate HIGH; a gate
+    # above image center gets an uncapped climb (the ceiling would be the
+    # F36 starvation all over again), the sink floor still applies.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller._pre_cross_brake_active = True
     controller._fh_untrusted = False
@@ -1319,6 +1322,21 @@ def test_brake_ceiling_band_bounds_collective_while_braking():
     controller._pre_cross_brake_active = False
     assert controller._governed_collective(0.30, SUPPORT) == pytest.approx(
         SUPPORT + 0.05, abs=1e-9
+    )
+
+    # Gate HIGH (ey < -0.10): the climb side is uncapped even while
+    # braking at the near gate; the sink floor still applies.  (Demand
+    # support + 0.06 sits above the old band top but below the 0.34
+    # envelope clamp.)
+    high = _tracked_controller(_track("A", 0.0, -0.50, scale=0.10))
+    high._pre_cross_brake_active = True
+    high._fh_untrusted = False
+    high._vz_est_m_s = 0.0
+    assert high._governed_collective(SUPPORT + 0.06, SUPPORT) == pytest.approx(
+        SUPPORT + 0.06, abs=1e-9
+    )
+    assert high._governed_collective(0.20, SUPPORT) == pytest.approx(
+        SUPPORT - 0.04, abs=1e-9
     )
 
 
