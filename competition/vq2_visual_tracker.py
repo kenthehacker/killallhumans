@@ -28,6 +28,12 @@ from competition.vq2_contracts import FrameEdge
 
 _UINT32_MAX = 2**32 - 1
 _NS_PER_S = 1_000_000_000.0
+_FRAGMENT_UNION_EDGE_MARGIN_PX = 2
+_FRAGMENT_UNION_MIN_DIMENSION_PX = 20
+_FRAGMENT_UNION_MAX_COMPONENT_ASPECT = 2.60
+_FRAGMENT_UNION_MAX_ASPECT = 1.45
+_FRAGMENT_UNION_MIN_IOU = 0.75
+_FRAGMENT_UNION_MAX_CENTER_JUMP_PX = 32.0
 
 
 class VisualTrackRole(str, Enum):
@@ -946,6 +952,13 @@ class _AssignmentPlan:
     ambiguous_detection_indexes: frozenset[int]
 
 
+@dataclass(frozen=True, slots=True)
+class _FragmentUnionAssignment:
+    detection: VisualDetection
+    component_detection_indexes: tuple[int, int]
+    pair_score: _PairScore
+
+
 class MultiTargetVisualTracker:
     """Stateful deterministic tracker with no I/O or command side effects."""
 
@@ -1108,6 +1121,10 @@ class MultiTargetVisualTracker:
         selected_pairs = plan.selected_pairs
         ambiguous_track_indexes = plan.ambiguous_track_indexes
         ambiguous_detection_indexes = plan.ambiguous_detection_indexes
+        fragment_unions = self._plan_authoritative_fragment_unions(
+            plan,
+            frame,
+        )
 
         self._frame_sequence += 1
         associated_ids: list[str] = []
@@ -1119,6 +1136,21 @@ class MultiTargetVisualTracker:
 
         for track_index, state in enumerate(active_states):
             detection_index = selected_pairs.get(track_index)
+            fragment_union = fragment_unions.get(track_index)
+            if fragment_union is not None:
+                used_detection_indexes.update(
+                    fragment_union.component_detection_indexes
+                )
+                evidence = self._associate(
+                    state,
+                    fragment_union.detection,
+                    frame,
+                    fragment_union.pair_score,
+                    ambiguous=False,
+                )
+                associated_ids.append(state.track_id)
+                association_evidence.append(evidence)
+                continue
             if detection_index is None:
                 state.missed_frame_count += 1
                 state.consecutive_frame_count = 0
@@ -1200,6 +1232,327 @@ class MultiTargetVisualTracker:
         )
         self._latest_update = update
         return update
+
+    def _plan_authoritative_fragment_unions(
+        self,
+        plan: _AssignmentPlan,
+        frame: VisualDetectionFrame,
+    ) -> dict[int, _FragmentUnionAssignment]:
+        """Fuse the known build-3385 TOP-gate contour split before a miss.
+
+        The detector can split one top-clipped current gate into complementary
+        upper/right and lower/left contours.  Their tight union is guidance
+        geometry only: it preserves the already race-authoritative CURRENT
+        identity but carries no inner-aperture or passage authority.
+        """
+
+        selected_detection_indexes = set(plan.selected_pairs.values())
+        reserved_detection_indexes: set[int] = set()
+        assignments: dict[int, _FragmentUnionAssignment] = {}
+        for track_index, state in enumerate(plan.active_states):
+            if (
+                state.nominal_role is not VisualTrackRole.CURRENT
+                or state.authoritative_gate_index is None
+                or state.authority_race_status_boot_ms is None
+                or state.missed_frame_count != 0
+                or state.ambiguous
+                or state.latest.clipping is not FrameEdge.TOP
+                or not state.latest.center_censored
+            ):
+                continue
+            own_selected_detection_index = plan.selected_pairs.get(
+                track_index
+            )
+            unavailable = (
+                {
+                    detection_index
+                    for detection_index in selected_detection_indexes
+                    if detection_index != own_selected_detection_index
+                }
+                | reserved_detection_indexes
+                | set(plan.ambiguous_detection_indexes)
+                | {
+                    detection_index
+                    for (
+                        candidate_track_index,
+                        detection_index,
+                    ), score in plan.pair_scores.items()
+                    if (
+                        candidate_track_index != track_index
+                        and score.cost
+                        <= self.config.max_assignment_cost
+                    )
+                }
+            )
+            available = tuple(
+                detection_index
+                for detection_index in range(
+                    len(plan.eligible_detections)
+                )
+                if detection_index not in unavailable
+            )
+            assignment = self._select_fragment_union_assignment(
+                state,
+                detections=plan.eligible_detections,
+                detection_indexes=available,
+                frame=frame,
+            )
+            if assignment is None:
+                continue
+            assignments[track_index] = assignment
+            reserved_detection_indexes.update(
+                assignment.component_detection_indexes
+            )
+        return assignments
+
+    def _select_fragment_union_assignment(
+        self,
+        state: _TrackState,
+        *,
+        detections: tuple[VisualDetection, ...],
+        detection_indexes: tuple[int, ...],
+        frame: VisualDetectionFrame,
+    ) -> Optional[_FragmentUnionAssignment]:
+        width_px, height_px = frame.image_size_px
+        prior_bbox_px = _bbox_to_pixels(
+            state.latest.bbox_norm,
+            frame.image_size_px,
+        )
+        prior_x, prior_y, prior_width, prior_height = prior_bbox_px
+        if (
+            prior_y > _FRAGMENT_UNION_EDGE_MARGIN_PX
+            or prior_width < _FRAGMENT_UNION_MIN_DIMENSION_PX
+            or prior_height < _FRAGMENT_UNION_MIN_DIMENSION_PX
+        ):
+            return None
+
+        valid: list[
+            tuple[int, VisualDetection, tuple[int, int, int, int]]
+        ] = []
+        for detection_index in detection_indexes:
+            detection = detections[detection_index]
+            bbox_px = _bbox_to_pixels(
+                detection.bbox_norm,
+                frame.image_size_px,
+            )
+            _x, _y, box_width, box_height = bbox_px
+            short = min(box_width, box_height)
+            long = max(box_width, box_height)
+            if (
+                box_width < _FRAGMENT_UNION_MIN_DIMENSION_PX
+                or box_height < _FRAGMENT_UNION_MIN_DIMENSION_PX
+                or short <= 0
+                or long / short
+                > _FRAGMENT_UNION_MAX_COMPONENT_ASPECT
+            ):
+                continue
+            valid.append((detection_index, detection, bbox_px))
+
+        candidates: list[
+            tuple[
+                float,
+                float,
+                float,
+                _FragmentUnionAssignment,
+            ]
+        ] = []
+        prior_area = prior_width * prior_height
+        prior_center_x = (
+            0.5 * (state.latest.center_norm[0] + 1.0) * width_px
+        )
+        prior_center_y = (
+            0.5 * (state.latest.center_norm[1] + 1.0) * height_px
+        )
+        for (
+            upper_index,
+            upper,
+            upper_bbox,
+        ) in valid:
+            upper_x, upper_y, upper_width, upper_height = upper_bbox
+            if upper_y > _FRAGMENT_UNION_EDGE_MARGIN_PX:
+                continue
+            upper_center_x = 0.5 * (
+                upper_x + upper_x + upper_width
+            )
+            upper_center_y = 0.5 * (
+                upper_y + upper_y + upper_height
+            )
+            for (
+                lower_index,
+                lower,
+                lower_bbox,
+            ) in valid:
+                if lower_index == upper_index:
+                    continue
+                lower_x, lower_y, lower_width, lower_height = (
+                    lower_bbox
+                )
+                lower_center_x = 0.5 * (
+                    lower_x + lower_x + lower_width
+                )
+                lower_center_y = 0.5 * (
+                    lower_y + lower_y + lower_height
+                )
+                if (
+                    lower_y <= _FRAGMENT_UNION_EDGE_MARGIN_PX
+                    or upper_center_x <= lower_center_x
+                    or upper_center_y >= lower_center_y
+                ):
+                    continue
+
+                union_x = min(upper_x, lower_x)
+                union_y = min(upper_y, lower_y)
+                union_right = max(
+                    upper_x + upper_width,
+                    lower_x + lower_width,
+                )
+                union_bottom = max(
+                    upper_y + upper_height,
+                    lower_y + lower_height,
+                )
+                union_width = union_right - union_x
+                union_height = union_bottom - union_y
+                if (
+                    union_width < _FRAGMENT_UNION_MIN_DIMENSION_PX
+                    or union_height
+                    < _FRAGMENT_UNION_MIN_DIMENSION_PX
+                ):
+                    continue
+                union_aspect = max(
+                    union_width,
+                    union_height,
+                ) / min(union_width, union_height)
+                if union_aspect > _FRAGMENT_UNION_MAX_ASPECT:
+                    continue
+
+                horizontal_gap = max(
+                    0,
+                    max(upper_x, lower_x)
+                    - min(
+                        upper_x + upper_width,
+                        lower_x + lower_width,
+                    ),
+                )
+                vertical_gap = max(
+                    0,
+                    max(upper_y, lower_y)
+                    - min(
+                        upper_y + upper_height,
+                        lower_y + lower_height,
+                    ),
+                )
+                if (
+                    horizontal_gap > 0.45 * union_width
+                    or vertical_gap > 0.20 * union_height
+                ):
+                    continue
+
+                intersection_width = max(
+                    0,
+                    min(
+                        upper_x + upper_width,
+                        lower_x + lower_width,
+                    )
+                    - max(upper_x, lower_x),
+                )
+                intersection_height = max(
+                    0,
+                    min(
+                        upper_y + upper_height,
+                        lower_y + lower_height,
+                    )
+                    - max(upper_y, lower_y),
+                )
+                visible_support = (
+                    upper_width * upper_height
+                    + lower_width * lower_height
+                    - intersection_width * intersection_height
+                )
+                union_area = union_width * union_height
+                support_ratio = visible_support / union_area
+                if not 0.20 <= support_ratio <= 0.80:
+                    continue
+
+                union_bbox_norm = (
+                    union_x / width_px,
+                    union_y / height_px,
+                    union_right / width_px,
+                    union_bottom / height_px,
+                )
+                overlap = _bbox_iou(
+                    union_bbox_norm,
+                    state.latest.bbox_norm,
+                )
+                union_center_x = union_x + union_width // 2
+                union_center_y = union_y + union_height // 2
+                center_jump = math.hypot(
+                    union_center_x - prior_center_x,
+                    union_center_y - prior_center_y,
+                )
+                area_ratio = union_area / prior_area
+                if (
+                    overlap < _FRAGMENT_UNION_MIN_IOU
+                    or center_jump
+                    > _FRAGMENT_UNION_MAX_CENTER_JUMP_PX
+                    or not 0.70 <= area_ratio <= 1.35
+                ):
+                    continue
+
+                clipping = _pixel_bbox_clipping(
+                    (
+                        union_x,
+                        union_y,
+                        union_width,
+                        union_height,
+                    ),
+                    frame.image_size_px,
+                )
+                if clipping is not FrameEdge.TOP:
+                    continue
+                composite = VisualDetection(
+                    source_index=min(
+                        upper.source_index,
+                        lower.source_index,
+                    ),
+                    center_norm=(
+                        2.0 * union_center_x / width_px - 1.0,
+                        2.0 * union_center_y / height_px - 1.0,
+                    ),
+                    bbox_norm=union_bbox_norm,
+                    confidence=min(
+                        upper.confidence,
+                        lower.confidence,
+                    ),
+                    clipping=clipping,
+                    center_censored=True,
+                    detection_method="vq2_tracked_fragment_union",
+                    appearance=None,
+                    inner_aperture=None,
+                )
+                pair_score = self._pair_score(
+                    state,
+                    composite,
+                    frame.observation_monotonic_ns,
+                )
+                if (
+                    pair_score is None
+                    or pair_score.cost
+                    > self.config.max_assignment_cost
+                ):
+                    continue
+                assignment = _FragmentUnionAssignment(
+                    detection=composite,
+                    component_detection_indexes=tuple(
+                        sorted((upper_index, lower_index))
+                    ),
+                    pair_score=pair_score,
+                )
+                candidates.append(
+                    (-overlap, center_jump, -support_ratio, assignment)
+                )
+        if not candidates:
+            return None
+        return min(candidates, key=lambda item: item[:3])[3]
 
     def assign_role(self, track_id: str, role: VisualTrackRole) -> None:
         """Assign a camera lifecycle role without inventing a gate index."""
@@ -2030,6 +2383,43 @@ def _bbox_iou(
     second_area = (second[2] - second[0]) * (second[3] - second[1])
     union = first_area + second_area - intersection
     return 0.0 if union <= 0.0 else intersection / union
+
+
+def _bbox_to_pixels(
+    bbox: tuple[float, float, float, float],
+    image_size_px: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    width_px, height_px = _image_size(image_size_px)
+    left, top, right, bottom = bbox
+    x = round(left * width_px)
+    y = round(top * height_px)
+    box_right = round(right * width_px)
+    box_bottom = round(bottom * height_px)
+    return x, y, box_right - x, box_bottom - y
+
+
+def _pixel_bbox_clipping(
+    bbox: tuple[int, int, int, int],
+    image_size_px: tuple[int, int],
+) -> FrameEdge:
+    width_px, height_px = _image_size(image_size_px)
+    x, y, box_width, box_height = bbox
+    clipping = FrameEdge.NONE
+    if x <= _FRAGMENT_UNION_EDGE_MARGIN_PX:
+        clipping |= FrameEdge.LEFT
+    if y <= _FRAGMENT_UNION_EDGE_MARGIN_PX:
+        clipping |= FrameEdge.TOP
+    if (
+        x + box_width
+        >= width_px - _FRAGMENT_UNION_EDGE_MARGIN_PX
+    ):
+        clipping |= FrameEdge.RIGHT
+    if (
+        y + box_height
+        >= height_px - _FRAGMENT_UNION_EDGE_MARGIN_PX
+    ):
+        clipping |= FrameEdge.BOTTOM
+    return clipping
 
 
 def _shift_bbox(
