@@ -4,13 +4,16 @@ These tests assert envelope and directional behavior only: one global
 vertical sign, decay-toward-support on vertical loss, a cut 0.30 x 0.40 s
 launch boost, a disabled-then-tested gate-0 climb bias that never lifts the
 aim point above image center, full-authority image-rate D bounded by a
-symmetric IMU world-vertical-rate climb/descent governor (alive in TRACK,
-PREDICT, and SEARCH, bypassed only by the exact-zero coast latch), phantom
+symmetric IMU world-vertical-rate climb/descent governor with a
+descent-regime hover feedforward (alive in TRACK, PREDICT, and SEARCH,
+bypassed only by the exact-zero coast latch), phantom
 vertical rates zeroed when the accepted-y measurement
 ages out (reseeded only by real measurements, never seeded by censored or
 engulfing detections), degenerate engulfing detections rejected as
-measurements but kept as bearing/existence anchors that block SEARCH and
-expire when the camera frame freezes,
+measurements but kept as bearing/existence anchors that block SEARCH,
+expire when the camera frame freezes, and never come from a missed
+(invisible) track, with a hard 1.5 s PREDICT stall cap that forces SEARCH
+regardless of anchor state,
 verified yaw/roll directions, clipping uncertainty (not abort),
 PREDICT->SEARCH on fresh empty frames, frozen-frame stalls that predict and
 never coast, a real bounded yaw sweep, finite bounded output, absolute race
@@ -28,6 +31,7 @@ from types import SimpleNamespace
 import pytest
 
 from competition.vq2_contracts import FrameEdge
+from competition.vq2_visual_tracker import CameraFrameToken
 from scripts.aigp_vq2_clean_course_stage import (
     LAUNCH_BOOST_DURATION_S,
     LAUNCH_BOOST_THRUST,
@@ -383,28 +387,34 @@ def test_vz_governor_floors_collective_below_descent_floor():
     # Flight 20260729T111003Z-visual-course-d52adcd4: a 6.1 s frozen-camera
     # stall blinded the loop while a_up ~= -1.9 m/s^2 sank it into a ground
     # graze; the climb-only governor did nothing.  The symmetric floor adds
-    # K_VZ_DESCENT per m/s below the -0.5 m/s sink bound.
+    # K_VZ_DESCENT per m/s below the -0.5 m/s sink bound, plus the fixed
+    # +0.025 descent-regime hover feedforward (flight d5e89c2b) whenever the
+    # estimate is below the floor.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     helper = controller._governed_collective
     controller._vz_est_m_s = -0.5  # at the floor boundary: no effect
     assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT, abs=1e-9)
-    controller._vz_est_m_s = -1.0  # 0.5 m/s below -> +0.03 collective
-    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.03, abs=1e-9)
-    controller._vz_est_m_s = -1.5  # 1.0 m/s below -> +0.06 (~+4 m/s^2)
-    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.06, abs=1e-9)
+    controller._vz_est_m_s = -1.0  # 0.5 m/s below -> +0.03 + 0.025 feedforward
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.055, abs=1e-9)
+    controller._vz_est_m_s = -1.5  # 1.0 m/s below -> +0.06 + 0.025
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.085, abs=1e-9)
     # The floor only raises collective; it never lowers a higher command.
-    controller._vz_est_m_s = -1.0
-    assert helper(0.31, SUPPORT) == pytest.approx(0.31, abs=1e-9)
+    controller._vz_est_m_s = -1.0  # floor target 0.33 here
+    assert helper(0.34, SUPPORT) == pytest.approx(0.34, abs=1e-9)
 
 
 def test_vz_descent_floor_raises_command_thrust():
-    # Command level: vz = -1.0 m/s lifts the emitted collective to
-    # support + 0.03 = 0.305, below the 0.32 clamp so it stays observable.
+    # Command level: vz = -0.7 m/s lifts the emitted collective to
+    # support + 0.012 (proportional) + 0.025 (feedforward) = 0.312, below
+    # the 0.32 clamp so it stays observable; a deeper sink saturates the
+    # clamp, which is the intended full-authority descent response.
     controller = _tracked_controller(_track("A", 0.0, 0.0))  # e = 0, vy ~ 0
-    controller._vz_est_m_s = -1.0
+    controller._vz_est_m_s = -0.7
     assert _command(controller, 100.10).thrust == pytest.approx(
-        SUPPORT + 0.03, abs=1e-9
+        SUPPORT + 0.037, abs=1e-9
     )
+    controller._vz_est_m_s = -1.0
+    assert _command(controller, 100.14).thrust == pytest.approx(0.32, abs=1e-9)
 
 
 def test_vz_descent_floor_applies_in_predict_and_search():
@@ -413,13 +423,13 @@ def test_vz_descent_floor_applies_in_predict_and_search():
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller.observe(_update([], frame_id=2), now_s=100.12)  # superseded
     assert controller.state is CleanCourseState.PREDICT
-    controller._vz_est_m_s = -1.0
+    controller._vz_est_m_s = -0.7
     assert _command(controller, 100.16).thrust == pytest.approx(
-        SUPPORT + 0.03, abs=1e-9
+        SUPPORT + 0.037, abs=1e-9
     )
     controller._enter_search(100.20)
     assert _command(controller, 100.22).thrust == pytest.approx(
-        SUPPORT + 0.03, abs=1e-9
+        SUPPORT + 0.037, abs=1e-9
     )
 
 
@@ -602,6 +612,114 @@ def test_engulfing_anchor_expires_on_frozen_frames():
     assert entered
     # The frozen republication never refreshed the anchor timestamp.
     assert controller._last_engulfing_anchor_s == pytest.approx(100.06)
+
+
+def test_engulfing_anchor_frozen_production_token_does_not_refresh():
+    # The production wrapper replay (d52adcd4, fid 2762570): a real
+    # CameraFrameToken whose publication_sequence strictly advances while
+    # (generation, frame_id) stays frozen is the SAME camera frame, so it
+    # must not refresh the anchor.  _frame_identity keys on
+    # (generation, frame_id) only; generation advances solely on a receiver
+    # reset (vq2_vision.py), never on republication.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    engulfing = _track(
+        "A",
+        0.30,
+        0.10,
+        scale=1.0,
+        clipping=(
+            FrameEdge.LEFT | FrameEdge.RIGHT | FrameEdge.TOP | FrameEdge.BOTTOM
+        ),
+    )
+
+    def production_update(publication_sequence):
+        return SimpleNamespace(
+            tracks=(engulfing,),
+            visible_track_ids=(engulfing.track_id,),
+            token=CameraFrameToken(
+                generation=0,
+                frame_id=2762570,
+                publication_sequence=publication_sequence,
+                stream_id="camera",
+            ),
+        )
+
+    controller.observe(production_update(41), now_s=100.06)
+    assert controller._last_engulfing_anchor_s == pytest.approx(100.06)
+    now = 100.06
+    entered = False
+    for sequence in range(42, 102):  # ~2 s of frozen-frame republications
+        now += 0.033
+        controller.observe(production_update(sequence), now_s=now)
+        if controller.state is CleanCourseState.SEARCH:
+            entered = True
+            break
+    assert entered
+    assert controller._last_engulfing_anchor_s == pytest.approx(100.06)
+
+
+def test_engulfing_anchor_requires_a_visible_track():
+    # Flight 20260729T112603Z-visual-course-d5e89c2b: the camera kept
+    # streaming (the watchdog never fired) but the crossed gate's
+    # authoritative-current track went missed and was never retired
+    # (vq2_visual_tracker.py keeps race-authoritative identity past
+    # max_missed_frames).  Its frozen engulfing bbox re-published on every
+    # FRESH frame (advancing frame identity) and refreshed the anchor for
+    # ~4 s, so no frame-identity freshness gate could ever fire.  A missed
+    # (invisible) track's bbox is stale content: it must never anchor.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    ghost = _track(
+        "A",
+        0.30,
+        0.10,
+        scale=1.0,
+        visible=False,  # missed track: tracker re-emits the last bbox
+        clipping=(
+            FrameEdge.LEFT | FrameEdge.RIGHT | FrameEdge.TOP | FrameEdge.BOTTOM
+        ),
+    )
+    now = 100.06
+    entered = False
+    for frame in range(60):  # ~2 s of genuinely FRESH frames carrying the ghost
+        now += 0.033
+        controller.observe(
+            SimpleNamespace(
+                tracks=(ghost,),
+                visible_track_ids=(),  # nothing associated this frame
+                token=CameraFrameToken(
+                    generation=0,
+                    frame_id=2791388 + frame,
+                    publication_sequence=100 + frame,
+                    stream_id="camera",
+                ),
+            ),
+            now_s=now,
+        )
+        if controller.state is CleanCourseState.SEARCH:
+            entered = True
+            break
+    assert entered
+    assert controller._last_engulfing_anchor_s is None
+
+
+def test_predict_stall_cap_forces_search_regardless_of_anchor():
+    # The d5e89c2b last-resort bound: even with a freshly refreshed anchor,
+    # PREDICT older than 1.5 s without an accepted measurement forces SEARCH
+    # from command() (observe-side anchor expiry can be suppressed forever).
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller.observe(_update([], frame_id=2), now_s=100.12)  # superseded
+    assert controller.state is CleanCourseState.PREDICT
+    # A fresh anchor plus a sub-cap measurement gap: no transition.
+    controller._last_engulfing_anchor_s = 100.50
+    _command(controller, 100.55)
+    assert controller.state is CleanCourseState.PREDICT
+    # Anchor refreshed again but the accepted measurement is now 1.6 s old.
+    controller._last_engulfing_anchor_s = 101.63
+    output = _command(controller, 101.65)
+    assert controller.state is CleanCourseState.SEARCH
+    assert output.state is CleanCourseState.SEARCH
+    assert abs(output.yaw_rate_rad_s) > 0.0  # real bounded sweep, not a park
+    assert output.thrust > 0.0
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():

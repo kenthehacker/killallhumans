@@ -8896,14 +8896,15 @@ class VQ2Runner:
         stage: str,
         elapsed_s: float,
         command: Optional[AttitudeRateCommand],
+        *,
+        extra: Optional[Mapping[str, Any]] = None,
     ) -> None:
         race = self.adapter.race_status
         telemetry = self.adapter.latest_telemetry
         imu = telemetry.imu if telemetry is not None else None
         target = self.tracker.target
         estimate = self.estimate
-        self.recorder.emit(
-            "tick",
+        fields: Dict[str, Any] = dict(
             stage=stage,
             elapsed_s=elapsed_s,
             imu_us=self._last_imu_us,
@@ -8916,6 +8917,12 @@ class VQ2Runner:
             target=(asdict(target) if target else None),
             command=(asdict(command) if command else None),
         )
+        if extra:
+            # Stage-specific per-tick evidence (e.g. the visual-course
+            # perception/controller snapshot) merged into the same tick
+            # record; one dict per tick, no new file.
+            fields.update(extra)
+        self.recorder.emit("tick", **fields)
 
     @staticmethod
     def _outbound_receipt_primitive(receipt: Any) -> Dict[str, Any]:

@@ -130,6 +130,16 @@ GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
 # (~+4 m/s^2 of arrest authority) and tapers to zero at the floor boundary.
 VZ_DESCENT_FLOOR_M_S = -0.5  # sink-rate bound, mirroring the climb cap
 VZ_DESCENT_GOVERNOR_GAIN = 0.06  # collective per m/s below the floor
+# Descent-regime hover feedforward (flight 20260729T112603Z-visual-course-
+# d5e89c2b): a ~-0.5 m/s^2 sink persisted ~4 s while the leaky vz estimate
+# (tau 2.5 s) wound up and the proportional floor alone reached only ~0.31
+# by ground contact; the effective fast-regime hover is ~=0.32.  A fixed
+# +0.025 (mid of the diagnosed +0.02..0.03) applies whenever vz is below
+# the floor, so full arrest authority arrives with the FIRST confirmed
+# sub-floor estimate instead of seconds later.  A shorter downward leak
+# tau was rejected: steady-state vz_est = a_up*tau would sit above the
+# -0.5 floor and the proportional floor would never engage at all.
+VZ_DESCENT_HOVER_FEEDFORWARD = 0.025  # step feedforward while below the floor
 
 # Launch boost is pure feedforward (it ignores ey).  Flight
 # 20260729T094736Z-visual-course-9d430a40: the 0.32 x 0.75 s boost alone
@@ -199,6 +209,16 @@ CROSSING_CREDIT_WAIT_S = 0.40  # July-18 safety contract item 9
 
 PREDICT_FRAME_GAP_S = 0.06  # ~2 camera frames without a measurement
 PREDICT_MAX_GAP_S = 0.50  # short-gap bound before SEARCH
+# Hard wall-clock cap on PREDICT (flight 20260729T112603Z-visual-course-
+# d5e89c2b): an engulfing anchor refreshed every fresh frame by a MISSED
+# (never-retired authoritative-current) tracker track parked PREDICT ~4 s
+# while the camera streamed normally — every anchor expiry rule lives in
+# observe(), so no freshness gate could end it.  command() runs every tick,
+# so it forces SEARCH once the last ACCEPTED measurement is this old,
+# regardless of anchor state.  1.5 s is 3x the anchor horizon: long enough
+# that a genuine engulfed crossing keeps its SEARCH suppression, short
+# enough to end a blind park before the ground does.
+PREDICT_STALL_FORCE_SEARCH_S = 1.50
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 SEARCH_YAW_RATE_RAD_S = 0.12  # bounded sweep inside the 0.15 yaw cap
 SEARCH_SWEEP_PERIOD_S = 1.20  # bounded reversal schedule
@@ -822,6 +842,19 @@ class CleanCourseController:
                     successor_track_id=self._successor_track_id(),
                 )
 
+        # Hard PREDICT stall cap (flight d5e89c2b): anchor expiry lives in
+        # observe(), which a continuously refreshed anchor can keep
+        # suppressing indefinitely.  command() runs every tick, so it owns
+        # the last-resort bound: PREDICT this long without an accepted
+        # measurement forces SEARCH regardless of anchor state.
+        if (
+            self.state is CleanCourseState.PREDICT
+            and self.current is not None
+            and now_s - self.current.last_measurement_s
+            > PREDICT_STALL_FORCE_SEARCH_S
+        ):
+            self._enter_search(now_s)
+
         support = _clamp(
             cfg.support_collective
             / max(0.85, math.cos(roll_rad) * math.cos(pitch_rad)),
@@ -1216,7 +1249,11 @@ class CleanCourseController:
         it; the exact-zero COAST/abort latch bypasses it by construction.
         Symmetric: caps collective above the climb cap and floors it below
         the descent floor (flight d52adcd4 sank ~-1.9 m/s^2 into a ground
-        graze while the frozen frame suppressed SEARCH).
+        graze while the frozen frame suppressed SEARCH).  Below the floor a
+        fixed descent-regime hover feedforward (flight d5e89c2b: effective
+        fast-regime hover ~=0.32, proportional floor alone reached only
+        ~0.31 by contact) steps in with the first confirmed sub-floor
+        estimate instead of waiting on the leaky integrator.
         """
 
         excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
@@ -1225,7 +1262,10 @@ class CleanCourseController:
         descent_excess = VZ_DESCENT_FLOOR_M_S - self._vz_est_m_s
         if descent_excess > 0.0:
             collective = max(
-                collective, support + VZ_DESCENT_GOVERNOR_GAIN * descent_excess
+                collective,
+                support
+                + VZ_DESCENT_GOVERNOR_GAIN * descent_excess
+                + VZ_DESCENT_HOVER_FEEDFORWARD,
             )
         return collective
 
@@ -1321,19 +1361,39 @@ def _is_engulfing_detection(track: Any) -> bool:
     )
 
 
+def _track_visible(track: Any, visible_ids: Any) -> bool:
+    """Duck-typed per-track visibility, shared by both acceptance seams.
+
+    A MISSED track (``visible=False``) is a propagated ghost: the tracker
+    re-emits its last-associated bbox on every fresh frame, and a
+    never-retired authoritative-current track keeps that bbox alive
+    indefinitely (flight d5e89c2b: an invisible engulfing ghost refreshed
+    the anchor for ~4 s of genuinely fresh frames, so no frame-identity
+    freshness gate could ever fire).  Stale content must never anchor.
+    """
+
+    visible = getattr(track, "visible", None)
+    if visible is None:
+        visible_ids = set(visible_ids or ())
+        return track.track_id in visible_ids if visible_ids else True
+    return bool(visible)
+
+
 def _engulfing_anchor_track(update: Any, track_id: Optional[str]) -> Optional[Any]:
     """Best engulfing box in one update for bearing/existence anchoring.
 
     Bearing/existence evidence only: the box never updates any filter axis.
     Prefers the current track_id, then the most confident engulfing box.
+    Only tracks the tracker associated on THIS frame (visible) qualify.
     """
 
     if update is None:
         return None
+    visible_ids = getattr(update, "visible_track_ids", ()) or ()
     engulfing = [
         track
         for track in (getattr(update, "tracks", ()) or ())
-        if _is_engulfing_detection(track)
+        if _track_visible(track, visible_ids) and _is_engulfing_detection(track)
     ]
     if not engulfing:
         return None
@@ -1357,10 +1417,7 @@ def _visible_tracks(update: Any) -> List[Any]:
     visible_ids = set(getattr(update, "visible_track_ids", ()) or ())
     result = []
     for track in tracks:
-        visible = getattr(track, "visible", None)
-        if visible is None:
-            visible = track.track_id in visible_ids if visible_ids else True
-        if visible and not _is_engulfing_detection(track):
+        if _track_visible(track, visible_ids) and not _is_engulfing_detection(track):
             result.append(track)
     return result
 
@@ -1482,6 +1539,95 @@ def clamp_final_command(
     )
 
 
+def _clean_course_tick_trace(
+    controller: CleanCourseController,
+    update: Any,
+    *,
+    now_s: float,
+    state_entry_s: float,
+) -> Dict[str, Any]:
+    """One compact per-tick perception/controller snapshot for the recorder.
+
+    Flight 20260729T112603Z-visual-course-d5e89c2b parked ~4 s on an
+    invisible engulfing ghost and the trace held only one box, leaving
+    gate-1 acquisition unflyable-blind.  Every tick now carries the full
+    candidate list with acceptance dispositions, the successor internals,
+    the governor estimate and clamp, and the state dwell, merged into the
+    runner's existing ``tick`` record (one dict, no new file).
+    """
+
+    tracks = []
+    visible_ids = set(getattr(update, "visible_track_ids", ()) or ())
+    for track in (getattr(update, "tracks", ()) or ()):
+        bbox = getattr(track, "bbox_norm", None)
+        width = height = None
+        if bbox is not None and len(bbox) >= 4:
+            width = float(bbox[2]) - float(bbox[0])
+            height = float(bbox[3]) - float(bbox[1])
+        visible = _track_visible(track, visible_ids)
+        engulfing = _is_engulfing_detection(track)
+        if engulfing:
+            # The d5e89c2b failure mode gets its own category: an invisible
+            # (missed, never-retired) engulfing ghost, never an anchor.
+            why = "engulfing_anchor" if visible else "engulfing_ghost"
+        elif not visible:
+            why = "missed"
+        elif bool(getattr(track, "center_censored", False)):
+            why = "censored"
+        else:
+            why = None
+        tracks.append(
+            {
+                "id": getattr(track, "track_id", None),
+                "center": [float(v) for v in getattr(track, "center_norm", ())],
+                "span": [width, height],
+                "confidence": float(getattr(track, "confidence", 0.0)),
+                "accepted": bool(visible and not engulfing),
+                "why_rejected": why,
+            }
+        )
+    successor = controller.successor
+    successor_trace = None
+    if successor is not None:
+        successor_trace = {
+            "track_id": successor.track_id,
+            "bearing": [successor.x, successor.y],
+            "log_scale": successor.log_scale,
+            "confidence": successor.confidence,
+            "position_std": successor.position_std,
+            "age_s": now_s - successor.last_measurement_s,
+            "matched": any(
+                row["id"] == successor.track_id and row["accepted"] for row in tracks
+            ),
+        }
+    token = getattr(update, "token", None)
+    token_trace = None
+    if token is not None and hasattr(token, "frame_id"):
+        token_trace = [
+            getattr(token, "generation", None),
+            getattr(token, "frame_id", None),
+            getattr(token, "publication_sequence", None),
+        ]
+    current = controller.current
+    return {
+        "state": controller.state.value,
+        "state_dwell_s": now_s - state_entry_s,
+        "token": token_trace,
+        "tracks": tracks,
+        "successor": successor_trace,
+        "vz_est_m_s": controller._vz_est_m_s,
+        "thrust_clamp": [controller.config.min_thrust, controller.config.max_thrust],
+        "anchor_age_s": (
+            None
+            if controller._last_engulfing_anchor_s is None
+            else now_s - controller._last_engulfing_anchor_s
+        ),
+        "measurement_gap_s": (
+            None if current is None else now_s - current.last_measurement_s
+        ),
+    }
+
+
 async def run_clean_course_stage(
     host: Any,
     context: Any,
@@ -1535,6 +1681,8 @@ async def run_clean_course_stage(
     zero_command_count = 0
     last_consumed_token: Any = None
     last_reported_state = controller.state
+    trace_state = controller.state
+    state_entry_s = controller._course_start_s
 
     try:
         while True:
@@ -1586,6 +1734,8 @@ async def run_clean_course_stage(
                     elapsed_s=elapsed,
                 )
                 last_reported_state = controller.state
+                trace_state = controller.state
+                state_entry_s = now
 
             estimate = host.estimate
             if estimate is None:
@@ -1641,7 +1791,26 @@ async def run_clean_course_stage(
                 zero_command_count += 1
             else:
                 command_count += 1
-            host._record_tick("visual-course", elapsed, command)
+            if controller.state is not trace_state:
+                # command() can transition (coast timeout, PREDICT stall cap)
+                # after the observe-side report above; keep dwell honest.
+                # last_reported_state stays untouched so the next tick still
+                # emits the clean_course_state event.
+                trace_state = controller.state
+                state_entry_s = now
+            host._record_tick(
+                "visual-course",
+                elapsed,
+                command,
+                extra={
+                    "clean_course": _clean_course_tick_trace(
+                        controller,
+                        update,
+                        now_s=now,
+                        state_entry_s=state_entry_s,
+                    )
+                },
+            )
             next_tick = rt.next_control_deadline(next_tick, rt.monotonic())
             await rt.sleep(max(0.0, next_tick - rt.monotonic()))
     except BaseException as exc:
