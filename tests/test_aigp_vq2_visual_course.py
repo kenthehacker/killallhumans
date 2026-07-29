@@ -4802,6 +4802,64 @@ def test_fresh_top_boundary_fallback_preserves_later_gate_fov_pitch(
     assert selected == pytest.approx(expected)
 
 
+def test_post_credit_top_pitch_carries_across_segment_and_next_frame():
+    transition_pitch = (
+        course_stage._select_fresh_top_boundary_recovery_pitch(
+            current_gate_index=1,
+            initial_gate_index=0,
+            continuity_target_pitch_rad=-0.21088402976993187,
+            allocated_brake_target_pitch_rad=0.12,
+        )
+    )
+    pending = course_stage._PendingPostCreditRecovery(
+        from_gate_index=0,
+        to_gate_index=1,
+        track_id="vq2-track-000002",
+        camera_token_at_credit=_token(40),
+        admitted_camera_token=_token(41),
+        deadline_s=10.0,
+        successor_steering_available=True,
+        successor_target_pitch_rad=transition_pitch,
+    )
+
+    next_continuity = course_stage._fresh_top_boundary_continuity_pitch(
+        current_track_id=pending.track_id,
+        segment_last_track_id=None,
+        segment_last_pitch_rad=None,
+        post_credit_successor_pitch_rad=(
+            pending.successor_target_pitch_rad
+        ),
+        allocated_brake_target_pitch_rad=0.12,
+    )
+    next_pitch = course_stage._select_fresh_top_boundary_recovery_pitch(
+        current_gate_index=1,
+        initial_gate_index=0,
+        continuity_target_pitch_rad=next_continuity,
+        allocated_brake_target_pitch_rad=0.12,
+    )
+    following_continuity = (
+        course_stage._fresh_top_boundary_continuity_pitch(
+            current_track_id=pending.track_id,
+            segment_last_track_id=pending.track_id,
+            segment_last_pitch_rad=next_pitch,
+            post_credit_successor_pitch_rad=None,
+            allocated_brake_target_pitch_rad=0.12,
+        )
+    )
+    following_pitch = (
+        course_stage._select_fresh_top_boundary_recovery_pitch(
+            current_gate_index=1,
+            initial_gate_index=0,
+            continuity_target_pitch_rad=following_continuity,
+            allocated_brake_target_pitch_rad=0.12,
+        )
+    )
+
+    assert transition_pitch == pytest.approx(-0.21088402976993187)
+    assert next_pitch == pytest.approx(transition_pitch)
+    assert following_pitch == pytest.approx(transition_pitch)
+
+
 @pytest.mark.parametrize(
     "retained",
     (False, True),

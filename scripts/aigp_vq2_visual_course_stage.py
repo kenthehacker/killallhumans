@@ -1883,6 +1883,28 @@ def _select_fresh_top_boundary_recovery_pitch(
     return brake_pitch
 
 
+def _fresh_top_boundary_continuity_pitch(
+    *,
+    current_track_id: str,
+    segment_last_track_id: Any,
+    segment_last_pitch_rad: Optional[float],
+    post_credit_successor_pitch_rad: Optional[float],
+    allocated_brake_target_pitch_rad: float,
+) -> float:
+    """Choose the newest identity-bound pitch for a fresh TOP boundary."""
+
+    if type(current_track_id) is not str or not current_track_id:
+        raise ValueError("fresh TOP recovery track identity is invalid")
+    if (
+        segment_last_track_id == current_track_id
+        and segment_last_pitch_rad is not None
+    ):
+        return float(segment_last_pitch_rad)
+    if post_credit_successor_pitch_rad is not None:
+        return float(post_credit_successor_pitch_rad)
+    return float(allocated_brake_target_pitch_rad)
+
+
 def _off_axis_top_fov_owns_pitch(
     *,
     mode: VisualApproachMode,
@@ -6098,6 +6120,7 @@ class _PendingPostCreditRecovery:
     admitted_camera_token: CameraFrameToken
     deadline_s: float
     successor_steering_available: bool
+    successor_target_pitch_rad: Optional[float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -7518,7 +7541,7 @@ async def _run_visual_course_stage_impl(
             PostCreditMeasurementMode
         ] = None,
         recovery_snapshot: Any = None,
-    ) -> bool:
+    ) -> Optional[float]:
         """Bridge one bounded handoff gap with retained dynamic authority."""
 
         nonlocal last_command_send_s
@@ -7852,10 +7875,24 @@ async def _run_visual_course_stage_impl(
                                 "fresh post-credit TOP boundary lacks bounded "
                                 "closure-recovery authority"
                             ) from propagated_fov_error
-                        target_pitch_rad = (
-                            top_censored_closure_recovery
-                            .allocated_target_pitch_rad
+                        selected_recovery_pitch_rad = (
+                            _select_fresh_top_boundary_recovery_pitch(
+                                current_gate_index=current_gate_index,
+                                initial_gate_index=initial_gate_index,
+                                continuity_target_pitch_rad=target_pitch_rad,
+                                allocated_brake_target_pitch_rad=(
+                                    top_censored_closure_recovery
+                                    .allocated_target_pitch_rad
+                                ),
+                            )
                         )
+                        top_censored_closure_recovery = replace(
+                            top_censored_closure_recovery,
+                            allocated_target_pitch_rad=(
+                                selected_recovery_pitch_rad
+                            ),
+                        )
+                        target_pitch_rad = selected_recovery_pitch_rad
                         thrust = (
                             top_censored_closure_recovery.allocated_thrust
                         )
@@ -8142,6 +8179,16 @@ async def _run_visual_course_stage_impl(
                         "passage_authority": False,
                         "advance_authority": False,
                     }
+                    fov_summary.update(
+                        {
+                            "last_track_id": authority[
+                                "reviewed_track_id"
+                            ],
+                            "last_camera_token": dict(
+                                top_fov_guidance["camera_token"]
+                            ),
+                        }
+                    )
                 elif retained_top_censored_closure_recovery is not None:
                     fov_summary[
                         "retained_exact_top_closure_recovery_command_count"
@@ -8269,7 +8316,7 @@ async def _run_visual_course_stage_impl(
             dynamic_controller.evidence_summary()
         )
         refresh_live_summary()
-        return actual_successor_steering
+        return target_pitch_rad if actual_successor_steering else None
 
     async def send_visual(
         *,
@@ -9172,10 +9219,55 @@ async def _run_visual_course_stage_impl(
                         }
                         top_censored_closure_recovery = None
                     else:
-                        target_pitch_rad = (
+                        continuity_target_pitch_rad = (
                             top_censored_closure_recovery
                             .allocated_target_pitch_rad
                         )
+                        if deferred_top_fov_error is not None:
+                            continuity_target_pitch_rad = (
+                                _fresh_top_boundary_continuity_pitch(
+                                    current_track_id=current_track_id,
+                                    segment_last_track_id=(
+                                        fov_summary["last_track_id"]
+                                    ),
+                                    segment_last_pitch_rad=(
+                                        fov_summary[
+                                            "last_protected_target_pitch_rad"
+                                        ]
+                                    ),
+                                    post_credit_successor_pitch_rad=(
+                                        None
+                                        if post_credit_recovery is None
+                                        else (
+                                            post_credit_recovery
+                                            .successor_target_pitch_rad
+                                        )
+                                    ),
+                                    allocated_brake_target_pitch_rad=(
+                                        continuity_target_pitch_rad
+                                    ),
+                                )
+                            )
+                        selected_recovery_pitch_rad = (
+                            _select_fresh_top_boundary_recovery_pitch(
+                                current_gate_index=current_gate_index,
+                                initial_gate_index=initial_gate_index,
+                                continuity_target_pitch_rad=(
+                                    continuity_target_pitch_rad
+                                ),
+                                allocated_brake_target_pitch_rad=(
+                                    top_censored_closure_recovery
+                                    .allocated_target_pitch_rad
+                                ),
+                            )
+                        )
+                        top_censored_closure_recovery = replace(
+                            top_censored_closure_recovery,
+                            allocated_target_pitch_rad=(
+                                selected_recovery_pitch_rad
+                            ),
+                        )
+                        target_pitch_rad = selected_recovery_pitch_rad
                         command_thrust = (
                             top_censored_closure_recovery.allocated_thrust
                         )
@@ -9975,6 +10067,17 @@ async def _run_visual_course_stage_impl(
                         fov_summary[
                             "last_protected_target_pitch_rad"
                         ] = target_pitch_rad
+                    fov_summary.update(
+                        {
+                            "last_track_id": current_track_id,
+                            "last_camera_token": asdict(
+                                snapshot.latest_camera_token
+                            ),
+                            "last_wire_start_monotonic_ns": (
+                                wire_start_monotonic_ns
+                            ),
+                        }
+                    )
                     host.recorder.emit(
                         "visual_course_fresh_top_censored_recovery",
                         gate_index=current_gate_index,
@@ -10599,6 +10702,22 @@ async def _run_visual_course_stage_impl(
             or post_credit_recovery.deadline_s <= segment_started_s
             or type(post_credit_recovery.successor_steering_available)
             is not bool
+            or (
+                post_credit_recovery.successor_target_pitch_rad
+                is not None
+                and (
+                    not math.isfinite(
+                        post_credit_recovery
+                        .successor_target_pitch_rad
+                    )
+                    or not MIN_VISUAL_TARGET_PITCH_RAD
+                    <= (
+                        post_credit_recovery
+                        .successor_target_pitch_rad
+                    )
+                    <= MAX_VISUAL_TARGET_PITCH_RAD
+                )
+            )
         ):
             raise abort_type(
                 "visual-course pending post-credit recovery is invalid "
@@ -11358,7 +11477,7 @@ async def _run_visual_course_stage_impl(
                             expected_current_track_id=current_track_id,
                             adjacent_precredit=False,
                         )
-                        propagated_steering = await send_continuity_hold(
+                        propagated_pitch = await send_continuity_hold(
                             (
                                 f"{VISUAL_COURSE_STAGE}/gate"
                                 f"{current_gate_index}/"
@@ -11387,7 +11506,7 @@ async def _run_visual_course_stage_impl(
                             "visual-course post-credit local-state "
                             f"propagation refused: {exc}"
                         ) from exc
-                    if not propagated_steering:
+                    if propagated_pitch is None:
                         raise abort_type(
                             "visual-course post-credit local-state steering "
                             "was not applied"
@@ -11442,7 +11561,7 @@ async def _run_visual_course_stage_impl(
                                 ),
                                 measurement_mode=recovery_measurement_mode,
                                 propagated_steering_applied=(
-                                    propagated_steering
+                                    propagated_pitch is not None
                                 ),
                             )
                         )
@@ -15964,6 +16083,7 @@ async def _run_visual_course_stage_impl(
             reviewed_track_id=requested_promoted_track_id,
         )
         post_credit_successor_steering_active = False
+        post_credit_successor_target_pitch_rad: Optional[float] = None
         post_credit_dynamic_handoff_active = False
         if type(advance_outcome) is CreditedUnboundGateAdvance:
             unbound_advance = advance_outcome
@@ -16116,7 +16236,7 @@ async def _run_visual_course_stage_impl(
                         "credited-unbound reacquisition"
                     )
                 if runtime.dynamic_controller is not None:
-                    post_credit_successor_steering_active = (
+                    post_credit_successor_target_pitch_rad = (
                         await send_continuity_hold(
                         (
                             f"{VISUAL_COURSE_STAGE}/gate"
@@ -16129,6 +16249,9 @@ async def _run_visual_course_stage_impl(
                             post_credit_successor_steering_active
                         ),
                         )
+                    )
+                    post_credit_successor_steering_active = (
+                        post_credit_successor_target_pitch_rad is not None
                     )
                     segment["post_credit_hold_command_count"] = int(
                         segment["post_credit_hold_command_count"]
@@ -16243,6 +16366,7 @@ async def _run_visual_course_stage_impl(
                 post_credit_successor_steering_active = (
                     rebound_steering_available
                 )
+                post_credit_successor_target_pitch_rad = None
                 post_credit_dynamic_handoff_active = (
                     rebound_steering_available
                 )
@@ -16539,7 +16663,7 @@ async def _run_visual_course_stage_impl(
             if evaluate_recovery_candidate(snapshot):
                 break
             if runtime.dynamic_controller is not None:
-                post_credit_successor_steering_active = (
+                post_credit_successor_target_pitch_rad = (
                     await send_continuity_hold(
                     (
                         f"{VISUAL_COURSE_STAGE}/gate"
@@ -16551,6 +16675,9 @@ async def _run_visual_course_stage_impl(
                         post_credit_successor_steering_active
                     ),
                     )
+                )
+                post_credit_successor_steering_active = (
+                    post_credit_successor_target_pitch_rad is not None
                 )
                 segment["post_credit_hold_command_count"] = int(
                     segment["post_credit_hold_command_count"]
@@ -16632,6 +16759,9 @@ async def _run_visual_course_stage_impl(
             deadline_s=fresh_deadline_s,
             successor_steering_available=(
                 post_credit_successor_steering_active
+            ),
+            successor_target_pitch_rad=(
+                post_credit_successor_target_pitch_rad
             ),
         )
         carry_adjacent_planner = bool(
