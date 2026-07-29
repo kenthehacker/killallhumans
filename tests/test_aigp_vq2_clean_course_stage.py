@@ -13,7 +13,11 @@ engulfing detections), degenerate engulfing detections rejected as
 measurements but kept as bearing/existence anchors that block SEARCH,
 expire when the camera frame freezes, and never come from a missed
 (invisible) track, with a hard 1.5 s PREDICT stall cap that forces SEARCH
-regardless of anchor state,
+regardless of anchor state, a genuine nose-up post-credit brake armed by
+every authoritative promotion until the successor is accepted and
+vertically qualified (bounded by a 2.75 s timeout) with a qualification-
+gated 0.5 m/s climb cap in the same window, a raised 0.34 thrust envelope
+under the runner's 0.35 hard abort,
 verified yaw/roll directions, clipping uncertainty (not abort),
 PREDICT->SEARCH on fresh empty frames, frozen-frame stalls that predict and
 never coast, a real bounded yaw sweep, finite bounded output, absolute race
@@ -230,7 +234,7 @@ def test_vertical_loss_decays_toward_support_not_saturation_retention():
     assert all(math.isfinite(value) for value in thrusts)
     assert thrusts[-1] > saturated + 0.01  # not retained at saturation
     assert thrusts[-1] == pytest.approx(SUPPORT, abs=0.01)  # decayed to support
-    assert all(0.21 <= value <= 0.32 for value in thrusts)
+    assert all(0.21 <= value <= 0.34 for value in thrusts)
 
 
 # ---------------------------------------------------------------------------
@@ -264,10 +268,10 @@ def test_gate0_climb_vertical_offset_is_bounded_feedforward():
     output = _command(controller, 100.10)
     # e = -0.10 - 0.25 = -0.35 -> full climb correction above support.
     assert output.thrust == pytest.approx(SUPPORT + 0.080 * 0.35, abs=1e-9)
-    assert 0.21 <= output.thrust <= 0.32
+    assert 0.21 <= output.thrust <= 0.34
 
     high = _tracked_controller(_track("A", 0.0, -0.60), config=config)
-    assert _command(high, 100.10).thrust <= 0.32
+    assert _command(high, 100.10).thrust <= 0.34
 
     controller.observe(
         _update(
@@ -396,8 +400,9 @@ def test_vz_governor_floors_collective_below_descent_floor():
     controller._vz_est_m_s = -0.5  # at the floor boundary: no effect
     assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT, abs=1e-9)
     controller._vz_est_m_s = -1.0  # 0.5 m/s below -> +0.03 + 0.025 feedforward
-    # 0.275 + 0.055 = 0.33 raw saturates at max_thrust as well.
-    assert helper(SUPPORT, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
+    # 0.275 + 0.055 = 0.33 raw: inside the raised 0.34 envelope (F9/F10
+    # headroom restoration; the old 0.32 clamp clipped exactly this case).
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.055, abs=1e-9)
     # Deep sinks saturate at max_thrust (flight 039186c8: the unclamped
     # floor boost exceeded the runner's 0.35 envelope abort in SEARCH).
     controller._vz_est_m_s = -1.5  # 1.0 m/s below -> +0.06 + 0.025 = 0.36 raw
@@ -405,21 +410,23 @@ def test_vz_governor_floors_collective_below_descent_floor():
     # The floor only raises collective, but the governed output is still
     # clamped: a higher command saturates at max_thrust as well.
     controller._vz_est_m_s = -1.0
-    assert helper(0.34, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
+    assert helper(0.35, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
 
 
 def test_vz_descent_floor_raises_command_thrust():
     # Command level: vz = -0.7 m/s lifts the emitted collective to
     # support + 0.012 (proportional) + 0.025 (feedforward) = 0.312, below
-    # the 0.32 clamp so it stays observable; a deeper sink saturates the
-    # clamp, which is the intended full-authority descent response.
+    # the raised 0.34 clamp so it stays observable; a deeper sink (vz -1.0,
+    # raw 0.33) now fits inside the envelope instead of clipping at 0.32.
     controller = _tracked_controller(_track("A", 0.0, 0.0))  # e = 0, vy ~ 0
     controller._vz_est_m_s = -0.7
     assert _command(controller, 100.10).thrust == pytest.approx(
         SUPPORT + 0.037, abs=1e-9
     )
     controller._vz_est_m_s = -1.0
-    assert _command(controller, 100.14).thrust == pytest.approx(0.32, abs=1e-9)
+    assert _command(controller, 100.14).thrust == pytest.approx(
+        SUPPORT + 0.055, abs=1e-9
+    )
 
 
 def test_vz_descent_floor_applies_in_predict_and_search():
@@ -727,6 +734,108 @@ def test_predict_stall_cap_forces_search_regardless_of_anchor():
     assert output.thrust > 0.0
 
 
+def test_post_credit_brake_engages_and_releases_on_qualification():
+    # Flights 039186c8/F10: gate-0 attack closure (~3+ m/s) carried into the
+    # post-credit phase collapsed thrust effectiveness and pushed gate-1
+    # bearing rates past the yaw cap.  Promotion arms a genuine nose-up
+    # brake (positive pitch; ADVANCE_PITCH_RAD = -0.18 is nose-down) until
+    # the successor is accepted AND vertically qualified.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller.observe(
+        _update(
+            [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
+            frame_id=3,
+        ),
+        now_s=100.08,
+    )
+    promoted = controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
+    assert promoted
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.current.track_id == "B"
+    # Unqualified window (aged accepted y): the brake engages and slews to
+    # the real pitch-back attitude while lateral pursuit of the accepted
+    # track keeps working.
+    controller.current.last_y_measurement_s = 100.10 - 1.0
+    now = 100.14
+    brake = _command(controller, now)
+    assert not brake.vertical_qualified
+    assert brake.yaw_rate_rad_s > 0.0  # x=+0.30 pursuit still steers
+    for _ in range(20):  # pitch slew (0.30 rad/s) reaches the brake attitude
+        now += 0.033
+        brake = _command(controller, now)
+    assert not brake.vertical_qualified
+    assert brake.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    # Fresh y measurements re-qualify; the brake releases immediately to the
+    # normal advance/brake interpolation (never positive pitch).
+    for frame, y in enumerate((0.06, 0.07, 0.08)):
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, y, scale=0.05)], frame_id=10 + frame),
+            now_s=now,
+        )
+    now += 0.033
+    released = _command(controller, now)
+    assert released.vertical_qualified
+    for _ in range(20):  # output slew converges back to the normal attitude
+        now += 0.033
+        released = _command(controller, now)
+    # The normal advance/brake interpolation never commands positive pitch.
+    assert released.target_pitch_rad <= 0.0
+
+
+def test_post_credit_brake_releases_on_timeout():
+    # A lost gate cannot brake forever: with no credible successor the
+    # promotion enters SEARCH, slews to the brake attitude, and resumes the
+    # normal near-level SEARCH attitude after the 2.75 s timeout.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    promoted = controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
+    assert promoted
+    assert controller.state is CleanCourseState.SEARCH  # no credible successor
+    now = 100.10
+    output = None
+    for _ in range(20):  # slew (0.30 rad/s) reaches the brake attitude
+        now += 0.033
+        output = _command(controller, now)
+    assert output.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    # Past the deadline the window ends even with nothing reacquired.
+    now = 100.10 + 2.80
+    for _ in range(20):
+        now += 0.033
+        output = _command(controller, now)
+    assert output.target_pitch_rad == pytest.approx(-0.02, abs=1e-9)
+
+
+def test_post_credit_climb_cap_is_qualification_gated():
+    # F10: a post-credit climb at vz +1.0 chased an unqualified low-conf
+    # bearing for ~1.4 s, spending ~0.7 m of altitude.  The climb cap
+    # tightens to 0.5 m/s for the post-credit unqualified window only; the
+    # full 1.0 cap never left gate 0 and returns on release.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller._vz_est_m_s = 1.4  # over even the full cap
+    assert controller._governed_collective(SUPPORT, SUPPORT) == pytest.approx(
+        SUPPORT - 0.03 * 0.4, abs=1e-9  # full 1.0 cap: no brake window
+    )
+    controller.observe(
+        _update(
+            [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
+            frame_id=3,
+        ),
+        now_s=100.08,
+    )
+    controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
+    controller.current.last_y_measurement_s = 100.10 - 1.0  # unqualified
+    _command(controller, 100.14)  # window confirmed active in command()
+    controller._vz_est_m_s = 0.8  # over the 0.5 post-credit cap only
+    assert controller._governed_collective(SUPPORT, SUPPORT) == pytest.approx(
+        SUPPORT - 0.03 * 0.3, abs=1e-9
+    )
+    # Timeout release restores the full cap (0.8 m/s no longer capped).
+    _command(controller, 100.10 + 2.80)
+    assert controller._governed_collective(SUPPORT, SUPPORT) == pytest.approx(
+        SUPPORT, abs=1e-9
+    )
+
+
 def test_clipping_increases_uncertainty_but_does_not_abort():
     clipped = _tracked_controller(
         _track("A", 0.10, 0.0, clipping=FrameEdge.RIGHT)
@@ -1004,7 +1113,7 @@ def test_finite_bounded_output_across_states():
         )
         assert all(math.isfinite(value) for value in values)
         assert abs(output.yaw_rate_rad_s) <= 0.15 + 1e-9
-        assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.32
+        assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
         assert abs(output.target_roll_rad) <= 0.12 + 1e-9
         assert -0.35 <= output.target_pitch_rad <= 0.15
         if output.thrust == 0.0:
@@ -1019,7 +1128,7 @@ def test_final_clamp_is_the_single_transparent_envelope():
     assert command.roll_rate == pytest.approx(0.25)
     assert command.pitch_rate == pytest.approx(-0.25)
     assert command.yaw_rate == pytest.approx(0.15)
-    assert command.thrust == pytest.approx(0.32)
+    assert command.thrust == pytest.approx(0.34)
     command = clamp_final_command(_Command(0.0, 0.0, 0.0, 0.05), runtime=runtime)
     assert command.thrust == pytest.approx(0.21)
     # Exact zero is reserved semantics and passes through unchanged.
@@ -1119,7 +1228,7 @@ def _test_runtime():
         max_yaw_rate_rad_s=0.15,
         max_command_rate_rad_s=0.25,
         min_thrust=0.21,
-        max_thrust=0.32,
+        max_thrust=0.34,
     )
 
 

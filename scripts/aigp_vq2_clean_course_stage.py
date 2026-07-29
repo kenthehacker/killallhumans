@@ -42,10 +42,18 @@ Control-law constant sources:
   IMU-based world-vertical-rate climb governor added after the fourth
   top-bar collision showed bearing pursuit builds unbounded vz; see the
   comment at its definition.  It supersedes the removed flight-2
-  D-direction limiter as the honest rate-limit mechanism.
+  D-direction limiter as the honest rate-limit mechanism.  A symmetric
+  descent floor with hover feedforward and a post-credit 0.5 m/s climb
+  cap (qualification-gated) extend it; see the constant blocks.
+- ``POST_CREDIT_BRAKE_PITCH_RAD`` / ``POST_CREDIT_BRAKE_TIMEOUT_S``: a
+  genuine nose-up brake after every authoritative promotion until the
+  successor is accepted and vertically qualified (bounded by the timeout),
+  added after flights 039186c8/F10 carried gate-0 attack closure into the
+  post-credit phase and collapsed thrust effectiveness.
 - Thrust envelope ``[MIN_COURSE_THRUST, MAX_COURSE_THRUST]`` and yaw cap: the
   accepted v3 yaw profile and the visual-course thrust envelope from the
-  July-18 safety contract.
+  July-18 safety contract (max raised 0.32 -> 0.34 under the 0.35 hard
+  abort for the fast-regime hover shift).
 
 This module never imports the runner; the async loop receives the runner as a
 duck-typed host plus an explicit :class:`CleanCourseRuntime` primitive bundle,
@@ -104,7 +112,14 @@ VERTICAL_MAX_ABS_ERROR_NORM = 0.50  # GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR
 VERTICAL_MAX_ABS_RATE_NORM_S = 5.0 / 3.0  # GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE
 
 MIN_COURSE_THRUST = 0.21  # MIN_VISUAL_THRUST (active visual-course envelope)
-MAX_COURSE_THRUST = 0.32  # MAX_VISUAL_THRUST
+# Raised 0.32 -> 0.34 (flights 20260729T114842Z-visual-course-039186c8 and
+# bf13f18's F10): carrying gate-0 attack speed into the post-credit phase
+# collapsed thrust effectiveness (VRS-like fast regime: measured effective
+# hover 0.335-0.36 while the low-speed fit predicts +2.9 m/s^2 at 0.32).
+# The runner's hard envelope abort stays 0.35 (validate_command), and this
+# also restores proportional descent-floor headroom: the vz = -1.0 floor
+# target 0.33 was clipped by the old 0.32 clamp.
+MAX_COURSE_THRUST = 0.34  # MAX_VISUAL_THRUST, below the 0.35 hard abort
 
 # IMU-based world-vertical-rate governor (climb only).  Four consecutive
 # gate-0 top-bar collisions (flights 20260729T085719Z-visual-course-4455fd61,
@@ -219,6 +234,26 @@ PREDICT_MAX_GAP_S = 0.50  # short-gap bound before SEARCH
 # that a genuine engulfed crossing keeps its SEARCH suppression, short
 # enough to end a blind park before the ground does.
 PREDICT_STALL_FORCE_SEARCH_S = 1.50
+# Post-credit brake (flights 20260729T114842Z-visual-course-039186c8 and
+# F10): gate 0 is crossed at ~3+ m/s closure, and carrying that attack
+# speed into the post-credit phase (a) collapsed thrust effectiveness in
+# the fast/VRS-like regime (measured vz_est derivative ~-0.5 m/s^2 with
+# thrust pinned at the clamp; effective hover 0.335-0.36) and (b) pushed
+# near off-axis gate-1 bearing rates past the 0.15 rad/s yaw cap, sliding
+# two accepted gate-1 tracks to x ~= 0.96 and losing them.  After every
+# authoritative promotion the stage therefore actively pitches back until
+# the successor is accepted AND vertically qualified, with a bounded
+# timeout so a lost gate cannot brake forever.  Pitch sign: NEGATIVE is
+# nose-down forward advance (ADVANCE_PITCH_RAD = -0.18), so a genuine
+# brake is POSITIVE nose-up; +0.12 sits well inside the +/-0.25 pitch cap.
+# Side benefit: pitch-back tilts the camera up toward gate 1's known
+# high-first-sight position.  The climb cap also tightens to 0.5 m/s for
+# the same unqualified window (F10 climbed at vz +1.0 for ~1.4 s chasing
+# an unqualified low-conf bearing, spending ~0.7 m of altitude); the full
+# 1.0 m/s cap returns the moment vertical is qualified.
+POST_CREDIT_BRAKE_PITCH_RAD = 0.12  # nose-up brake attitude (see block above)
+POST_CREDIT_BRAKE_TIMEOUT_S = 2.75  # bounded brake even with no reacquisition
+POST_CREDIT_CLIMB_CAP_M_S = 0.5  # climb cap while post-credit unqualified
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 SEARCH_YAW_RATE_RAD_S = 0.12  # bounded sweep inside the 0.15 yaw cap
 SEARCH_SWEEP_PERIOD_S = 1.20  # bounded reversal schedule
@@ -472,6 +507,9 @@ class CleanCourseConfig:
     crossing_credit_wait_s: float = CROSSING_CREDIT_WAIT_S
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
+    post_credit_brake_pitch_rad: float = POST_CREDIT_BRAKE_PITCH_RAD
+    post_credit_brake_timeout_s: float = POST_CREDIT_BRAKE_TIMEOUT_S
+    post_credit_climb_cap_m_s: float = POST_CREDIT_CLIMB_CAP_M_S
     search_covariance_std_norm: float = SEARCH_COVARIANCE_STD_NORM
     search_yaw_rate_rad_s: float = SEARCH_YAW_RATE_RAD_S
     search_sweep_period_s: float = SEARCH_SWEEP_PERIOD_S
@@ -558,6 +596,12 @@ class CleanCourseController:
         # keep refreshing it, or the anchor never expires and SEARCH is
         # suppressed for the whole blind descent.
         self._last_engulfing_anchor_identity: Optional[Tuple[Any, Any]] = None
+        # Post-credit brake window (flights 039186c8/F10): deadline set on
+        # every authoritative promotion; released early when the successor
+        # is accepted and vertically qualified.  While active, command()
+        # pitches back genuinely and tightens the climb cap.
+        self._post_credit_deadline_s: Optional[float] = None
+        self._active_climb_cap_m_s = VZ_CLIMB_CAP_M_S
 
     # -- initialization ----------------------------------------------------
 
@@ -796,6 +840,13 @@ class CleanCourseController:
         # Re-seed the collective tracker so a retained saturated sub-support
         # command can never survive into the next gate.
         self._collective = None
+        # Arm the post-credit brake window (flights 039186c8/F10): kill the
+        # gate-0 attack closure before it collapses thrust effectiveness and
+        # outruns the yaw cap on the next gate's bearing.
+        self._post_credit_deadline_s = (
+            float(now_s) + self.config.post_credit_brake_timeout_s
+        )
+        self._active_climb_cap_m_s = self.config.post_credit_climb_cap_m_s
         return True
 
     # -- the one continuous control law -------------------------------------
@@ -855,6 +906,21 @@ class CleanCourseController:
         ):
             self._enter_search(now_s)
 
+        # Post-credit brake window (flights 039186c8/F10): timeout release
+        # here (a lost gate cannot brake forever); the qualification release
+        # happens in the main path where vertical_qualified is computed.
+        # The tighter climb cap applies for the whole unqualified window.
+        if (
+            self._post_credit_deadline_s is not None
+            and now_s >= self._post_credit_deadline_s
+        ):
+            self._post_credit_deadline_s = None
+        self._active_climb_cap_m_s = (
+            cfg.post_credit_climb_cap_m_s
+            if self._post_credit_deadline_s is not None
+            else VZ_CLIMB_CAP_M_S
+        )
+
         support = _clamp(
             cfg.support_collective
             / max(0.85, math.cos(roll_rad) * math.cos(pitch_rad)),
@@ -866,7 +932,12 @@ class CleanCourseController:
             sweep_yaw = self._search_yaw(dt)
             self._collective = support
             target_roll = self._slew_roll(0.0, dt)
-            target_pitch = self._slew_pitch(cfg.brake_pitch_rad, dt)
+            target_pitch = self._slew_pitch(
+                cfg.post_credit_brake_pitch_rad
+                if self._post_credit_deadline_s is not None
+                else cfg.brake_pitch_rad,
+                dt,
+            )
             return NavigationOutput(
                 target_roll_rad=target_roll,
                 target_pitch_rad=target_pitch,
@@ -945,6 +1016,13 @@ class CleanCourseController:
             <= cfg.vertical_qualify_max_age_s
             and current.y_axis.std <= cfg.search_covariance_std_norm
         )
+        # Qualification release for the post-credit brake: the successor is
+        # accepted and vertically qualified, so normal advance and the full
+        # climb cap resume immediately (no waiting out the timeout).
+        if vertical_qualified and self._post_credit_deadline_s is not None:
+            self._post_credit_deadline_s = None
+            self._active_climb_cap_m_s = VZ_CLIMB_CAP_M_S
+        post_credit_brake = self._post_credit_deadline_s is not None
         if vertical_qualified:
             bounded_error = _clamp(
                 ey - vertical_setpoint_offset,
@@ -1035,10 +1113,18 @@ class CleanCourseController:
             / (cfg.near_brake_log_scale - cfg.near_free_log_scale)
         )
         advance = align * confidence * uncertainty * expansion * near_plane
-        target_pitch = (
-            cfg.brake_pitch_rad
-            + (cfg.advance_pitch_rad - cfg.brake_pitch_rad) * advance
-        )
+        if post_credit_brake:
+            # Post-credit brake (flights 039186c8/F10): a genuine nose-up
+            # pitch-back (positive; ADVANCE_PITCH_RAD = -0.18 is nose-down)
+            # to kill the gate-0 attack closure before it collapses thrust
+            # effectiveness and outruns the yaw cap.  Lateral yaw/roll
+            # pursuit above and the vz governor stay fully active.
+            target_pitch = cfg.post_credit_brake_pitch_rad
+        else:
+            target_pitch = (
+                cfg.brake_pitch_rad
+                + (cfg.advance_pitch_rad - cfg.brake_pitch_rad) * advance
+            )
 
         return NavigationOutput(
             target_roll_rad=self._slew_roll(target_roll, dt),
@@ -1249,14 +1335,17 @@ class CleanCourseController:
         it; the exact-zero COAST/abort latch bypasses it by construction.
         Symmetric: caps collective above the climb cap and floors it below
         the descent floor (flight d52adcd4 sank ~-1.9 m/s^2 into a ground
-        graze while the frozen frame suppressed SEARCH).  Below the floor a
+        graze while the frozen frame suppressed SEARCH).  The climb cap is
+        dynamic: the full VZ_CLIMB_CAP_M_S, tightened to the post-credit
+        cap while the post-credit brake window is active (F10's unqualified
+        post-credit climb).  Below the floor a
         fixed descent-regime hover feedforward (flight d5e89c2b: effective
         fast-regime hover ~=0.32, proportional floor alone reached only
         ~0.31 by contact) steps in with the first confirmed sub-floor
         estimate instead of waiting on the leaky integrator.
         """
 
-        excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
+        excess = self._vz_est_m_s - self._active_climb_cap_m_s
         if excess > 0.0:
             collective = min(collective, support - VZ_GOVERNOR_GAIN * excess)
         descent_excess = VZ_DESCENT_FLOOR_M_S - self._vz_est_m_s
@@ -1630,6 +1719,7 @@ def _clean_course_tick_trace(
         "measurement_gap_s": (
             None if current is None else now_s - current.last_measurement_s
         ),
+        "post_credit_brake": controller._post_credit_deadline_s is not None,
     }
 
 
