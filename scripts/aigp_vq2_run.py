@@ -7918,12 +7918,6 @@ class VQ2Runner:
         )
         if config.gravity_correction_kp != 0.0 or config.gyro_bias_ki != 0.0:
             raise AssertionError("powered VQ2 estimator must be pure gyro after bootstrap")
-        # F23: pure gyro sealed a 25-47 degree attitude error in during the
-        # fast regime (innovation past the veto, every trust gate closed).
-        # The config-default slow secular correction (kp_slow=0.08, full
-        # authority only at/above the 30-degree veto, impact-gated) stays
-        # enabled as the bounded exception to the pure-gyro policy; the
-        # fast maneuver-chasing paths remain off.
         self.estimator = ImuAttitudeEstimator(config)
 
         self.estimate: Optional[AttitudeEstimate] = None
