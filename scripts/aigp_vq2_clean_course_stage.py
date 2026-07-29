@@ -917,6 +917,7 @@ class CleanCourseController:
             if (
                 self.state is CleanCourseState.TRACK
                 and fresh
+                and not self._fh_untrusted
                 and self.current.outer_log_scale >= cfg.crossing_min_log_scale
             ):
                 # Credible close crossing lost the target on a FRESH frame:
@@ -925,6 +926,13 @@ class CleanCourseController:
                 # a ~0.27 s camera stall republished one frozen frame id and
                 # the stale close-range loss latched zero thrust at the
                 # gate-0 top bar, so a superseded frame must never arm this.
+                # Flight 20260729T152745Z-visual-course-6bebd725: at fh 7.5
+                # (untrusted) a fast terrain/frame object hit engulfing scale
+                # and vanished, latching zero thrust at speed -> instant hard
+                # drop (impulse 3.11).  Zero thrust is only safe in the slow
+                # crossing regime the coast was designed for; while fh is
+                # untrusted a close-target loss must fall through to PREDICT
+                # with the support+margin collective instead.
                 self.state = CleanCourseState.COAST_FOR_CREDIT
                 self._coast_entry_s = float(now_s)
                 self._coast_race_boot_ms = self._last_race_boot_ms
