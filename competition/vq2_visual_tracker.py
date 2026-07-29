@@ -31,7 +31,8 @@ _NS_PER_S = 1_000_000_000.0
 _FRAGMENT_UNION_EDGE_MARGIN_PX = 2
 _FRAGMENT_UNION_MIN_DIMENSION_PX = 20
 _FRAGMENT_UNION_MAX_COMPONENT_ASPECT = 2.60
-_FRAGMENT_UNION_MAX_ASPECT = 1.45
+_FRAGMENT_UNION_MIN_PRIOR_ASPECT_RATIO = 0.75
+_FRAGMENT_UNION_MAX_PRIOR_ASPECT_RATIO = 1.35
 _FRAGMENT_UNION_MIN_IOU = 0.75
 _FRAGMENT_UNION_MAX_CENTER_JUMP_PX = 32.0
 
@@ -1256,6 +1257,7 @@ class MultiTargetVisualTracker:
                 or state.authority_race_status_boot_ms is None
                 or state.missed_frame_count != 0
                 or state.ambiguous
+                or track_index in plan.ambiguous_track_indexes
                 or state.latest.clipping is not FrameEdge.TOP
                 or not state.latest.center_censored
             ):
@@ -1296,9 +1298,22 @@ class MultiTargetVisualTracker:
                 detections=plan.eligible_detections,
                 detection_indexes=available,
                 frame=frame,
+                required_component_detection_index=(
+                    own_selected_detection_index
+                ),
             )
             if assignment is None:
                 continue
+            if own_selected_detection_index is not None:
+                ordinary_score = plan.pair_scores.get(
+                    (track_index, own_selected_detection_index)
+                )
+                if (
+                    ordinary_score is None
+                    or assignment.pair_score.cost
+                    >= ordinary_score.cost
+                ):
+                    continue
             assignments[track_index] = assignment
             reserved_detection_indexes.update(
                 assignment.component_detection_indexes
@@ -1312,6 +1327,7 @@ class MultiTargetVisualTracker:
         detections: tuple[VisualDetection, ...],
         detection_indexes: tuple[int, ...],
         frame: VisualDetectionFrame,
+        required_component_detection_index: Optional[int],
     ) -> Optional[_FragmentUnionAssignment]:
         width_px, height_px = frame.image_size_px
         prior_bbox_px = _bbox_to_pixels(
@@ -1384,6 +1400,12 @@ class MultiTargetVisualTracker:
             ) in valid:
                 if lower_index == upper_index:
                     continue
+                if (
+                    required_component_detection_index is not None
+                    and required_component_detection_index
+                    not in {upper_index, lower_index}
+                ):
+                    continue
                 lower_x, lower_y, lower_width, lower_height = (
                     lower_bbox
                 )
@@ -1418,11 +1440,14 @@ class MultiTargetVisualTracker:
                     < _FRAGMENT_UNION_MIN_DIMENSION_PX
                 ):
                     continue
-                union_aspect = max(
-                    union_width,
-                    union_height,
-                ) / min(union_width, union_height)
-                if union_aspect > _FRAGMENT_UNION_MAX_ASPECT:
+                prior_aspect = prior_width / prior_height
+                union_aspect = union_width / union_height
+                relative_aspect = union_aspect / prior_aspect
+                if not (
+                    _FRAGMENT_UNION_MIN_PRIOR_ASPECT_RATIO
+                    <= relative_aspect
+                    <= _FRAGMENT_UNION_MAX_PRIOR_ASPECT_RATIO
+                ):
                     continue
 
                 horizontal_gap = max(
@@ -1510,9 +1535,15 @@ class MultiTargetVisualTracker:
                 if clipping is not FrameEdge.TOP:
                     continue
                 composite = VisualDetection(
-                    source_index=min(
-                        upper.source_index,
-                        lower.source_index,
+                    source_index=(
+                        detections[
+                            required_component_detection_index
+                        ].source_index
+                        if required_component_detection_index is not None
+                        else min(
+                            upper.source_index,
+                            lower.source_index,
+                        )
                     ),
                     center_norm=(
                         2.0 * union_center_x / width_px - 1.0,
