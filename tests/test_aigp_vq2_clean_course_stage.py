@@ -1259,9 +1259,12 @@ def test_descent_floor_cannot_fire_from_frozen_vz_est():
     )
     out = _command(controller, now, fh=4.0)
     assert out.vertical_qualified  # fresh camera y
-    # Governor suppressed: centered target -> bare support, NOT the
-    # descent-floor boost that would clamp at 0.34.
-    assert out.thrust == pytest.approx(SUPPORT, abs=1e-9)
+    # Governor suppressed: centered target -> PD asks for bare support, NOT
+    # the descent-floor boost that would clamp at 0.34.  But the F21
+    # fh-untrusted floor (support + margin) still bounds it from below —
+    # while vz/alt are known lies nothing commands less (flight 9828d64c:
+    # qualified-PD sagged to 0.254 at fh 7 and sank ~2 m).
+    assert out.thrust == pytest.approx(SUPPORT + 0.05, abs=1e-9)
 
 
 def test_edge_parked_stall_forces_search_after_dwell_without_progress():

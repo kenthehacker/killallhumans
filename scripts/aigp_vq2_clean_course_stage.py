@@ -1742,8 +1742,21 @@ class CleanCourseController:
             # the descent floor/feedforward, which pinned F14's thrust at
             # the clamp on a phantom -4.36 m/s sink.  Camera-qualified PD
             # output only, hard-clamped to the envelope.
+            # F21 (9828d64c) floor: an invisible "missed" track kept
+            # refreshing vertical_qualified from its frozen ghost position,
+            # so the qualified-PD path sagged collective 0.318 -> 0.254 over
+            # 1.5 s at fh 6.5-7.5 — below real hover in the fast regime — and
+            # the drone sank ~2 m into terrain.  While vz/alt are known lies,
+            # NOTHING may command below support + margin (the F14-measured
+            # biased-regime deficit); honest qualified PD may still command
+            # above the floor.  This closes the blind-sink family in one
+            # place (F19 SEARCH hold, F20 coast gate, F21 qualified-PD sag)
+            # instead of per-path patches.
+            floor = support + self.config.fh_untrusted_vertical_margin
             return _clamp(
-                collective, self.config.min_thrust, self.config.max_thrust
+                max(collective, floor),
+                self.config.min_thrust,
+                self.config.max_thrust,
             )
         excess = self._vz_est_m_s - self._active_climb_cap_m_s
         if excess > 0.0:
