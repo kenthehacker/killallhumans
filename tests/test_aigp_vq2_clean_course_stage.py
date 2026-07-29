@@ -174,6 +174,11 @@ def test_identical_global_vertical_sign_at_every_gate():
                 ),
                 now_s=now,
             )
+            # F42: promotion requires a persistent successor; seed the age
+            # of every candidate (the old track id disappearing makes the
+            # "current"-id track a successor candidate too).
+            controller._track_first_seen_s["current"] = now - 1.0
+            controller._track_first_seen_s[successor_id] = now - 1.0
             promoted = controller.note_race(
                 gate_index=gate, race_boot_ms=1000 + gate, now_s=now
             )
@@ -300,6 +305,8 @@ def test_gate0_climb_vertical_offset_is_bounded_feedforward():
         ),
         now_s=100.12,
     )
+    # F42: promotion requires a persistent successor; seed the age.
+    controller._track_first_seen_s["B"] = 100.12 - 1.0
     promoted = controller.note_race(
         gate_index=1, race_boot_ms=1250, now_s=100.14
     )
@@ -772,6 +779,9 @@ def _promote_to_gate_one(controller, now_s=100.10):
         ),
         now_s=now_s - 0.02,
     )
+    # F42: promotion credibility requires a persistent successor; seed the
+    # association age as if B had been tracked through the approach.
+    controller._track_first_seen_s["B"] = now_s - 1.0
     promoted = controller.note_race(
         gate_index=1, race_boot_ms=2500, now_s=now_s
     )
@@ -874,6 +884,8 @@ def test_altitude_floor_never_overrides_coast_support_hold():
         ),
         now_s=100.08,
     )
+    # F42: promotion requires a persistent successor; seed the age.
+    controller._track_first_seen_s["B"] = 100.08 - 1.0
     assert controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
     controller.observe(_update([], frame_id=4), now_s=100.12)  # fresh close loss
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
@@ -1608,6 +1620,8 @@ def test_authoritative_promotion_event_never_vetoed_by_vision():
         _update([_track("A", 0.10, 0.0), _track("B", 0.30, 0.05)], frame_id=3),
         now_s=100.08,
     )
+    # F42: promotion requires a persistent successor; seed the age.
+    controller._track_first_seen_s["B"] = 100.08 - 1.0
     promoted = controller.note_race(
         gate_index=1, race_boot_ms=2500, now_s=100.10
     )
@@ -1663,12 +1677,145 @@ def test_promotion_rejects_successor_with_unmeasured_x_axis():
     )
     assert controller.successor is not None
     assert controller.successor.last_x_measurement_s == NEVER_MEASURED_S
+    # Old enough to pass the F42 persistence check: the never-measured
+    # x-axis (F41) is what must reject this successor.
+    controller._track_first_seen_s["B"] = 100.08 - 1.0
     promoted = controller.note_race(
         gate_index=1, race_boot_ms=2500, now_s=100.10
     )
     assert promoted  # the gate increment is still authoritative
     assert controller.state is CleanCourseState.SEARCH
     assert controller.current is None
+
+
+def test_successor_prefers_persistent_track_over_newborn_debris():
+    # F42 (20260729T201743Z-visual-course-1e24b6d2): a bottom-left debris
+    # splinter out-confidenced the real gate halves (0.62-0.71 vs 0.42-0.54)
+    # and the pure max-confidence rule adopted it at promotion.  Age beats
+    # confidence: a newborn high-confidence track must not steal the
+    # successor slot from a persistent lower-confidence one.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    now = 100.10
+    frame = 10
+    for _ in range(20):  # ~0.66 s: P persists across the approach
+        now += 0.033
+        controller.observe(
+            _update(
+                [
+                    _track("A", 0.0, 0.0, scale=0.10),
+                    _track("P", 0.35, -0.28, scale=0.05, confidence=0.45),
+                ],
+                frame_id=frame,
+            ),
+            now_s=now,
+        )
+        frame += 1
+    assert controller.successor.track_id == "P"
+    # Newborn debris with HIGHER confidence (uncensored, so only the F42
+    # age rule can reject it): the persistent track keeps the slot.
+    now += 0.033
+    controller.observe(
+        _update(
+            [
+                _track("A", 0.0, 0.0, scale=0.10),
+                _track("P", 0.35, -0.28, scale=0.05, confidence=0.45),
+                _track("D", -0.96, -0.92, scale=0.05, confidence=0.70),
+            ],
+            frame_id=frame,
+        ),
+        now_s=now,
+    )
+    assert controller.successor.track_id == "P"
+
+
+def test_promotion_requires_persistent_successor():
+    # F42: an otherwise credible but NEWBORN successor must not be adopted
+    # (debris is newborn every frame); the same successor is adopted once
+    # it has been associated past successor_min_age_s.
+    young = _tracked_controller(_track("A", 0.0, 0.0))
+    young.observe(
+        _update(
+            [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
+            frame_id=3,
+        ),
+        now_s=100.08,
+    )
+    promoted = young.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
+    assert promoted
+    assert young.state is CleanCourseState.SEARCH
+    assert young.current is None
+
+    aged = _tracked_controller(_track("A", 0.0, 0.0))
+    now = 100.10
+    frame = 10
+    for _ in range(20):  # ~0.66 s of association before the increment
+        now += 0.033
+        aged.observe(
+            _update(
+                [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
+                frame_id=frame,
+            ),
+            now_s=now,
+        )
+        frame += 1
+    promoted = aged.note_race(gate_index=1, race_boot_ms=2500, now_s=now)
+    assert promoted
+    assert aged.state is CleanCourseState.TRACK
+    assert aged.current.track_id == "B"
+
+
+def test_unmeasurable_x_hypothesis_cannot_hold_track():
+    # F42 anti-deadlock: the adopted debris splinter's x-axis could never be
+    # measured, and the F41 x-steer gate froze yaw/roll at 0 for 0.8 s until
+    # the splinter died on its own.  A never-measured-x current older than
+    # UNMEASURED_X_FORCE_SEARCH_S must force SEARCH at the next observe.
+    controller = _tracked_controller(
+        _track("A", 0.40, 0.0, scale=0.10, clipping=FrameEdge.RIGHT)
+    )
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.current.last_x_measurement_s == NEVER_MEASURED_S
+    controller.current.created_s = 100.10  # adoption time for this scenario
+    now = 100.10
+    for frame in range(22):  # ~0.73 s of censored matches: still TRACK
+        now += 0.033
+        controller.observe(
+            _update(
+                [_track("A", 0.40, 0.0, scale=0.10, clipping=FrameEdge.RIGHT)],
+                frame_id=20 + frame,
+            ),
+            now_s=now,
+        )
+    assert controller.state is CleanCourseState.TRACK
+    now += 0.033  # ~0.76 s: past the bound, the next observe forces SEARCH
+    controller.observe(
+        _update(
+            [_track("A", 0.40, 0.0, scale=0.10, clipping=FrameEdge.RIGHT)],
+            frame_id=50,
+        ),
+        now_s=now,
+    )
+    assert controller.state is CleanCourseState.SEARCH
+
+
+def test_search_reacquisition_falls_back_to_newborn_tracks():
+    # F42: persistence is a PREFERENCE at re-acquisition, not a requirement —
+    # with only newborn candidates the nearest-to-bearing pick still adopts
+    # one, or SEARCH could never recover from a cold start.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    now = 100.10
+    for _ in range(40):
+        now += 0.033
+        controller.observe(_update([], frame_id=9), now_s=now)
+        if controller.state is CleanCourseState.SEARCH:
+            break
+    assert controller.state is CleanCourseState.SEARCH
+    now += 0.033
+    controller.observe(
+        _update([_track("N", 0.10, 0.0)], frame_id=50),  # newborn id only
+        now_s=now,
+    )
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.current.track_id == "N"
 
 
 # ---------------------------------------------------------------------------

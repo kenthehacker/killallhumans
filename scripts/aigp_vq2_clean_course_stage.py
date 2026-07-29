@@ -320,6 +320,11 @@ PREDICT_STALL_FORCE_SEARCH_S = 1.50
 # point — 0.5 s of max yaw the wrong way threw the real gate off-frame.  An
 # x measurement older than this (or never taken) may not command yaw/roll.
 X_STEER_MAX_AGE_S = 0.5
+# F42 (20260729T201743Z-visual-course-1e24b6d2) anti-deadlock: an adopted
+# debris splinter whose x-axis could NEVER be measured held TRACK for 0.8 s
+# with the x-steer gate freezing yaw/roll at 0 until the splinter died on
+# its own.  An unmeasurable hypothesis this old forces SEARCH in observe().
+UNMEASURED_X_FORCE_SEARCH_S = 0.75
 # Closure-rate governor (F31 redesign after F26/F28/F29/F30 all died the
 # same way — terrain at the gate-1 threshold in the high-drag regime with
 # frozen estimates): vision expansion rate is the ONLY honest closure
@@ -468,6 +473,14 @@ PROMOTE_MAX_STD_NORM = 0.60  # cached-successor credibility at promotion
 # best evidence of the next gate at the one moment the course geometry is
 # known — adopt it unless it is truly stale.
 PROMOTE_MAX_AGE_S = 0.50  # cached-successor freshness at promotion
+# F42 (20260729T201743Z-visual-course-1e24b6d2): confidence provably cannot
+# separate the real gate from detector debris — a bottom-left splinter
+# out-confidenced the real gate-1 halves (0.62-0.71 vs 0.42-0.54) and was
+# adopted at promotion.  PERSISTENCE can: debris is newborn every frame
+# while the real gate halves stayed associated for seconds.  Successor
+# ranking, promotion credibility, and re-acquisition all prefer track age.
+SUCCESSOR_MIN_AGE_S = 0.5  # persistence required of a promoted successor
+REACQUIRE_MIN_AGE_S = 0.3  # persistence preferred at SEARCH re-acquisition
 
 COLLECTIVE_DECAY_TAU_S = 0.25  # smooth decay toward support on vertical loss
 # Qualified vertical measurement horizon.  The bound applies to the last
@@ -747,6 +760,7 @@ class CleanCourseConfig:
     blend_near_log_scale: float = BLEND_NEAR_LOG_SCALE
     promote_max_std_norm: float = PROMOTE_MAX_STD_NORM
     promote_max_age_s: float = PROMOTE_MAX_AGE_S
+    successor_min_age_s: float = SUCCESSOR_MIN_AGE_S
     collective_decay_tau_s: float = COLLECTIVE_DECAY_TAU_S
     vertical_qualify_max_age_s: float = VERTICAL_QUALIFY_MAX_AGE_S
     target_slew_rad_s: float = TARGET_SLEW_RAD_S
@@ -798,6 +812,8 @@ class CleanCourseController:
         self.successor: Optional[_Hypothesis] = None
         self.last_reliable_bearing: Tuple[float, float] = (0.0, 0.0)
         self.successor_bearing_cache: Dict[int, Tuple[float, float]] = {}
+        self._track_first_seen_s: Dict[str, float] = {}
+        self._track_last_seen_s: Dict[str, float] = {}
         self._course_start_s: Optional[float] = None
         self._last_observe_s: Optional[float] = None
         self._last_command_s: Optional[float] = None
@@ -931,6 +947,19 @@ class CleanCourseController:
             dt = _clamp(now_s - self._last_observe_s, 1e-3, 0.25)
         self._last_observe_s = float(now_s)
         tracks = _visible_tracks(update)
+        # F42 track persistence bookkeeping: confidence provably cannot
+        # separate the real gate from detector debris, but persistence can —
+        # debris is newborn every frame, the real gate stays associated for
+        # seconds.  Record first-seen per track id; prune ids unseen > 2 s.
+        for track in tracks:
+            track_id = str(track.track_id)
+            if track_id not in self._track_first_seen_s:
+                self._track_first_seen_s[track_id] = float(now_s)
+            self._track_last_seen_s[track_id] = float(now_s)
+        for track_id, last_seen in list(self._track_last_seen_s.items()):
+            if now_s - last_seen > 2.0:
+                del self._track_last_seen_s[track_id]
+                self._track_first_seen_s.pop(track_id, None)
         # Frame freshness: the tracker republishes during a camera stall with
         # a new publication token but the SAME underlying camera-frame
         # identity.  Only a new camera frame is new evidence; an update whose
@@ -981,7 +1010,7 @@ class CleanCourseController:
             self._update_hypothesis(self.current, match, now_s)
             self.state = CleanCourseState.TRACK
         elif self.state is CleanCourseState.SEARCH or self.current is None:
-            adopted = self._select_search_reacquisition(tracks)
+            adopted = self._select_search_reacquisition(tracks, now_s)
             if adopted is not None:
                 self.current = self._hypothesis_from_track(adopted, now_s)
                 self.state = CleanCourseState.TRACK
@@ -1032,6 +1061,18 @@ class CleanCourseController:
                     )
                 ):
                     self._enter_search(now_s)
+
+        # F42 anti-deadlock: an adopted debris splinter whose x-axis can
+        # NEVER be measured held TRACK for 0.8 s with the F41 x-steer gate
+        # freezing yaw/roll at 0 until the splinter died on its own.  An
+        # unmeasurable adopted hypothesis this old must not hold the state.
+        if (
+            self.state is CleanCourseState.TRACK
+            and self.current is not None
+            and self.current.last_x_measurement_s <= NEVER_MEASURED_S + 1
+            and now_s - self.current.created_s > UNMEASURED_X_FORCE_SEARCH_S
+        ):
+            self._enter_search(now_s)
 
         self._refresh_successor(tracks, now_s)
         if self.current is not None and match is not None:
@@ -1084,6 +1125,11 @@ class CleanCourseController:
             # adopted as the aim point.
             and now_s - successor.last_x_measurement_s
             <= self.config.promote_max_age_s
+            # F42: the successor must also be PERSISTENT — debris is newborn
+            # every frame while the real gate stays associated; a
+            # never-seen id ages 0 and fails.
+            and self._track_age_s(successor.track_id, now_s)
+            >= self.config.successor_min_age_s
         )
         if credible:
             self.current = successor
@@ -1620,6 +1666,16 @@ class CleanCourseController:
                 return track
         return None
 
+    def _track_age_s(self, track_id: Optional[str], now_s: float) -> float:
+        """Seconds since this track id was first seen (0.0 if unknown)."""
+
+        if track_id is None:
+            return 0.0
+        first_seen = self._track_first_seen_s.get(str(track_id))
+        if first_seen is None:
+            return 0.0
+        return float(now_s) - first_seen
+
     def _hypothesis_from_track(self, track: Any, now_s: float) -> _Hypothesis:
         center, log_scale, _stds = _track_measurement(track)
         hypothesis = _Hypothesis(
@@ -1752,7 +1808,30 @@ class CleanCourseController:
                 clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
             ):
                 eligible.append(track)
-        best = max(eligible or others, key=lambda track: float(track.confidence))
+        # F42: among the x-observable candidates PERSISTENCE outranks
+        # confidence — the real gate halves stayed associated for seconds
+        # while the higher-confidence debris splinter was newborn every
+        # frame.  Rank the age-qualified candidates by age (confidence
+        # tie-break); fall back to uncensored-preferred max confidence when
+        # nothing has persisted long enough yet.
+        aged = [
+            track
+            for track in eligible
+            if self._track_age_s(track.track_id, now_s)
+            >= self.config.successor_min_age_s
+        ]
+        if aged:
+            best = max(
+                aged,
+                key=lambda track: (
+                    self._track_age_s(track.track_id, now_s),
+                    float(track.confidence),
+                ),
+            )
+        else:
+            best = max(
+                eligible or others, key=lambda track: float(track.confidence)
+            )
         if (
             self.successor is not None
             and self.successor.track_id == best.track_id
@@ -1765,7 +1844,9 @@ class CleanCourseController:
             self.successor.y,
         )
 
-    def _select_search_reacquisition(self, tracks: List[Any]) -> Optional[Any]:
+    def _select_search_reacquisition(
+        self, tracks: List[Any], now_s: float
+    ) -> Optional[Any]:
         """Re-acquisition in SEARCH; the SAME track_id may be re-adopted."""
 
         if not tracks:
@@ -1775,8 +1856,17 @@ class CleanCourseController:
             if same is not None:
                 return same
         bx, by = self.last_reliable_bearing
+        # F42: prefer persistent tracks for the nearest-to-bearing pick —
+        # debris is newborn every frame while the real gate stays
+        # associated.  Fall back to all tracks when nothing has persisted.
+        persistent = [
+            track
+            for track in tracks
+            if self._track_age_s(track.track_id, now_s) >= REACQUIRE_MIN_AGE_S
+        ]
+        candidates = persistent or tracks
         return min(
-            tracks,
+            candidates,
             key=lambda track: (
                 math.hypot(
                     float(track.center_norm[0]) - bx,
