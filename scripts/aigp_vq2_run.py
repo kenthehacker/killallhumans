@@ -13345,6 +13345,8 @@ class VQ2Runner:
                         "reason": str(exc),
                     }
                     raise
+            elif stage == VISUAL_COURSE_STAGE:
+                details = await self._run_visual_course(context)
             else:
                 raise AssertionError("powered stage dispatch was not exhaustive")
             success = True

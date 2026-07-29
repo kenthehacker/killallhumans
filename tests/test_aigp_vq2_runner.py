@@ -6466,6 +6466,40 @@ def test_gate0_stage_does_not_enter_post_pass_observation(monkeypatch):
     assert result.details["cleanup_collision_safety"]["safe"] is True
 
 
+def test_visual_course_stage_dispatches_to_clean_course(monkeypatch):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def wait_for_go():
+        return vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    calls = []
+
+    async def course(_context):
+        calls.append("course")
+        raise SafetyAbort("course dispatched")
+
+    async def cleanup():
+        return True
+
+    monkeypatch.setattr(runner, "establish_reset_epoch", no_op)
+    monkeypatch.setattr(runner, "normalize_disarmed", no_op)
+    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
+    monkeypatch.setattr(runner, "arm_confirmed", no_op)
+    monkeypatch.setattr(runner, "_run_visual_course", course)
+    monkeypatch.setattr(runner, "safe_cleanup", cleanup)
+
+    result = asyncio.run(runner.run_powered_stage("visual-course"))
+
+    assert calls == ["course"]
+    assert not result.success
+    assert "course dispatched" in result.reason
+
+
 @pytest.mark.parametrize("stage", ["full-lap"])
 def test_unaccepted_course_stages_are_rejected_before_powered_lifecycle(
     monkeypatch,
