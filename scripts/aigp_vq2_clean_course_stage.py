@@ -224,12 +224,13 @@ YAW_ERROR_GAIN = 0.30
 ROLL_ERROR_SIGN = +1.0  # flip this one line if the first flight contradicts
 ROLL_ERROR_GAIN = 0.24
 MAX_TARGET_ROLL_RAD = 0.12  # GATE1_RECENTER_ROLL cap
-# Raised 0.15 -> 0.30 (flights 4ba3922b/89a175a9/d058b8a0): accepted gate-1
+# Raised 0.15 -> 0.25 (flights 4ba3922b/89a175a9/d058b8a0): accepted gate-1
 # tracks repeatedly slid to the x ~= 0.95 frame edge with yaw pinned at the
-# cap while the v3 authority profile measured ~0.5 rad/s of plant capability
-# (3x headroom).  Bearing rates of near off-axis gates at surviving closure
-# exceed 0.15 rad/s; 0.30 stays inside the calibrated envelope.
-MAX_COURSE_YAW_RATE_RAD_S = 0.30  # accepted v3 profile production cap
+# cap while the v3 authority profile measured ~0.5 rad/s of plant capability.
+# Bearing rates of near off-axis gates at surviving closure exceed 0.15 rad/s.
+# 0.25 sits at the runner's hard MAX_COMMAND_RATE_RAD_S wire clamp and inside
+# the measured-authority envelope the runner now checks against.
+MAX_COURSE_YAW_RATE_RAD_S = 0.25  # runner wire clamp is 0.25
 
 # Softened -0.18 -> -0.12 (flight 4ba3922b): the whole gate-0 transit is
 # ~2 s, so the advance attitude builds most of the closure the pre-cross

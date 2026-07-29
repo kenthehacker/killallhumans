@@ -12918,8 +12918,15 @@ class VQ2Runner:
             != self.yaw_calibration_profile_evidence.get("sha256")
             or course_yaw_profile.profile_sha256
             != YAW_CALIBRATION_PROFILE_SHA256
+            # The course runtime may command up to the profile's MEASURED
+            # authority, not its conservative calibration command cap: the
+            # v3 profile commanded 0.15 while the plant tracked up to 0.5
+            # rad/s measured, and flights 4ba3922b/89a175a9/d058b8a0 showed
+            # 0.15 insufficient to hold near off-axis gates in frame.  The
+            # stage cap (0.25) also stays at the MAX_COMMAND_RATE_RAD_S wire
+            # clamp.
             or DEFAULT_VISUAL_COURSE_LIMITS.max_yaw_rate_rad_s
-            > course_yaw_profile.max_abs_yaw_rate_command_rad_s
+            > course_yaw_profile.max_abs_measured_yaw_rate_rad_s
             or DEFAULT_VISUAL_COURSE_LIMITS.max_measured_yaw_rate_rad_s
             > course_yaw_profile.max_abs_measured_yaw_rate_rad_s
         ):
@@ -12948,7 +12955,7 @@ class VQ2Runner:
                     ),
                     max_yaw_rate_rad_s=min(
                         DEFAULT_VISUAL_COURSE_LIMITS.max_yaw_rate_rad_s,
-                        course_yaw_profile.max_abs_yaw_rate_command_rad_s,
+                        course_yaw_profile.max_abs_measured_yaw_rate_rad_s,
                     ),
                     max_command_rate_rad_s=MAX_COMMAND_RATE_RAD_S,
                     min_thrust=DEFAULT_VISUAL_COURSE_LIMITS.min_thrust,
