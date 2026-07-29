@@ -10103,19 +10103,19 @@ class _RunnerVision:
 
 
 @pytest.mark.parametrize(
-    ("race_finished", "ordered_transitions", "cleanup_confirmed", "success"),
+    ("race_finished", "cleanup_confirmed", "graph_pairs", "success"),
     (
-        (True, True, True, True),
-        (False, True, True, False),
-        (True, False, True, False),
-        (True, True, False, False),
+        (True, True, [(0, 2)], True),
+        (True, True, [], True),
+        (False, True, [(0, 1), (1, 2)], False),
+        (True, False, [(0, 1), (1, 2)], False),
     ),
 )
-def test_runner_course_boundary_requires_finish_chain_and_cleanup(
+def test_runner_course_boundary_requires_authoritative_finish_and_cleanup(
     monkeypatch,
     race_finished,
-    ordered_transitions,
     cleanup_confirmed,
+    graph_pairs,
     success,
 ):
     adapter = _RunnerAdapter()
@@ -10152,11 +10152,9 @@ def test_runner_course_boundary_requires_finish_chain_and_cleanup(
             2,
             500,
         )
-        pairs = (
-            [(0, 1), (1, 2)]
-            if ordered_transitions
-            else [(0, 2)]
-        )
+        # Rolling-graph transitions are intentionally unordered or absent;
+        # course success no longer depends on rolling-graph bookkeeping.
+        pairs = graph_pairs
         graph_transitions = tuple(
             SimpleNamespace(
                 from_gate_index=from_index,
@@ -10185,7 +10183,9 @@ def test_runner_course_boundary_requires_finish_chain_and_cleanup(
                 latest_race_status=finish_ref,
             )
         )
-        runner._visual_transition = graph_transitions[-1]
+        runner._visual_transition = (
+            graph_transitions[-1] if graph_transitions else None
+        )
         summary = {
             "stage": vq2_run.VISUAL_COURSE_STAGE,
             "success": True,
@@ -10219,11 +10219,6 @@ def test_runner_course_boundary_requires_finish_chain_and_cleanup(
     monkeypatch.setattr(runner, "establish_reset_epoch", no_result)
     monkeypatch.setattr(runner, "normalize_disarmed", no_result)
     monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
-    monkeypatch.setattr(
-        runner,
-        "_bind_initial_visual_gate",
-        lambda _context: None,
-    )
     monkeypatch.setattr(runner, "arm_confirmed", no_result)
     monkeypatch.setattr(runner, "_run_visual_course", run_course)
     monkeypatch.setattr(runner, "safe_cleanup", cleanup)
@@ -10239,15 +10234,11 @@ def test_runner_course_boundary_requires_finish_chain_and_cleanup(
     assert result.cleanup_confirmed is cleanup_confirmed
     assert result.details["authoritative_cleanup_entry"][
         "transitions"
-    ] == [list(pair) for pair in (
-        [(0, 1), (1, 2)]
-        if ordered_transitions
-        else [(0, 2)]
-    )]
+    ] == [list(pair) for pair in graph_pairs]
     assert result.details["visual_course"]["cleanup_confirmed"] is (
         cleanup_confirmed
     )
-    if not race_finished or not ordered_transitions:
-        assert "race_finished/ordered rolling-graph proof" in result.reason
+    if not race_finished:
+        assert "race_finished evidence" in result.reason
     if not cleanup_confirmed:
         assert "cleanup unconfirmed" in result.reason

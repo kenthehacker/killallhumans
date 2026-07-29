@@ -54,6 +54,7 @@ import threading
 import time
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
+from enum import Enum
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -788,6 +789,13 @@ VISUAL_ALIGN_STAGE = "visual-align"
 VISUAL_COURSE_STAGE = "visual-course"
 VISUAL_CHECKPOINT_STAGES = (VISUAL_SHADOW_STAGE, VISUAL_ALIGN_STAGE)
 VISUAL_POWERED_STAGES = (*VISUAL_CHECKPOINT_STAGES, VISUAL_COURSE_STAGE)
+
+
+class FlightCommandSendResult(Enum):
+    """Outcome of a race-only atomic navigation send (no visual authority)."""
+
+    SENT = "sent"
+    SKIPPED_RACE_BOUNDARY_CHANGED = "skipped: race boundary changed"
 VISUAL_SHADOW_POST_CREDIT_TIMEOUT_S = 0.15
 VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES = 3
 VISUAL_ALIGN_HARD_DURATION_S = 0.90
@@ -9654,6 +9662,7 @@ class VQ2Runner:
                 time.perf_counter_ns() if capture_enabled else None
             )
             detector_latency_ms: Optional[float] = None
+            course_mode = self._visual_active_stage == VISUAL_COURSE_STAGE
             try:
                 image = snapshot.camera_frame.image
                 self._latest_detection_image = image
@@ -9710,26 +9719,33 @@ class VQ2Runner:
                         ),
                     )
                     visual_update = self.visual_tracker.update(visual_frame)
-                    _assert_visual_aperture_prior_lineage(
-                        visual_update,
-                        aperture_prior_lineages,
-                    )
-                    self._visual_latest_graph_snapshot = (
-                        self.visual_gate_graph.observe(self.visual_tracker)
-                    )
-                    # Graph observation can authoritatively update tracker
-                    # roles.  Retain the refreshed exact update rather than
-                    # the pre-graph immutable view that may still say NEXT.
-                    refreshed_update = self.visual_tracker.latest_update
-                    if (
-                        refreshed_update is None
-                        or refreshed_update.token != visual_update.token
-                    ):
-                        raise SafetyAbort(
-                            "visual graph role refresh lost exact frame identity"
+                    if course_mode:
+                        # Course mode isolates flight-critical perception from
+                        # rolling-graph bookkeeping: no aperture-lineage
+                        # assertion, no graph observation, and no role-refresh
+                        # identity abort.
+                        self._visual_latest_tracker_update = visual_update
+                    else:
+                        _assert_visual_aperture_prior_lineage(
+                            visual_update,
+                            aperture_prior_lineages,
                         )
-                    self._visual_latest_tracker_update = refreshed_update
-                    if self._visual_diagnostic_logging:
+                        self._visual_latest_graph_snapshot = (
+                            self.visual_gate_graph.observe(self.visual_tracker)
+                        )
+                        # Graph observation can authoritatively update tracker
+                        # roles.  Retain the refreshed exact update rather than
+                        # the pre-graph immutable view that may still say NEXT.
+                        refreshed_update = self.visual_tracker.latest_update
+                        if (
+                            refreshed_update is None
+                            or refreshed_update.token != visual_update.token
+                        ):
+                            raise SafetyAbort(
+                                "visual graph role refresh lost exact frame identity"
+                            )
+                        self._visual_latest_tracker_update = refreshed_update
+                    if self._visual_diagnostic_logging and not course_mode:
                         visual_race = self.adapter.race_status
                         self.recorder.emit(
                             "visual_gate_graph_frame",
@@ -9821,219 +9837,54 @@ class VQ2Runner:
                                 self._visual_latest_graph_snapshot
                             ),
                         )
-                tracking_detections = detections
-                if self._post_gate_reacquisition:
-                    tracking_detections = [
-                        detection
-                        for detection in detections
-                        if not is_crossing_residue(
-                            detection,
+                if course_mode:
+                    # Course-mode recorder/diagnostic evidence is
+                    # best-effort: anomalies are logged and skipped,
+                    # never flight-fatal.
+                    try:
+                        self._update_frame_evidence(
+                            snapshot=snapshot,
+                            image=image,
+                            detections=detections,
                             image_width=image_width,
                             image_height=image_height,
+                            capture_enabled=capture_enabled,
+                            detector_latency_ms=detector_latency_ms,
+                            consume_monotonic_ns=consume_monotonic_ns,
+                            work_started_ns=work_started_ns,
+                            detector_started_ns=detector_started_ns,
+                            detector_ended_ns=detector_ended_ns,
+                            now=now,
                         )
-                        and gate_detection_summary(
-                            detection,
-                            detector_index=0,
-                            image_width=image_width,
-                            image_height=image_height,
-                            reject_crossing_residue=True,
-                        )["selector_eligible"]
-                    ]
-                tracking_started_ns = (
-                    time.perf_counter_ns() if capture_enabled else None
-                )
-                race = self.adapter.race_status
-                course_edge_gate_index = self._course_edge_continuation_gate_index
-                allow_course_edge_continuation = bool(
-                    course_edge_gate_index is not None
-                    and race is not None
-                    and not race.race_finished
-                    and int(race.active_gate_index) == course_edge_gate_index
-                )
-                accepted = self.tracker.update(
-                    tracking_detections,
-                    frame_id=snapshot.frame_id,
-                    sim_time_ns=snapshot.sim_time_ns,
-                    received_monotonic_s=snapshot.received_monotonic_s,
-                    allow_tracked_edge_continuation=allow_course_edge_continuation,
-                    allow_tracked_fragment_union=allow_course_edge_continuation,
-                    image_width=image_width,
-                    image_height=image_height,
-                )
-                tracking_ended_ns = (
-                    time.perf_counter_ns() if capture_enabled else None
-                )
-                self._latest_accepted_target = accepted
-                if self._post_gate_reacquisition:
-                    self._post_gate_last_frame = (
-                        (
-                            int(snapshot.generation),
-                            int(snapshot.frame_id),
-                            int(snapshot.sim_time_ns),
-                        ),
-                        image,
-                    )
-                summaries = (
-                    [
-                        gate_detection_summary(
-                            detection,
-                            detector_index=index,
-                            image_width=image_width,
-                            image_height=image_height,
-                            reject_crossing_residue=self._post_gate_reacquisition,
-                        )
-                        for index, detection in enumerate(detections)
-                    ]
-                    if self._vision_diagnostic_logging or capture_enabled
-                    else []
-                )
-                if self._vision_diagnostic_logging:
-                    selected = self.tracker.last_selected_detection
-                    selected_index = next(
-                        (
-                            index
-                            for index, detection in enumerate(detections)
-                            if detection is selected
-                        ),
-                        None,
-                    )
-                    selected_indices = [
-                        index
-                        for index, detection in enumerate(detections)
-                        if any(
-                            detection is selected_detection
-                            for selected_detection in (
-                                self.tracker.last_selected_detections
-                            )
-                        )
-                    ]
-                    race = self.adapter.race_status
-                    estimate = self.estimate
-                    self.recorder.emit(
-                        "vision_detection_frame",
-                        phase=(
-                            "gate1_reacquisition"
-                            if self._post_gate_reacquisition
-                            else "gate0_crossing"
-                        ),
-                        frame_id=snapshot.frame_id,
-                        sim_time_ns=snapshot.sim_time_ns,
-                        generation=snapshot.generation,
-                        received_monotonic_s=snapshot.received_monotonic_s,
-                        receive_age_s=snapshot.age_s(now),
-                        image_size_px=[image_width, image_height],
-                        race_boot_ms=(race.sim_boot_time_ms if race else None),
-                        gate_index=(race.active_gate_index if race else None),
-                        detections=summaries,
-                        selected_detection_index=selected_index,
-                        tracker_selected_detection_indices=selected_indices,
-                        tracker_selection_mode=self.tracker.last_selection_mode,
-                        tracker_streak=self.tracker.consecutive,
-                        accepted_target=(asdict(accepted) if accepted else None),
-                        tracker_target=(
-                            asdict(self.tracker.target) if self.tracker.target else None
-                        ),
-                        rpy=(
-                            list(estimate.orientation.to_euler()) if estimate else None
-                        ),
-                        body_rates=(list(estimate.body_rates) if estimate else None),
-                        last_command=(
-                            asdict(self._last_flight_command)
-                            if self._last_flight_command
-                            else None
-                        ),
-                    )
-                if capture_enabled:
-                    if snapshot.timing is None:
-                        raise ValueError(
-                            "capture-loaded frame lacks exact FrameTimingV1"
-                        )
-                    assert work_started_ns is not None
-                    assert consume_monotonic_ns is not None
-                    assert detector_started_ns is not None
-                    assert detector_ended_ns is not None
-                    assert tracking_started_ns is not None
-                    assert tracking_ended_ns is not None
-                    record_timing = getattr(
-                        self.recorder, "record_camera_timing", None
-                    )
-                    if not callable(record_timing):
-                        raise ValueError(
-                            "capture recorder cannot preserve camera timing"
-                        )
-                capture_frame = getattr(self.recorder, "capture_frame", None)
-                if capture_enabled and callable(capture_frame):
-                    current_telemetry = self.adapter.latest_telemetry
-                    current_imu = (
-                        current_telemetry.imu
-                        if current_telemetry is not None
-                        else None
-                    )
-                    current_command = (
-                        asdict(self._last_flight_command)
-                        if self._last_flight_command is not None
-                        else None
-                    )
-                    capture_frame(
-                        image,
-                        generation=int(snapshot.generation),
-                        frame_id=int(snapshot.frame_id),
-                        sim_time_ns=int(snapshot.sim_time_ns),
-                        received_monotonic_s=float(snapshot.received_monotonic_s),
-                        detector_latency_ms=detector_latency_ms,
-                        detections=summaries,
-                        tracker={
-                            "consecutive": self.tracker.consecutive,
-                            "target": asdict(self.tracker.target) if self.tracker.target else None,
-                            **(
-                                {
-                                    "visual_gate_graph": (
-                                        self._visual_graph_summary(
-                                            self._visual_latest_graph_snapshot
-                                        )
-                                    ),
-                                    "visual_tracks": (
-                                        [
-                                            self._visual_track_summary(track)
-                                            for track in (
-                                                self._visual_latest_tracker_update.tracks
-                                            )
-                                        ]
-                                        if self._visual_latest_tracker_update
-                                        is not None
-                                        else []
-                                    ),
-                                }
-                                if self._visual_tracking_enabled
-                                else {}
+                    except Exception as evidence_exc:
+                        self.recorder.emit(
+                            "frame_evidence_error",
+                            generation=int(snapshot.generation),
+                            frame_id=int(snapshot.frame_id),
+                            sim_time_ns=int(snapshot.sim_time_ns),
+                            reason=(
+                                f"{type(evidence_exc).__name__}: "
+                                f"{evidence_exc}"
                             ),
-                        },
-                        imu=current_imu,
-                        estimator=self._replay_estimator_fields(),
-                        race_status=self.adapter.race_status,
-                        generated_command=current_command,
-                        sent_command=current_command,
-                        phase=(
-                            "gate1_reacquisition"
-                            if self._post_gate_reacquisition
-                            else "gate0_or_preflight"
-                        ),
-                    )
-                if capture_enabled:
-                    # End-to-end passive frame work includes the synchronous
-                    # replay snapshot/copy enqueue above.  The asynchronous
-                    # writer remains separately diagnosed by capture stats.
-                    observation = CameraFrameTimingObservationV1(
-                        frame_timing=snapshot.timing,
+                        )
+                else:
+                    self._update_frame_evidence(
+                        snapshot=snapshot,
+                        image=image,
+                        detections=detections,
+                        image_width=image_width,
+                        image_height=image_height,
+                        capture_enabled=capture_enabled,
+                        detector_latency_ms=detector_latency_ms,
                         consume_monotonic_ns=consume_monotonic_ns,
-                        work_start_monotonic_ns=work_started_ns,
-                        detection_start_monotonic_ns=detector_started_ns,
-                        detection_end_monotonic_ns=detector_ended_ns,
-                        tracking_start_monotonic_ns=tracking_started_ns,
-                        tracking_end_monotonic_ns=tracking_ended_ns,
-                        work_end_monotonic_ns=time.perf_counter_ns(),
+                        work_started_ns=work_started_ns,
+                        detector_started_ns=detector_started_ns,
+                        detector_ended_ns=detector_ended_ns,
+                        now=now,
                     )
-                    record_timing(observation)
+                # A successfully processed vision sample clears any earlier
+                # detector error; only a fresh failure trips the watchdog.
+                self._detection_error = None
             except Exception as exc:  # OpenCV errors must fail closed in flight.
                 if detector_started_ns is not None:
                     detector_latency_ms = (
@@ -10049,6 +9900,242 @@ class VQ2Runner:
                     sim_time_ns=int(snapshot.sim_time_ns),
                     reason=self._detection_error,
                 )
+
+    def _update_frame_evidence(
+        self,
+        *,
+        snapshot: Any,
+        image: Any,
+        detections: List[Any],
+        image_width: int,
+        image_height: int,
+        capture_enabled: bool,
+        detector_latency_ms: Optional[float],
+        consume_monotonic_ns: Optional[int],
+        work_started_ns: Optional[int],
+        detector_started_ns: Optional[int],
+        detector_ended_ns: Optional[int],
+        now: float,
+    ) -> None:
+        """Update the legacy tracker and record per-frame evidence.
+
+        In visual-course mode the caller treats this whole block as
+        best-effort diagnostic evidence; in every other mode exceptions
+        propagate and fail closed through ``_detection_error``.
+        """
+        tracking_detections = detections
+        if self._post_gate_reacquisition:
+            tracking_detections = [
+                detection
+                for detection in detections
+                if not is_crossing_residue(
+                    detection,
+                    image_width=image_width,
+                    image_height=image_height,
+                )
+                and gate_detection_summary(
+                    detection,
+                    detector_index=0,
+                    image_width=image_width,
+                    image_height=image_height,
+                    reject_crossing_residue=True,
+                )["selector_eligible"]
+            ]
+        tracking_started_ns = (
+            time.perf_counter_ns() if capture_enabled else None
+        )
+        race = self.adapter.race_status
+        course_edge_gate_index = self._course_edge_continuation_gate_index
+        allow_course_edge_continuation = bool(
+            course_edge_gate_index is not None
+            and race is not None
+            and not race.race_finished
+            and int(race.active_gate_index) == course_edge_gate_index
+        )
+        accepted = self.tracker.update(
+            tracking_detections,
+            frame_id=snapshot.frame_id,
+            sim_time_ns=snapshot.sim_time_ns,
+            received_monotonic_s=snapshot.received_monotonic_s,
+            allow_tracked_edge_continuation=allow_course_edge_continuation,
+            allow_tracked_fragment_union=allow_course_edge_continuation,
+            image_width=image_width,
+            image_height=image_height,
+        )
+        tracking_ended_ns = (
+            time.perf_counter_ns() if capture_enabled else None
+        )
+        self._latest_accepted_target = accepted
+        if self._post_gate_reacquisition:
+            self._post_gate_last_frame = (
+                (
+                    int(snapshot.generation),
+                    int(snapshot.frame_id),
+                    int(snapshot.sim_time_ns),
+                ),
+                image,
+            )
+        summaries = (
+            [
+                gate_detection_summary(
+                    detection,
+                    detector_index=index,
+                    image_width=image_width,
+                    image_height=image_height,
+                    reject_crossing_residue=self._post_gate_reacquisition,
+                )
+                for index, detection in enumerate(detections)
+            ]
+            if self._vision_diagnostic_logging or capture_enabled
+            else []
+        )
+        if self._vision_diagnostic_logging:
+            selected = self.tracker.last_selected_detection
+            selected_index = next(
+                (
+                    index
+                    for index, detection in enumerate(detections)
+                    if detection is selected
+                ),
+                None,
+            )
+            selected_indices = [
+                index
+                for index, detection in enumerate(detections)
+                if any(
+                    detection is selected_detection
+                    for selected_detection in (
+                        self.tracker.last_selected_detections
+                    )
+                )
+            ]
+            race = self.adapter.race_status
+            estimate = self.estimate
+            self.recorder.emit(
+                "vision_detection_frame",
+                phase=(
+                    "gate1_reacquisition"
+                    if self._post_gate_reacquisition
+                    else "gate0_crossing"
+                ),
+                frame_id=snapshot.frame_id,
+                sim_time_ns=snapshot.sim_time_ns,
+                generation=snapshot.generation,
+                received_monotonic_s=snapshot.received_monotonic_s,
+                receive_age_s=snapshot.age_s(now),
+                image_size_px=[image_width, image_height],
+                race_boot_ms=(race.sim_boot_time_ms if race else None),
+                gate_index=(race.active_gate_index if race else None),
+                detections=summaries,
+                selected_detection_index=selected_index,
+                tracker_selected_detection_indices=selected_indices,
+                tracker_selection_mode=self.tracker.last_selection_mode,
+                tracker_streak=self.tracker.consecutive,
+                accepted_target=(asdict(accepted) if accepted else None),
+                tracker_target=(
+                    asdict(self.tracker.target) if self.tracker.target else None
+                ),
+                rpy=(
+                    list(estimate.orientation.to_euler()) if estimate else None
+                ),
+                body_rates=(list(estimate.body_rates) if estimate else None),
+                last_command=(
+                    asdict(self._last_flight_command)
+                    if self._last_flight_command
+                    else None
+                ),
+            )
+        if capture_enabled:
+            if snapshot.timing is None:
+                raise ValueError(
+                    "capture-loaded frame lacks exact FrameTimingV1"
+                )
+            assert work_started_ns is not None
+            assert consume_monotonic_ns is not None
+            assert detector_started_ns is not None
+            assert detector_ended_ns is not None
+            assert tracking_started_ns is not None
+            assert tracking_ended_ns is not None
+            record_timing = getattr(
+                self.recorder, "record_camera_timing", None
+            )
+            if not callable(record_timing):
+                raise ValueError(
+                    "capture recorder cannot preserve camera timing"
+                )
+        capture_frame = getattr(self.recorder, "capture_frame", None)
+        if capture_enabled and callable(capture_frame):
+            current_telemetry = self.adapter.latest_telemetry
+            current_imu = (
+                current_telemetry.imu
+                if current_telemetry is not None
+                else None
+            )
+            current_command = (
+                asdict(self._last_flight_command)
+                if self._last_flight_command is not None
+                else None
+            )
+            capture_frame(
+                image,
+                generation=int(snapshot.generation),
+                frame_id=int(snapshot.frame_id),
+                sim_time_ns=int(snapshot.sim_time_ns),
+                received_monotonic_s=float(snapshot.received_monotonic_s),
+                detector_latency_ms=detector_latency_ms,
+                detections=summaries,
+                tracker={
+                    "consecutive": self.tracker.consecutive,
+                    "target": asdict(self.tracker.target) if self.tracker.target else None,
+                    **(
+                        {
+                            "visual_gate_graph": (
+                                self._visual_graph_summary(
+                                    self._visual_latest_graph_snapshot
+                                )
+                            ),
+                            "visual_tracks": (
+                                [
+                                    self._visual_track_summary(track)
+                                    for track in (
+                                        self._visual_latest_tracker_update.tracks
+                                    )
+                                ]
+                                if self._visual_latest_tracker_update
+                                is not None
+                                else []
+                            ),
+                        }
+                        if self._visual_tracking_enabled
+                        else {}
+                    ),
+                },
+                imu=current_imu,
+                estimator=self._replay_estimator_fields(),
+                race_status=self.adapter.race_status,
+                generated_command=current_command,
+                sent_command=current_command,
+                phase=(
+                    "gate1_reacquisition"
+                    if self._post_gate_reacquisition
+                    else "gate0_or_preflight"
+                ),
+            )
+        if capture_enabled:
+            # End-to-end passive frame work includes the synchronous
+            # replay snapshot/copy enqueue above.  The asynchronous
+            # writer remains separately diagnosed by capture stats.
+            observation = CameraFrameTimingObservationV1(
+                frame_timing=snapshot.timing,
+                consume_monotonic_ns=consume_monotonic_ns,
+                work_start_monotonic_ns=work_started_ns,
+                detection_start_monotonic_ns=detector_started_ns,
+                detection_end_monotonic_ns=detector_ended_ns,
+                tracking_start_monotonic_ns=tracking_started_ns,
+                tracking_end_monotonic_ns=tracking_ended_ns,
+                work_end_monotonic_ns=time.perf_counter_ns(),
+            )
+            record_timing(observation)
 
     def _powered_vision_readiness(
         self,
@@ -10273,8 +10360,19 @@ class VQ2Runner:
         wire_start_deadline_ns: Optional[int] = None,
         wire_visual_token: Optional[VisualCameraFrameToken] = None,
         wire_race_gate_index: Optional[int] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Send one validated setpoint and optionally prove wire-call timing."""
+    ) -> Union[Optional[Dict[str, Any]], "FlightCommandSendResult"]:
+        """Send one validated setpoint and optionally prove wire-call timing.
+
+        With ``wire_visual_token`` the caller gets the exact visual wire
+        authority contract (publication lease, receipt provenance, and
+        re-raised race-boundary refusals) and the return value is the wire
+        receipt or ``None``.  Supplying ``wire_race_gate_index`` without a
+        visual token selects the race-only path: the atomic race-active
+        adapter send still runs, but no visual authority, receipt, or
+        deadline is required, and a race-boundary change returns
+        ``FlightCommandSendResult.SKIPPED_RACE_BOUNDARY_CHANGED`` instead of
+        raising.
+        """
 
         if type(require_wire_receipt) is not bool:
             raise TypeError("require_wire_receipt must be an exact bool")
@@ -10310,15 +10408,6 @@ class VQ2Runner:
                 raise ValueError(
                     "wire_race_gate_index must be a non-negative exact int"
                 )
-            if (
-                wire_visual_token is None
-                or not require_wire_receipt
-                or wire_start_deadline_ns is None
-            ):
-                raise ValueError(
-                    "race-active wire authority requires visual authority, "
-                    "an exact receipt, and a call-start deadline"
-                )
         drain_receipts = getattr(self.adapter, "drain_outbound_receipts", None)
         if require_wire_receipt:
             if not callable(drain_receipts):
@@ -10353,8 +10442,52 @@ class VQ2Runner:
             send_options["call_start_deadline_monotonic_ns"] = wire_start_deadline_ns
         wire_visual_authority: Optional[Dict[str, Any]] = None
         wire_race_authority: Optional[Dict[str, Any]] = None
+        race_only_wire = (
+            wire_visual_token is None and wire_race_gate_index is not None
+        )
         if wire_visual_token is None:
-            await self.adapter.send_attitude_rate(command, **send_options)
+            if wire_race_gate_index is None:
+                await self.adapter.send_attitude_rate(command, **send_options)
+            else:
+                guarded_send = getattr(
+                    self.adapter,
+                    "send_attitude_rate_if_race_active",
+                    None,
+                )
+                if not callable(guarded_send):
+                    raise SafetyAbort(
+                        "adapter lacks atomic race-active send "
+                        "authority"
+                    )
+                try:
+                    guarded_authority = await guarded_send(
+                        command,
+                        expected_active_gate_index=(
+                            wire_race_gate_index
+                        ),
+                        **send_options,
+                    )
+                except RaceActiveBoundaryChangedBeforeWire:
+                    # The authoritative race boundary advanced before the
+                    # wire call; the setpoint was not sent and the caller
+                    # may replan instead of aborting the attempt.
+                    return (
+                        FlightCommandSendResult
+                        .SKIPPED_RACE_BOUNDARY_CHANGED
+                    )
+                except (RuntimeError, ValueError) as exc:
+                    raise SafetyAbort(
+                        "race-active boundary refused the atomic "
+                        "navigation send"
+                    ) from exc
+                if not isinstance(guarded_authority, Mapping):
+                    raise SafetyAbort(
+                        "adapter returned invalid race-active send "
+                        "authority"
+                    )
+                wire_race_authority = dict(
+                    guarded_authority
+                )
         else:
             publication_lease = getattr(
                 self.vision,
@@ -10514,7 +10647,10 @@ class VQ2Runner:
                 wire_receipt["visual_receiver_authority"] = (
                     wire_visual_authority
                 )
-            if wire_race_gate_index is not None:
+            if (
+                wire_race_gate_index is not None
+                and wire_visual_token is not None
+            ):
                 authority = wire_race_authority
                 received = (
                     authority.get("received_race_status")
@@ -10580,6 +10716,8 @@ class VQ2Runner:
                 monotonic_s=self._last_flight_command_sent_s,
                 frame_token=frame_token,
             )
+        if race_only_wire:
+            return FlightCommandSendResult.SENT
         return wire_receipt
 
     async def _wait_for_next_flight_command_slot(self) -> float:
@@ -18872,7 +19010,7 @@ class VQ2Runner:
             context = await self.wait_for_go()
             race = self.adapter.race_status
             gate_before = race.active_gate_index if race else None
-            if stage in VISUAL_POWERED_STAGES:
+            if stage in VISUAL_CHECKPOINT_STAGES:
                 self._bind_initial_visual_gate(context)
             await self.arm_confirmed()
             if stage == "sign-id":
@@ -19149,64 +19287,12 @@ class VQ2Runner:
                         )
             if stage == VISUAL_COURSE_STAGE and success:
                 course_summary = self._visual_course_summary
-                summary_transitions = (
-                    course_summary.get("authoritative_transitions")
-                    if isinstance(course_summary, Mapping)
-                    else None
-                )
-                summary_transition_pairs = (
-                    [
-                        [
-                            item.get("from_gate_index"),
-                            item.get("to_gate_index"),
-                        ]
-                        for item in summary_transitions
-                    ]
-                    if (
-                        type(summary_transitions) is list
-                        and all(
-                            isinstance(item, Mapping)
-                            for item in summary_transitions
-                        )
-                    )
-                    else None
-                )
-                ordered_transition_chain = bool(
-                    all(
-                        pair == [index, index + 1]
-                        for index, pair in enumerate(
-                            visual_transition_pairs
-                        )
-                    )
-                    and (
-                        (
-                            visual_transition_pairs
-                            and visual_transition_pairs[-1][1]
-                            == cleanup_entry_gate_index
-                        )
-                        or (
-                            not visual_transition_pairs
-                            and cleanup_entry_gate_index == 0
-                        )
-                    )
-                )
-                graph_race = (
-                    visual_graph_at_cleanup.latest_race_status
-                    if visual_graph_at_cleanup is not None
-                    else None
-                )
+                # Course success is judged on authoritative race evidence
+                # alone; rolling-graph bookkeeping is no longer part of the
+                # boundary contract.
                 course_boundary_valid = bool(
                     cleanup_entry_gate_index is not None
                     and cleanup_entry_race_finished is True
-                    and visual_graph_at_cleanup is not None
-                    and visual_graph_at_cleanup.race_finished is True
-                    and visual_graph_at_cleanup.current_gate_index
-                    == cleanup_entry_gate_index
-                    and graph_race is not None
-                    and graph_race.race_finished is True
-                    and graph_race.active_gate_index
-                    == cleanup_entry_gate_index
-                    and ordered_transition_chain
                     and isinstance(course_summary, Mapping)
                     and course_summary.get("success") is True
                     and course_summary.get("race_finished") is True
@@ -19223,8 +19309,6 @@ class VQ2Runner:
                         "maximum_authoritative_gate_index"
                     ]
                     >= cleanup_entry_gate_index
-                    and summary_transition_pairs
-                    == visual_transition_pairs
                     and course_summary.get(
                         "yaw_calibration_profile"
                     )
@@ -19234,10 +19318,9 @@ class VQ2Runner:
                     success = False
                     boundary_reason = (
                         "visual-course cleanup boundary lacks authoritative "
-                        "race_finished/ordered rolling-graph proof "
+                        "race_finished evidence "
                         f"(gate_index={cleanup_entry_gate_index}, "
-                        f"race_finished={cleanup_entry_race_finished}, "
-                        f"transitions={visual_transition_pairs})"
+                        f"race_finished={cleanup_entry_race_finished})"
                     )
                     reason = (
                         boundary_reason

@@ -2906,6 +2906,167 @@ def test_runner_records_atomic_race_authority_with_visual_wire_receipt():
     )
 
 
+def test_runner_race_only_atomic_send_without_visual_authority():
+    class GuardedAdapter(_FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.guarded_calls = []
+
+        async def send_attitude_rate_if_race_active(
+            self,
+            command,
+            *,
+            expected_active_gate_index,
+            **_kwargs,
+        ):
+            self.guarded_calls.append(expected_active_gate_index)
+            self.commands.append(command)
+            return {
+                "schema": "aigp-vq2-race-active-send-authority/1",
+                "expected_active_gate_index": expected_active_gate_index,
+            }
+
+    adapter = GuardedAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+
+    result = asyncio.run(
+        runner._send_flight_command(
+            AttitudeRateCommand(0.0, 0.0, -0.04, 0.25),
+            wire_race_gate_index=0,
+        )
+    )
+
+    assert result is vq2_module.FlightCommandSendResult.SENT
+    assert adapter.guarded_calls == [0]
+    assert runner._last_flight_command is not None
+
+
+def test_runner_race_only_send_returns_skipped_on_boundary_change():
+    class BoundaryAdapter(_FakeAdapter):
+        async def send_attitude_rate_if_race_active(
+            self,
+            _command,
+            *,
+            expected_active_gate_index,
+            **_kwargs,
+        ):
+            assert expected_active_gate_index == 0
+            raise RaceActiveBoundaryChangedBeforeWire(
+                "race-active send boundary changed before wire"
+            )
+
+    adapter = BoundaryAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+
+    result = asyncio.run(
+        runner._send_flight_command(
+            AttitudeRateCommand(0.0, 0.0, -0.04, 0.25),
+            wire_race_gate_index=0,
+        )
+    )
+
+    assert result is (
+        vq2_module.FlightCommandSendResult.SKIPPED_RACE_BOUNDARY_CHANGED
+    )
+    assert adapter.commands == []
+    assert runner._last_flight_command is None
+
+
+def test_runner_course_mode_sample_skips_graph_and_best_effort_evidence(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    vision = _FakeVision()
+    vision.current_snapshot = _vision_snapshot(
+        frame_id=101, sim_time_ns=1_010, received_monotonic_s=1.0
+    )
+    runner = VQ2Runner(adapter, vision)
+    runner._visual_tracking_enabled = True
+    runner._visual_active_stage = vq2_module.VISUAL_COURSE_STAGE
+    runner.detector = SimpleNamespace(
+        detect=lambda _image: [_detection(10, 10, 40, 40)]
+    )
+
+    def forbidden_observe(_tracker):
+        raise AssertionError("course mode must not observe the gate graph")
+
+    monkeypatch.setattr(
+        runner.visual_gate_graph, "observe", forbidden_observe
+    )
+    events = []
+    original_emit = runner.recorder.emit
+
+    def record_emit(event, **fields):
+        events.append(event)
+        return original_emit(event, **fields)
+
+    monkeypatch.setattr(runner.recorder, "emit", record_emit)
+
+    def failing_tracker_update(*_args, **_kwargs):
+        raise RuntimeError("legacy tracker evidence boom")
+
+    monkeypatch.setattr(runner.tracker, "update", failing_tracker_update)
+
+    runner._sample()
+
+    assert runner._detection_error is None
+    assert "frame_evidence_error" in events
+    assert runner._visual_latest_tracker_update is not None
+    failures = runner._stream_failures(
+        require_estimator=False,
+        require_target=False,
+        require_armed=False,
+    )
+    assert not any("gate detector failed" in item for item in failures)
+
+
+def test_runner_detection_error_clears_on_successful_sample():
+    adapter = _FakeAdapter()
+    vision = _FakeVision()
+    vision.current_snapshot = _vision_snapshot(
+        frame_id=101, sim_time_ns=1_010, received_monotonic_s=1.0
+    )
+    runner = VQ2Runner(adapter, vision)
+    runner._visual_tracking_enabled = True
+    runner._visual_active_stage = vq2_module.VISUAL_COURSE_STAGE
+
+    def raise_boom(_image):
+        raise RuntimeError("detector boom")
+
+    runner.detector = SimpleNamespace(detect=raise_boom)
+
+    runner._sample()
+
+    assert runner._detection_error is not None
+    assert any(
+        "gate detector failed" in item
+        for item in runner._stream_failures(
+            require_estimator=False,
+            require_target=False,
+            require_armed=False,
+        )
+    )
+
+    runner.detector = SimpleNamespace(
+        detect=lambda _image: [_detection(10, 10, 40, 40)]
+    )
+    vision.current_snapshot = _vision_snapshot(
+        frame_id=102, sim_time_ns=1_020, received_monotonic_s=1.0
+    )
+
+    runner._sample()
+
+    assert runner._detection_error is None
+    assert not any(
+        "gate detector failed" in item
+        for item in runner._stream_failures(
+            require_estimator=False,
+            require_target=False,
+            require_armed=False,
+        )
+    )
+
+
 def _configure_gate1_recenter_candidate(monkeypatch, *, entry_center_x=530):
     clock = [0.0]
     adapter = _FakeAdapter()
