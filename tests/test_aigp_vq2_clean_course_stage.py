@@ -1228,6 +1228,53 @@ def test_search_commands_brake_attitude_when_blind_and_fast():
     assert abs(out.yaw_rate_rad_s) > 0.0  # the sweep stays alive
 
 
+def test_crossing_loss_latches_coast_even_while_fh_untrusted():
+    # F32 (8cc53db2): fh went untrusted from BRAKING drag at the engulfed
+    # gate-0 plane, the fh guard blocked the coast latch, and the drone
+    # flew blind into the frame in PREDICT.  The coast holds the SUPPORT
+    # collective at level attitude (F25), so there is no zero-thrust drop
+    # to guard against: a credible close crossing loss coasts regardless.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller._fh_untrusted = True
+    now = 100.10
+    now += 0.033
+    controller.observe(_update([], frame_id=20), now_s=now)  # fresh close loss
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    output = _command(controller, now + 0.02)
+    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+
+
+def test_brake_ceiling_forbids_climb_while_braking():
+    # F32: the +0.15 brake stopped the drone horizontally short of gate 0
+    # while the vertical channel (PD climb, high-gate bias, fh-untrusted
+    # floor) kept carrying it UP at +1.0 m/s into the gate's lower
+    # structure.  While the closure governor brakes, the collective is
+    # capped at support — no climb, from any source.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller._pre_cross_brake_active = True
+    # fh-untrusted floor alone would command support + 0.05:
+    controller._fh_untrusted = True
+    assert controller._governed_collective(0.30, SUPPORT) == pytest.approx(
+        SUPPORT, abs=1e-9
+    )
+    # A qualified-PD climb demand is capped too:
+    assert controller._governed_collective(0.34, SUPPORT) == pytest.approx(
+        SUPPORT, abs=1e-9
+    )
+    # Sub-support demands are pinned to support as well: while braking the
+    # collective is exactly the hover support (the fh floor may not lift it,
+    # the ceiling may not sink it).
+    assert controller._governed_collective(0.24, SUPPORT) == pytest.approx(
+        SUPPORT, abs=1e-9
+    )
+    # Released: the fh-untrusted floor applies again.
+    controller._pre_cross_brake_active = False
+    assert controller._governed_collective(0.30, SUPPORT) == pytest.approx(
+        SUPPORT + 0.05, abs=1e-9
+    )
+
+
 def test_pre_cross_brake_does_not_suppress_crossing_detection():
     # Replay the shape of a normal crossing under braking: the apparent
     # size keeps growing through crossing_min_log_scale while the brake is

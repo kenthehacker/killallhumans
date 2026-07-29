@@ -888,7 +888,6 @@ class CleanCourseController:
             if (
                 self.state is CleanCourseState.TRACK
                 and fresh
-                and not self._fh_untrusted
                 and self.current.outer_log_scale >= cfg.crossing_min_log_scale
             ):
                 # Credible close crossing lost the target on a FRESH frame:
@@ -897,13 +896,13 @@ class CleanCourseController:
                 # a ~0.27 s camera stall republished one frozen frame id and
                 # the stale close-range loss latched zero thrust at the
                 # gate-0 top bar, so a superseded frame must never arm this.
-                # Flight 20260729T152745Z-visual-course-6bebd725: at fh 7.5
-                # (untrusted) a fast terrain/frame object hit engulfing scale
-                # and vanished, latching zero thrust at speed -> instant hard
-                # drop (impulse 3.11).  Zero thrust is only safe in the slow
-                # crossing regime the coast was designed for; while fh is
-                # untrusted a close-target loss must fall through to PREDICT
-                # with the support+margin collective instead.
+                # The F22 fh-untrusted guard (flight 6bebd725: zero thrust
+                # latched at speed) was retired in F33: the coast has held
+                # the SUPPORT collective at level attitude since F25, so
+                # there is no zero-thrust drop to guard against — and the
+                # guard blocked the F32 coast at the engulfed gate-0 plane
+                # (fh was high from BRAKING drag, not speed), sending the
+                # drone blind into the frame in PREDICT instead.
                 self.state = CleanCourseState.COAST_FOR_CREDIT
                 self._coast_entry_s = float(now_s)
                 self._coast_race_boot_ms = self._last_race_boot_ms
@@ -1643,10 +1642,7 @@ class CleanCourseController:
         construction.
         Symmetric: caps collective above the climb cap and floors it below
         the descent floor (flight d52adcd4 sank ~-1.9 m/s^2 into a ground
-        graze while the frozen frame suppressed SEARCH).  The climb cap is
-        dynamic: the full VZ_CLIMB_CAP_M_S, tightened to the post-credit
-        cap while the post-credit brake window is active (F10's unqualified
-        post-credit climb).  Below the floor a
+        graze while the frozen frame suppressed SEARCH).  Below the floor a
         fixed descent-regime hover feedforward (flight d5e89c2b: effective
         fast-regime hover ~=0.32, proportional floor alone reached only
         ~0.31 by contact) steps in with the first confirmed sub-floor
@@ -1670,28 +1666,47 @@ class CleanCourseController:
             # place (F19 SEARCH hold, F20 coast gate, F21 qualified-PD sag)
             # instead of per-path patches.
             floor = support + self.config.fh_untrusted_vertical_margin
-            return _clamp(
+            governed = _clamp(
                 max(collective, floor),
                 self.config.min_thrust,
                 self.config.max_thrust,
             )
-        excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
-        if excess > 0.0:
-            collective = min(collective, support - VZ_GOVERNOR_GAIN * excess)
-        descent_excess = VZ_DESCENT_FLOOR_M_S - self._vz_est_m_s
-        if descent_excess > 0.0:
-            collective = max(
-                collective,
-                support
-                + VZ_DESCENT_GOVERNOR_GAIN * descent_excess
-                + VZ_DESCENT_HOVER_FEEDFORWARD,
+        else:
+            excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
+            if excess > 0.0:
+                collective = min(collective, support - VZ_GOVERNOR_GAIN * excess)
+            descent_excess = VZ_DESCENT_FLOOR_M_S - self._vz_est_m_s
+            if descent_excess > 0.0:
+                collective = max(
+                    collective,
+                    support
+                    + VZ_DESCENT_GOVERNOR_GAIN * descent_excess
+                    + VZ_DESCENT_HOVER_FEEDFORWARD,
+                )
+            # Hard clamp here, not only at the main-path call site: the SEARCH
+            # and defensive-fallback returns emit the governed value directly,
+            # and an unclamped deep-sink floor boost (support + gain*excess +
+            # feedforward) exceeded the runner's 0.35 envelope abort in flight
+            # 20260729T115619Z-visual-course-039186c8.
+            governed = _clamp(
+                collective, self.config.min_thrust, self.config.max_thrust
             )
-        # Hard clamp here, not only at the main-path call site: the SEARCH
-        # and defensive-fallback returns emit the governed value directly,
-        # and an unclamped deep-sink floor boost (support + gain*excess +
-        # feedforward) exceeded the runner's 0.35 envelope abort in flight
-        # 20260729T115619Z-visual-course-039186c8.
-        return _clamp(collective, self.config.min_thrust, self.config.max_thrust)
+        # F33 brake ceiling: while the closure governor brakes, the drone
+        # must not climb.  F32 stopped horizontally short of gate 0 (the
+        # +0.15 brake works — integrated IMU shows +1.4 -> -2.1 m/s), but
+        # the vertical aim (qualified PD chasing a slightly-high ey, the
+        # high-gate bias, and the fh-untrusted floor) kept the collective
+        # oscillating 0.275 -> 0.34 and carried the drone UP at +1.0 m/s
+        # into the gate's lower structure.  Braking drag is NOT the
+        # gliding deficit regime: F32 held vz +1.0 at bare support, so the
+        # fh floor must not lift the ceiling here either.
+        if self._pre_cross_brake_active:
+            governed = _clamp(
+                min(governed, support),
+                self.config.min_thrust,
+                self.config.max_thrust,
+            )
+        return governed
 
     def _anchor_clamped_yaw(
         self, yaw_rate: float, yaw_rad: Optional[float]
