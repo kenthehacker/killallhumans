@@ -117,11 +117,19 @@ MAX_COURSE_THRUST = 0.32  # MAX_VISUAL_THRUST
 # support 0.275), so 0.01 collective ~= 0.67 m/s^2 and 2 m/s over the cap
 # costs -0.06 collective ~= -4 m/s^2, inside the 0.21 floor's authority.
 # The governor is IMU-based precisely so it stays alive when vision is
-# censored or stalled; there is no symmetric descent governor.
+# censored or stalled.
 VZ_CLIMB_CAP_M_S = 1.0  # generous bound vs the ~0.9 m/s average requirement
 VZ_GOVERNOR_GAIN = 0.03  # collective per m/s over the cap (see block above)
 VZ_LEAK_TAU_S = 2.5  # leaky-integrator time constant (bias/noise guard)
 GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
+# Symmetric descent floor (flight 20260729T111003Z-visual-course-d52adcd4):
+# a 6.1 s frozen-camera stall blinded the loop while a_up ~= -1.9 m/s^2 sank
+# it into a ground graze.  The hover regime shifts ~0.275 -> ~0.30 support
+# in fast/descending flight, so from the measured plant (a_up =
+# 66.7*thrust - 18.44) the gain adds +0.06 collective at vz = -1.5 m/s
+# (~+4 m/s^2 of arrest authority) and tapers to zero at the floor boundary.
+VZ_DESCENT_FLOOR_M_S = -0.5  # sink-rate bound, mirroring the climb cap
+VZ_DESCENT_GOVERNOR_GAIN = 0.06  # collective per m/s below the floor
 
 # Launch boost is pure feedforward (it ignores ey).  Flight
 # 20260729T094736Z-visual-course-9d430a40: the 0.32 x 0.75 s boost alone
@@ -525,6 +533,11 @@ class CleanCourseController:
         # Freshness of the last engulfing-box bearing/existence anchor (see
         # ENGULFING_ANCHOR_MAX_AGE_S); never a filter measurement.
         self._last_engulfing_anchor_s: Optional[float] = None
+        # Camera-frame identity that set the anchor; a frozen frame
+        # republished by the tracker (flight d52adcd4: 6.1 s stall) must not
+        # keep refreshing it, or the anchor never expires and SEARCH is
+        # suppressed for the whole blind descent.
+        self._last_engulfing_anchor_identity: Optional[Tuple[Any, Any]] = None
 
     # -- initialization ----------------------------------------------------
 
@@ -624,8 +637,16 @@ class CleanCourseController:
         # servo, but its center still says "gate centered, very close", so it
         # refreshes horizontal bearing/existence evidence and (below) blocks
         # the PREDICT->SEARCH churn while flying through the gate plane.
+        # Freshness-gated on the camera-frame identity (flight d52adcd4): a
+        # republished frozen frame must not keep refreshing the anchor, or it
+        # never expires during a camera stall.  An update whose identity
+        # cannot be determined is conservatively treated as fresh, matching
+        # the `fresh` rule above.
         anchor = _engulfing_anchor_track(update, self._current_track_id())
-        if anchor is not None:
+        if anchor is not None and (
+            identity is None or identity != self._last_engulfing_anchor_identity
+        ):
+            self._last_engulfing_anchor_identity = identity
             self._last_engulfing_anchor_s = float(now_s)
             self.last_reliable_bearing = (
                 float(anchor.center_norm[0]),
@@ -1188,18 +1209,25 @@ class CleanCourseController:
         return cfg.successor_blend_max * closure * trust
 
     def _governed_collective(self, collective: float, support: float) -> float:
-        """IMU climb-rate governor: cap collective by estimated world vz.
+        """IMU climb/descent-rate governor: bound collective by estimated vz.
 
         Applied wherever a nonzero collective is emitted (TRACK, PREDICT,
         SEARCH, and the defensive fallback) so vision loss never disables
         it; the exact-zero COAST/abort latch bypasses it by construction.
-        Climb-only: there is no symmetric descent governor this iteration.
+        Symmetric: caps collective above the climb cap and floors it below
+        the descent floor (flight d52adcd4 sank ~-1.9 m/s^2 into a ground
+        graze while the frozen frame suppressed SEARCH).
         """
 
         excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
-        if excess <= 0.0:
-            return collective
-        return min(collective, support - VZ_GOVERNOR_GAIN * excess)
+        if excess > 0.0:
+            collective = min(collective, support - VZ_GOVERNOR_GAIN * excess)
+        descent_excess = VZ_DESCENT_FLOOR_M_S - self._vz_est_m_s
+        if descent_excess > 0.0:
+            collective = max(
+                collective, support + VZ_DESCENT_GOVERNOR_GAIN * descent_excess
+            )
+        return collective
 
     def _search_yaw(self, dt: float) -> float:
         cfg = self.config

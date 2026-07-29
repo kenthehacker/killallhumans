@@ -3,12 +3,14 @@
 These tests assert envelope and directional behavior only: one global
 vertical sign, decay-toward-support on vertical loss, a cut 0.30 x 0.40 s
 launch boost, a disabled-then-tested gate-0 climb bias that never lifts the
-aim point above image center, full-authority image-rate D bounded by an
-IMU world-vertical-rate climb governor (alive in TRACK, PREDICT, and
-SEARCH), phantom vertical rates zeroed when the accepted-y measurement
+aim point above image center, full-authority image-rate D bounded by a
+symmetric IMU world-vertical-rate climb/descent governor (alive in TRACK,
+PREDICT, and SEARCH, bypassed only by the exact-zero coast latch), phantom
+vertical rates zeroed when the accepted-y measurement
 ages out (reseeded only by real measurements, never seeded by censored or
 engulfing detections), degenerate engulfing detections rejected as
-measurements but kept as bearing/existence anchors that block SEARCH,
+measurements but kept as bearing/existence anchors that block SEARCH and
+expire when the camera frame freezes,
 verified yaw/roll directions, clipping uncertainty (not abort),
 PREDICT->SEARCH on fresh empty frames, frozen-frame stalls that predict and
 never coast, a real bounded yaw sweep, finite bounded output, absolute race
@@ -377,6 +379,61 @@ def test_vz_governor_applies_in_predict_and_search():
     )
 
 
+def test_vz_governor_floors_collective_below_descent_floor():
+    # Flight 20260729T111003Z-visual-course-d52adcd4: a 6.1 s frozen-camera
+    # stall blinded the loop while a_up ~= -1.9 m/s^2 sank it into a ground
+    # graze; the climb-only governor did nothing.  The symmetric floor adds
+    # K_VZ_DESCENT per m/s below the -0.5 m/s sink bound.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    helper = controller._governed_collective
+    controller._vz_est_m_s = -0.5  # at the floor boundary: no effect
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT, abs=1e-9)
+    controller._vz_est_m_s = -1.0  # 0.5 m/s below -> +0.03 collective
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.03, abs=1e-9)
+    controller._vz_est_m_s = -1.5  # 1.0 m/s below -> +0.06 (~+4 m/s^2)
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.06, abs=1e-9)
+    # The floor only raises collective; it never lowers a higher command.
+    controller._vz_est_m_s = -1.0
+    assert helper(0.31, SUPPORT) == pytest.approx(0.31, abs=1e-9)
+
+
+def test_vz_descent_floor_raises_command_thrust():
+    # Command level: vz = -1.0 m/s lifts the emitted collective to
+    # support + 0.03 = 0.305, below the 0.32 clamp so it stays observable.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))  # e = 0, vy ~ 0
+    controller._vz_est_m_s = -1.0
+    assert _command(controller, 100.10).thrust == pytest.approx(
+        SUPPORT + 0.03, abs=1e-9
+    )
+
+
+def test_vz_descent_floor_applies_in_predict_and_search():
+    # The floor is IMU-based for the same reason as the climb cap: vision
+    # loss (the d52adcd4 stall case) must not disable it.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller.observe(_update([], frame_id=2), now_s=100.12)  # superseded
+    assert controller.state is CleanCourseState.PREDICT
+    controller._vz_est_m_s = -1.0
+    assert _command(controller, 100.16).thrust == pytest.approx(
+        SUPPORT + 0.03, abs=1e-9
+    )
+    controller._enter_search(100.20)
+    assert _command(controller, 100.22).thrust == pytest.approx(
+        SUPPORT + 0.03, abs=1e-9
+    )
+
+
+def test_vz_descent_floor_bypassed_by_coast_exact_zero():
+    # The credit/abort latch emits exact zeros by construction; the descent
+    # floor must never resurrect thrust during the bounded coast wait.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.observe(_update([], frame_id=3), now_s=100.12)  # fresh close loss
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    controller._vz_est_m_s = -1.0
+    assert _command(controller, 100.14).thrust == 0.0
+
+
 def test_vz_leaky_integrator_integrates_and_decays():
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     _command(controller, 100.10, a_up=1.0)  # first call: dt = control period
@@ -514,6 +571,37 @@ def test_engulfing_anchor_blocks_search_and_keeps_vertical_unqualified():
     assert controller.last_reliable_bearing[0] == pytest.approx(0.30)
     assert controller.current.y_axis.v == 0.0
     assert not output.vertical_qualified
+
+
+def test_engulfing_anchor_expires_on_frozen_frames():
+    # Flight 20260729T111003Z-visual-course-d52adcd4: a frozen engulfing
+    # frame (fid 2762570) republished for 6.1 s kept refreshing the anchor,
+    # so it never expired, SEARCH was suppressed, and the loop flew blind
+    # into a ground graze.  The anchor refreshes only on a NEW camera frame;
+    # a republished frozen frame lets it expire and SEARCH proceeds.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    engulfing = _track(
+        "A",
+        0.30,
+        0.10,
+        scale=1.0,  # bbox spans the whole frame
+        clipping=(
+            FrameEdge.LEFT | FrameEdge.RIGHT | FrameEdge.TOP | FrameEdge.BOTTOM
+        ),
+    )
+    controller.observe(_update([engulfing], frame_id=10), now_s=100.06)
+    assert controller._last_engulfing_anchor_s == pytest.approx(100.06)
+    now = 100.06
+    entered = False
+    for _ in range(60):  # ~2 s of the SAME frozen frame republished
+        now += 0.033
+        controller.observe(_update([engulfing], frame_id=10), now_s=now)
+        if controller.state is CleanCourseState.SEARCH:
+            entered = True
+            break
+    assert entered
+    # The frozen republication never refreshed the anchor timestamp.
+    assert controller._last_engulfing_anchor_s == pytest.approx(100.06)
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():
