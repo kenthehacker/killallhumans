@@ -30,6 +30,20 @@ also surfaced as an unhealthy estimate rather than integrated across.  These
 guards favor a short conservative stabilization flight over aggressive but
 potentially false attitude corrections.
 
+The same guards can SEAL a large estimate error in (flight F23, trace
+20260729T155209Z-visual-course-fed5026d): once gyro drift carries the
+estimate past the 30-degree innovation veto, correction is locked out
+permanently and the error random-walks with bias (measured 25->47->18->39
+degrees while the drone flew a real fast-flight equilibrium it believed was
+level).  A slow secular correction (``gravity_correction_kp_slow``, full
+authority at/above the veto ramping to zero at 10 degrees of innovation,
+and gated by a wide magnitude band so impact spikes stay excluded) relaxes
+such a sealed error back inside the veto envelope so the full-trust
+correction can re-engage when genuinely steady flight returns.  The cost is
+a bounded leak (~0.3 deg/s worst case) during sustained sub-veto
+off-gravity maneuvers — orders of magnitude below the 0.3-0.6 rad F13
+convergence it replaces, and bounded by maneuver duration.
+
 This file performs no I/O and sends no simulator traffic.  Feed it the raw
 ``timestamp_us``, ``accel`` and ``gyro`` fields from :class:`IMUData`.
 """
@@ -92,6 +106,26 @@ class ImuAttitudeConfig:
     accel_trust_fh_zero_mps2: float = 2.50
     accel_innovation_full_rad: float = math.radians(6.0)
     accel_innovation_zero_rad: float = math.radians(30.0)
+
+    # Slow secular correction (F23): a weak pull toward the measured
+    # specific-force direction with FULL authority in the sealed zone
+    # (innovation at/above the 30-degree veto, where every fast trust gate
+    # is exactly zero), ramping down to zero at 10 degrees — below that the
+    # fast correction is healthy and owns recovery.  A wide magnitude band
+    # excludes impact spikes.  Prevents the trust gates above from sealing a
+    # >30-degree estimate error in permanently; the ~12 s full-authority
+    # time constant is far too slow to chase maneuvers.  The price is a
+    # bounded leak during sustained sub-veto off-gravity maneuvers (the F13
+    # band): worst case ~0.3 deg/s at 10-15 degrees of innovation, versus
+    # the 17-34 degree convergence the F13 fast-correction bug produced.
+    gravity_correction_kp_slow: float = 0.08
+    slow_correction_zero_innovation_rad: float = math.radians(10.0)
+    slow_correction_full_innovation_rad: float = math.radians(30.0)
+    # Wide magnitude band, but tight enough to exclude hard maneuver/impact
+    # specific force: F23's sealed fast cruise sat at |f|-g <= 0.4 while the
+    # gate-0 bar graze spikes to |f| ~15 and a 2.9 m/s^2 maneuver reads ~2.9.
+    slow_trust_full_deviation_mps2: float = 1.00
+    slow_trust_zero_deviation_mps2: float = 2.00
 
     # Timing guards.  A large backwards jump is a simulator clock reset and
     # restarts calibration; a small backwards jump is an out-of-order packet.
@@ -327,6 +361,27 @@ class ImuAttitudeEstimator:
         error = _cross(measured_up, predicted_up)
         feedback_rate = _scale(error, cfg.gravity_correction_kp * accel_trust)
         self._q = _integrate_body_rate(q_pred, feedback_rate, dt)
+        # Slow secular correction (F23, see the config block): a weak pull
+        # with full authority in the sealed zone (innovation at/above the
+        # veto, where every fast trust gate is exactly zero), ramping to
+        # zero at 10 degrees where the fast correction is healthy again.
+        # Relaxes a sealed-in estimate error back inside the veto envelope
+        # so the fast correction can re-engage; the cost is a bounded leak
+        # (~0.3 deg/s worst case) during sustained sub-veto off-gravity
+        # maneuvers, which the F13 fast-correction guard still rejects.
+        if cfg.gravity_correction_kp_slow > 0.0:
+            slow_trust = _descending_ramp(
+                magnitude_deviation,
+                cfg.slow_trust_full_deviation_mps2,
+                cfg.slow_trust_zero_deviation_mps2,
+            ) * _ascending_ramp(
+                innovation_angle,
+                cfg.slow_correction_zero_innovation_rad,
+                cfg.slow_correction_full_innovation_rad,
+            )
+            if slow_trust > 0.0:
+                slow_rate = _scale(error, cfg.gravity_correction_kp_slow * slow_trust)
+                self._q = _integrate_body_rate(self._q, slow_rate, dt)
 
         # Learn bias only in a near-stationary regime.  This keeps sustained
         # racing acceleration from being absorbed as a fictitious gyro bias.
@@ -502,6 +557,8 @@ def _validate_config(cfg: ImuAttitudeConfig) -> None:
         "accel_trust_full_deviation_mps2": cfg.accel_trust_full_deviation_mps2,
         "accel_trust_fh_full_mps2": cfg.accel_trust_fh_full_mps2,
         "accel_innovation_full_rad": cfg.accel_innovation_full_rad,
+        "gravity_correction_kp_slow": cfg.gravity_correction_kp_slow,
+        "slow_trust_full_deviation_mps2": cfg.slow_trust_full_deviation_mps2,
     }
     if not math.isfinite(cfg.gravity_mps2) or cfg.gravity_mps2 <= 0.0:
         raise ValueError("gravity_mps2 must be finite and > 0")
@@ -530,6 +587,22 @@ def _validate_config(cfg: ImuAttitudeConfig) -> None:
         or cfg.accel_innovation_zero_rad <= cfg.accel_innovation_full_rad
     ):
         raise ValueError("accel innovation zero threshold must exceed full threshold")
+    if (
+        not math.isfinite(cfg.slow_trust_zero_deviation_mps2)
+        or cfg.slow_trust_zero_deviation_mps2
+        <= cfg.slow_trust_full_deviation_mps2
+    ):
+        raise ValueError("slow trust zero threshold must exceed full threshold")
+    if (
+        not math.isfinite(cfg.slow_correction_zero_innovation_rad)
+        or not math.isfinite(cfg.slow_correction_full_innovation_rad)
+        or cfg.slow_correction_zero_innovation_rad < 0.0
+        or cfg.slow_correction_full_innovation_rad
+        <= cfg.slow_correction_zero_innovation_rad
+    ):
+        raise ValueError(
+            "slow correction full innovation must exceed zero innovation (>= 0)"
+        )
     if not math.isfinite(cfg.max_dt_s) or cfg.max_dt_s <= 0.0:
         raise ValueError("max_dt_s must be finite and > 0")
     if cfg.timestamp_reset_threshold_us < 1:
@@ -645,6 +718,14 @@ def _descending_ramp(value: float, full: float, zero: float) -> float:
     if value >= zero:
         return 0.0
     return (zero - value) / (zero - full)
+
+
+def _ascending_ramp(value: float, zero: float, full: float) -> float:
+    if value <= zero:
+        return 0.0
+    if value >= full:
+        return 1.0
+    return (value - zero) / (full - zero)
 
 
 def _angle_between(a: Vector3, b: Vector3) -> float:

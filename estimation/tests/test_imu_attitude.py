@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from competition.adapter import IMUData
+from competition.adapter import IMUData, Quaternion
 from estimation.imu_attitude import ImuAttitudeConfig, ImuAttitudeEstimator
 
 
@@ -180,15 +180,21 @@ def test_maneuver_horizontal_specific_force_zeroes_trust():
         estimate = estimator.update(40_000 + i * 10_000, accel, (0.0, 0.0, 0.0))
 
     assert estimate is not None and estimate.healthy
-    assert estimate.horizontal_specific_force_mps2 == pytest.approx(fh, abs=1e-9)
+    # Bounded slow-leak tilt over the 1 s window shifts the q-rotated
+    # horizontal component slightly; the maneuver-band value is unchanged.
+    assert estimate.horizontal_specific_force_mps2 == pytest.approx(fh, abs=0.1)
     assert estimate.accel_magnitude_deviation_mps2 == pytest.approx(
         magnitude - G, abs=1e-9
     )
     assert estimate.accel_trust == 0.0
-    # The correction must not drag the level estimate toward the false
-    # gravity direction no matter how long the maneuver lasts.
-    assert estimate.roll == pytest.approx(0.0, abs=1e-12)
-    assert estimate.pitch == pytest.approx(0.0, abs=1e-12)
+    # The fast correction must not drag the level estimate toward the false
+    # gravity direction no matter how long the maneuver lasts.  The F23 slow
+    # secular correction adds a bounded leak in this band (~0.3 deg/s at
+    # 15 degrees of innovation, ramping to zero at 10) — orders below the
+    # 17-34 degree convergence the F13 fast-correction bug produced, and the
+    # price of breaking the F23 seal-in; it is asserted explicitly here.
+    assert abs(estimate.roll) < math.radians(0.5)
+    assert abs(estimate.pitch) < math.radians(0.5)
 
 
 def test_vertical_acceleration_beyond_tightened_band_zeroes_trust():
@@ -293,3 +299,59 @@ def test_quaternion_stays_normalized_over_long_rotation():
 def test_invalid_config_fails_at_construction(config):
     with pytest.raises(ValueError):
         ImuAttitudeEstimator(config)
+
+
+def test_slow_secular_correction_breaks_innovation_veto_seal():
+    # F23 (trace 20260729T155209Z-visual-course-fed5026d): once gyro drift
+    # carried the estimate past the 30-degree innovation veto, every trust
+    # gate closed permanently and the error random-walked 25->47 degrees in
+    # flight.  The slow secular correction must relax a sealed error back
+    # inside the veto envelope on steady accel alone, while a build with
+    # the correction disabled stays sealed.
+    corrupt = Quaternion.from_euler(math.radians(40.0), 0.0, 0.0)
+    corrupt_q = (corrupt.w, corrupt.x, corrupt.y, corrupt.z)
+
+    def _sealed_estimator(**overrides):
+        estimator = ImuAttitudeEstimator(_fast_config(gyro_bias_ki=0.0, **overrides))
+        _bootstrap(estimator)
+        estimator._q = corrupt_q  # white-box: sealed 40-degree roll error
+        return estimator
+
+    def _run(estimator, seconds):
+        estimate = None
+        for i in range(1, int(seconds * 100) + 1):
+            estimate = estimator.update(
+                40_000 + i * 10_000, (0.0, 0.0, -G), (0.0, 0.0, 0.0)
+            )
+        assert estimate is not None
+        return estimate
+
+    # Control: with the slow correction disabled the error never relaxes —
+    # accel_trust is exactly zero for the whole 40 s (innovation and
+    # horizontal-specific-force gates both closed).
+    sealed = _run(_sealed_estimator(gravity_correction_kp_slow=0.0), 40.0)
+    assert sealed.accel_trust == 0.0
+    assert abs(sealed.roll) == pytest.approx(math.radians(40.0), abs=1e-9)
+
+    # The slow correction relaxes the seal; once the error is back inside
+    # the fast trust envelope the full correction re-engages and finishes.
+    recovered = _run(_sealed_estimator(), 40.0)
+    assert abs(recovered.roll) < math.radians(5.0)
+    assert recovered.accel_trust > 0.9
+
+
+def test_slow_correction_ignores_impact_magnitude_spikes():
+    # The secular pull must stay gated by the wide magnitude band: a hard
+    # impact (|f| far above gravity) carries no gravity direction.
+    corrupt = Quaternion.from_euler(math.radians(40.0), 0.0, 0.0)
+    estimator = ImuAttitudeEstimator(_fast_config(gyro_bias_ki=0.0))
+    _bootstrap(estimator)
+    estimator._q = (corrupt.w, corrupt.x, corrupt.y, corrupt.z)
+
+    estimate = None
+    for i in range(1, 101):
+        estimate = estimator.update(
+            40_000 + i * 10_000, (0.0, 0.0, -3.0 * G), (0.0, 0.0, 0.0)
+        )
+    assert estimate is not None
+    assert abs(estimate.roll) == pytest.approx(math.radians(40.0), abs=1e-9)
