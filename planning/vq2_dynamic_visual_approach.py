@@ -1234,14 +1234,51 @@ class DynamicVisualCourseSession:
 
         targets = self._successor_steering_targets(prediction)
         unconstrained_target_roll = float(targets["target_roll_rad"])
+        yaw_rate = float(targets["yaw_rate_rad_s"])
         # After credit, fresh successor geometry may bend the trajectory as
-        # well as point the camera.  Never retain the old pre-credit bank:
-        # this proportional request is recomputed from the promoted gate.
+        # well as point the camera.  Never retain the old pre-credit bank.
+        # When the exact promoted state is moving outward while calibrated yaw
+        # is already saturated, use the full bounded lateral intercept on this
+        # publication instead of spending the short visibility window ramping
+        # a small proportional request.  No target is latched: an inward or
+        # degraded next publication releases immediately.
         self._pending_post_credit_roll_reference = None
         self._post_credit_roll_reference_handoff = None
         target_roll = unconstrained_target_roll
+        outward_full_bank_applied = False
+        exact_fresh_promoted_current = bool(
+            state.current.visible
+            and state.current.missed_count == 0
+            and state.current.state_monotonic_ns
+            == state.current.last_measurement_monotonic_ns
+            and not state.current.ambiguous
+            and not state.current.censored_axes[0]
+            and state.current.bearing_rate_qualified[0]
+            and prediction.last_measurement_monotonic_ns
+            == state.current.last_measurement_monotonic_ns
+            and abs(yaw_rate) >= 0.90 * MAX_YAW_RATE_RAD_S
+        )
+        if exact_fresh_promoted_current:
+            (
+                target_roll,
+                outward_full_bank_applied,
+            ) = successor_roll_reference(
+                stable_bearing_rad=prediction.stable_bearing_rad[0],
+                stable_bearing_rate_rad_s=(
+                    prediction.stable_bearing_rate_rad_s[0]
+                ),
+                bearing_std_rad=prediction.bearing_std_rad[0],
+                roll_guidance_sign=self.core.config.roll_guidance_sign,
+                roll_gain=self.core.config.roll_gain,
+                lateral_rate_gain=self.core.config.lateral_rate_gain,
+                off_axis_brake_rad=self.core.config.off_axis_brake_rad,
+                maximum_bearing_std_rad=(
+                    self.core.config
+                    .successor_prediction_max_extrapolation_rad
+                ),
+                full_bank_when_outward=True,
+            )
         target_pitch = float(targets["target_pitch_rad"])
-        yaw_rate = float(targets["yaw_rate_rad_s"])
         camera_elevation = float(
             targets["camera_elevation_error_rad"]
         )
@@ -1325,6 +1362,9 @@ class DynamicVisualCourseSession:
                 "target_roll_rad": target_roll,
                 "unconstrained_target_roll_rad": unconstrained_target_roll,
                 "retained_roll_reference_applied": False,
+                "outward_full_bank_applied": (
+                    outward_full_bank_applied
+                ),
                 "target_pitch_rad": target_pitch,
                 "yaw_rate_rad_s": yaw_rate,
                 "thrust": SUPPORT_THRUST,

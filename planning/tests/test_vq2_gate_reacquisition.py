@@ -711,6 +711,123 @@ def _second_same_gate_candidate_detection(sequence: int) -> VisualDetection:
     )
 
 
+def _departure_current_detection(
+    sequence: int,
+    *,
+    side: int,
+    spans_optical_axis: bool,
+) -> VisualDetection:
+    assert side in {-1, 1}
+    return _detection(
+        0,
+        0.0 if spans_optical_axis else 0.80 * side,
+        -0.55 + 0.002 * sequence,
+        0.44 if spans_optical_axis else 0.12,
+        0.16,
+        confidence=0.95,
+    )
+
+
+def _departure_rebound_detection(
+    sequence: int,
+    *,
+    side: int,
+) -> VisualDetection:
+    assert side in {-1, 1}
+    return _detection(
+        1,
+        (0.72 - 0.004 * (sequence - 7)) * side,
+        0.55 - 0.003 * (sequence - 7),
+        0.12,
+        0.15,
+        confidence=0.91,
+    )
+
+
+def _same_gate_departure_rebind_outcome(
+    *,
+    lost_side: int,
+    candidate_side: int,
+    spans_optical_axis: bool = False,
+) -> tuple[
+    MultiTargetVisualTracker,
+    RollingVisualGateGraph,
+    str,
+    str,
+    ConfirmedSameGateRebind | GateReacquisitionPending,
+]:
+    tracker = MultiTargetVisualTracker(
+        MultiTargetTrackerConfig(max_association_gap_ns=300_000_000)
+    )
+    graph = RollingVisualGateGraph()
+    lost_id: str | None = None
+    latest_frame: VisualDetectionFrame | None = None
+    for sequence in range(1, 6):
+        latest_frame = _frame(
+            sequence,
+            (
+                _departure_current_detection(
+                    sequence,
+                    side=lost_side,
+                    spans_optical_axis=spans_optical_axis,
+                ),
+            ),
+        )
+        update = tracker.update(latest_frame)
+        if sequence == 1:
+            assert len(update.created_track_ids) == 1
+            lost_id = update.created_track_ids[0]
+    assert lost_id is not None
+    assert latest_frame is not None
+    race = _race(
+        gate_index=2,
+        sequence=100,
+        boot_ms=1_000,
+        received_ns=latest_frame.publish_monotonic_ns + 1,
+    )
+    graph.bind_initial_current(
+        tracker,
+        track_id=lost_id,
+        race_status=race,
+    )
+
+    search_frame = _frame(6, ())
+    tracker.update(search_frame)
+    graph.observe(tracker)
+    search = graph.begin_same_gate_rebind_search(
+        tracker,
+        race_status=race,
+        camera_token_at_start=search_frame.token,
+    )
+
+    candidate_id: str | None = None
+    binding_frame: VisualDetectionFrame | None = None
+    for sequence in range(7, 10):
+        binding_frame = _frame(
+            sequence,
+            (
+                _departure_rebound_detection(
+                    sequence,
+                    side=candidate_side,
+                ),
+            ),
+        )
+        update = tracker.update(binding_frame)
+        graph.observe(tracker)
+        if sequence == 7:
+            assert len(update.created_track_ids) == 1
+            candidate_id = update.created_track_ids[0]
+    assert candidate_id is not None
+    assert binding_frame is not None
+    outcome = graph.try_confirm_same_gate_rebind(
+        tracker,
+        search=search,
+        race_status=race,
+        camera_token_at_binding=binding_frame.token,
+    )
+    return tracker, graph, lost_id, candidate_id, outcome
+
+
 def _begin_same_gate_search(
     *,
     gate_index: int = 2,
@@ -810,6 +927,66 @@ def test_same_gate_rebind_requires_three_new_contiguous_frames_and_preserves_gat
     assert snapshot.current_gate_index == 2
     assert snapshot.current_track_id == candidate_id
     assert snapshot.authority_usable
+
+
+@pytest.mark.parametrize("lost_side", (-1, 1))
+def test_same_gate_rebind_rejects_opposite_departure_half_plane(
+    lost_side,
+) -> None:
+    tracker, graph, lost_id, candidate_id, outcome = (
+        _same_gate_departure_rebind_outcome(
+            lost_side=lost_side,
+            candidate_side=-lost_side,
+        )
+    )
+
+    assert type(outcome) is GateReacquisitionPending
+    assert not outcome.ambiguous
+    assert "contradicts lost-current departure side" in outcome.reason
+    assert tracker.track(lost_id).role is VisualTrackRole.CURRENT
+    assert tracker.track(candidate_id).authoritative_gate_index is None
+    assert graph.latest_snapshot is not None
+    assert graph.latest_snapshot.current_track_id == lost_id
+
+
+@pytest.mark.parametrize("side", (-1, 1))
+def test_same_gate_rebind_accepts_matching_departure_half_plane(
+    side,
+) -> None:
+    tracker, graph, lost_id, candidate_id, outcome = (
+        _same_gate_departure_rebind_outcome(
+            lost_side=side,
+            candidate_side=side,
+        )
+    )
+
+    assert type(outcome) is ConfirmedSameGateRebind
+    assert outcome.retired_track_id == lost_id
+    assert outcome.rebound_track_id == candidate_id
+    assert tracker.track(lost_id).role is VisualTrackRole.RETIRED
+    assert tracker.track(candidate_id).role is VisualTrackRole.CURRENT
+    assert graph.latest_snapshot is not None
+    assert graph.latest_snapshot.current_track_id == candidate_id
+
+
+@pytest.mark.parametrize("candidate_side", (-1, 1))
+def test_same_gate_rebind_center_spanning_loss_does_not_impose_a_side(
+    candidate_side,
+) -> None:
+    tracker, graph, lost_id, candidate_id, outcome = (
+        _same_gate_departure_rebind_outcome(
+            lost_side=1,
+            candidate_side=candidate_side,
+            spans_optical_axis=True,
+        )
+    )
+
+    assert type(outcome) is ConfirmedSameGateRebind
+    assert outcome.retired_track_id == lost_id
+    assert outcome.rebound_track_id == candidate_id
+    assert tracker.track(candidate_id).role is VisualTrackRole.CURRENT
+    assert graph.latest_snapshot is not None
+    assert graph.latest_snapshot.current_track_id == candidate_id
 
 
 def test_same_gate_rebind_excludes_every_track_present_at_search_start() -> None:

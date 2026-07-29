@@ -4707,6 +4707,34 @@ class DynamicCourseCore:
         # motion is evidence that more correction is needed, not authority to
         # discard the only bounded lateral-translation channel.
         yaw = -self.config.yaw_gain * heading_error
+        outward_full_bank = bool(
+            current.visible
+            and current.missed_count == 0
+            and current.state_monotonic_ns
+            == current.last_measurement_monotonic_ns
+            and not current.ambiguous
+            and not current.censored_axes[0]
+            and current.bearing_rate_qualified[0]
+            and abs(stable_passage_bearing[0])
+            >= self.config.off_axis_brake_rad
+            and stable_passage_bearing[0]
+            * stable_passage_rate_norm_s[0]
+            > _EPSILON
+            and abs(yaw) >= 0.90 * MAX_YAW_RATE_RAD_S
+            and abs(roll) > _EPSILON
+            and roll
+            * self.config.roll_guidance_sign
+            * stable_passage_bearing[0]
+            > _EPSILON
+        )
+        if outward_full_bank:
+            # A fresh off-axis gate that is still moving toward the image edge
+            # while calibrated yaw is saturated needs the available lateral
+            # intercept now.  The former proportional-only request spent most
+            # of Gate 1's 1.3-second visibility window merely reversing the
+            # inherited bank.  This escalation is stateless: the next fresh
+            # inward publication immediately returns to proportional control.
+            roll = math.copysign(MAX_TARGET_ROLL_RAD, roll)
         # Successor geometry may only slow the current-gate approach with the
         # same progressively admitted authority that governs successor yaw.
         # In particular, a visible but temporally unproved successor must not

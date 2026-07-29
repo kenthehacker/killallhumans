@@ -4125,7 +4125,7 @@ def test_unaccepted_post_credit_roll_target_cannot_create_handoff():
     "normal_roll_rad",
     (-0.04, -0.06),
 )
-def test_fresh_rebound_uses_proportional_roll_without_arming_handoff(
+def test_fresh_rebound_uses_full_outward_bank_without_arming_handoff(
     normal_roll_rad: float,
 ):
     session, successor_id = _bound_post_credit_successor()
@@ -4187,10 +4187,13 @@ def test_fresh_rebound_uses_proportional_roll_without_arming_handoff(
         now_monotonic_ns=normal.monotonic_ns,
     )
     rebound_roll = float(rebound_authority["target_roll_rad"])
-    assert rebound_roll == pytest.approx(
-        rebound_authority["unconstrained_target_roll_rad"]
+    assert rebound_roll == pytest.approx(-MAX_TARGET_ROLL_RAD)
+    assert (
+        -MAX_TARGET_ROLL_RAD
+        < float(rebound_authority["unconstrained_target_roll_rad"])
+        < 0.0
     )
-    assert 0.0 < abs(rebound_roll) < MAX_TARGET_ROLL_RAD
+    assert rebound_authority["outward_full_bank_applied"] is True
     assert constrained.command.target_roll_rad == pytest.approx(rebound_roll)
     assert constrained.passage_committed is False
     assert constrained.current_gate_index == 1
@@ -4221,8 +4224,8 @@ def test_fresh_rebound_uses_proportional_roll_without_arming_handoff(
     )
     assert session.post_credit_roll_reference_handoff_active is False
 
-    # Recovery completion retires the rebound lease. The accepted
-    # proportional request must not survive as a retained-bank latch.
+    # Recovery completion retires the rebound lease. The accepted stateless
+    # full-bank request must not survive as a retained-bank latch.
     session._post_credit_successor_steering = None  # noqa: SLF001
     outward = replace(
         normal,

@@ -1373,18 +1373,8 @@ def test_off_axis_outward_steering_retains_bounded_intercept_bank(
     assert not decision.passage_committed
     assert decision.successor_passage_authority == 0.0
     assert decision.passage_yaw_authority == 0.0
-    expected_outward_roll = core.config.roll_guidance_sign * (
-        core.config.roll_gain
-        * math.atan(
-            decision.passage_error_norm[0]
-            * core.config.horizontal_angle_scale_rad
-        )
-        + core.config.lateral_rate_gain
-        * current.residual_translational_rate_rad_s[0]
-    )
-    assert 0.0 < expected_outward_roll < MAX_TARGET_ROLL_RAD
     assert decision.proposed_command.target_roll_rad == pytest.approx(
-        expected_outward_roll
+        MAX_TARGET_ROLL_RAD
     )
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
@@ -1427,7 +1417,7 @@ def test_off_axis_outward_steering_retains_bounded_intercept_bank(
     assert 0.0 < recovered_decision.proposed_command.target_roll_rad
     assert (
         recovered_decision.proposed_command.target_roll_rad
-        < expected_outward_roll
+        < MAX_TARGET_ROLL_RAD
     )
     assert math.isfinite(
         recovered_decision.proposed_command.target_roll_rad

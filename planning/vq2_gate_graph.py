@@ -1725,6 +1725,7 @@ class RollingVisualGateGraph:
         local_candidates: list[
             tuple[VisualTrack, tuple[VisualTrackSample, ...]]
         ] = []
+        departure_side_rejected = False
         for track in update.tracks:
             stable_tail = _same_gate_rebind_observable_tail(
                 track,
@@ -1736,10 +1737,24 @@ class RollingVisualGateGraph:
                 ),
             )
             if stable_tail is not None:
+                if not _same_gate_rebind_matches_departure_half_plane(
+                    lost,
+                    stable_tail,
+                ):
+                    departure_side_rejected = True
+                    continue
                 local_candidates.append((track, stable_tail))
         if not local_candidates:
             raise GateReacquisitionNotReadyError(
-                "no unique fresh post-search same-gate candidate is ready"
+                (
+                    "fresh post-search same-gate candidate contradicts "
+                    "lost-current departure side"
+                    if departure_side_rejected
+                    else (
+                        "no unique fresh post-search same-gate candidate "
+                        "is ready"
+                    )
+                )
             )
         if len(local_candidates) > 1:
             raise AmbiguousGateReacquisitionError(
@@ -2919,6 +2934,51 @@ def _same_gate_rebind_observable_tail(
         ):
             return None
     return tail
+
+
+def _same_gate_rebind_matches_departure_half_plane(
+    lost: VisualTrack,
+    stable_tail: tuple[VisualTrackSample, ...],
+) -> bool:
+    """Reject a new identity that appears across the optical axis.
+
+    A wholly off-axis current can disappear and later acquire a new local
+    tracker identity, but an opposite-side contour is not a defensible
+    same-gate continuation.  This is a fixed geometric boundary rather than
+    a timer: when the lost current spans the optical axis, no side constraint
+    is imposed.
+    """
+
+    if (
+        type(lost) is not VisualTrack
+        or not lost.history
+        or type(stable_tail) is not tuple
+        or not stable_tail
+        or any(type(sample) is not VisualTrackSample for sample in stable_tail)
+    ):
+        raise TypeError(
+            "same-gate departure-side continuity inputs are invalid"
+        )
+
+    last_visible = lost.history[-1]
+    has_left = bool(last_visible.clipping & FrameEdge.LEFT)
+    has_right = bool(last_visible.clipping & FrameEdge.RIGHT)
+    departure_side = 0
+    if has_left != has_right:
+        departure_side = -1 if has_left else 1
+    else:
+        left, _top, right, _bottom = last_visible.bbox_norm
+        if right < 0.5:
+            departure_side = -1
+        elif left > 0.5:
+            departure_side = 1
+
+    if departure_side == 0:
+        return True
+    return all(
+        departure_side * float(sample.center_norm[0]) >= 0.0
+        for sample in stable_tail
+    )
 
 
 def _token_precedes_or_equals(
