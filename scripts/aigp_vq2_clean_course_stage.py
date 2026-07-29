@@ -2333,11 +2333,24 @@ async def run_clean_course_stage(
             # wire and its PD bypass were retired — every crossing went
             # ballistic, flight 22ceaa6f: vz -2.79 m/s and -0.37 m by the
             # end of the 0.4 s wait, and the per-flight bottom-bar graze).
+            # F26 (e89a3aa2): the brake targets were never attained because
+            # the default pitch kp (0.5) uses only ~0.03-0.08 of the 0.25
+            # rad/s wire authority — fh grew 2.7 -> 8.7 through the
+            # post-credit brake while measured pitch sat at +0.05-0.10.
+            # Brake ticks (pre-cross or post-credit) now request the full
+            # intercept pitch response (kp 2.0, same as roll; the wire
+            # governor stays authoritative); fine tracking keeps the gentle
+            # default.
+            braking = (
+                controller._pre_cross_brake_active
+                or controller._post_credit_deadline_s is not None
+            )
             pd_command = rt.attitude_rate_command(
                 estimate,
                 target_roll_rad=nav.target_roll_rad,
                 target_pitch_rad=nav.target_pitch_rad,
                 thrust=nav.thrust,
+                intercept_response_authority=1.0 if braking else 0.0,
             )
             command = rt.attitude_rate_command_type(
                 float(pd_command.roll_rate),

@@ -1790,11 +1790,15 @@ def _test_runtime():
     )
 
 
-def _fake_pd(estimate, *, target_roll_rad, target_pitch_rad, thrust):
+def _fake_pd(estimate, *, target_roll_rad, target_pitch_rad, thrust,
+             intercept_response_authority=0.0):
+    # Mirror the live loop: pitch kp scales 0.5 -> 2.0 with intercept
+    # authority; roll is always 2.0; the 0.25 wire cap bounds rates.
+    pitch_kp = 0.5 + intercept_response_authority * (2.0 - 0.5)
     roll, pitch, _yaw = estimate.orientation.to_euler()
     return _Command(
         max(-0.25, min(0.25, 2.0 * (target_roll_rad - roll))),
-        max(-0.25, min(0.25, 2.0 * (target_pitch_rad - pitch))),
+        max(-0.25, min(0.25, pitch_kp * (target_pitch_rad - pitch))),
         0.0,
         thrust,
     )
