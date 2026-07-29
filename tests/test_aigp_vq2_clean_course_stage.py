@@ -760,168 +760,6 @@ def test_predict_stall_cap_forces_search_regardless_of_anchor():
     assert output.thrust > 0.0
 
 
-def test_post_credit_brake_engages_and_releases_on_qualification():
-    # Flights 039186c8/F10: gate-0 attack closure (~3+ m/s) carried into the
-    # post-credit phase collapsed thrust effectiveness and pushed gate-1
-    # bearing rates past the yaw cap.  Promotion arms a genuine nose-up
-    # brake (positive pitch; ADVANCE_PITCH_RAD = -0.18 is nose-down) until
-    # the successor is accepted AND vertically qualified.
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
-    controller.observe(
-        _update(
-            [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
-            frame_id=3,
-        ),
-        now_s=100.08,
-    )
-    promoted = controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
-    assert promoted
-    assert controller.state is CleanCourseState.TRACK
-    assert controller.current.track_id == "B"
-    controller._alt_est_m = 2.0  # honest post-credit altitude (floor quiet)
-    # Unqualified window (aged accepted y): the brake engages and slews to
-    # the real pitch-back attitude while lateral pursuit of the accepted
-    # track keeps working.
-    controller.current.last_y_measurement_s = 100.10 - 1.0
-    now = 100.14
-    brake = _command(controller, now)
-    assert not brake.vertical_qualified
-    assert brake.yaw_rate_rad_s > 0.0  # x=+0.30 pursuit still steers
-    # Dedicated 1.0 rad/s brake slew: the +0.10 attitude is attained well
-    # inside 0.5 s of window start (F12: the generic 0.30 rad/s slew moved
-    # pitch only -0.085 -> ~=0 inside the 1.0 s hold, never braking).
-    for _ in range(8):
-        now += 0.033
-        brake = _command(controller, now)
-    assert now - 100.10 <= 0.5
-    assert not brake.vertical_qualified
-    assert brake.target_pitch_rad == pytest.approx(0.10, abs=1e-9)
-    # Fresh y measurements re-qualify, but the 0.6 s minimum hold keeps the
-    # brake armed; the release fires only after the hold.
-    frame = 10
-    held = brake
-    while now < 100.10 + 0.5:
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        held = _command(controller, now)
-        frame += 1
-    assert held.vertical_qualified
-    assert held.target_pitch_rad == pytest.approx(0.10, abs=1e-9)  # still held
-    released = held
-    while now < 100.10 + 0.8:
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        released = _command(controller, now)
-        frame += 1
-    assert released.vertical_qualified
-    assert controller._post_credit_deadline_s is None
-    for _ in range(25):  # output slew converges back to the normal attitude
-        now += 0.033
-        released = _command(controller, now)
-    # The normal advance/brake interpolation never commands positive pitch.
-    assert released.target_pitch_rad <= 0.0
-
-
-def test_post_credit_brake_holds_despite_qualification_within_min_hold():
-    # Flight 4480d0a6: gate 1 was already accepted AND vertically qualified
-    # at the credit tick, so the instant qualification release fired within
-    # one 20 ms tick and the brake never engaged (flag False the whole
-    # flight; the attack closure was never killed).  Qualification may only
-    # release the brake after the minimum hold.
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
-    controller.observe(
-        _update(
-            [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
-            frame_id=3,
-        ),
-        now_s=100.08,
-    )
-    promoted = controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
-    assert promoted
-    controller._alt_est_m = 2.0  # honest post-credit altitude (floor quiet)
-    # Track stays vertically qualified with fresh y measurements throughout.
-    now = 100.10
-    for frame in range(15):  # ~0.5 s < the 0.6 s minimum hold
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=10 + frame),
-            now_s=now,
-        )
-        out = _command(controller, now)
-        assert out.vertical_qualified
-        assert controller._post_credit_deadline_s is not None
-    # Past the hold, continued qualification releases the brake.
-    for frame in range(15, 40):
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=10 + frame),
-            now_s=now,
-        )
-        _command(controller, now)
-    assert controller._post_credit_deadline_s is None
-
-
-def test_post_credit_brake_releases_on_timeout():
-    # A lost gate cannot brake forever: with no credible successor the
-    # promotion enters SEARCH, slews to the brake attitude, and resumes the
-    # normal near-level SEARCH attitude after the 1.0 s timeout.
-    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
-    promoted = controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
-    assert promoted
-    controller._alt_est_m = 2.0  # honest post-credit altitude (floor quiet)
-    assert controller.state is CleanCourseState.SEARCH  # no credible successor
-    now = 100.10
-    output = None
-    for _ in range(20):  # slew (1.0 rad/s) reaches the brake attitude
-        now += 0.033
-        output = _command(controller, now)
-    assert output.target_pitch_rad == pytest.approx(0.10, abs=1e-9)
-    # Past the deadline the window ends even with nothing reacquired.
-    now = 100.10 + 2.80
-    for _ in range(25):  # generic 0.30 rad/s slew returns to near level
-        now += 0.033
-        output = _command(controller, now)
-    assert output.target_pitch_rad == pytest.approx(-0.02, abs=1e-9)
-
-
-def test_post_credit_climb_cap_is_qualification_gated():
-    # F10: a post-credit climb at vz +1.0 chased an unqualified low-conf
-    # bearing for ~1.4 s, spending ~0.7 m of altitude.  The climb cap
-    # tightens to 0.5 m/s for the post-credit unqualified window only; the
-    # full 1.0 cap never left gate 0 and returns on release.
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
-    controller._vz_est_m_s = 1.4  # over even the full cap
-    assert controller._governed_collective(SUPPORT, SUPPORT) == pytest.approx(
-        SUPPORT - 0.03 * 0.4, abs=1e-9  # full 1.0 cap: no brake window
-    )
-    controller.observe(
-        _update(
-            [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
-            frame_id=3,
-        ),
-        now_s=100.08,
-    )
-    controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
-    controller._alt_est_m = 2.0  # honest post-credit altitude (floor quiet)
-    controller.current.last_y_measurement_s = 100.10 - 1.0  # unqualified
-    _command(controller, 100.14)  # window confirmed active in command()
-    controller._vz_est_m_s = 0.8  # over the 0.5 post-credit cap only
-    assert controller._governed_collective(SUPPORT, SUPPORT) == pytest.approx(
-        SUPPORT - 0.03 * 0.3, abs=1e-9
-    )
-    # Timeout release restores the full cap (0.8 m/s no longer capped).
-    _command(controller, 100.10 + 2.80)
-    assert controller._governed_collective(SUPPORT, SUPPORT) == pytest.approx(
-        SUPPORT, abs=1e-9
-    )
-
-
 def _promote_to_gate_one(controller, now_s=100.10):
     """Promote a TRACK controller to gate 1 with successor B accepted."""
 
@@ -1275,15 +1113,13 @@ def test_descent_floor_cannot_fire_from_frozen_vz_est():
     assert out.thrust == pytest.approx(SUPPORT + 0.05, abs=1e-9)
 
 
-def test_pre_cross_brake_engages_near_with_fast_slew_and_lateral_alive():
-    # Codex F9-F11 analysis: even +0.12 rad pitch-back gives only
-    # g*tan(0.12) ~= 1.18 m/s^2, so killing ~3 m/s needs ~2.5 s while the
-    # gate disappears ~0.5 s after credit — the brake must START before
-    # the plane.  Inside the near window the stage commands a genuine
-    # nose-up attitude at the fast 1.0 rad/s slew while lateral pursuit
-    # and the vz governor stay active.
+def test_closure_governor_full_brake_at_high_expansion_rate():
+    # F31: the vision log-scale expansion rate is the only honest closure
+    # signal (fh is a signless drag magnitude).  At/above the full-brake
+    # rate the governor commands the gentle brake attitude exactly, at the
+    # fast slew, with lateral pursuit and the vz governor alive.
     controller = _tracked_controller(_track("A", 0.20, 0.0, scale=0.10))
-    controller.current.scale_axis.p = math.log(0.42)  # inside the near window
+    controller.current.scale_axis.v = 0.7  # above CLOSURE_FULL_BRAKE_RATE_S
     now = 100.10
     out = None
     for _ in range(15):  # ~0.5 s: the fast slew attains the attitude
@@ -1297,76 +1133,49 @@ def test_pre_cross_brake_engages_near_with_fast_slew_and_lateral_alive():
     assert out.thrust > 0.0  # the vz governor keeps the collective alive
 
 
-def test_pre_cross_brake_does_not_engage_at_long_range():
-    # The brake must never stall the approach at long range: outside the
-    # -1.8 near field even a spurious fast expansion rate (TTC 0.5 s)
-    # leaves the normal advance law alone.
-    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.15))
-    # log(0.15) = -1.90 < PRE_CROSS_BRAKE_NEAR_LOG_SCALE (-1.8).
-    controller.current.scale_axis.v = 2.0
+def test_closure_governor_does_not_brake_below_target_rate():
+    # Slow closure is free flight: below the 0.35/s target rate the
+    # governor contributes nothing and the advance law still closes.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller.current.scale_axis.v = 0.1
     out = _command(controller, 100.10)
     assert not controller._pre_cross_brake_active
     assert out.target_pitch_rad < 0.0  # advance law still closes
 
 
-def test_pre_cross_brake_expansion_ttc_trigger_in_near_field():
-    # F13 timing (agent-10): at 3 m/s closure TTC 1.2 s IS log_scale -1.1,
-    # so the old trigger could never create braking distance.  TTC 2.5 s
-    # binds at log_scale ~= -1.6...-1.8, buying ~0.9-1.0 s of genuine
-    # brake: this case (log -1.61, TTC 2.0 s) engages under the new timing
-    # but was outside BOTH the old near field (-1.5) and the old TTC (1.2).
-    controller = _tracked_controller(_track("A", 0.10, 0.0, scale=0.20))
-    # log(0.20) = -1.61 >= -1.8; expansion TTC = 2.0 s < 2.5 s.
-    controller.current.scale_axis.v = 0.5
-    out = None
+def test_closure_governor_is_a_continuous_blend():
+    # Mid-band rate (0.475/s -> closure 0.5): the pitch target blends
+    # halfway from the advance law (<= -0.02) toward the +0.08 brake
+    # attitude, without latching the fast-slew brake flag.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller.current.scale_axis.v = 0.475
     now = 100.10
-    for _ in range(15):
+    out = None
+    for _ in range(25):  # generic slew converges to the blended target
         now += 0.033
         out = _command(controller, now)
-    assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(0.08, abs=1e-9)
-    assert out.yaw_rate_rad_s > 0.0  # lateral pursuit alive under braking
+    assert not controller._pre_cross_brake_active
+    assert -0.02 + 1e-9 < out.target_pitch_rad < 0.08 - 1e-9
 
 
-def test_fh_closure_governor_brakes_on_speed_alone_with_hysteresis():
-    # F28 (732904b4): the log_scale/TTC triggers released through the
-    # advance blend at engulf and the drone re-accelerated to fh 3.4 across
-    # the plane — fh untrusted BEFORE credit, frozen vz/alt for the whole
-    # gate-1 leg, terrain at the threshold.  Speed alone must now brake:
-    # engaged above 2.5 m/s^2, held through 2.2, released below 2.0, and
-    # active in PREDICT (fh is live IMU even when the camera is blind).
+def test_closure_governor_brakes_in_predict():
+    # The governor applies in PREDICT too (the scale rate is filter state,
+    # live even while the camera is briefly blind).
     controller = _tracked_controller(_track("A", 0.20, 0.0, scale=0.10))
     now = 100.10
-    out = _command(controller, now, fh=1.0)
-    assert not controller._pre_cross_brake_active
-    assert out.target_pitch_rad < 0.0  # far field: the advance law closes
-    out = None
-    for _ in range(15):  # ~0.5 s: the fast slew attains the brake attitude
-        now += 0.033
-        out = _command(controller, now, fh=3.0)
-    assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(0.08, abs=1e-9)
-    now += 0.033
-    out = _command(controller, now, fh=2.2)  # hysteresis: still braking
-    assert controller._pre_cross_brake_active
-    for _ in range(20):  # release below 2.0 and slew back to the law
-        now += 0.033
-        out = _command(controller, now, fh=1.0)
-    assert not controller._pre_cross_brake_active
-    assert out.target_pitch_rad < 0.08 - 1e-9
-    # PREDICT (camera blind, fh live): the governor still brakes.
     now += 0.033
     controller.observe(
         _update([_track("A", 0.20, 0.0, scale=0.10)], frame_id=39), now_s=now
     )  # fresh measurement so the dropout starts from TRACK
+    controller.current.scale_axis.v = 0.7
     for frame in range(3):  # ~0.1 s without a measurement -> PREDICT
         now += 0.033
         controller.observe(_update([], frame_id=40 + frame), now_s=now)
-        out = _command(controller, now, fh=1.0)
+        out = _command(controller, now)
     assert controller.state is CleanCourseState.PREDICT
     for _ in range(10):  # inside the 0.5 s PREDICT bound
         now += 0.033
-        out = _command(controller, now, fh=3.0)
+        out = _command(controller, now)
     assert controller.state is CleanCourseState.PREDICT
     assert controller._pre_cross_brake_active
     assert out.target_pitch_rad == pytest.approx(0.08, abs=1e-9)

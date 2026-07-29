@@ -43,28 +43,25 @@ Control-law constant sources:
   top-bar collision showed bearing pursuit builds unbounded vz; see the
   comment at its definition.  It supersedes the removed flight-2
   D-direction limiter as the honest rate-limit mechanism.  A symmetric
-  descent floor with hover feedforward and a post-credit 0.5 m/s climb
-  cap (qualification-gated) extend it; see the constant blocks.
-- ``POST_CREDIT_BRAKE_PITCH_RAD`` / ``POST_CREDIT_BRAKE_TIMEOUT_S``: a
-  genuine nose-up brake after every authoritative promotion until the
-  successor is accepted and vertically qualified (bounded by the timeout),
-  added after flights 039186c8/F10 carried gate-0 attack closure into the
-  post-credit phase and collapsed thrust effectiveness.
-- ``PRE_CROSS_BRAKE_PITCH_RAD`` / ``PRE_CROSS_BRAKE_TTC_S``: the brake must
-  START before the plane (codex F9-F11 analysis: post-credit braking alone
-  can never kill ~3 m/s inside the ~0.5 s post-credit visibility window),
-  so TRACK inside the near/expansion window commands a genuine nose-up
-  attitude at the fast brake slew while lateral pursuit and the vz
-  governor stay active.  The COAST latch holds level attitude at the
-  support collective through the normal PD (F25: the old exact-zero coast
-  made every crossing ballistic, vz -2.79 m/s by credit).
+  descent floor with hover feedforward extends it; see the constant blocks.
+- ``CLOSURE_TARGET_RATE_S`` / ``CLOSURE_FULL_BRAKE_RATE_S``: the vision
+  closure-rate governor (F31).  The filtered log-scale expansion rate is
+  the only honest closure signal — fh is a signless drag magnitude that
+  conflates speed with braking — so speed is capped CONTINUOUSLY at every
+  range: the pitch target blends from the advance law toward the gentle
+  ``PRE_CROSS_BRAKE_PITCH_RAD`` attitude as the expansion rate rises past
+  the target.  This replaces the retired fh closure governor (wrong
+  signal), the near-field log_scale/TTC triggers (late), and the
+  post-credit brake window (all deleted with F31).  The COAST latch holds
+  level attitude at the support collective through the normal PD (F25: the
+  old exact-zero coast made every crossing ballistic, vz -2.79 m/s by
+  credit).
 - ``FH_UNTRUSTED_*``: the F14 inflow-regime gate.  vz_est is invalidated
   by REGIME (a smooth fh-proportional thrust deficit), not attitude or
   vibration, so sustained fh > 3.0 freezes the vz/alt integrators, blocks
   alt-floor arming, suppresses every vz-based governor floor/cap, and
   falls back to the camera-qualified vertical PD (support + margin when
-  unqualified); the latch releases below fh 2.0.  ``EDGE_PARK_*`` caps the
-  edge-parked zero-advance dwell (F14's last 4 s) with a forced SEARCH.
+  unqualified); the latch releases below fh 2.0.
 - Thrust envelope ``[MIN_COURSE_THRUST, MAX_COURSE_THRUST]`` and yaw cap: the
   accepted v3 yaw profile and the visual-course thrust envelope from the
   July-18 safety contract (max raised 0.32 -> 0.34 under the 0.35 hard
@@ -277,92 +274,21 @@ PREDICT_MAX_GAP_S = 0.50  # short-gap bound before SEARCH
 # that a genuine engulfed crossing keeps its SEARCH suppression, short
 # enough to end a blind park before the ground does.
 PREDICT_STALL_FORCE_SEARCH_S = 1.50
-# Post-credit brake (flights 20260729T114842Z-visual-course-039186c8 and
-# F10): gate 0 is crossed at ~3+ m/s closure, and carrying that attack
-# speed into the post-credit phase (a) collapsed thrust effectiveness in
-# the fast/VRS-like regime (measured vz_est derivative ~-0.5 m/s^2 with
-# thrust pinned at the clamp; effective hover 0.335-0.36) and (b) pushed
-# near off-axis gate-1 bearing rates past the 0.15 rad/s yaw cap, sliding
-# two accepted gate-1 tracks to x ~= 0.96 and losing them.  After every
-# authoritative promotion the stage therefore actively pitches back until
-# the successor is accepted AND vertically qualified, with a bounded
-# timeout so a lost gate cannot brake forever.  Pitch sign: NEGATIVE is
-# nose-down forward advance (ADVANCE_PITCH_RAD = -0.18), so a genuine
-# brake is POSITIVE nose-up; +0.12 sits well inside the +/-0.25 pitch cap.
-# Side benefit: pitch-back tilts the camera up toward gate 1's known
-# high-first-sight position.  The climb cap also tightens to 0.5 m/s for
-# the same unqualified window (F10 climbed at vz +1.0 for ~1.4 s chasing
-# an unqualified low-conf bearing, spending ~0.7 m of altitude); the full
-# 1.0 m/s cap returns the moment vertical is qualified.
-# 0.18 -> 0.15 (flight 43f51a4d): with full intercept pitch authority on
-# brake ticks the target is now actually ATTAINED, and 0.18 rad = 10.3 deg
-# trips the runner's MAX_PITCH_RAD 10.0 deg abort.  0.15 (8.6 deg) keeps
-# ~1.4 deg of overshoot margin while g*tan(0.15) ~= 1.57 m/s^2 keeps ~87%
-# of the deceleration.
-# 0.15 -> 0.10 (F29, d8169633): hard braking IS the fast regime for the
-# signless fh magnitude — +0.15 at the 0.34 clamp drove fh 4-5, latched the
-# untrusted freeze on the braking itself, and the VRS lift loss sank the
-# drone at full throttle.  0.10 (5.7 deg, g*tan ~= 0.79 m/s^2) keeps the
-# settle decel inside the |fh| < 3 trusted envelope.
-POST_CREDIT_BRAKE_PITCH_RAD = 0.10  # nose-up brake attitude (see block above)
-# 2.75 -> 1.5 s (flights 99e093fa/25361816): with the pre-cross brake now
-# owning closure killing before the plane, the post-credit brake is a
-# settling pause, not the closure mechanism.  A long no-successor hold
-# hovers blind in the fh-untrusted regime (real sub-hover sink) while far
-# gate-1 candidates can never grow their span without advance — F18/F19
-# both died in that window before the 2.75 s timeout could release.
-# 1.5 -> 1.0 s (F29): every extra second of brake attitude is another second
-# of VRS sink at low altitude; the gentle 0.10 attitude needs less hold.
-POST_CREDIT_BRAKE_TIMEOUT_S = 1.0  # bounded brake even with no reacquisition
-POST_CREDIT_BRAKE_HARD_S = 4.0  # absolute cap on the post-credit brake window
-POST_CREDIT_CLIMB_CAP_M_S = 0.5  # climb cap while post-credit unqualified
-# Minimum brake hold (flight 20260729T125400Z-visual-course-4480d0a6): gate 1
-# is often already accepted AND vertically qualified at the credit tick, so
-# the qualification release fired within one 20 ms tick and the brake never
-# engaged — the flag stayed False for the entire F11 trace and the attack
-# closure was never killed.  The brake now holds for at least this long
-# regardless of qualification; qualification only releases it afterwards.
-# 2.0 -> 1.0 s (flights 99e093fa/25361816, see the timeout block above):
-# the dedicated 1.0 rad/s brake slew lands the worst-case attitude swing in
-# ~0.36 s, so 1.0 s is still ~3x the slew need, and the pre-cross brake has
-# already killed the attack closure that motivated the 2.0 s hold.
-# 1.0 -> 0.6 s (F29): same VRS reasoning as the timeout — with the fh
-# governor capping crossing speed pre-credit, a long post-credit settle is
-# redundant.
-POST_CREDIT_BRAKE_MIN_HOLD_S = 0.6
-# Dedicated brake slew (same flight): the generic 0.30 rad/s target slew
-# moved pitch only from -0.085 to ~=0 inside the 1.0 s F12 hold, so the
-# brake attitude was never attained and closure was never killed.  At
-# 1.0 rad/s the worst-case swing (advance -0.18 to brake +0.18) lands in
-# ~0.36 s of window start.  Applies ONLY while the brake window is active;
-# normal steering keeps the transparent 0.30 rad/s slew.
-POST_CREDIT_BRAKE_SLEW_RAD_S = 1.0
-# Pre-crossing expansion brake (independent codex analysis of the F9-F11
-# traces): post-credit braking alone can never be robust — even +0.12 rad
-# pitch-back yields only g*tan(0.12) ~= 1.18 m/s^2, so killing a ~3 m/s
-# attack closure needs ~2.5 s while the gate disappears ~0.5 s after
-# credit.  The brake therefore STARTS before the plane: while TRACKing the
-# current gate inside the near window (log_scale at/past
-# NEAR_BRAKE_LOG_SCALE), or with the filtered expansion rate saying
-# time-to-contact below ~2.5 s, the stage commands a genuine nose-up
-# attitude at the fast brake slew so the crossing happens at ~1-1.5 m/s
-# instead of 3+.  Timing (agent-10, F13): at 3 m/s closure TTC 1.2 s IS
-# log_scale -1.1, inside the old near field — the old trigger could never
-# create braking distance.  TTC 2.5 s fires at log_scale ~= -1.6...-1.8,
-# buying ~0.9-1.0 s of genuine brake, so the expansion trigger's near-field
-# gate moved out to -1.8 to let the earlier TTC actually bind.  Lateral
-# pursuit and the vz governor stay fully active;
-# the altitude floor and the COAST support-hold latch still preempt.  The
-# near threshold stays below CROSSING_MIN_LOG_SCALE so apparent size keeps
-# growing through the crossing-arm scale and the engulfing/COAST detection
-# fires unchanged under braking.  The continuous near/expansion derate
-# (advance -> brake_pitch_rad) remains as the far-field shaping; the
-# post-credit brake window is unchanged and becomes the cleanup for
-# residual closure.
-PRE_CROSS_BRAKE_PITCH_RAD = 0.08  # gentle pre-plane brake (F29 VRS block above)
-PRE_CROSS_BRAKE_TTC_S = 2.5  # expansion-rate time-to-contact trigger (F13)
-PRE_CROSS_BRAKE_NEAR_LOG_SCALE = -1.8  # near-field gate for the TTC trigger
-PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew, shared with the brake window
+# Closure-rate governor (F31 redesign after F26/F28/F29/F30 all died the
+# same way — terrain at the gate-1 threshold in the high-drag regime with
+# frozen estimates): vision expansion rate is the ONLY honest closure
+# signal (fh is a signless drag magnitude that conflates speed with
+# braking).  Speed is now capped CONTINUOUSLY at every range: as the
+# filtered log-scale rate rises past the target, the pitch target blends
+# from the advance law toward the gentle brake attitude, reaching it at the
+# full-brake rate.  This replaces the fh closure governor (wrong signal),
+# the near-field log_scale/TTC triggers (late), and the post-credit brake
+# (no job left once crossings are slow — and its hard nose-up episodes
+# were themselves VRS generators).
+CLOSURE_TARGET_RATE_S = 0.35  # log-scale rate the governor holds (TTC ~3 s)
+CLOSURE_FULL_BRAKE_RATE_S = 0.60  # rate at which the full brake pitch applies
+PRE_CROSS_BRAKE_PITCH_RAD = 0.08  # gentle brake attitude (F29 VRS lesson)
+PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
 # Pre-gate-1 altitude floor (terrain insurance; flights F10/F11/F12 all
 # flew their final 6-10 s below 0.7 m with thrust pinned at the clamp into
 # terrain hits).  alt_est integrates the governor's IMU vz_est from course
@@ -409,12 +335,6 @@ FH_UNTRUSTED_SUSTAIN_S = 0.3  # transients shorter than this never latch
 # biased-regime deficit at ~0.05 collective, so the margin must cover all of
 # it, not part of it.
 FH_UNTRUSTED_VERTICAL_MARGIN = 0.05  # unqualified hold: support + margin
-# FH closure governor (F28, 732904b4): engage the pre-cross brake on speed
-# alone, before the near-field log_scale/TTC triggers — the approach may
-# never outrun the regime the post-credit floor can hold (~0.9*fh - 0.5
-# deficit vs the 0.34 clamp).  2.5 m/s^2 leaves the F26-style crossing
-# (fh ~2.2, estimates live) achievable; 3.0 is the untrusted latch.
-FH_BRAKE_ENGAGE_MPS2 = 2.5
 # High-gate climb bias (post-credit pursuit redesign, agent-10 F26/F27/L13/
 # L18 trace analysis): gate 1 is handed off HIGH (ey ~ -0.69, 20% already
 # top-clipped at credit), and a censored/unqualified y-axis decays the
@@ -682,15 +602,9 @@ class CleanCourseConfig:
     crossing_credit_wait_s: float = CROSSING_CREDIT_WAIT_S
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
-    post_credit_brake_pitch_rad: float = POST_CREDIT_BRAKE_PITCH_RAD
-    post_credit_brake_timeout_s: float = POST_CREDIT_BRAKE_TIMEOUT_S
-    post_credit_brake_hard_s: float = POST_CREDIT_BRAKE_HARD_S
-    post_credit_climb_cap_m_s: float = POST_CREDIT_CLIMB_CAP_M_S
-    post_credit_brake_min_hold_s: float = POST_CREDIT_BRAKE_MIN_HOLD_S
-    post_credit_brake_slew_rad_s: float = POST_CREDIT_BRAKE_SLEW_RAD_S
+    closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
+    closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
-    pre_cross_brake_ttc_s: float = PRE_CROSS_BRAKE_TTC_S
-    pre_cross_brake_near_log_scale: float = PRE_CROSS_BRAKE_NEAR_LOG_SCALE
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
     alt_floor_release_m: float = ALT_FLOOR_RELEASE_M
@@ -790,12 +704,6 @@ class CleanCourseController:
         # keep refreshing it, or the anchor never expires and SEARCH is
         # suppressed for the whole blind descent.
         self._last_engulfing_anchor_identity: Optional[Tuple[Any, Any]] = None
-        # Post-credit brake window (flights 039186c8/F10): deadline set on
-        # every authoritative promotion; released early when the successor
-        # is accepted and vertically qualified.  While active, command()
-        # pitches back genuinely and tightens the climb cap.
-        self._post_credit_deadline_s: Optional[float] = None
-        self._post_credit_armed_s: Optional[float] = None
         # IMU altitude estimate (m) integrated from the governor's vz_est,
         # seeded 0 at course start (takeoff pad reference) and clamped below
         # at alt_est_min_m (F13).  Guards only the
@@ -808,7 +716,6 @@ class CleanCourseController:
         self._alt_floor_latch_s: Optional[float] = None
         self._alt_floor_cooldown = False
         self._alt_floor_above_release_since_s: Optional[float] = None
-        self._active_climb_cap_m_s = VZ_CLIMB_CAP_M_S
         # Pre-crossing expansion brake latch for the tick trace; recomputed
         # every main-path tick (see the PRE_CROSS_BRAKE_* constant block).
         self._pre_cross_brake_active = False
@@ -818,8 +725,6 @@ class CleanCourseController:
         self._fh_mps2 = 0.0
         self._fh_untrusted = False
         self._fh_above_since_s: Optional[float] = None
-        # FH closure-governor hysteresis flag (see FH_BRAKE_ENGAGE_MPS2).
-        self._fh_brake_active = False
 
     # -- initialization ----------------------------------------------------
 
@@ -1069,14 +974,6 @@ class CleanCourseController:
         # Re-seed the collective tracker so a retained saturated sub-support
         # command can never survive into the next gate.
         self._collective = None
-        # Arm the post-credit brake window (flights 039186c8/F10): kill the
-        # gate-0 attack closure before it collapses thrust effectiveness and
-        # outruns the yaw cap on the next gate's bearing.
-        self._post_credit_deadline_s = (
-            float(now_s) + self.config.post_credit_brake_timeout_s
-        )
-        self._post_credit_armed_s = float(now_s)
-        self._active_climb_cap_m_s = self.config.post_credit_climb_cap_m_s
         return True
 
     # -- the one continuous control law -------------------------------------
@@ -1187,31 +1084,6 @@ class CleanCourseController:
         ):
             self._enter_search(now_s)
 
-        # Post-credit brake window (flights 039186c8/F10): timeout release
-        # here (a lost gate cannot brake forever); the qualification release
-        # happens in the main path where vertical_qualified is computed.
-        # The tighter climb cap applies for the whole unqualified window.
-        # F22 (97450705) blocked the timeout release while fh-untrusted, but
-        # the F26/F27/L13/L18 traces refute the premise: fh GREW through the
-        # latched brake in every flight (the brake never bought the slow
-        # regime back), and the 4 s pinned-pitch latch is exactly the window
-        # where gate 1 escapes — yaw alone cannot center a near off-axis
-        # gate while the path never bends (nose != path).  The timeout now
-        # releases unconditionally; only the hard bound remains as backstop.
-        if self._post_credit_deadline_s is not None:
-            hard_bound_s = (
-                self._post_credit_armed_s + cfg.post_credit_brake_hard_s
-                if self._post_credit_armed_s is not None
-                else self._post_credit_deadline_s
-            )
-            if now_s >= hard_bound_s or now_s >= self._post_credit_deadline_s:
-                self._post_credit_deadline_s = None
-        self._active_climb_cap_m_s = (
-            cfg.post_credit_climb_cap_m_s
-            if self._post_credit_deadline_s is not None
-            else VZ_CLIMB_CAP_M_S
-        )
-
         support = _clamp(
             cfg.support_collective
             / max(0.85, math.cos(roll_rad) * math.cos(pitch_rad)),
@@ -1299,15 +1171,8 @@ class CleanCourseController:
             self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
             target_pitch = self._slew_pitch(
-                cfg.post_credit_brake_pitch_rad
-                if self._post_credit_deadline_s is not None
-                else cfg.brake_pitch_rad,
+                cfg.brake_pitch_rad,
                 dt,
-                slew_rad_s=(
-                    cfg.post_credit_brake_slew_rad_s
-                    if self._post_credit_deadline_s is not None
-                    else None
-                ),
             )
             return NavigationOutput(
                 target_roll_rad=target_roll,
@@ -1393,59 +1258,18 @@ class CleanCourseController:
             <= cfg.vertical_qualify_max_age_s
             and current.y_axis.std <= cfg.search_covariance_std_norm
         )
-        # Qualification release for the post-credit brake, but only after the
-        # minimum hold (flight 4480d0a6): gate 1 is often already qualified at
-        # the credit tick, and an instant release made the brake a no-op while
-        # the gate-0 attack closure was still carried.  The F22 fh-untrusted
-        # block was removed with the timeout block above: the brake never
-        # bought the slow regime back, and a qualified vertical track is the
-        # best available evidence — release and pursue.
-        if (
-            vertical_qualified
-            and self._post_credit_deadline_s is not None
-            and self._post_credit_armed_s is not None
-            and now_s - self._post_credit_armed_s
-            >= cfg.post_credit_brake_min_hold_s
-        ):
-            self._post_credit_deadline_s = None
-            self._active_climb_cap_m_s = VZ_CLIMB_CAP_M_S
-        post_credit_brake = self._post_credit_deadline_s is not None
-        # Pre-crossing expansion brake (codex F9-F11 analysis, see the
-        # PRE_CROSS_BRAKE_* constant block): the brake must START before the
-        # plane.  TRACK-only: PREDICT keeps the continuous derate, and the
-        # post-credit window owns the post-plane phase.  The expansion
-        # (time-to-contact) trigger is gated to the near field so far-range
-        # scale noise cannot stall the approach.
-        # FH closure governor (F28, 732904b4): the log_scale/TTC triggers
-        # release through the advance blend as the gate engulfs, and F28
-        # re-accelerated to fh 3.4 across the plane — fh untrusted BEFORE
-        # credit, frozen vz/alt for the whole gate-1 leg, and a real
-        # -2.5 m/s^2 sink into terrain at the threshold.  Speed itself now
-        # brakes: engaged above 2.5 m/s^2, released below the trust
-        # hysteresis (2.0), in TRACK and PREDICT alike (fh is live IMU even
-        # when the camera is engulfed/blind).
-        if self._fh_mps2 > FH_BRAKE_ENGAGE_MPS2:
-            self._fh_brake_active = True
-        elif self._fh_mps2 < cfg.fh_trusted_release_mps2:
-            self._fh_brake_active = False
-        pre_cross_brake = not post_credit_brake and (
-            (
-                self.state is CleanCourseState.TRACK
-                and (
-                    current.log_scale >= cfg.near_brake_log_scale
-                    or (
-                        current.log_scale >= cfg.pre_cross_brake_near_log_scale
-                        and current.expansion_rate * cfg.pre_cross_brake_ttc_s
-                        > 1.0
-                    )
-                )
-            )
-            or (
-                self._fh_brake_active
-                and self.state
-                in (CleanCourseState.TRACK, CleanCourseState.PREDICT)
-            )
+        # Vision closure-rate governor (F31, see the CLOSURE_* constant
+        # block): the filtered log-scale rate is the only honest closure
+        # signal — fh is a signless drag magnitude that conflates speed with
+        # braking.  Speed is capped CONTINUOUSLY at every range: the pitch
+        # target below blends from the advance law toward the gentle brake
+        # attitude as the expansion rate rises past the target.  Applies in
+        # TRACK and PREDICT alike (the SEARCH path returned above).
+        closure_brake = _clamp01(
+            (current.expansion_rate - cfg.closure_target_rate_s)
+            / (cfg.closure_full_brake_rate_s - cfg.closure_target_rate_s)
         )
+        pre_cross_brake = closure_brake > 0.5
         self._pre_cross_brake_active = pre_cross_brake
         if vertical_qualified:
             bounded_error = _clamp(
@@ -1550,44 +1374,29 @@ class CleanCourseController:
             / (cfg.near_brake_log_scale - cfg.near_free_log_scale)
         )
         advance = align * confidence * uncertainty * expansion * near_plane
-        if post_credit_brake:
-            # Post-credit brake (flights 039186c8/F10): a genuine nose-up
-            # pitch-back (positive; ADVANCE_PITCH_RAD = -0.18 is nose-down)
-            # to kill the gate-0 attack closure before it collapses thrust
-            # effectiveness and outruns the yaw cap.  Lateral yaw/roll
-            # pursuit above and the vz governor stay fully active.  Now only
-            # the cleanup for residual closure: the pre-crossing brake below
-            # owns the approach.
-            target_pitch = cfg.post_credit_brake_pitch_rad
-        elif pre_cross_brake:
-            # Pre-crossing expansion brake (codex F9-F11 analysis): a
-            # genuine nose-up attitude in the last ~1-1.5 s before the plane
-            # so the drone crosses at ~1-1.5 m/s instead of 3+.  Lateral
-            # yaw/roll pursuit above and the vz governor stay fully active;
-            # the altitude floor and the COAST latch still preempt.
-            target_pitch = cfg.pre_cross_brake_pitch_rad
-        else:
-            target_pitch = (
-                cfg.brake_pitch_rad
-                + (cfg.advance_pitch_rad - cfg.brake_pitch_rad) * advance
-            )
+        # Closure-rate governor (F31): continuous blend toward the gentle
+        # brake attitude as the vision expansion rate rises past the target
+        # — speed is capped at every range, not just near the plane.
+        law_pitch = (
+            cfg.brake_pitch_rad
+            + (cfg.advance_pitch_rad - cfg.brake_pitch_rad) * advance
+        )
+        target_pitch = law_pitch + closure_brake * (
+            cfg.pre_cross_brake_pitch_rad - law_pitch
+        )
 
         return NavigationOutput(
             target_roll_rad=self._slew_roll(target_roll, dt),
-            # Both brake regimes get the dedicated fast slew (F12: the
+            # The braking regime gets the dedicated fast slew (F12: the
             # generic 0.30 rad/s slew never attained the brake attitude
             # inside the hold); normal steering keeps the transparent slew.
             target_pitch_rad=self._slew_pitch(
                 target_pitch,
                 dt,
                 slew_rad_s=(
-                    cfg.post_credit_brake_slew_rad_s
-                    if post_credit_brake
-                    else (
-                        cfg.pre_cross_brake_slew_rad_s
-                        if pre_cross_brake
-                        else None
-                    )
+                    cfg.pre_cross_brake_slew_rad_s
+                    if pre_cross_brake
+                    else None
                 ),
             ),
             yaw_rate_rad_s=yaw_rate,
@@ -1829,7 +1638,7 @@ class CleanCourseController:
                 self.config.min_thrust,
                 self.config.max_thrust,
             )
-        excess = self._vz_est_m_s - self._active_climb_cap_m_s
+        excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
         if excess > 0.0:
             collective = min(collective, support - VZ_GOVERNOR_GAIN * excess)
         descent_excess = VZ_DESCENT_FLOOR_M_S - self._vz_est_m_s
@@ -1890,9 +1699,9 @@ class CleanCourseController:
         dt: float,
         slew_rad_s: Optional[float] = None,
     ) -> float:
-        # Optional per-call slew rate: the post-credit brake window uses a
-        # dedicated faster slew so the brake attitude is actually attained
-        # (F12); everything else keeps the transparent target slew.
+        # Optional per-call slew rate: the closure-governor braking regime
+        # uses a dedicated faster slew so the brake attitude is actually
+        # attained (F12); everything else keeps the transparent target slew.
         limit = (
             slew_rad_s
             if slew_rad_s is not None
@@ -2215,7 +2024,7 @@ def _clean_course_tick_trace(
         "measurement_gap_s": (
             None if current is None else now_s - current.last_measurement_s
         ),
-        "post_credit_brake": controller._post_credit_deadline_s is not None,
+        "post_credit_brake": False,
         "pre_cross_brake": controller._pre_cross_brake_active,
         "alt_est_m": controller._alt_est_m,
         "alt_floor_active": controller._alt_floor_active,
@@ -2369,14 +2178,11 @@ async def run_clean_course_stage(
             # the default pitch kp (0.5) uses only ~0.03-0.08 of the 0.25
             # rad/s wire authority — fh grew 2.7 -> 8.7 through the
             # post-credit brake while measured pitch sat at +0.05-0.10.
-            # Brake ticks (pre-cross or post-credit) now request the full
+            # Brake ticks (closure governor) now request the full
             # intercept pitch response (kp 2.0, same as roll; the wire
             # governor stays authoritative); fine tracking keeps the gentle
             # default.
-            braking = (
-                controller._pre_cross_brake_active
-                or controller._post_credit_deadline_s is not None
-            )
+            braking = controller._pre_cross_brake_active
             pd_command = rt.attitude_rate_command(
                 estimate,
                 target_roll_rad=nav.target_roll_rad,
