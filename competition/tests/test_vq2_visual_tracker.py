@@ -635,7 +635,11 @@ def test_authoritative_current_fuses_live_gate1_complementary_fragments() -> Non
     )
 
 
-def test_fragment_union_requires_race_authoritative_current_identity() -> None:
+def test_non_authoritative_track_fuses_complementary_fragments() -> None:
+    # F41 (run 20260729T200803Z-visual-course-a540212f): the diagonal
+    # split is a detector artifact, so a next-gate track without any
+    # race-authoritative identity must fuse the same way the
+    # authoritative CURRENT gate does.
     tracker = MultiTargetVisualTracker()
     prior = VisualDetection(
         source_index=0,
@@ -647,7 +651,6 @@ def test_fragment_union_requires_race_authoritative_current_identity() -> None:
     )
     first = tracker.update(_frame(1, (prior,)))
     track_id = first.visible_track_ids[0]
-    tracker.assign_role(track_id, VisualTrackRole.CURRENT)
 
     split = tracker.update(
         _frame(
@@ -688,8 +691,60 @@ def test_fragment_union_requires_race_authoritative_current_identity() -> None:
     assert retained.visible
     assert retained.missed_frame_count == 0
     assert retained.bbox_norm == pytest.approx(
+        (0.4625, 0.0, 0.659375, 0.2777777777777778)
+    )
+    assert retained.center_norm == pytest.approx(
+        (0.121875, -0.7222222222222222)
+    )
+    assert retained.clipping is FrameEdge.TOP
+    assert retained.center_censored
+    assert retained.history[-1].inner_aperture is None
+    assert split.associated_track_ids == (track_id,)
+    assert split.created_track_ids == ()
+    assert split.associations[0].bbox_iou == pytest.approx(
+        0.9507142857142858
+    )
+
+
+def test_non_authoritative_track_rejects_non_diagonal_fragment_pair() -> None:
+    tracker = MultiTargetVisualTracker()
+    prior = VisualDetection(
+        source_index=0,
+        center_norm=(0.121875, -0.7277777777777779),
+        bbox_norm=(0.4671875, 0.0, 0.65625, 0.275),
+        confidence=0.70,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+    )
+    first = tracker.update(_frame(1, (prior,)))
+    track_id = first.visible_track_ids[0]
+
+    upper_right = VisualDetection(
+        source_index=0,
+        center_norm=(0.1875, -0.8222222222222222),
+        bbox_norm=(
+            0.528125,
+            0.0,
+            0.659375,
+            0.18055555555555555,
+        ),
+        confidence=0.64,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+    )
+    # Below the upper contour but to its RIGHT: the complementary
+    # diagonal-split direction is lower/LEFT, so this pair must not fuse.
+    lower_right = _detection(1, 0.45, -0.58, 0.10, 0.14, confidence=0.52)
+
+    split = tracker.update(_frame(2, (upper_right, lower_right)))
+
+    retained = split.track(track_id)
+    assert retained.visible
+    assert retained.missed_frame_count == 0
+    assert retained.bbox_norm == pytest.approx(
         (0.528125, 0.0, 0.659375, 0.18055555555555555)
     )
+    assert split.associated_track_ids == (track_id,)
     assert len(split.created_track_ids) == 1
 
 

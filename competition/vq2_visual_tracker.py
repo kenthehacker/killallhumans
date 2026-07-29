@@ -1122,7 +1122,7 @@ class MultiTargetVisualTracker:
         selected_pairs = plan.selected_pairs
         ambiguous_track_indexes = plan.ambiguous_track_indexes
         ambiguous_detection_indexes = plan.ambiguous_detection_indexes
-        fragment_unions = self._plan_authoritative_fragment_unions(
+        fragment_unions = self._plan_fragment_unions(
             plan,
             frame,
         )
@@ -1234,29 +1234,42 @@ class MultiTargetVisualTracker:
         self._latest_update = update
         return update
 
-    def _plan_authoritative_fragment_unions(
+    def _plan_fragment_unions(
         self,
         plan: _AssignmentPlan,
         frame: VisualDetectionFrame,
     ) -> dict[int, _FragmentUnionAssignment]:
         """Fuse the known build-3385 diagonal gate-contour split.
 
-        The detector can split one current gate into complementary upper/right
+        The detector can split one gate into complementary upper/right
         and lower/left contours, both before and after the upper contour
-        reaches the TOP edge.  Their tight union is guidance geometry only: it
-        preserves the already race-authoritative CURRENT identity but carries
-        no inner-aperture or passage authority.
+        reaches the TOP edge.  Their tight union is guidance geometry
+        only: it preserves the identity of the track it attaches to but
+        carries no inner-aperture or passage authority.
+
+        Eligibility is not limited to the race-authoritative CURRENT
+        gate.  Flight run 20260729T200803Z-visual-course-a540212f (F41)
+        showed the next gate splitting into two rival half-tracks after
+        gate 0 while the authoritative-only restriction kept the halves
+        unfused.  Any track with a fresh, unambiguous prior may fuse a
+        fragment pair that matches the split geometry; the unchanged
+        prior-consistency, diagonal-offset, vertical-gap, support, and
+        assignment-cost guards below still decide whether two contours
+        are halves of one gate, so unrelated or cross-gate pairs reject.
         """
 
         selected_detection_indexes = set(plan.selected_pairs.values())
         reserved_detection_indexes: set[int] = set()
         assignments: dict[int, _FragmentUnionAssignment] = {}
         for track_index, state in enumerate(plan.active_states):
+            # F41 (run 20260729T200803Z-visual-course-a540212f): the
+            # diagonal split is a detector artifact, not a property of
+            # race-authoritative identity, so any track with a fresh,
+            # unambiguous prior is eligible.  The authoritative-CURRENT
+            # case keeps the exact same required-component and
+            # ordinary-match handling below as before.
             if (
-                state.nominal_role is not VisualTrackRole.CURRENT
-                or state.authoritative_gate_index is None
-                or state.authority_race_status_boot_ms is None
-                or state.missed_frame_count != 0
+                state.missed_frame_count != 0
                 or state.ambiguous
                 or track_index in plan.ambiguous_track_indexes
             ):
