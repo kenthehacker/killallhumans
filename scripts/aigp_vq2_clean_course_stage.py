@@ -278,7 +278,13 @@ PREDICT_STALL_FORCE_SEARCH_S = 1.50
 # an unqualified low-conf bearing, spending ~0.7 m of altitude); the full
 # 1.0 m/s cap returns the moment vertical is qualified.
 POST_CREDIT_BRAKE_PITCH_RAD = 0.18  # nose-up brake attitude (see block above)
-POST_CREDIT_BRAKE_TIMEOUT_S = 2.75  # bounded brake even with no reacquisition
+# 2.75 -> 1.5 s (flights 99e093fa/25361816): with the pre-cross brake now
+# owning closure killing before the plane, the post-credit brake is a
+# settling pause, not the closure mechanism.  A long no-successor hold
+# hovers blind in the fh-untrusted regime (real sub-hover sink) while far
+# gate-1 candidates can never grow their span without advance — F18/F19
+# both died in that window before the 2.75 s timeout could release.
+POST_CREDIT_BRAKE_TIMEOUT_S = 1.5  # bounded brake even with no reacquisition
 POST_CREDIT_CLIMB_CAP_M_S = 0.5  # climb cap while post-credit unqualified
 # Minimum brake hold (flight 20260729T125400Z-visual-course-4480d0a6): gate 1
 # is often already accepted AND vertically qualified at the credit tick, so
@@ -286,10 +292,11 @@ POST_CREDIT_CLIMB_CAP_M_S = 0.5  # climb cap while post-credit unqualified
 # engaged — the flag stayed False for the entire F11 trace and the attack
 # closure was never killed.  The brake now holds for at least this long
 # regardless of qualification; qualification only releases it afterwards.
-# 1.0 -> 2.0 s (flight 20260729T125958Z-visual-course-d058b8a0): the F12
-# brake held its 1.0 s but released before the slew-limited attitude change
-# had killed any closure (track 0006 span grew x3.8 in the next 1.6 s).
-POST_CREDIT_BRAKE_MIN_HOLD_S = 2.0
+# 2.0 -> 1.0 s (flights 99e093fa/25361816, see the timeout block above):
+# the dedicated 1.0 rad/s brake slew lands the worst-case attitude swing in
+# ~0.36 s, so 1.0 s is still ~3x the slew need, and the pre-cross brake has
+# already killed the attack closure that motivated the 2.0 s hold.
+POST_CREDIT_BRAKE_MIN_HOLD_S = 1.0
 # Dedicated brake slew (same flight): the generic 0.30 rad/s target slew
 # moved pitch only from -0.085 to ~=0 inside the 1.0 s F12 hold, so the
 # brake attitude was never attained and closure was never killed.  At
@@ -1232,7 +1239,14 @@ class CleanCourseController:
 
         if self.state is CleanCourseState.SEARCH:
             sweep_yaw = self._search_yaw(dt)
-            self._collective = support
+            # Flight 25361816: the unqualified hold margin must apply here
+            # too — SEARCH at bare support in the fh-untrusted regime sank
+            # ~1 m/s for real into terrain (the margin only covered the
+            # TRACK path).
+            search_hold = support + (
+                cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
+            )
+            self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
             target_pitch = self._slew_pitch(
                 cfg.post_credit_brake_pitch_rad
@@ -1251,7 +1265,7 @@ class CleanCourseController:
                 yaw_rate_rad_s=sweep_yaw,
                 # The IMU climb governor applies here too: vision loss must
                 # never disable it.
-                thrust=self._governed_collective(support, support),
+                thrust=self._governed_collective(search_hold, support),
                 state=self.state,
                 gate_index=self.gate_index,
                 current_track_id=self._current_track_id(),
@@ -1263,12 +1277,15 @@ class CleanCourseController:
             # Defensive: no hypothesis outside SEARCH should be impossible,
             # but never emit an unbounded command if it happens.
             self._enter_search(now_s)
-            self._collective = support
+            fallback_hold = support + (
+                cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
+            )
+            self._collective = fallback_hold
             return NavigationOutput(
                 target_roll_rad=0.0,
                 target_pitch_rad=cfg.brake_pitch_rad,
                 yaw_rate_rad_s=0.0,
-                thrust=self._governed_collective(support, support),
+                thrust=self._governed_collective(fallback_hold, support),
                 state=self.state,
                 gate_index=self.gate_index,
             )

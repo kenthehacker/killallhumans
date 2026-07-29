@@ -788,11 +788,11 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
     assert now - 100.10 <= 0.5
     assert not brake.vertical_qualified
     assert brake.target_pitch_rad == pytest.approx(0.18, abs=1e-9)
-    # Fresh y measurements re-qualify, but the 2.0 s minimum hold keeps the
+    # Fresh y measurements re-qualify, but the 1.0 s minimum hold keeps the
     # brake armed; the release fires only after the hold.
     frame = 10
     held = brake
-    while now < 100.10 + 1.9:
+    while now < 100.10 + 0.9:
         now += 0.033
         controller.observe(
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
@@ -803,7 +803,7 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
     assert held.vertical_qualified
     assert held.target_pitch_rad == pytest.approx(0.18, abs=1e-9)  # still held
     released = held
-    while now < 100.10 + 2.05:
+    while now < 100.10 + 1.2:
         now += 0.033
         controller.observe(
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
@@ -839,7 +839,7 @@ def test_post_credit_brake_holds_despite_qualification_within_min_hold():
     controller._alt_est_m = 2.0  # honest post-credit altitude (floor quiet)
     # Track stays vertically qualified with fresh y measurements throughout.
     now = 100.10
-    for frame in range(55):  # ~1.8 s < the 2.0 s minimum hold
+    for frame in range(27):  # ~0.9 s < the 1.0 s minimum hold
         now += 0.033
         controller.observe(
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=10 + frame),
@@ -849,7 +849,7 @@ def test_post_credit_brake_holds_despite_qualification_within_min_hold():
         assert out.vertical_qualified
         assert controller._post_credit_deadline_s is not None
     # Past the hold, continued qualification releases the brake.
-    for frame in range(55, 75):
+    for frame in range(27, 45):
         now += 0.033
         controller.observe(
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=10 + frame),
@@ -862,7 +862,7 @@ def test_post_credit_brake_holds_despite_qualification_within_min_hold():
 def test_post_credit_brake_releases_on_timeout():
     # A lost gate cannot brake forever: with no credible successor the
     # promotion enters SEARCH, slews to the brake attitude, and resumes the
-    # normal near-level SEARCH attitude after the 2.75 s timeout.
+    # normal near-level SEARCH attitude after the 1.5 s timeout.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     promoted = controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
     assert promoted
