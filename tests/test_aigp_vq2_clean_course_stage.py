@@ -15,8 +15,12 @@ expire when the camera frame freezes, and never come from a missed
 (invisible) track, with a hard 1.5 s PREDICT stall cap that forces SEARCH
 regardless of anchor state, a genuine nose-up post-credit brake armed by
 every authoritative promotion until the successor is accepted and
-vertically qualified (bounded by a 2.75 s timeout) with a qualification-
-gated 0.5 m/s climb cap in the same window, a raised 0.34 thrust envelope
+vertically qualified (bounded by a 2.75 s timeout and a 2.0 s minimum
+hold, slewed in at a dedicated 1.0 rad/s) with a qualification-
+gated 0.5 m/s climb cap in the same window, a pre-gate-1 altitude floor
+(vz_est-integrated alt_est, 0.7 -> 1.2 m hysteresis) overriding everything
+but the exact-zero coast latch with a level attitude, zero yaw, and a
+governed climb collective, a raised 0.34 thrust envelope
 under the runner's 0.35 hard abort,
 verified yaw/roll directions, clipping uncertainty (not abort),
 PREDICT->SEARCH on fresh empty frames, frozen-frame stalls that predict and
@@ -165,6 +169,7 @@ def test_identical_global_vertical_sign_at_every_gate():
             controller.current.confidence = 0.9
             controller.current.last_y_measurement_s = now
             controller.current.last_measurement_s = now
+            controller._alt_est_m = 2.0  # honest altitude (floor quiet)
         output = _command(controller, now + 0.02)
         assert output.vertical_qualified
         assert output.gate_index == gate
@@ -285,6 +290,7 @@ def test_gate0_climb_vertical_offset_is_bounded_feedforward():
     )
     assert promoted
     assert controller.state is CleanCourseState.TRACK
+    controller._alt_est_m = 2.0  # honest altitude (floor quiet)
     output = _command(controller, 100.16)
     assert output.gate_index == 1
     # Same centered target after promotion: the unbiased law holds support.
@@ -752,6 +758,7 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
     assert promoted
     assert controller.state is CleanCourseState.TRACK
     assert controller.current.track_id == "B"
+    controller._alt_est_m = 2.0  # honest post-credit altitude (floor quiet)
     # Unqualified window (aged accepted y): the brake engages and slews to
     # the real pitch-back attitude while lateral pursuit of the accepted
     # track keeps working.
@@ -760,23 +767,41 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
     brake = _command(controller, now)
     assert not brake.vertical_qualified
     assert brake.yaw_rate_rad_s > 0.0  # x=+0.30 pursuit still steers
-    for _ in range(20):  # pitch slew (0.30 rad/s) reaches the brake attitude
+    # Dedicated 1.0 rad/s brake slew: the +0.18 attitude is attained well
+    # inside 0.5 s of window start (F12: the generic 0.30 rad/s slew moved
+    # pitch only -0.085 -> ~=0 inside the 1.0 s hold, never braking).
+    for _ in range(8):
         now += 0.033
         brake = _command(controller, now)
+    assert now - 100.10 <= 0.5
     assert not brake.vertical_qualified
-    assert brake.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
-    # Fresh y measurements re-qualify; the brake releases immediately to the
-    # normal advance/brake interpolation (never positive pitch).
-    for frame, y in enumerate((0.06, 0.07, 0.08)):
+    assert brake.target_pitch_rad == pytest.approx(0.18, abs=1e-9)
+    # Fresh y measurements re-qualify, but the 2.0 s minimum hold keeps the
+    # brake armed; the release fires only after the hold.
+    frame = 10
+    held = brake
+    while now < 100.10 + 1.9:
         now += 0.033
         controller.observe(
-            _update([_track("B", 0.30, y, scale=0.05)], frame_id=10 + frame),
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
             now_s=now,
         )
-    now += 0.033
-    released = _command(controller, now)
+        held = _command(controller, now)
+        frame += 1
+    assert held.vertical_qualified
+    assert held.target_pitch_rad == pytest.approx(0.18, abs=1e-9)  # still held
+    released = held
+    while now < 100.10 + 2.05:
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
+            now_s=now,
+        )
+        released = _command(controller, now)
+        frame += 1
     assert released.vertical_qualified
-    for _ in range(20):  # output slew converges back to the normal attitude
+    assert controller._post_credit_deadline_s is None
+    for _ in range(25):  # output slew converges back to the normal attitude
         now += 0.033
         released = _command(controller, now)
     # The normal advance/brake interpolation never commands positive pitch.
@@ -799,9 +824,10 @@ def test_post_credit_brake_holds_despite_qualification_within_min_hold():
     )
     promoted = controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
     assert promoted
+    controller._alt_est_m = 2.0  # honest post-credit altitude (floor quiet)
     # Track stays vertically qualified with fresh y measurements throughout.
     now = 100.10
-    for frame in range(20):  # ~0.66 s < the 1.0 s minimum hold
+    for frame in range(55):  # ~1.8 s < the 2.0 s minimum hold
         now += 0.033
         controller.observe(
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=10 + frame),
@@ -811,7 +837,7 @@ def test_post_credit_brake_holds_despite_qualification_within_min_hold():
         assert out.vertical_qualified
         assert controller._post_credit_deadline_s is not None
     # Past the hold, continued qualification releases the brake.
-    for frame in range(20, 40):
+    for frame in range(55, 75):
         now += 0.033
         controller.observe(
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=10 + frame),
@@ -828,16 +854,17 @@ def test_post_credit_brake_releases_on_timeout():
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     promoted = controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
     assert promoted
+    controller._alt_est_m = 2.0  # honest post-credit altitude (floor quiet)
     assert controller.state is CleanCourseState.SEARCH  # no credible successor
     now = 100.10
     output = None
-    for _ in range(20):  # slew (0.30 rad/s) reaches the brake attitude
+    for _ in range(20):  # slew (1.0 rad/s) reaches the brake attitude
         now += 0.033
         output = _command(controller, now)
-    assert output.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    assert output.target_pitch_rad == pytest.approx(0.18, abs=1e-9)
     # Past the deadline the window ends even with nothing reacquired.
     now = 100.10 + 2.80
-    for _ in range(20):
+    for _ in range(25):  # generic 0.30 rad/s slew returns to near level
         now += 0.033
         output = _command(controller, now)
     assert output.target_pitch_rad == pytest.approx(-0.02, abs=1e-9)
@@ -861,6 +888,7 @@ def test_post_credit_climb_cap_is_qualification_gated():
         now_s=100.08,
     )
     controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
+    controller._alt_est_m = 2.0  # honest post-credit altitude (floor quiet)
     controller.current.last_y_measurement_s = 100.10 - 1.0  # unqualified
     _command(controller, 100.14)  # window confirmed active in command()
     controller._vz_est_m_s = 0.8  # over the 0.5 post-credit cap only
@@ -872,6 +900,126 @@ def test_post_credit_climb_cap_is_qualification_gated():
     assert controller._governed_collective(SUPPORT, SUPPORT) == pytest.approx(
         SUPPORT, abs=1e-9
     )
+
+
+def _promote_to_gate_one(controller, now_s=100.10):
+    """Promote a TRACK controller to gate 1 with successor B accepted."""
+
+    controller.observe(
+        _update(
+            [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
+            frame_id=3,
+        ),
+        now_s=now_s - 0.02,
+    )
+    promoted = controller.note_race(
+        gate_index=1, race_boot_ms=2500, now_s=now_s
+    )
+    assert promoted
+    assert controller.current.track_id == "B"
+
+
+def test_altitude_floor_triggers_and_releases_with_hysteresis():
+    # F10/F11/F12: the final 6-10 s before gate 1 ran below 0.7 m with
+    # thrust pinned into terrain.  The pre-gate-1 floor (alt_est integrated
+    # from the governor's vz_est, seeded 0 at course start) overrides
+    # everything but the coast latch: level attitude, zero yaw, and a
+    # governed climb collective until the release hysteresis clears.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 2.0
+    controller._vz_est_m_s = -1.0  # a_up=None holds the estimate constant
+    now = 100.10
+    frame = 10
+    out = None
+    while controller._alt_est_m >= 0.7:  # ~40 ticks of integrated sink
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
+            now_s=now,
+        )
+        out = _command(controller, now)
+        frame += 1
+    assert controller._alt_floor_active
+    assert out.yaw_rate_rad_s == 0.0
+    # Sinking at -1.0 m/s: support + 0.06 * 0.5 + 0.025 feedforward = 0.33.
+    assert out.thrust == pytest.approx(0.33, abs=1e-9)
+    # Hysteresis: climbing between 0.7 and 1.2 m keeps the floor active.
+    controller._vz_est_m_s = 1.0
+    while controller._alt_est_m < 1.0:
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
+            now_s=now,
+        )
+        out = _command(controller, now)
+        frame += 1
+    assert controller._alt_floor_active
+    assert out.yaw_rate_rad_s == 0.0
+    # Above the 1.2 m release the normal pursuit law resumes.
+    while controller._alt_est_m <= 1.2:
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
+            now_s=now,
+        )
+        out = _command(controller, now)
+        frame += 1
+    assert not controller._alt_floor_active
+    assert out.yaw_rate_rad_s > 0.0  # x=+0.30 pursuit steers again
+
+
+def test_altitude_floor_is_gated_to_gate_one():
+    # The floor protects only the measured pre-gate-1 window: gate 0 keeps
+    # the normal law at the same low altitude, and post-gate-1 flight is
+    # unaffected (re-anchoring alt_est after gate 1 is a follow-up).
+    controller = _tracked_controller(_track("A", 0.30, 0.0))
+    controller._alt_est_m = 0.5
+    out = _command(controller, 100.10)
+    assert not controller._alt_floor_active
+    assert out.yaw_rate_rad_s > 0.0  # normal x=+0.30 pursuit at gate 0
+    _promote_to_gate_one(controller, now_s=100.12)
+    out = _command(controller, 100.14)
+    assert controller._alt_floor_active  # the gate-1 window is live at 0.5 m
+    assert out.yaw_rate_rad_s == 0.0
+    assert controller.note_race(gate_index=2, race_boot_ms=3000, now_s=100.16)
+    _command(controller, 100.18)
+    assert not controller._alt_floor_active
+
+
+def test_altitude_floor_respects_max_thrust():
+    # F12's -4.3 m/s sink would demand support + 0.06*3.8 + 0.025 ~= 0.53;
+    # the governor's internal clamp keeps the override inside the course
+    # envelope (0.34, below the runner's 0.35 hard abort).
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 0.5
+    controller._vz_est_m_s = -4.3
+    out = _command(controller, 100.14)
+    assert controller._alt_floor_active
+    assert out.thrust == pytest.approx(controller.config.max_thrust, abs=1e-9)
+
+
+def test_altitude_floor_never_overrides_coast_exact_zero():
+    # The exact-zero credit/abort latch still wins over the floor: a fresh
+    # close loss inside the low-altitude window must not resurrect thrust.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.observe(
+        _update(
+            [
+                _track("A", 0.0, 0.0, scale=0.50),
+                _track("B", 0.30, 0.05, scale=0.50),
+            ],
+            frame_id=3,
+        ),
+        now_s=100.08,
+    )
+    assert controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
+    controller.observe(_update([], frame_id=4), now_s=100.12)  # fresh close loss
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    controller._alt_est_m = 0.3
+    controller._vz_est_m_s = -1.0
+    assert _command(controller, 100.14).thrust == 0.0
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():

@@ -251,7 +251,7 @@ PREDICT_STALL_FORCE_SEARCH_S = 1.50
 # the same unqualified window (F10 climbed at vz +1.0 for ~1.4 s chasing
 # an unqualified low-conf bearing, spending ~0.7 m of altitude); the full
 # 1.0 m/s cap returns the moment vertical is qualified.
-POST_CREDIT_BRAKE_PITCH_RAD = 0.12  # nose-up brake attitude (see block above)
+POST_CREDIT_BRAKE_PITCH_RAD = 0.18  # nose-up brake attitude (see block above)
 POST_CREDIT_BRAKE_TIMEOUT_S = 2.75  # bounded brake even with no reacquisition
 POST_CREDIT_CLIMB_CAP_M_S = 0.5  # climb cap while post-credit unqualified
 # Minimum brake hold (flight 20260729T125400Z-visual-course-4480d0a6): gate 1
@@ -260,7 +260,27 @@ POST_CREDIT_CLIMB_CAP_M_S = 0.5  # climb cap while post-credit unqualified
 # engaged — the flag stayed False for the entire F11 trace and the attack
 # closure was never killed.  The brake now holds for at least this long
 # regardless of qualification; qualification only releases it afterwards.
-POST_CREDIT_BRAKE_MIN_HOLD_S = 1.0
+# 1.0 -> 2.0 s (flight 20260729T125958Z-visual-course-d058b8a0): the F12
+# brake held its 1.0 s but released before the slew-limited attitude change
+# had killed any closure (track 0006 span grew x3.8 in the next 1.6 s).
+POST_CREDIT_BRAKE_MIN_HOLD_S = 2.0
+# Dedicated brake slew (same flight): the generic 0.30 rad/s target slew
+# moved pitch only from -0.085 to ~=0 inside the 1.0 s F12 hold, so the
+# brake attitude was never attained and closure was never killed.  At
+# 1.0 rad/s the worst-case swing (advance -0.18 to brake +0.18) lands in
+# ~0.36 s of window start.  Applies ONLY while the brake window is active;
+# normal steering keeps the transparent 0.30 rad/s slew.
+POST_CREDIT_BRAKE_SLEW_RAD_S = 1.0
+# Pre-gate-1 altitude floor (terrain insurance; flights F10/F11/F12 all
+# flew their final 6-10 s below 0.7 m with thrust pinned at the clamp into
+# terrain hits).  alt_est integrates the governor's IMU vz_est from course
+# start (takeoff pad = 0); drift is bounded inside this <15 s
+# gate-0-credit -> gate-1-credit window.  Hysteresis: trigger below 0.7 m,
+# release above 1.2 m.  Inactive at gate_index 0 (takeoff/climb-out) and
+# once gate_index >= 2 — post-gate-1 reference re-anchoring is a follow-up.
+ALT_FLOOR_TRIGGER_M = 0.7
+ALT_FLOOR_RELEASE_M = 1.2
+ALT_FLOOR_CLIMB_MARGIN = 0.05  # support + margin -> governed recovery climb
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 SEARCH_YAW_RATE_RAD_S = 0.12  # bounded sweep inside the 0.15 yaw cap
 SEARCH_SWEEP_PERIOD_S = 1.20  # bounded reversal schedule
@@ -518,6 +538,10 @@ class CleanCourseConfig:
     post_credit_brake_timeout_s: float = POST_CREDIT_BRAKE_TIMEOUT_S
     post_credit_climb_cap_m_s: float = POST_CREDIT_CLIMB_CAP_M_S
     post_credit_brake_min_hold_s: float = POST_CREDIT_BRAKE_MIN_HOLD_S
+    post_credit_brake_slew_rad_s: float = POST_CREDIT_BRAKE_SLEW_RAD_S
+    alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
+    alt_floor_release_m: float = ALT_FLOOR_RELEASE_M
+    alt_floor_climb_margin: float = ALT_FLOOR_CLIMB_MARGIN
     search_covariance_std_norm: float = SEARCH_COVARIANCE_STD_NORM
     search_yaw_rate_rad_s: float = SEARCH_YAW_RATE_RAD_S
     search_sweep_period_s: float = SEARCH_SWEEP_PERIOD_S
@@ -610,6 +634,11 @@ class CleanCourseController:
         # pitches back genuinely and tightens the climb cap.
         self._post_credit_deadline_s: Optional[float] = None
         self._post_credit_armed_s: Optional[float] = None
+        # IMU altitude estimate (m) integrated from the governor's vz_est,
+        # seeded 0 at course start (takeoff pad reference).  Guards only the
+        # bounded pre-gate-1 window; see the ALT_FLOOR_* constant block.
+        self._alt_est_m = 0.0
+        self._alt_floor_active = False
         self._active_climb_cap_m_s = VZ_CLIMB_CAP_M_S
 
     # -- initialization ----------------------------------------------------
@@ -882,6 +911,10 @@ class CleanCourseController:
             # IMU-fed so it stays alive in every state, including COAST.
             self._vz_est_m_s += float(world_up_accel_m_s2) * dt
             self._vz_est_m_s -= self._vz_est_m_s * dt / VZ_LEAK_TAU_S
+        # IMU altitude estimate from course start (takeoff pad = 0).  Feeds
+        # only the pre-gate-1 altitude floor; bounded drift is acceptable
+        # inside that short window (see the ALT_FLOOR_* constant block).
+        self._alt_est_m += self._vz_est_m_s * dt
 
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             assert self._coast_entry_s is not None
@@ -938,6 +971,37 @@ class CleanCourseController:
             cfg.max_thrust,
         )
 
+        # Pre-gate-1 altitude floor (F10/F11/F12: the final 6-10 s ran below
+        # 0.7 m with thrust pinned into terrain).  Hysteresis 0.7 -> 1.2 m,
+        # gate-1 window only; the exact-zero COAST latch above still wins.
+        if self.gate_index == 1:
+            if self._alt_floor_active:
+                self._alt_floor_active = (
+                    self._alt_est_m <= cfg.alt_floor_release_m
+                )
+            else:
+                self._alt_floor_active = (
+                    self._alt_est_m < cfg.alt_floor_trigger_m
+                )
+        else:
+            self._alt_floor_active = False
+        if self._alt_floor_active:
+            # Terrain recovery override: level attitude, zero yaw, governed
+            # climb collective.  Everything else yields; the governor keeps
+            # it inside the thrust envelope.
+            return NavigationOutput(
+                target_roll_rad=self._slew_roll(0.0, dt),
+                target_pitch_rad=self._slew_pitch(0.0, dt),
+                yaw_rate_rad_s=0.0,
+                thrust=self._governed_collective(
+                    support + cfg.alt_floor_climb_margin, support
+                ),
+                state=self.state,
+                gate_index=self.gate_index,
+                current_track_id=self._current_track_id(),
+                successor_track_id=self._successor_track_id(),
+            )
+
         if self.state is CleanCourseState.SEARCH:
             sweep_yaw = self._search_yaw(dt)
             self._collective = support
@@ -947,6 +1011,11 @@ class CleanCourseController:
                 if self._post_credit_deadline_s is not None
                 else cfg.brake_pitch_rad,
                 dt,
+                slew_rad_s=(
+                    cfg.post_credit_brake_slew_rad_s
+                    if self._post_credit_deadline_s is not None
+                    else None
+                ),
             )
             return NavigationOutput(
                 target_roll_rad=target_roll,
@@ -1145,7 +1214,18 @@ class CleanCourseController:
 
         return NavigationOutput(
             target_roll_rad=self._slew_roll(target_roll, dt),
-            target_pitch_rad=self._slew_pitch(target_pitch, dt),
+            # The brake window gets the dedicated fast slew (F12: the
+            # generic 0.30 rad/s slew never attained the brake attitude
+            # inside the hold); normal steering keeps the transparent slew.
+            target_pitch_rad=self._slew_pitch(
+                target_pitch,
+                dt,
+                slew_rad_s=(
+                    cfg.post_credit_brake_slew_rad_s
+                    if post_credit_brake
+                    else None
+                ),
+            ),
             yaw_rate_rad_s=yaw_rate,
             thrust=thrust,
             state=self.state,
@@ -1417,8 +1497,20 @@ class CleanCourseController:
         )
         return self._prev_target_roll
 
-    def _slew_pitch(self, target: float, dt: float) -> float:
-        limit = self.config.target_slew_rad_s * dt
+    def _slew_pitch(
+        self,
+        target: float,
+        dt: float,
+        slew_rad_s: Optional[float] = None,
+    ) -> float:
+        # Optional per-call slew rate: the post-credit brake window uses a
+        # dedicated faster slew so the brake attitude is actually attained
+        # (F12); everything else keeps the transparent target slew.
+        limit = (
+            slew_rad_s
+            if slew_rad_s is not None
+            else self.config.target_slew_rad_s
+        ) * dt
         self._prev_target_pitch = _clamp(
             target,
             self._prev_target_pitch - limit,
@@ -1737,6 +1829,8 @@ def _clean_course_tick_trace(
             None if current is None else now_s - current.last_measurement_s
         ),
         "post_credit_brake": controller._post_credit_deadline_s is not None,
+        "alt_est_m": controller._alt_est_m,
+        "alt_floor_active": controller._alt_floor_active,
     }
 
 
