@@ -187,6 +187,22 @@ _VISUAL_INNER_APERTURE_CONFIG = VQ2ApertureConfig(
 )
 
 
+def _unmirror_frame_edge(edges: FrameEdge) -> FrameEdge:
+    """Swap LEFT/RIGHT so pixel-space edge flags match physical norm x.
+
+    The detector image is x-mirrored relative to the physical camera
+    (F43 run 20260729T202844Z-visual-course-ee8fd1e5, F44 run
+    20260729T204149Z-visual-course-ba0a22b3).  Tracker norm space negates
+    x at ingestion, so every edge flag adapted alongside must swap sides.
+    """
+
+    bits = int(edges)
+    horizontal = int(FrameEdge.LEFT) | int(FrameEdge.RIGHT)
+    left = bits & int(FrameEdge.LEFT)
+    right = bits & int(FrameEdge.RIGHT)
+    return FrameEdge((bits & ~horizontal) | (left << 2) | (right >> 2))
+
+
 def _visual_inner_aperture_from_fit(
     fit: VQ2ApertureFit,
 ) -> VisualInnerApertureGeometry:
@@ -200,8 +216,11 @@ def _visual_inner_aperture_from_fit(
         if passage_geometry is not None
         else tracking_geometry_from_vq2_aperture_fit(fit)
     )
-    clipping = FrameEdge(int(fit.clipping))
-    visible_edges = FrameEdge(int(fit.visible_edges))
+    # The fit pipeline works in detector pixel space; negate x and swap
+    # the horizontal edge flags so the adapted geometry shares the
+    # physical norm convention of the tracker ingestion boundary.
+    clipping = _unmirror_frame_edge(FrameEdge(int(fit.clipping)))
+    visible_edges = _unmirror_frame_edge(FrameEdge(int(fit.visible_edges)))
     tracking_prior_only = (
         fit.geometry_model_id
         == "vq2-temporally-associated-inner-quad-lines-v1"
@@ -221,7 +240,10 @@ def _visual_inner_aperture_from_fit(
             and fit.clipping != ApertureSide.NONE
         )
         return VisualInnerApertureGeometry(
-            center_norm=geometry.center_norm,
+            center_norm=(
+                -geometry.center_norm[0],
+                geometry.center_norm[1],
+            ),
             half_size_norm=geometry.aperture_half_size_norm,
             log_scale=geometry.log_scale,
             measurement_std=geometry.measurement_std,
@@ -501,8 +523,12 @@ def _visual_aperture_tracking_prior(
         isotropic_scale * previous_half_unit[1],
     )
     image_width, image_height = frame.image_size_px
+    # Tracker norm x is physical (the detector feed is x-mirrored; F43
+    # run 20260729T202844Z-visual-course-ee8fd1e5, F44 run
+    # 20260729T204149Z-visual-course-ba0a22b3), but this prior indexes
+    # the detector pixel mask, so un-mirror x on the way back to pixels.
     center_px = (
-        current_center_unit[0] * image_width,
+        (1.0 - current_center_unit[0]) * image_width,
         current_center_unit[1] * image_height,
     )
     half_size_px = (

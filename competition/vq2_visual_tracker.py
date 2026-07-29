@@ -371,13 +371,23 @@ class VisualDetection:
             raise ValueError("detection center must lie inside its bbox")
         if not 0 <= center_x < width_px or not 0 <= center_y < height_px:
             raise ValueError("detection center must stay inside the image")
+        # F43 (run 20260729T202844Z-visual-course-ee8fd1e5) and F44 (run
+        # 20260729T204149Z-visual-course-ba0a22b3): detector pixel x is
+        # mirrored relative to the physical camera.  Every pursuit of an
+        # off-center target showed the measured bearing fleeing to the
+        # frame right while the drone yawed right (d(x)/d(heading)
+        # roughly +1.6 where a static world gives -1).  Negate x here, at
+        # the single pixel-to-norm ingestion boundary, so norm space is
+        # physically consistent: yaw right now decreases measured
+        # bearing, matching the derotated prediction physics.  The
+        # pixel-left edge is the physical RIGHT edge and vice versa.
         clipping = FrameEdge.NONE
         if x <= edge_margin_px:
-            clipping |= FrameEdge.LEFT
+            clipping |= FrameEdge.RIGHT
         if y <= edge_margin_px:
             clipping |= FrameEdge.TOP
         if x + width >= width_px - edge_margin_px:
-            clipping |= FrameEdge.RIGHT
+            clipping |= FrameEdge.LEFT
         if y + height >= height_px - edge_margin_px:
             clipping |= FrameEdge.BOTTOM
         confidence = _finite(
@@ -392,13 +402,13 @@ class VisualDetection:
         return cls(
             source_index=source_index,
             center_norm=(
-                2.0 * center_x / width_px - 1.0,
+                1.0 - 2.0 * center_x / width_px,
                 2.0 * center_y / height_px - 1.0,
             ),
             bbox_norm=(
-                x / width_px,
+                1.0 - (x + width) / width_px,
                 y / height_px,
-                (x + width) / width_px,
+                1.0 - x / width_px,
                 (y + height) / height_px,
             ),
             confidence=confidence,
@@ -1241,8 +1251,10 @@ class MultiTargetVisualTracker:
     ) -> dict[int, _FragmentUnionAssignment]:
         """Fuse the known build-3385 diagonal gate-contour split.
 
-        The detector can split one gate into complementary upper/right
-        and lower/left contours, both before and after the upper contour
+        The detector can split one gate into complementary upper/left
+        and lower/right contours (in the physical norm convention; the
+        mirrored pixel feed showed the same split as upper/right and
+        lower/left), both before and after the upper contour
         reaches the TOP edge.  Their tight union is guidance geometry
         only: it preserves the identity of the track it attaches to but
         carries no inner-aperture or passage authority.
@@ -1377,7 +1389,7 @@ class MultiTargetVisualTracker:
             valid.append((detection_index, detection, bbox_px))
 
         single_fragment_projection = (
-            self._select_top_right_single_fragment_projection(
+            self._select_top_edge_single_fragment_projection(
                 state,
                 valid=valid,
                 frame=frame,
@@ -1437,9 +1449,16 @@ class MultiTargetVisualTracker:
                 lower_center_y = 0.5 * (
                     lower_y + lower_y + lower_height
                 )
+                # The build-3385 diagonal split is fixed in pixel space
+                # (upper/right + lower/left there); after the ingestion
+                # mirror correction it presents in norm space as
+                # upper/LEFT + lower/RIGHT.  F43/F44 (runs
+                # 20260729T202844Z-visual-course-ee8fd1e5,
+                # 20260729T204149Z-visual-course-ba0a22b3) confirm the
+                # feed mirror, so pair only that physical diagonal.
                 if (
                     lower_y <= _FRAGMENT_UNION_EDGE_MARGIN_PX
-                    or upper_center_x <= lower_center_x
+                    or upper_center_x >= lower_center_x
                     or upper_center_y >= lower_center_y
                 ):
                     continue
@@ -1618,7 +1637,7 @@ class MultiTargetVisualTracker:
             return None
         return min(candidates, key=lambda item: item[:3])[3]
 
-    def _select_top_right_single_fragment_projection(
+    def _select_top_edge_single_fragment_projection(
         self,
         state: _TrackState,
         *,
@@ -1627,23 +1646,30 @@ class MultiTargetVisualTracker:
         ],
         frame: VisualDetectionFrame,
     ) -> Optional[_FragmentUnionAssignment]:
-        """Retain one live gate when only its lower-left contour survives.
+        """Retain one live gate when only its lower side contour survives.
 
-        A near-plane build-3385 gate can lose its upper/right contour one
-        frame before the camera loses the gate entirely.  For an already
-        authoritative CURRENT track whose prior box was clipped at exactly
-        TOP|RIGHT, the remaining lower-left contour still observes the full
-        gate's left and bottom anchors.  Project only the two already-censored
-        edges and require the resulting box to remain strongly prior
-        consistent.  The projection is guidance-only and never carries inner
-        aperture or passage authority.
+        A near-plane build-3385 gate can lose its upper contour one
+        frame before the camera loses the gate entirely.  For a track
+        whose prior box was clipped at exactly TOP and one horizontal
+        edge, the remaining lower contour on the opposite side still
+        observes the full gate's in-frame side and bottom anchors.  In
+        the physical norm convention the empirically observed case
+        (F41/F43/F44, seen at the pixel-right edge through the mirrored
+        feed) is a TOP|LEFT prior with a surviving lower-right contour;
+        the TOP|RIGHT mirror case is handled symmetrically.  Project
+        only the two already-censored edges and require the resulting
+        box to remain strongly prior consistent.  The projection is
+        guidance-only and never carries inner aperture or passage
+        authority.
         """
 
-        if (
-            state.latest.clipping
-            != (FrameEdge.TOP | FrameEdge.RIGHT)
-            or len(valid) != 1
-        ):
+        if len(valid) != 1:
+            return None
+        if state.latest.clipping == (FrameEdge.TOP | FrameEdge.RIGHT):
+            clipped_right = True
+        elif state.latest.clipping == (FrameEdge.TOP | FrameEdge.LEFT):
+            clipped_right = False
+        else:
             return None
 
         width_px, height_px = frame.image_size_px
@@ -1653,11 +1679,12 @@ class MultiTargetVisualTracker:
         )
         prior_right = prior_x + prior_width
         prior_bottom = prior_y + prior_height
-        if (
-            prior_y > _FRAGMENT_UNION_EDGE_MARGIN_PX
-            or prior_right
-            < width_px - _FRAGMENT_UNION_EDGE_MARGIN_PX
-        ):
+        if prior_y > _FRAGMENT_UNION_EDGE_MARGIN_PX:
+            return None
+        if clipped_right:
+            if prior_right < width_px - _FRAGMENT_UNION_EDGE_MARGIN_PX:
+                return None
+        elif prior_x > _FRAGMENT_UNION_EDGE_MARGIN_PX:
             return None
 
         detection_index, component, component_bbox = valid[0]
@@ -1673,6 +1700,14 @@ class MultiTargetVisualTracker:
         component_center_y = component_y + 0.5 * component_height
         prior_center_x = prior_x + 0.5 * prior_width
         prior_center_y = prior_y + 0.5 * prior_height
+        # The surviving lower contour sits on the in-frame side of the
+        # prior center and still anchors the prior's in-frame vertical
+        # edge and its bottom edge.
+        side_anchor_jump = (
+            abs(component_x - prior_x)
+            if clipped_right
+            else abs(component_right - prior_right)
+        )
         if (
             component.clipping != FrameEdge.NONE
             or component.center_censored
@@ -1681,17 +1716,22 @@ class MultiTargetVisualTracker:
             >= width_px - _FRAGMENT_UNION_EDGE_MARGIN_PX
             or component_bottom
             >= height_px - _FRAGMENT_UNION_EDGE_MARGIN_PX
-            or component_center_x >= prior_center_x
+            or (
+                component_center_x >= prior_center_x
+                if clipped_right
+                else component_center_x <= prior_center_x
+            )
             or component_center_y <= prior_center_y
-            or abs(component_x - prior_x)
-            > _FRAGMENT_UNION_MAX_CENTER_JUMP_PX
+            or side_anchor_jump > _FRAGMENT_UNION_MAX_CENTER_JUMP_PX
             or abs(component_bottom - prior_bottom)
             > _FRAGMENT_UNION_MAX_CENTER_JUMP_PX
         ):
             return None
 
-        projected_x = component_x
-        projected_right = width_px
+        projected_x = component_x if clipped_right else 0
+        projected_right = (
+            width_px if clipped_right else component_right
+        )
         projected_bottom = component_bottom
         projected_width = projected_right - projected_x
         projected_height = projected_bottom
@@ -1707,7 +1747,7 @@ class MultiTargetVisualTracker:
         projected_bbox_norm = (
             projected_x / width_px,
             0.0,
-            1.0,
+            projected_right / width_px,
             projected_bottom / height_px,
         )
         overlap = _bbox_iou(
@@ -1744,10 +1784,16 @@ class MultiTargetVisualTracker:
             ),
             bbox_norm=projected_bbox_norm,
             confidence=component.confidence,
-            clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+            clipping=(
+                FrameEdge.TOP | FrameEdge.RIGHT
+                if clipped_right
+                else FrameEdge.TOP | FrameEdge.LEFT
+            ),
             center_censored=True,
             detection_method=(
                 "vq2_tracked_top_right_single_fragment_projection"
+                if clipped_right
+                else "vq2_tracked_top_left_single_fragment_projection"
             ),
             appearance=None,
             inner_aperture=None,
