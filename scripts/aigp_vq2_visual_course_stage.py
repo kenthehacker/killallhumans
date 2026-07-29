@@ -12243,47 +12243,41 @@ async def _run_visual_course_stage_impl(
                                 "visual-course propagated visibility-gap QPC "
                                 "clock is invalid"
                             ) from exc
-                        gap_unavailable_reason: Optional[str] = (
-                            "later-gate visual loss enters fresh search "
-                            "without blind command retention"
-                            if current_gate_index > initial_gate_index
-                            else None
-                        )
-                        if gap_unavailable_reason is None:
-                            try:
-                                gap_evidence = (
-                                    dynamic_controller
-                                    .propagated_current_visibility_gap_authority(
-                                        track=snapshot.current_track,
-                                        camera_token=token,
-                                        now_monotonic_ns=gap_proposal_ns,
-                                    )
+                        gap_unavailable_reason: Optional[str] = None
+                        try:
+                            gap_evidence = (
+                                dynamic_controller
+                                .propagated_current_visibility_gap_authority(
+                                    track=snapshot.current_track,
+                                    camera_token=token,
+                                    now_monotonic_ns=gap_proposal_ns,
                                 )
-                                gap_authority = (
-                                    _approach_propagated_visibility_gap_authority(
-                                        gap_evidence,
-                                        snapshot=snapshot,
-                                        gate_index=current_gate_index,
-                                        track_id=current_track_id,
-                                        fov_summary=segment[
-                                            "top_fov_pitch_protection"
-                                        ],
-                                    )
+                            )
+                            gap_authority = (
+                                _approach_propagated_visibility_gap_authority(
+                                    gap_evidence,
+                                    snapshot=snapshot,
+                                    gate_index=current_gate_index,
+                                    track_id=current_track_id,
+                                    fov_summary=segment[
+                                        "top_fov_pitch_protection"
+                                    ],
                                 )
-                            except (
-                                PropagatedCurrentVisibilityGapUnavailable
-                            ) as gap_exc:
-                                gap_unavailable_reason = str(gap_exc)
-                            except (
-                                AttributeError,
-                                KeyError,
-                                TypeError,
-                                ValueError,
-                            ) as gap_exc:
-                                raise abort_type(
-                                    "visual-course propagated visibility-gap "
-                                    f"guidance refused: {gap_exc}"
-                                ) from gap_exc
+                            )
+                        except (
+                            PropagatedCurrentVisibilityGapUnavailable
+                        ) as gap_exc:
+                            gap_unavailable_reason = str(gap_exc)
+                        except (
+                            AttributeError,
+                            KeyError,
+                            TypeError,
+                            ValueError,
+                        ) as gap_exc:
+                            raise abort_type(
+                                "visual-course propagated visibility-gap "
+                                f"guidance refused: {gap_exc}"
+                            ) from gap_exc
                         if gap_unavailable_reason is not None:
                             try:
                                 (
@@ -12299,14 +12293,15 @@ async def _run_visual_course_stage_impl(
                                     unavailable_reason=gap_unavailable_reason,
                                     segment=segment,
                                 )
-                                approach_same_gate_rebind_search = (
-                                    host.visual_gate_graph
-                                    .begin_same_gate_rebind_search(
-                                        host.visual_tracker,
-                                        race_status=race,
-                                        camera_token_at_start=token,
+                                if approach_same_gate_rebind_search is None:
+                                    approach_same_gate_rebind_search = (
+                                        host.visual_gate_graph
+                                        .begin_same_gate_rebind_search(
+                                            host.visual_tracker,
+                                            race_status=race,
+                                            camera_token_at_start=token,
+                                        )
                                     )
-                                )
                             except (
                                 GateGraphError,
                                 TypeError,
@@ -12351,6 +12346,32 @@ async def _run_visual_course_stage_impl(
                                     ),
                                     "outcome": "propagating",
                                 }
+                                # Freeze candidate eligibility at the first
+                                # missing publication even while the bounded
+                                # accepted-wire command is still valid.  If
+                                # the hold expires, a gate contour that first
+                                # appeared during the hold must remain
+                                # eligible for same-gate rebind rather than
+                                # being mislabeled as preexisting.
+                                try:
+                                    approach_same_gate_rebind_search = (
+                                        host.visual_gate_graph
+                                        .begin_same_gate_rebind_search(
+                                            host.visual_tracker,
+                                            race_status=race,
+                                            camera_token_at_start=token,
+                                        )
+                                    )
+                                except (
+                                    GateGraphError,
+                                    TypeError,
+                                    ValueError,
+                                ) as search_exc:
+                                    raise abort_type(
+                                        "visual-course visibility-gap rebind "
+                                        "boundary refused: "
+                                        f"{search_exc}"
+                                    ) from search_exc
                             try:
                                 command_deadline_s = (
                                     _approach_propagated_visibility_gap_command_deadline_s(
@@ -12376,14 +12397,18 @@ async def _run_visual_course_stage_impl(
                                         unavailable_reason=None,
                                         segment=segment,
                                     )
-                                    approach_same_gate_rebind_search = (
-                                        host.visual_gate_graph
-                                        .begin_same_gate_rebind_search(
-                                            host.visual_tracker,
-                                            race_status=race,
-                                            camera_token_at_start=token,
+                                    if (
+                                        approach_same_gate_rebind_search
+                                        is None
+                                    ):
+                                        approach_same_gate_rebind_search = (
+                                            host.visual_gate_graph
+                                            .begin_same_gate_rebind_search(
+                                                host.visual_tracker,
+                                                race_status=race,
+                                                camera_token_at_start=token,
+                                            )
                                         )
-                                    )
                                 except (
                                     GateGraphError,
                                     TypeError,
@@ -14117,6 +14142,7 @@ async def _run_visual_course_stage_impl(
                     )
                 approach_propagated_visibility_gap_started_s = None
                 approach_propagated_visibility_gap_fresh_frame_count = 0
+                approach_same_gate_rebind_search = None
             if approach_inner_dropout_authority is not None:
                 hold_summary = segment[
                     "approach_inner_dropout_hold"

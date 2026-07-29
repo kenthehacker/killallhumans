@@ -30,7 +30,6 @@ _UINT32_MAX = 2**32 - 1
 _NS_PER_S = 1_000_000_000.0
 _FRAGMENT_UNION_EDGE_MARGIN_PX = 2
 _FRAGMENT_UNION_MIN_DIMENSION_PX = 20
-_FRAGMENT_UNION_MAX_COMPONENT_ASPECT = 2.60
 _FRAGMENT_UNION_MIN_PRIOR_ASPECT_RATIO = 0.75
 _FRAGMENT_UNION_MAX_PRIOR_ASPECT_RATIO = 1.35
 _FRAGMENT_UNION_MIN_IOU = 0.75
@@ -1357,14 +1356,9 @@ class MultiTargetVisualTracker:
                 frame.image_size_px,
             )
             _x, _y, box_width, box_height = bbox_px
-            short = min(box_width, box_height)
-            long = max(box_width, box_height)
             if (
                 box_width < _FRAGMENT_UNION_MIN_DIMENSION_PX
                 or box_height < _FRAGMENT_UNION_MIN_DIMENSION_PX
-                or short <= 0
-                or long / short
-                > _FRAGMENT_UNION_MAX_COMPONENT_ASPECT
             ):
                 continue
             valid.append((detection_index, detection, bbox_px))
@@ -1500,7 +1494,13 @@ class MultiTargetVisualTracker:
                 )
                 union_area = union_width * union_height
                 support_ratio = visible_support / union_area
-                if not 0.20 <= support_ratio <= 0.80:
+                # Near-plane gate contours legitimately become two thin,
+                # widely separated frame pieces.  Strong prior-union IoU,
+                # center, area, aspect, and assignment continuity below
+                # establish that they are still the authoritative gate; a
+                # minimum painted-pixel fraction only makes the same gate
+                # disappear as its open aperture grows.
+                if support_ratio > 0.80:
                     continue
 
                 union_bbox_norm = (

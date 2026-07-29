@@ -2870,15 +2870,12 @@ class DynamicVisualCourseSession:
             fixed_visibility_gap_horizon_s * 1_000_000_000.0
         )
         decision = anchor.decision
-        command = replace(
-            decision.command,
-            # Never carry forward/negative pitch through blindness.  This
-            # branch is reacquisition steering, not approach closure.
-            target_pitch_rad=max(
-                0.0,
-                float(decision.command.target_pitch_rad),
-            ),
-        )
+        # Retain the exact finite, bounded same-gate steering command that
+        # reached the wire.  In particular, a TOP-clipped gate needs its
+        # accepted negative pitch correction during this short lease; forcing
+        # it to zero turns a one-frame visibility gap into an avoidable
+        # vertical escape.
+        command = decision.command
         remaining_horizon_s = (
             steering_deadline_ns - now_monotonic_ns
         ) / 1_000_000_000.0

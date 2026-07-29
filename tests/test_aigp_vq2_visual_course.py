@@ -6041,7 +6041,7 @@ def test_same_gate_wire_anchor_needs_no_independent_fov_lease():
         "steering_prediction_horizon_remaining_s": 0.60,
         "command": {
             "target_roll_rad": -0.35,
-            "target_pitch_rad": 0.12,
+            "target_pitch_rad": -0.35,
             "yaw_rate_rad_s": -0.15,
             "thrust": 0.275,
         },
@@ -6062,7 +6062,7 @@ def test_same_gate_wire_anchor_needs_no_independent_fov_lease():
 
     assert authority.command.anchor_camera_token == last_visible_token
     assert authority.command.target_roll_rad == pytest.approx(-0.35)
-    assert authority.command.target_pitch_rad == pytest.approx(0.12)
+    assert authority.command.target_pitch_rad == pytest.approx(-0.35)
     assert authority.command.yaw_rate_rad_s == pytest.approx(-0.15)
     assert authority.command.requested_thrust == pytest.approx(0.275)
     assert authority.remaining_horizon_s == pytest.approx(0.60)

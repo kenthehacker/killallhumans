@@ -2493,6 +2493,72 @@ def test_fresh_clipped_misses_keep_accepted_same_gate_steering() -> None:
         )
 
 
+def test_visibility_gap_retains_accepted_top_pitch_correction() -> None:
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+
+    update = tracker.update(
+        _frame(
+            6,
+            include_successor=False,
+            current_center_x=0.10,
+            current_clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+            current_center_censored=True,
+            current_inner_aperture=None,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+    output = proposal.servo_output
+    accepted_pitch = -0.35
+    session.record_wire_acceptance(
+        target_roll_rad=output.target_roll_rad,
+        target_pitch_rad=accepted_pitch,
+        yaw_rate_rad_s=output.yaw_rate_rad_s,
+        thrust=output.thrust,
+        wire_command=AttitudeRateCommand(
+            0.0,
+            0.0,
+            output.yaw_rate_rad_s,
+            output.thrust,
+        ),
+        wire_start_monotonic_ns=update.observation_monotonic_ns + 8_000_000,
+    )
+
+    update = tracker.update(
+        replace(_frame(7, include_successor=False), detections=())
+    )
+    snapshot = graph.observe(tracker)
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="withheld authoritative current-gate identity",
+    ):
+        _observe(planner, snapshot, tracker)
+
+    authority = session.propagated_current_visibility_gap_authority(
+        track=tracker.track(current_id),
+        camera_token=update.token,
+        now_monotonic_ns=update.observation_monotonic_ns + 5_000_000,
+    )
+
+    assert authority["command"]["target_pitch_rad"] == pytest.approx(
+        accepted_pitch
+    )
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+
+
 def test_missing_wire_anchor_is_a_normal_fresh_search_transition():
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
