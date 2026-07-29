@@ -854,6 +854,75 @@ def test_authoritative_current_fuses_live_interior_diagonal_fragments() -> None:
     assert fused.associations[0].bbox_iou > 0.88
 
 
+def test_authoritative_current_fuses_near_plane_open_aperture_fragments() -> None:
+    tracker = MultiTargetVisualTracker()
+    prior = VisualDetection(
+        source_index=0,
+        center_norm=(0.609375, -0.6277777777777778),
+        bbox_norm=(0.609375, 0.0, 1.0, 0.37222222222222223),
+        confidence=0.3839373314579045,
+        clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+        center_censored=True,
+    )
+    first = tracker.update(_frame(1, (prior,)))
+    current_id = first.visible_track_ids[0]
+    tracker.assign_role(current_id, VisualTrackRole.CURRENT)
+    tracker.confirm_authoritative_gate(
+        current_id,
+        gate_index=1,
+        race_status_sequence=1529,
+        race_status_boot_ms=6300,
+    )
+
+    split_frame = _frame(
+        2,
+        (
+            VisualDetection(
+                source_index=0,
+                center_norm=(0.8531249999999999, -0.7166666666666667),
+                bbox_norm=(
+                    0.8546875,
+                    0.0,
+                    1.0,
+                    0.2833333333333333,
+                ),
+                confidence=0.612283494808231,
+                clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+                center_censored=True,
+            ),
+            VisualDetection(
+                source_index=1,
+                center_norm=(0.27812499999999996, -0.4222222222222223),
+                bbox_norm=(
+                    0.6125,
+                    0.2,
+                    0.665625,
+                    0.37777777777777777,
+                ),
+                confidence=0.3468086112554202,
+            ),
+        ),
+    )
+    preview = tracker.preview_associations(split_frame)
+    assert preview[0].track_id == current_id
+
+    fused = tracker.update(split_frame)
+
+    current = fused.track(current_id)
+    assert current.visible
+    assert current.bbox_norm == pytest.approx(
+        (0.6125, 0.0, 1.0, 0.37777777777777777)
+    )
+    assert current.center_norm == pytest.approx(
+        (0.6125, -0.6222222222222222)
+    )
+    assert current.clipping == FrameEdge.TOP | FrameEdge.RIGHT
+    assert current.center_censored
+    assert current.history[-1].inner_aperture is None
+    assert fused.created_track_ids == ()
+    assert fused.associations[0].bbox_iou > 0.97
+
+
 def test_edge_transition_quarantines_only_censored_box_derivatives() -> None:
     tracker = MultiTargetVisualTracker()
     first = tracker.update(

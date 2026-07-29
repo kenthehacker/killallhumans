@@ -1469,10 +1469,12 @@ class MultiTargetVisualTracker:
                         lower_y + lower_height,
                     ),
                 )
-                if (
-                    horizontal_gap > 0.45 * union_width
-                    or vertical_gap > 0.20 * union_height
-                ):
+                # The two red frame contours can be horizontally separated
+                # by most of the open gate aperture.  Prior-union IoU, center,
+                # area, support, and association cost already prove local
+                # continuity; an arbitrary horizontal-gap fraction only
+                # discards the same gate as it grows near-plane.
+                if vertical_gap > 0.20 * union_height:
                     continue
 
                 intersection_width = max(
