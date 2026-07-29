@@ -50,6 +50,14 @@ Control-law constant sources:
   successor is accepted and vertically qualified (bounded by the timeout),
   added after flights 039186c8/F10 carried gate-0 attack closure into the
   post-credit phase and collapsed thrust effectiveness.
+- ``PRE_CROSS_BRAKE_PITCH_RAD`` / ``PRE_CROSS_BRAKE_TTC_S``: the brake must
+  START before the plane (codex F9-F11 analysis: post-credit braking alone
+  can never kill ~3 m/s inside the ~0.5 s post-credit visibility window),
+  so TRACK inside the near/expansion window commands a genuine nose-up
+  attitude at the fast brake slew while lateral pursuit and the vz
+  governor stay active.  The COAST latch also bypasses the runner's
+  attitude PD on the wire so coast sends are exact zeros (F11 sent nonzero
+  roll/pitch rates at zero thrust).
 - Thrust envelope ``[MIN_COURSE_THRUST, MAX_COURSE_THRUST]`` and yaw cap: the
   accepted v3 yaw profile and the visual-course thrust envelope from the
   July-18 safety contract (max raised 0.32 -> 0.34 under the 0.35 hard
@@ -271,6 +279,28 @@ POST_CREDIT_BRAKE_MIN_HOLD_S = 2.0
 # ~0.36 s of window start.  Applies ONLY while the brake window is active;
 # normal steering keeps the transparent 0.30 rad/s slew.
 POST_CREDIT_BRAKE_SLEW_RAD_S = 1.0
+# Pre-crossing expansion brake (independent codex analysis of the F9-F11
+# traces): post-credit braking alone can never be robust — even +0.12 rad
+# pitch-back yields only g*tan(0.12) ~= 1.18 m/s^2, so killing a ~3 m/s
+# attack closure needs ~2.5 s while the gate disappears ~0.5 s after
+# credit.  The brake therefore STARTS before the plane: while TRACKing the
+# current gate inside the near window (log_scale at/past
+# NEAR_BRAKE_LOG_SCALE), or with the filtered expansion rate saying
+# time-to-contact below ~1.2 s, the stage commands a genuine nose-up
+# attitude at the fast brake slew so the crossing happens at ~1-1.5 m/s
+# instead of 3+.  The expansion trigger is gated to the near field
+# (log_scale >= NEAR_FREE_LOG_SCALE) so far-field scale noise cannot stall
+# the approach.  Lateral pursuit and the vz governor stay fully active;
+# the altitude floor and the exact-zero COAST latch still preempt.  The
+# near threshold stays below CROSSING_MIN_LOG_SCALE so apparent size keeps
+# growing through the crossing-arm scale and the engulfing/COAST detection
+# fires unchanged under braking.  The continuous near/expansion derate
+# (advance -> brake_pitch_rad) remains as the far-field shaping; the
+# post-credit brake window is unchanged and becomes the cleanup for
+# residual closure.
+PRE_CROSS_BRAKE_PITCH_RAD = 0.12  # genuine nose-up pre-plane brake attitude
+PRE_CROSS_BRAKE_TTC_S = 1.2  # expansion-rate time-to-contact trigger
+PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew, shared with the brake window
 # Pre-gate-1 altitude floor (terrain insurance; flights F10/F11/F12 all
 # flew their final 6-10 s below 0.7 m with thrust pinned at the clamp into
 # terrain hits).  alt_est integrates the governor's IMU vz_est from course
@@ -539,6 +569,9 @@ class CleanCourseConfig:
     post_credit_climb_cap_m_s: float = POST_CREDIT_CLIMB_CAP_M_S
     post_credit_brake_min_hold_s: float = POST_CREDIT_BRAKE_MIN_HOLD_S
     post_credit_brake_slew_rad_s: float = POST_CREDIT_BRAKE_SLEW_RAD_S
+    pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
+    pre_cross_brake_ttc_s: float = PRE_CROSS_BRAKE_TTC_S
+    pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
     alt_floor_release_m: float = ALT_FLOOR_RELEASE_M
     alt_floor_climb_margin: float = ALT_FLOOR_CLIMB_MARGIN
@@ -640,6 +673,9 @@ class CleanCourseController:
         self._alt_est_m = 0.0
         self._alt_floor_active = False
         self._active_climb_cap_m_s = VZ_CLIMB_CAP_M_S
+        # Pre-crossing expansion brake latch for the tick trace; recomputed
+        # every main-path tick (see the PRE_CROSS_BRAKE_* constant block).
+        self._pre_cross_brake_active = False
 
     # -- initialization ----------------------------------------------------
 
@@ -901,6 +937,7 @@ class CleanCourseController:
         """Produce the single navigation request for one tick."""
 
         cfg = self.config
+        self._pre_cross_brake_active = False  # main path recomputes below
         if self._last_command_s is None:
             dt = cfg.control_period_s
         else:
@@ -1109,6 +1146,24 @@ class CleanCourseController:
             self._post_credit_deadline_s = None
             self._active_climb_cap_m_s = VZ_CLIMB_CAP_M_S
         post_credit_brake = self._post_credit_deadline_s is not None
+        # Pre-crossing expansion brake (codex F9-F11 analysis, see the
+        # PRE_CROSS_BRAKE_* constant block): the brake must START before the
+        # plane.  TRACK-only: PREDICT keeps the continuous derate, and the
+        # post-credit window owns the post-plane phase.  The expansion
+        # (time-to-contact) trigger is gated to the near field so far-range
+        # scale noise cannot stall the approach.
+        pre_cross_brake = (
+            self.state is CleanCourseState.TRACK
+            and not post_credit_brake
+            and (
+                current.log_scale >= cfg.near_brake_log_scale
+                or (
+                    current.log_scale >= cfg.near_free_log_scale
+                    and current.expansion_rate * cfg.pre_cross_brake_ttc_s > 1.0
+                )
+            )
+        )
+        self._pre_cross_brake_active = pre_cross_brake
         if vertical_qualified:
             bounded_error = _clamp(
                 ey - vertical_setpoint_offset,
@@ -1204,8 +1259,17 @@ class CleanCourseController:
             # pitch-back (positive; ADVANCE_PITCH_RAD = -0.18 is nose-down)
             # to kill the gate-0 attack closure before it collapses thrust
             # effectiveness and outruns the yaw cap.  Lateral yaw/roll
-            # pursuit above and the vz governor stay fully active.
+            # pursuit above and the vz governor stay fully active.  Now only
+            # the cleanup for residual closure: the pre-crossing brake below
+            # owns the approach.
             target_pitch = cfg.post_credit_brake_pitch_rad
+        elif pre_cross_brake:
+            # Pre-crossing expansion brake (codex F9-F11 analysis): a
+            # genuine nose-up attitude in the last ~1-1.5 s before the plane
+            # so the drone crosses at ~1-1.5 m/s instead of 3+.  Lateral
+            # yaw/roll pursuit above and the vz governor stay fully active;
+            # the altitude floor and the COAST latch still preempt.
+            target_pitch = cfg.pre_cross_brake_pitch_rad
         else:
             target_pitch = (
                 cfg.brake_pitch_rad
@@ -1214,7 +1278,7 @@ class CleanCourseController:
 
         return NavigationOutput(
             target_roll_rad=self._slew_roll(target_roll, dt),
-            # The brake window gets the dedicated fast slew (F12: the
+            # Both brake regimes get the dedicated fast slew (F12: the
             # generic 0.30 rad/s slew never attained the brake attitude
             # inside the hold); normal steering keeps the transparent slew.
             target_pitch_rad=self._slew_pitch(
@@ -1223,7 +1287,11 @@ class CleanCourseController:
                 slew_rad_s=(
                     cfg.post_credit_brake_slew_rad_s
                     if post_credit_brake
-                    else None
+                    else (
+                        cfg.pre_cross_brake_slew_rad_s
+                        if pre_cross_brake
+                        else None
+                    )
                 ),
             ),
             yaw_rate_rad_s=yaw_rate,
@@ -1829,6 +1897,7 @@ def _clean_course_tick_trace(
             None if current is None else now_s - current.last_measurement_s
         ),
         "post_credit_brake": controller._post_credit_deadline_s is not None,
+        "pre_cross_brake": controller._pre_cross_brake_active,
         "alt_est_m": controller._alt_est_m,
         "alt_floor_active": controller._alt_floor_active,
     }
@@ -1966,19 +2035,33 @@ async def run_clean_course_stage(
                 pitch_rad=pitch_rad,
                 world_up_accel_m_s2=world_up_accel,
             )
-            # One attitude PD for roll/pitch; yaw stays an explicit channel.
-            pd_command = rt.attitude_rate_command(
-                estimate,
-                target_roll_rad=nav.target_roll_rad,
-                target_pitch_rad=nav.target_pitch_rad,
-                thrust=nav.thrust,
-            )
-            command = rt.attitude_rate_command_type(
-                float(pd_command.roll_rate),
-                float(pd_command.pitch_rate),
-                float(nav.yaw_rate_rad_s),
-                float(pd_command.thrust),
-            )
+            if (
+                nav.state is CleanCourseState.COAST_FOR_CREDIT
+                and nav.thrust == 0.0
+            ):
+                # July-18 safety contract: the coast latch is exact zeros on
+                # the WIRE.  The attitude PD would trade the zero target
+                # attitude against the current attitude and emit NONZERO
+                # roll/pitch rates at zero thrust (flight F11: t=2.156 rates
+                # (-0.0663,+0.0388,0), t=2.203 (-0.0455,+0.0318,0)), so the
+                # genuine coast latch bypasses the PD entirely.  Only this
+                # latch qualifies; every other command keeps the PD path.
+                command = rt.attitude_rate_command_type(0.0, 0.0, 0.0, 0.0)
+            else:
+                # One attitude PD for roll/pitch; yaw stays an explicit
+                # channel.
+                pd_command = rt.attitude_rate_command(
+                    estimate,
+                    target_roll_rad=nav.target_roll_rad,
+                    target_pitch_rad=nav.target_pitch_rad,
+                    thrust=nav.thrust,
+                )
+                command = rt.attitude_rate_command_type(
+                    float(pd_command.roll_rate),
+                    float(pd_command.pitch_rate),
+                    float(nav.yaw_rate_rad_s),
+                    float(pd_command.thrust),
+                )
             command = clamp_final_command(command, runtime=rt)
             rt.validate_command(command)
             result = await host._send_flight_command(

@@ -17,10 +17,14 @@ regardless of anchor state, a genuine nose-up post-credit brake armed by
 every authoritative promotion until the successor is accepted and
 vertically qualified (bounded by a 2.75 s timeout and a 2.0 s minimum
 hold, slewed in at a dedicated 1.0 rad/s) with a qualification-
-gated 0.5 m/s climb cap in the same window, a pre-gate-1 altitude floor
+gated 0.5 m/s climb cap in the same window, a genuine nose-up pre-crossing
+expansion brake (near window or sub-1.2 s expansion TTC, near-field gated,
+fast slew, lateral pursuit and vz governor alive, crossing detection
+unsuppressed), a pre-gate-1 altitude floor
 (vz_est-integrated alt_est, 0.7 -> 1.2 m hysteresis) overriding everything
 but the exact-zero coast latch with a level attitude, zero yaw, and a
-governed climb collective, a raised 0.34 thrust envelope
+governed climb collective, an exact-zero coast WIRE that bypasses the
+attitude PD so no rates leak at zero thrust, a raised 0.34 thrust envelope
 under the runner's 0.35 hard abort,
 verified yaw/roll directions, clipping uncertainty (not abort),
 PREDICT->SEARCH on fresh empty frames, frozen-frame stalls that predict and
@@ -1022,6 +1026,86 @@ def test_altitude_floor_never_overrides_coast_exact_zero():
     assert _command(controller, 100.14).thrust == 0.0
 
 
+def test_pre_cross_brake_engages_near_with_fast_slew_and_lateral_alive():
+    # Codex F9-F11 analysis: even +0.12 rad pitch-back gives only
+    # g*tan(0.12) ~= 1.18 m/s^2, so killing ~3 m/s needs ~2.5 s while the
+    # gate disappears ~0.5 s after credit — the brake must START before
+    # the plane.  Inside the near window the stage commands a genuine
+    # nose-up attitude at the fast 1.0 rad/s slew while lateral pursuit
+    # and the vz governor stay active.
+    controller = _tracked_controller(_track("A", 0.20, 0.0, scale=0.10))
+    controller.current.scale_axis.p = math.log(0.42)  # inside the near window
+    now = 100.10
+    out = None
+    for _ in range(15):  # ~0.5 s: the fast slew attains the attitude
+        now += 0.033
+        out = _command(controller, now)
+    assert controller._pre_cross_brake_active
+    assert out.state is CleanCourseState.TRACK
+    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    assert now - 100.10 <= 0.5  # fast slew, not the generic 0.30 rad/s
+    assert out.yaw_rate_rad_s > 0.0  # x=+0.20 pursuit stays alive
+    assert out.thrust > 0.0  # the vz governor keeps the collective alive
+
+
+def test_pre_cross_brake_does_not_engage_at_long_range():
+    # The brake must never stall the approach at long range: below the near
+    # field even a spurious fast expansion rate (TTC 0.5 s) leaves the
+    # normal advance law alone.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller.current.scale_axis.v = 2.0
+    out = _command(controller, 100.10)
+    assert not controller._pre_cross_brake_active
+    assert out.target_pitch_rad < 0.0  # advance law still closes
+
+
+def test_pre_cross_brake_expansion_ttc_trigger_in_near_field():
+    # Below the near-scale trigger but inside the near field, a filtered
+    # expansion rate saying time-to-contact < 1.2 s engages the brake.
+    controller = _tracked_controller(_track("A", 0.10, 0.0, scale=0.25))
+    # log(0.25) = -1.39 < NEAR_BRAKE_LOG_SCALE; expansion TTC = 1.0 s.
+    controller.current.scale_axis.v = 1.0
+    out = None
+    now = 100.10
+    for _ in range(15):
+        now += 0.033
+        out = _command(controller, now)
+    assert controller._pre_cross_brake_active
+    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    assert out.yaw_rate_rad_s > 0.0  # lateral pursuit alive under braking
+
+
+def test_pre_cross_brake_does_not_suppress_crossing_detection():
+    # Replay the shape of a normal crossing under braking: the apparent
+    # size keeps growing through crossing_min_log_scale while the brake is
+    # active, and the fresh close loss still latches the exact-zero COAST
+    # wait (the brake's deceleration must not suppress crossing detection).
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.30))
+    controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    now = 100.10
+    brake_seen = False
+    for frame, scale in enumerate((0.32, 0.36, 0.40, 0.44, 0.48, 0.52)):
+        now += 0.033
+        controller.observe(
+            _update([_track("A", 0.0, 0.0, scale=scale)], frame_id=10 + frame),
+            now_s=now,
+        )
+        _command(controller, now)
+        brake_seen = brake_seen or controller._pre_cross_brake_active
+    assert brake_seen  # the brake engaged during the final approach
+    assert controller.current.outer_log_scale >= -0.80  # crossing armed
+    now += 0.033
+    controller.observe(_update([], frame_id=20), now_s=now)  # fresh close loss
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    output = _command(controller, now + 0.02)
+    assert (
+        output.target_roll_rad,
+        output.target_pitch_rad,
+        output.yaw_rate_rad_s,
+        output.thrust,
+    ) == (0.0, 0.0, 0.0, 0.0)
+
+
 def test_clipping_increases_uncertainty_but_does_not_abort():
     clipped = _tracked_controller(
         _track("A", 0.10, 0.0, clipping=FrameEdge.RIGHT)
@@ -1509,5 +1593,54 @@ def test_loop_coast_sends_exact_zero_then_accepts_credit():
     ]
     assert zero_sends  # exact-zero latch happened
     assert summary["exact_zero_command_count"] == len(zero_sends)
+    assert summary["final_gate_index"] == 1
+
+
+def test_loop_coast_wire_is_exact_zero_despite_nonzero_attitude():
+    # F11 safety-contract violation (codex-verified from the trace): in
+    # COAST_FOR_CREDIT the stage's exact-zero targets passed through the
+    # runner's attitude PD, which traded the zero target attitude against
+    # the current attitude and emitted NONZERO roll/pitch rates at zero
+    # thrust (t=2.156: (-0.0663,+0.0388,0); t=2.203: (-0.0455,+0.0318,0)).
+    # The genuine coast latch must bypass the PD entirely: exact zeros on
+    # the wire.  This host holds a nonzero attitude so the fake PD WOULD
+    # emit nonzero rates without the bypass.
+    host = _Host(_update([_track("A", 0.0, 0.0, scale=0.50)]))
+    host.estimate = SimpleNamespace(
+        orientation=SimpleNamespace(to_euler=lambda: (0.10, -0.08, 0.0)),
+        body_rates=(0.0, 0.0, 0.0),
+    )
+    probe = _fake_pd(
+        host.estimate, target_roll_rad=0.0, target_pitch_rad=0.0, thrust=0.0
+    )
+    assert (probe.roll_rate, probe.pitch_rate) != (0.0, 0.0)  # PD would leak
+
+    def script(host):
+        if host.ticks == 3:
+            host.update = _update([], frame_id=99)  # close crossing loses target
+        if host.ticks == 6:
+            # Authoritative credit during the bounded wait.
+            host.race.active_gate_index = 1
+            host.race.sim_boot_time_ms = 1250
+        if host.ticks == 10:
+            host.race.race_finished = True
+
+    host.script = script
+    context = SimpleNamespace(
+        initial_gate_x=322, initial_gate_y=174, initial_gate_area=6400
+    )
+    summary = asyncio.run(
+        run_clean_course_stage(host, context, runtime=_test_runtime())
+    )
+    zero_thrust = [command for command, _index in host.sent if command.thrust == 0.0]
+    assert zero_thrust  # the bounded coast wait emitted wire commands
+    for command in zero_thrust:
+        assert (
+            command.roll_rate,
+            command.pitch_rate,
+            command.yaw_rate,
+        ) == (0.0, 0.0, 0.0)
+    # The exact-zero metric still counts the coast sends (all of them now).
+    assert summary["exact_zero_command_count"] == len(zero_thrust)
     assert summary["final_gate_index"] == 1
     assert summary["success"] is True
