@@ -1144,6 +1144,19 @@ def test_closure_governor_does_not_brake_below_target_rate():
     assert out.target_pitch_rad < 0.0  # advance law still closes
 
 
+def test_closure_governor_distrusts_tiny_track_expansion():
+    # F33 (64050a81): post-credit, gate 1 (span 0.03-0.04, log_scale ~-2.9)
+    # "grew" at 0.9/s — sub-pixel noise on a far tiny track — and pinned a
+    # +0.12 brake with aw_fwd -5 m/s^2 for the whole leg, reversing the
+    # drone into gate 0's structure.  Below CLOSURE_MIN_LOG_SCALE the
+    # governor stays out no matter how large the reported expansion is.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.05))
+    controller.current.scale_axis.v = 0.9  # noise-level expansion
+    out = _command(controller, 100.10)
+    assert not controller._pre_cross_brake_active
+    assert out.target_pitch_rad < 0.0  # advance law still closes
+
+
 def test_closure_governor_is_a_continuous_blend():
     # Mid-band rate (0.475/s -> closure 0.5): the pitch target blends
     # halfway from the advance law (<= -0.02) toward the +0.15 brake

@@ -287,6 +287,14 @@ PREDICT_STALL_FORCE_SEARCH_S = 1.50
 # were themselves VRS generators).
 CLOSURE_TARGET_RATE_S = 0.35  # log-scale rate the governor holds (TTC ~3 s)
 CLOSURE_FULL_BRAKE_RATE_S = 0.60  # rate at which the full brake pitch applies
+# Governor trust gate (F33): expansion from a tiny far track is sub-pixel
+# noise — post-credit, gate 1 (span 0.03-0.04, log_scale ~-2.9) "grew" at
+# 0.9/s and pinned a +0.12 brake with aw_fwd -5 m/s^2 for the whole leg,
+# reversing the drone into gate 0's structure.  Below this log_scale the
+# expansion rate is untrustworthy and the governor stays out of the loop
+# (far-field real closure at our speeds never exceeds the target anyway:
+# 4 m/s at 10 m is 0.4/s with scale already >= ~0.08).
+CLOSURE_MIN_LOG_SCALE = -2.6
 PRE_CROSS_BRAKE_PITCH_RAD = 0.15  # brake attitude (F31: +0.08 gave only
 # ~0.84 m/s^2 rearward, ~5x too weak against the gravity-powered glide;
 # fh grew 4.1 -> 6.0 through 1.7 s of fully-attained brake)
@@ -620,6 +628,7 @@ class CleanCourseConfig:
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
     closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
     closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
+    closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     search_fh_brake_mps2: float = SEARCH_FH_BRAKE_MPS2
@@ -1300,8 +1309,15 @@ class CleanCourseController:
         # target below blends from the advance law toward the gentle brake
         # attitude as the expansion rate rises past the target.  Applies in
         # TRACK and PREDICT alike (the SEARCH path returned above).
+        # F33 trust gate: expansion from tiny far tracks is sub-pixel noise,
+        # so the governor only runs above CLOSURE_MIN_LOG_SCALE.
+        closure_rate = (
+            current.expansion_rate
+            if current.log_scale >= cfg.closure_min_log_scale
+            else 0.0
+        )
         closure_brake = _clamp01(
-            (current.expansion_rate - cfg.closure_target_rate_s)
+            (closure_rate - cfg.closure_target_rate_s)
             / (cfg.closure_full_brake_rate_s - cfg.closure_target_rate_s)
         )
         pre_cross_brake = closure_brake > 0.5
