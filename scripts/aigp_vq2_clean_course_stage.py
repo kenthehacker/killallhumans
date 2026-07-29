@@ -244,12 +244,17 @@ MAX_TARGET_ROLL_RAD = 0.25  # coordinated-turn lateral translation cap
 # the measured-authority envelope the runner now checks against.
 MAX_COURSE_YAW_RATE_RAD_S = 0.25  # runner wire clamp is 0.25
 
-# Softened -0.18 -> -0.12 (flight 4ba3922b): the whole gate-0 transit is
-# ~2 s, so the advance attitude builds most of the closure the pre-cross
-# brake must then kill, and it arrives too late to kill it all (crossing
-# span grew 0.72 -> 0.89 in 0.14 s).  A gentler advance trades ~1 s of
-# approach time for a crossing speed the brake can actually manage.
-ADVANCE_PITCH_RAD = -0.12  # nose-down closure target when aligned/confident
+# Softened -0.18 -> -0.12 (flight 4ba3922b), then -0.12 -> -0.08 (F29,
+# d8169633): fh is a SIGNLESS magnitude (hypot of world horizontal specific
+# force), so hard braking reads exactly like the fast glide — the F29 brake
+# stack (pre-cross +0.12 for 0.9 s then pcb +0.15 for 1.3 s) drove fh to
+# 4-5, tripped the untrusted latch on the braking itself, and put the drone
+# in the inflow/VRS regime where even the 0.34 clamp lost ~2 m/s^2 of lift
+# (az -7.9 at full collective) — terrain at the gate while braking at full
+# throttle.  The operating point must keep |fh| < 3 everywhere so the
+# estimators stay LIVE: gentle advance builds less speed, gentle brakes
+# kill it without VRS.
+ADVANCE_PITCH_RAD = -0.08  # nose-down closure target when aligned/confident
 BRAKE_PITCH_RAD = -0.02  # near-level braking target
 ANGULAR_FULL_BRAKE_NORM = 0.60  # angular error that fully suppresses advance
 EXPANSION_BRAKE_FREE_S = 1.5  # expansion rate below which no braking applies
@@ -294,18 +299,21 @@ PREDICT_STALL_FORCE_SEARCH_S = 1.50
 # trips the runner's MAX_PITCH_RAD 10.0 deg abort.  0.15 (8.6 deg) keeps
 # ~1.4 deg of overshoot margin while g*tan(0.15) ~= 1.57 m/s^2 keeps ~87%
 # of the deceleration.
-POST_CREDIT_BRAKE_PITCH_RAD = 0.15  # nose-up brake attitude (see block above)
+# 0.15 -> 0.10 (F29, d8169633): hard braking IS the fast regime for the
+# signless fh magnitude — +0.15 at the 0.34 clamp drove fh 4-5, latched the
+# untrusted freeze on the braking itself, and the VRS lift loss sank the
+# drone at full throttle.  0.10 (5.7 deg, g*tan ~= 0.79 m/s^2) keeps the
+# settle decel inside the |fh| < 3 trusted envelope.
+POST_CREDIT_BRAKE_PITCH_RAD = 0.10  # nose-up brake attitude (see block above)
 # 2.75 -> 1.5 s (flights 99e093fa/25361816): with the pre-cross brake now
 # owning closure killing before the plane, the post-credit brake is a
 # settling pause, not the closure mechanism.  A long no-successor hold
 # hovers blind in the fh-untrusted regime (real sub-hover sink) while far
 # gate-1 candidates can never grow their span without advance — F18/F19
 # both died in that window before the 2.75 s timeout could release.
-POST_CREDIT_BRAKE_TIMEOUT_S = 1.5  # bounded brake even with no reacquisition
-# F22 (97450705): while fh is untrusted neither release may fire — the brake
-# is the only tool that buys the slow regime back, and the fh-untrusted
-# collective floor keeps the extended window safe.  The hard bound caps that
-# persistence so a stuck-fast regime cannot brake forever.
+# 1.5 -> 1.0 s (F29): every extra second of brake attitude is another second
+# of VRS sink at low altitude; the gentle 0.10 attitude needs less hold.
+POST_CREDIT_BRAKE_TIMEOUT_S = 1.0  # bounded brake even with no reacquisition
 POST_CREDIT_BRAKE_HARD_S = 4.0  # absolute cap on the post-credit brake window
 POST_CREDIT_CLIMB_CAP_M_S = 0.5  # climb cap while post-credit unqualified
 # Minimum brake hold (flight 20260729T125400Z-visual-course-4480d0a6): gate 1
@@ -318,7 +326,10 @@ POST_CREDIT_CLIMB_CAP_M_S = 0.5  # climb cap while post-credit unqualified
 # the dedicated 1.0 rad/s brake slew lands the worst-case attitude swing in
 # ~0.36 s, so 1.0 s is still ~3x the slew need, and the pre-cross brake has
 # already killed the attack closure that motivated the 2.0 s hold.
-POST_CREDIT_BRAKE_MIN_HOLD_S = 1.0
+# 1.0 -> 0.6 s (F29): same VRS reasoning as the timeout — with the fh
+# governor capping crossing speed pre-credit, a long post-credit settle is
+# redundant.
+POST_CREDIT_BRAKE_MIN_HOLD_S = 0.6
 # Dedicated brake slew (same flight): the generic 0.30 rad/s target slew
 # moved pitch only from -0.085 to ~=0 inside the 1.0 s F12 hold, so the
 # brake attitude was never attained and closure was never killed.  At
@@ -348,7 +359,7 @@ POST_CREDIT_BRAKE_SLEW_RAD_S = 1.0
 # (advance -> brake_pitch_rad) remains as the far-field shaping; the
 # post-credit brake window is unchanged and becomes the cleanup for
 # residual closure.
-PRE_CROSS_BRAKE_PITCH_RAD = 0.12  # genuine nose-up pre-plane brake attitude
+PRE_CROSS_BRAKE_PITCH_RAD = 0.08  # gentle pre-plane brake (F29 VRS block above)
 PRE_CROSS_BRAKE_TTC_S = 2.5  # expansion-rate time-to-contact trigger (F13)
 PRE_CROSS_BRAKE_NEAR_LOG_SCALE = -1.8  # near-field gate for the TTC trigger
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew, shared with the brake window

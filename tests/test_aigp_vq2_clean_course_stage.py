@@ -787,7 +787,7 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
     brake = _command(controller, now)
     assert not brake.vertical_qualified
     assert brake.yaw_rate_rad_s > 0.0  # x=+0.30 pursuit still steers
-    # Dedicated 1.0 rad/s brake slew: the +0.15 attitude is attained well
+    # Dedicated 1.0 rad/s brake slew: the +0.10 attitude is attained well
     # inside 0.5 s of window start (F12: the generic 0.30 rad/s slew moved
     # pitch only -0.085 -> ~=0 inside the 1.0 s hold, never braking).
     for _ in range(8):
@@ -795,12 +795,12 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
         brake = _command(controller, now)
     assert now - 100.10 <= 0.5
     assert not brake.vertical_qualified
-    assert brake.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
-    # Fresh y measurements re-qualify, but the 1.0 s minimum hold keeps the
+    assert brake.target_pitch_rad == pytest.approx(0.10, abs=1e-9)
+    # Fresh y measurements re-qualify, but the 0.6 s minimum hold keeps the
     # brake armed; the release fires only after the hold.
     frame = 10
     held = brake
-    while now < 100.10 + 0.9:
+    while now < 100.10 + 0.5:
         now += 0.033
         controller.observe(
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
@@ -809,9 +809,9 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
         held = _command(controller, now)
         frame += 1
     assert held.vertical_qualified
-    assert held.target_pitch_rad == pytest.approx(0.15, abs=1e-9)  # still held
+    assert held.target_pitch_rad == pytest.approx(0.10, abs=1e-9)  # still held
     released = held
-    while now < 100.10 + 1.2:
+    while now < 100.10 + 0.8:
         now += 0.033
         controller.observe(
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
@@ -847,7 +847,7 @@ def test_post_credit_brake_holds_despite_qualification_within_min_hold():
     controller._alt_est_m = 2.0  # honest post-credit altitude (floor quiet)
     # Track stays vertically qualified with fresh y measurements throughout.
     now = 100.10
-    for frame in range(27):  # ~0.9 s < the 1.0 s minimum hold
+    for frame in range(15):  # ~0.5 s < the 0.6 s minimum hold
         now += 0.033
         controller.observe(
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=10 + frame),
@@ -857,7 +857,7 @@ def test_post_credit_brake_holds_despite_qualification_within_min_hold():
         assert out.vertical_qualified
         assert controller._post_credit_deadline_s is not None
     # Past the hold, continued qualification releases the brake.
-    for frame in range(27, 45):
+    for frame in range(15, 40):
         now += 0.033
         controller.observe(
             _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=10 + frame),
@@ -870,7 +870,7 @@ def test_post_credit_brake_holds_despite_qualification_within_min_hold():
 def test_post_credit_brake_releases_on_timeout():
     # A lost gate cannot brake forever: with no credible successor the
     # promotion enters SEARCH, slews to the brake attitude, and resumes the
-    # normal near-level SEARCH attitude after the 1.5 s timeout.
+    # normal near-level SEARCH attitude after the 1.0 s timeout.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     promoted = controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
     assert promoted
@@ -881,7 +881,7 @@ def test_post_credit_brake_releases_on_timeout():
     for _ in range(20):  # slew (1.0 rad/s) reaches the brake attitude
         now += 0.033
         output = _command(controller, now)
-    assert output.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
+    assert output.target_pitch_rad == pytest.approx(0.10, abs=1e-9)
     # Past the deadline the window ends even with nothing reacquired.
     now = 100.10 + 2.80
     for _ in range(25):  # generic 0.30 rad/s slew returns to near level
@@ -1291,7 +1291,7 @@ def test_pre_cross_brake_engages_near_with_fast_slew_and_lateral_alive():
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
-    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(0.08, abs=1e-9)
     assert now - 100.10 <= 0.5  # fast slew, not the generic 0.30 rad/s
     assert out.yaw_rate_rad_s > 0.0  # x=+0.20 pursuit stays alive
     assert out.thrust > 0.0  # the vz governor keeps the collective alive
@@ -1324,7 +1324,7 @@ def test_pre_cross_brake_expansion_ttc_trigger_in_near_field():
         now += 0.033
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(0.08, abs=1e-9)
     assert out.yaw_rate_rad_s > 0.0  # lateral pursuit alive under braking
 
 
@@ -1345,7 +1345,7 @@ def test_fh_closure_governor_brakes_on_speed_alone_with_hysteresis():
         now += 0.033
         out = _command(controller, now, fh=3.0)
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(0.08, abs=1e-9)
     now += 0.033
     out = _command(controller, now, fh=2.2)  # hysteresis: still braking
     assert controller._pre_cross_brake_active
@@ -1353,7 +1353,7 @@ def test_fh_closure_governor_brakes_on_speed_alone_with_hysteresis():
         now += 0.033
         out = _command(controller, now, fh=1.0)
     assert not controller._pre_cross_brake_active
-    assert out.target_pitch_rad < 0.12 - 1e-9
+    assert out.target_pitch_rad < 0.08 - 1e-9
     # PREDICT (camera blind, fh live): the governor still brakes.
     now += 0.033
     controller.observe(
@@ -1369,7 +1369,7 @@ def test_fh_closure_governor_brakes_on_speed_alone_with_hysteresis():
         out = _command(controller, now, fh=3.0)
     assert controller.state is CleanCourseState.PREDICT
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(0.08, abs=1e-9)
 
 
 def test_pre_cross_brake_does_not_suppress_crossing_detection():
@@ -1652,7 +1652,7 @@ def test_finite_bounded_output_across_states():
         assert abs(output.yaw_rate_rad_s) <= 0.25 + 1e-9
         assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
         assert abs(output.target_roll_rad) <= 0.25 + 1e-9
-        assert -0.35 <= output.target_pitch_rad <= 0.15 + 1e-9
+        assert -0.35 <= output.target_pitch_rad <= 0.10 + 1e-9
         if output.thrust == 0.0:
             assert output.state is CleanCourseState.COAST_FOR_CREDIT
 
