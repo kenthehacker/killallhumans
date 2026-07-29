@@ -295,6 +295,14 @@ CLOSURE_FULL_BRAKE_RATE_S = 0.60  # rate at which the full brake pitch applies
 # (far-field real closure at our speeds never exceeds the target anyway:
 # 4 m/s at 10 m is 0.4/s with scale already >= ~0.08).
 CLOSURE_MIN_LOG_SCALE = -2.6
+# Brake ceiling band (F33/F34): while the governor brakes, the collective
+# is confined to support +/- this band.  F33's hard pin AT support removed
+# all vertical centering authority and F34 crossed at 1.07 m into the
+# bottom bar (impulse 3.74) — approach geometry raises the gate's
+# elevation the whole way in, so the qualified PD must retain a small
+# climb budget; F32's climb-into-frame came from the fh floor and the
+# high-gate bias, which this band still caps.
+BRAKE_CEILING_BAND = 0.04
 PRE_CROSS_BRAKE_PITCH_RAD = 0.15  # brake attitude (F31: +0.08 gave only
 # ~0.84 m/s^2 rearward, ~5x too weak against the gravity-powered glide;
 # fh grew 4.1 -> 6.0 through 1.7 s of fully-attained brake)
@@ -631,6 +639,7 @@ class CleanCourseConfig:
     closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
+    brake_ceiling_band: float = BRAKE_CEILING_BAND
     search_fh_brake_mps2: float = SEARCH_FH_BRAKE_MPS2
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
@@ -1707,20 +1716,20 @@ class CleanCourseController:
             governed = _clamp(
                 collective, self.config.min_thrust, self.config.max_thrust
             )
-        # F33 brake ceiling: while the closure governor brakes, the drone
-        # must not climb.  F32 stopped horizontally short of gate 0 (the
-        # +0.15 brake works — integrated IMU shows +1.4 -> -2.1 m/s), but
-        # the vertical aim (qualified PD chasing a slightly-high ey, the
-        # high-gate bias, and the fh-untrusted floor) kept the collective
-        # oscillating 0.275 -> 0.34 and carried the drone UP at +1.0 m/s
-        # into the gate's lower structure.  Braking drag is NOT the
-        # gliding deficit regime: F32 held vz +1.0 at bare support, so the
-        # fh floor must not lift the ceiling here either.
+        # F33/F34 brake ceiling band: while the closure governor brakes,
+        # the collective is confined to support +/- brake_ceiling_band.
+        # F32 stopped horizontally short of gate 0 while the vertical
+        # channel (qualified PD, high-gate bias, fh-untrusted floor)
+        # carried it UP at +1.0 m/s into the gate's lower structure; but
+        # F34's hard pin AT support removed all centering authority and
+        # the drone crossed at 1.07 m into the bottom bar — approach
+        # geometry raises the gate's elevation the whole way in, so the
+        # qualified PD keeps a small climb budget inside the band.
         if self._pre_cross_brake_active:
             governed = _clamp(
-                min(governed, support),
-                self.config.min_thrust,
-                self.config.max_thrust,
+                governed,
+                max(self.config.min_thrust, support - self.config.brake_ceiling_band),
+                min(self.config.max_thrust, support + self.config.brake_ceiling_band),
             )
         return governed
 

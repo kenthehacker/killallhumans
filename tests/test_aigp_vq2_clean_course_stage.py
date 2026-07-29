@@ -1258,28 +1258,35 @@ def test_crossing_loss_latches_coast_even_while_fh_untrusted():
     assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
 
 
-def test_brake_ceiling_forbids_climb_while_braking():
+def test_brake_ceiling_band_bounds_collective_while_braking():
     # F32: the +0.15 brake stopped the drone horizontally short of gate 0
     # while the vertical channel (PD climb, high-gate bias, fh-untrusted
-    # floor) kept carrying it UP at +1.0 m/s into the gate's lower
-    # structure.  While the closure governor brakes, the collective is
-    # capped at support — no climb, from any source.
+    # floor) carried it UP at +1.0 m/s into the gate's lower structure.
+    # F34: the hard pin AT support removed all centering authority and the
+    # drone crossed at 1.07 m into the bottom bar.  While braking, the
+    # collective is confined to support +/- 0.04: the qualified PD keeps a
+    # small climb budget, but the fh floor and high-gate bias cannot push
+    # past the band top.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller._pre_cross_brake_active = True
-    # fh-untrusted floor alone would command support + 0.05:
+    controller._fh_untrusted = False
+    controller._vz_est_m_s = 0.0
+    # A small qualified-PD correction inside the band passes through
+    # (trusted, vz neutral): the vertical centering budget survives.
+    assert controller._governed_collective(SUPPORT + 0.03, SUPPORT) == pytest.approx(
+        SUPPORT + 0.03, abs=1e-9
+    )
+    # Deep sub-support demands are lifted to the band bottom:
+    assert controller._governed_collective(0.20, SUPPORT) == pytest.approx(
+        SUPPORT - 0.04, abs=1e-9
+    )
     controller._fh_untrusted = True
+    # fh floor (support + 0.05) is capped at the band top:
     assert controller._governed_collective(0.30, SUPPORT) == pytest.approx(
-        SUPPORT, abs=1e-9
+        SUPPORT + 0.04, abs=1e-9
     )
-    # A qualified-PD climb demand is capped too:
     assert controller._governed_collective(0.34, SUPPORT) == pytest.approx(
-        SUPPORT, abs=1e-9
-    )
-    # Sub-support demands are pinned to support as well: while braking the
-    # collective is exactly the hover support (the fh floor may not lift it,
-    # the ceiling may not sink it).
-    assert controller._governed_collective(0.24, SUPPORT) == pytest.approx(
-        SUPPORT, abs=1e-9
+        SUPPORT + 0.04, abs=1e-9
     )
     # Released: the fh-untrusted floor applies again.
     controller._pre_cross_brake_active = False
