@@ -33,11 +33,11 @@ Control-law constant sources:
   analysis (Q5) falsified the retired controller's lateral direction
   post-credit; see the comments at their definitions.  Magnitudes are the
   proved gate-1-recenter roll gain and the visual-align yaw gain.
-- ``GATE0_CLIMB_VERTICAL_OFFSET_NORM``: the 2026-07-29 analysis (Q1/Q4)
-  pre-crossing climb recommendation, closure-scaled between
-  ``GATE0_CLIMB_REFERENCE_LOG_SCALE`` and ``CROSSING_MIN_LOG_SCALE`` after
-  flight 20260729T085719Z-visual-course-4455fd61 climbed into the gate-0 top
-  bar under the fixed offset.
+- ``GATE0_CLIMB_VERTICAL_OFFSET_NORM``: DISABLED (0.0) after three gate-0
+  top-bar strikes showed any positive pre-crossing climb bias is re-climbed
+  to and produces unrecoverable overshoot; see the comment at its
+  definition.  The closure-scaling machinery remains tested for possible
+  post-credit reuse.
 - Thrust envelope ``[MIN_COURSE_THRUST, MAX_COURSE_THRUST]`` and yaw cap: the
   accepted v3 yaw profile and the visual-course thrust envelope from the
   July-18 safety contract.
@@ -112,19 +112,21 @@ MAX_COURSE_THRUST = 0.32  # MAX_VISUAL_THRUST
 LAUNCH_BOOST_THRUST = 0.30
 LAUNCH_BOOST_DURATION_S = 0.40
 
-# Gate-0-phase feedforward vertical setpoint offset (image-down norm).  The
-# 2026-07-29 crossing-geometry analysis (Q1/Q4) shows gate 1 first appears at
-# median y=-0.69 (~9 deg from the top edge, 20% of runs already TOP-clipped
-# at first sight) because the vehicle crosses gate 0 too low.  Biasing the
-# gate-0 vertical setpoint +0.25 norm (holding the gate-0 target lower in
-# frame) crosses ~1-1.2 m higher, putting gate-1 first-seen near y=-0.3 and
-# roughly doubling the post-credit observability window.  Feedforward only,
-# gate-0 phase only, inside the thrust envelope (max +0.02 above support).
-# Flight 20260729T085719Z-visual-course-4455fd61 showed the FIXED offset held
-# the climb into gate 0's top bar (ey ran to +0.44 against the +0.25
-# setpoint), so the bias is closure-scaled: full at the spawn detection scale
-# and ramping linearly to zero at CROSSING_MIN_LOG_SCALE (see command()).
-GATE0_CLIMB_VERTICAL_OFFSET_NORM = 0.25
+# Gate-0-phase feedforward vertical setpoint offset (image-down norm).
+# DISABLED (0.0) after three consecutive gate-0 top-bar strikes
+# (20260729T085719Z-4455fd61, 20260729T094736Z-9d430a40,
+# 20260729T100733Z-95644bf5).  The 2026-07-29 crossing-geometry analysis
+# (Q1/Q4) motivated a +0.25 bias to cross higher and see gate 1 sooner,
+# but the spawn geometry already requires ~1.8-2 m of climb, so the loop
+# climbs anyway: any positive offset is re-climbed to (at the 0.32
+# ceiling right after boost) and peak vz was ~3.2 m/s in ALL THREE
+# flights while the [0.21, 0.32] envelope can only erase ~2.5 m/s in the
+# remaining descent window.  The ramp-to-crossing and >=0-center clamps
+# trimmed the aim (ey 0.44 -> 0.40 -> 0.20 at close scale) but not the
+# energy.  With 0.0 the modeled peak vz is ~1.2-1.5 m/s and the aim
+# settles inside the aperture.  If gate-1 post-crossing visibility needs
+# extra height, add it as a POST-CREDIT climb, not a pre-crossing bias.
+GATE0_CLIMB_VERTICAL_OFFSET_NORM = 0.0
 
 # Reference (spawn) detection log scale for the closure-scaled gate-0 climb
 # bias.  Flight 20260729T085719Z-visual-course-4455fd61 spawned with gate 0
