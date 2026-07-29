@@ -257,11 +257,22 @@ MAX_COURSE_YAW_RATE_RAD_S = 0.50  # runner runtime cap = min(this, profile 0.5)
 # 4-5, tripped the untrusted latch on the braking itself, and put the drone
 # in the inflow/VRS regime where even the 0.34 clamp lost ~2 m/s^2 of lift
 # (az -7.9 at full collective) — terrain at the gate while braking at full
-# throttle.  The operating point must keep |fh| < 3 everywhere so the
-# estimators stay LIVE: gentle advance builds less speed, gentle brakes
-# kill it without VRS.
-ADVANCE_PITCH_RAD = -0.08  # nose-down closure target when aligned/confident
-BRAKE_PITCH_RAD = -0.02  # near-level braking target
+# throttle.  (Written under the INVERTED pre-F38 pitch convention: the
+# "brake stack" was in truth a powered dive; see the F38 block below.)
+# --- F38 VERIFIED PITCH CONVENTION (build 3385) ----------------------------
+# The controller long assumed POSITIVE pitch target = nose-up (brake) and
+# NEGATIVE = nose-down (advance).  The F37 trace (62bc5772) disproves it:
+# (1) the spawn attitude is -0.31 with the gate span FLAT (0.13 for 0.38 s)
+#     — negative pitch holds the drone nearly stationary;
+# (2) the "brake" target +0.15 was fully attained and closure ACCELERATED
+#     (span 0.32 -> 1.00 in 0.5 s, log-rate ~2.3/s) into the gate-0 impact;
+# (3) the "advance" target ~-0.06 nearly STOPPED closure.
+# So in this build positive pitch = nose-DOWN (accelerate), negative =
+# nose-UP (brake).  Every pre-F38 "brake" episode (F29/F31/F32/F34/F36/F37)
+# was a powered dive into the gate — this is why the brake "never worked"
+# and why fh (thrust-tilt magnitude) always "grew through the brake".
+ADVANCE_PITCH_RAD = 0.08  # nose-down closure target when aligned/confident
+BRAKE_PITCH_RAD = 0.02  # near-level braking target
 ANGULAR_FULL_BRAKE_NORM = 0.60  # angular error that fully suppresses advance
 EXPANSION_BRAKE_FREE_S = 1.5  # expansion rate below which no braking applies
 EXPANSION_BRAKE_SPAN_S = 3.0  # span from free advance to full expansion brake
@@ -313,9 +324,10 @@ CLOSURE_MIN_LOG_SCALE = -2.6
 # climb budget; F32's climb-into-frame came from the fh floor and the
 # high-gate bias, which this band still caps.
 BRAKE_CEILING_BAND = 0.04
-PRE_CROSS_BRAKE_PITCH_RAD = 0.15  # brake attitude (F31: +0.08 gave only
-# ~0.84 m/s^2 rearward, ~5x too weak against the gravity-powered glide;
-# fh grew 4.1 -> 6.0 through 1.7 s of fully-attained brake)
+PRE_CROSS_BRAKE_PITCH_RAD = -0.15  # TRUE nose-up brake attitude under the
+# verified F38 convention.  (Pre-F38 this was +0.15 — a powered DIVE into
+# the gate; F31's "5x too weak brake" was the sign error, not the
+# magnitude.)
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
 # Blind-at-speed brake (F31): SEARCH has no expansion signal, so the
 # governor cannot run there — and F31's blind legs were where the speed
@@ -1351,11 +1363,12 @@ class CleanCourseController:
             / (cfg.closure_full_brake_rate_s - cfg.closure_target_rate_s)
         )
         # Misalignment brake (F35, d25f23fe): a fully misaligned gate only
-        # suppressed ADVANCE, leaving the pitch law at brake_pitch (-0.02,
-        # still nose-down) — the gate-1 leg held yaw at the cap with pitch
-        # ~level while fh grew 4 -> 7.3 into gate-1-area structure.  Speed
-        # with no alignment is pure risk: blend toward the TRUE brake
-        # attitude with the same signal that suppresses advance.
+        # suppressed ADVANCE, leaving the pitch law at brake_pitch (near
+        # level, still creeping forward) — the gate-1 leg held yaw at the
+        # cap with pitch ~level while fh grew 4 -> 7.3 into gate-1-area
+        # structure.  Speed with no alignment is pure risk: blend toward
+        # the TRUE brake attitude with the same signal that suppresses
+        # advance.
         angular_error = math.hypot(ex, ey)
         align = _clamp01(1.0 - angular_error / cfg.angular_full_brake_norm)
         brake_demand = max(closure_brake, 1.0 - align)

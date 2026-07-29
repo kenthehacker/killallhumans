@@ -1128,7 +1128,7 @@ def test_closure_governor_full_brake_at_high_expansion_rate():
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
-    assert out.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(-0.15, abs=1e-9)
     assert now - 100.10 <= 0.5  # fast slew, not the generic 0.30 rad/s
     assert out.yaw_rate_rad_s > 0.0  # x=+0.20 pursuit stays alive
     assert out.thrust > 0.0  # the vz governor keeps the collective alive
@@ -1141,7 +1141,7 @@ def test_closure_governor_does_not_brake_below_target_rate():
     controller.current.scale_axis.v = 0.1
     out = _command(controller, 100.10)
     assert not controller._pre_cross_brake_active
-    assert out.target_pitch_rad < 0.0  # advance law still closes
+    assert out.target_pitch_rad > 0.0  # advance law still closes
 
 
 def test_closure_governor_distrusts_tiny_track_expansion():
@@ -1154,7 +1154,7 @@ def test_closure_governor_distrusts_tiny_track_expansion():
     controller.current.scale_axis.v = 0.9  # noise-level expansion
     out = _command(controller, 100.10)
     assert not controller._pre_cross_brake_active
-    assert out.target_pitch_rad < 0.0  # advance law still closes
+    assert out.target_pitch_rad > 0.0  # advance law still closes
 
 
 def test_closure_governor_is_a_continuous_blend():
@@ -1169,7 +1169,7 @@ def test_closure_governor_is_a_continuous_blend():
         now += 0.033
         out = _command(controller, now)
     assert not controller._pre_cross_brake_active
-    assert -0.02 + 1e-9 < out.target_pitch_rad < 0.15 - 1e-9
+    assert -0.15 + 1e-9 < out.target_pitch_rad < 0.02 - 1e-9
 
 
 def test_misaligned_far_gate_brakes_and_climbs():
@@ -1189,7 +1189,7 @@ def test_misaligned_far_gate_brakes_and_climbs():
         now += 0.033
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(-0.15, abs=1e-9)
     # Top-clipped gate: y censored -> unqualified -> one-sided climb hold.
     assert not out.vertical_qualified
     # support + 0.12 exceeds the old +0.065 hover-equivalent margin even
@@ -1219,7 +1219,7 @@ def test_closure_governor_brakes_in_predict():
         out = _command(controller, now)
     assert controller.state is CleanCourseState.PREDICT
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(-0.15, abs=1e-9)
 
 
 def test_heading_anchor_clamps_outward_yaw_only():
@@ -1257,14 +1257,14 @@ def test_search_commands_brake_attitude_when_blind_and_fast():
     controller._enter_search(100.10)
     controller._fh_mps2 = 0.5  # slow: near-level target
     out = _command(controller, 100.143)
-    assert out.target_pitch_rad <= 0.0
+    assert out.target_pitch_rad >= 0.0  # near-level brake pitch (+0.02)
     controller._fh_mps2 = 3.0  # blind and fast: brake
     now = 100.143
     for _ in range(20):  # generic slew converges to the brake attitude
         now += 0.033
         out = _command(controller, now)
     assert out.state is CleanCourseState.SEARCH
-    assert out.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(-0.15, abs=1e-9)
     assert abs(out.yaw_rate_rad_s) > 0.0  # the sweep stays alive
 
 
@@ -1626,7 +1626,7 @@ def test_finite_bounded_output_across_states():
         assert abs(output.yaw_rate_rad_s) <= 0.50 + 1e-9
         assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
         assert abs(output.target_roll_rad) <= 0.25 + 1e-9
-        assert -0.35 <= output.target_pitch_rad <= 0.15 + 1e-9
+        assert -0.35 <= output.target_pitch_rad <= 0.35
         if output.thrust == 0.0:
             assert output.state is CleanCourseState.COAST_FOR_CREDIT
 
