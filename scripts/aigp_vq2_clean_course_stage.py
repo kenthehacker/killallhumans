@@ -346,6 +346,19 @@ CLOSURE_FULL_BRAKE_RATE_S = 0.60  # rate at which the full brake pitch applies
 # (far-field real closure at our speeds never exceeds the target anyway:
 # 4 m/s at 10 m is 0.4/s with scale already >= ~0.08).
 CLOSURE_MIN_LOG_SCALE = -2.6
+# Fragment advance gate (F43, 20260729T202844Z-visual-course-ee8fd1e5): the
+# gate-1 leg advanced at full +0.08 on a LONE span-(0.04,0.10) fragment
+# (log_scale ~-3.7), built fh 3-4 mps2, and parallax outran yaw authority
+# into the gate-1 structure.  A small span is "whole gate far away" OR
+# "fragment of a gate that is NEAR" — absolute log_scale cannot tell them
+# apart.  VisualTrack exposes no union marker (vq2_tracked_fragment_union
+# lives on the internal VisualDetection only), so the bound is span-based:
+# F43's lone fragments measured apparent_scale <= 0.125 (log <= -2.08),
+# the fused unions 0.255-0.286, and the proved gate-0 spawn ~0.17 (log
+# ~-1.76) — log -2.0 separates them with margin on both sides.  Below it
+# the leg creeps while centering instead of advancing at full pitch.
+FRAGMENT_ADVANCE_MIN_LOG_SCALE = -2.0  # lone-fragment span bound (log apparent)
+FRAGMENT_CREEP_PITCH_RAD = 0.03  # creep while centering a lone fragment
 # Brake ceiling band (F33/F34): while the governor brakes, the collective
 # is confined to support +/- this band.  F33's hard pin AT support removed
 # all vertical centering authority and F34 crossed at 1.07 m into the
@@ -371,6 +384,11 @@ SEARCH_FH_BRAKE_MPS2 = 1.5
 # own stronger nose-up attitude; pre_cross_brake_pitch_rad stays for the
 # vision-guided brake.
 SEARCH_BLIND_BRAKE_PITCH_RAD = -0.22
+# F43 (20260729T202844Z-visual-course-ee8fd1e5): the blind brake relearned
+# the F12 lesson — searches last 0.35-0.8 s, and the generic 0.30 rad/s
+# slew only reached ~-0.04 of the -0.22 attitude before TRACK resumed, so
+# the brake never actually engaged.  It gets the same dedicated fast slew.
+SEARCH_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the blind SEARCH brake runs
 # Course-heading anchor (F31): after losing the gate-1 track the drone
 # search-swept and edge-chased its heading +2.63 rad off the course
 # bearing, then flew sideways/backwards at ~0.65g drag into structure it
@@ -731,11 +749,14 @@ class CleanCourseConfig:
     closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
     closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
     closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
+    fragment_advance_min_log_scale: float = FRAGMENT_ADVANCE_MIN_LOG_SCALE
+    fragment_creep_pitch_rad: float = FRAGMENT_CREEP_PITCH_RAD
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     brake_ceiling_band: float = BRAKE_CEILING_BAND
     search_fh_brake_mps2: float = SEARCH_FH_BRAKE_MPS2
     search_blind_brake_pitch_rad: float = SEARCH_BLIND_BRAKE_PITCH_RAD
+    search_brake_slew_rad_s: float = SEARCH_BRAKE_SLEW_RAD_S
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
     alt_floor_release_m: float = ALT_FLOOR_RELEASE_M
@@ -1371,6 +1392,14 @@ class CleanCourseController:
             target_pitch = self._slew_pitch(
                 search_pitch,
                 dt,
+                # F43: the blind brake gets the F12 dedicated fast slew too —
+                # at the generic 0.30 rad/s a typical 0.35-0.8 s search never
+                # attained -0.22 (pitch reached ~-0.04 before TRACK resumed).
+                slew_rad_s=(
+                    cfg.search_brake_slew_rad_s
+                    if self._fh_mps2 > cfg.search_fh_brake_mps2
+                    else None
+                ),
             )
             return NavigationOutput(
                 target_roll_rad=target_roll,
@@ -1612,6 +1641,16 @@ class CleanCourseController:
             cfg.brake_pitch_rad
             + (cfg.advance_pitch_rad - cfg.brake_pitch_rad) * advance
         )
+        # F43 (20260729T202844Z-visual-course-ee8fd1e5): a lone small span is
+        # ambiguous range evidence — "whole gate far away" or "fragment of a
+        # gate that is NEAR" (the gate-1 leg advanced at +0.08 on a
+        # span-(0.04,0.10) fragment, built fh 3-4, and parallax outran yaw
+        # authority into the structure).  Below the span bound the advance
+        # law is capped at the creep pitch while yaw/roll centering runs;
+        # the closure governor and the brake blends above are untouched, and
+        # a fused union or whole gate (span above the bound) advances fully.
+        if current.log_scale < cfg.fragment_advance_min_log_scale:
+            law_pitch = min(law_pitch, cfg.fragment_creep_pitch_rad)
         target_pitch = law_pitch + brake_demand * (
             cfg.pre_cross_brake_pitch_rad - law_pitch
         )

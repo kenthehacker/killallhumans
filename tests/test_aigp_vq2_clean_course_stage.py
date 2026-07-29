@@ -1290,6 +1290,53 @@ def test_search_commands_brake_attitude_when_blind_and_fast():
     assert abs(out.yaw_rate_rad_s) > 0.0  # the sweep stays alive
 
 
+def test_search_blind_brake_slew_attains_attitude_in_short_search():
+    # F43 (20260729T202844Z-visual-course-ee8fd1e5): searches last 0.35-0.8 s
+    # and the generic 0.30 rad/s slew only reached ~-0.04 of the -0.22 blind
+    # brake before TRACK resumed — the brake never actually engaged.  The
+    # dedicated fast slew (the F12 lesson) attains it inside a short search.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller._enter_search(100.10)
+    controller._fh_mps2 = 3.0  # blind and fast
+    now = 100.10
+    out = None
+    for _ in range(10):  # ~0.33 s — a typical short search
+        now += 0.033
+        out = _command(controller, now)
+    assert out.state is CleanCourseState.SEARCH
+    assert out.target_pitch_rad == pytest.approx(-0.22, abs=1e-9)
+
+
+def test_lone_small_fragment_creeps_instead_of_advancing():
+    # F43: a lone small span is ambiguous range evidence — "whole gate far
+    # away" or "fragment of a gate that is NEAR" — and the gate-1 leg built
+    # fh 3-4 mps2 advancing at +0.08 on a span-(0.04,0.10) fragment.  Below
+    # the span bound the leg creeps while centering; a whole gate (or fused
+    # union, span above the bound) keeps the full advance law.
+    fragment = _tracked_controller(_track("A", 0.0, 0.0, scale=0.06))
+    now = 100.10
+    out = None
+    for _ in range(20):  # generic slew converges to the law target
+        now += 0.033
+        fragment.current.last_x_measurement_s = now
+        out = _command(fragment, now)
+    # Never +0.08 on fragment evidence: capped at the creep pitch.
+    assert out.target_pitch_rad == pytest.approx(0.03, abs=1e-9)
+    # Centering authority (yaw) is untouched on a fragment.
+    offset = _tracked_controller(_track("A", 0.30, 0.0, scale=0.06))
+    offset.current.last_x_measurement_s = 100.10
+    assert _command(offset, 100.10).yaw_rate_rad_s > 0.0
+    # A confidently whole gate (span above the bound) advances fully.
+    whole = _tracked_controller(_track("A", 0.0, 0.0, scale=0.20))
+    now = 100.10
+    out = None
+    for _ in range(20):
+        now += 0.033
+        whole.current.last_x_measurement_s = now
+        out = _command(whole, now)
+    assert out.target_pitch_rad > 0.04  # full advance law, no creep cap
+
+
 def test_crossing_loss_latches_coast_even_while_fh_untrusted():
     # F32 (8cc53db2): fh went untrusted from BRAKING drag at the engulfed
     # gate-0 plane, the fh guard blocked the coast latch, and the drone
