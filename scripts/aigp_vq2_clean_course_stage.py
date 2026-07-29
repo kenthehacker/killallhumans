@@ -203,7 +203,13 @@ PROMOTE_MAX_STD_NORM = 0.30  # cached-successor credibility at promotion
 PROMOTE_MAX_AGE_S = 0.50  # cached-successor freshness at promotion
 
 COLLECTIVE_DECAY_TAU_S = 0.25  # smooth decay toward support on vertical loss
-VERTICAL_QUALIFY_MAX_AGE_S = 0.30  # qualified vertical measurement horizon
+# Qualified vertical measurement horizon.  The bound applies to the last
+# ACCEPTED (non-engulfing, non-censored) y measurement: flight
+# 20260729T104947Z-visual-course-bc8c6003 flew 5.4 s on a phantom vertical
+# state after the crossing, so hypothesis creation must never claim a fresh
+# y from a censored detection, and the retained rate is zeroed the moment
+# qualification is lost (see command()).
+VERTICAL_QUALIFY_MAX_AGE_S = 0.30
 
 TARGET_SLEW_RAD_S = 0.30  # single transparent target slew rate
 CLIPPED_STEERING_FRACTION = 0.5  # clipping saturates corrective steering
@@ -220,6 +226,12 @@ OUTER_MEAS_STD_NORM = 0.06  # outer bbox center measurement std
 # rule (full-frame width).
 ENGULFING_BBOX_SPAN_FRACTION = 0.9  # bbox width/height vs the whole frame
 ENGULFING_BBOX_AREA_FRACTION = 0.7  # bbox area vs the whole frame
+# An engulfing box is useless for scale/vertical servo but its center still
+# says "gate centered, very close": flight bc8c6003 cycled TRACK<->SEARCH
+# five times on phantom yaw sweeps while flying through the gate plane.
+# Fresh engulfing evidence anchors the horizontal bearing and blocks the
+# PREDICT->SEARCH transition; it never updates any filter axis.
+ENGULFING_ANCHOR_MAX_AGE_S = 0.50  # existence-evidence freshness horizon
 SCALE_MEAS_STD = 0.10  # log-scale measurement std
 MIN_MEAS_CONFIDENCE = 0.05  # confidence noise floor divisor
 
@@ -233,6 +245,9 @@ INITIAL_RATE_VAR = 0.25
 SYNTHETIC_POS_VAR_NORM = 0.16  # StartContext-only fallback hypothesis
 ROTATION_COMP_FOCAL_NORM = 1.0  # normalized focal length for de-rotation
 ROTATION_COMP_UNCERTAINTY = 0.25  # fraction of comp drift added as variance
+# Timestamp sentinel for "this axis has never had an accepted measurement"
+# (censored creation detection); any horizon check against it fails.
+NEVER_MEASURED_S = -1e9
 
 CONTROL_PERIOD_S = 0.02  # 50 Hz pacing (runner-owned invariant)
 
@@ -507,6 +522,9 @@ class CleanCourseController:
         # Leaky world-vertical-rate estimate (m/s, up positive) fed by IMU
         # specific force; the stage starts on the pad, so zero is honest.
         self._vz_est_m_s = 0.0
+        # Freshness of the last engulfing-box bearing/existence anchor (see
+        # ENGULFING_ANCHOR_MAX_AGE_S); never a filter measurement.
+        self._last_engulfing_anchor_s: Optional[float] = None
 
     # -- initialization ----------------------------------------------------
 
@@ -602,6 +620,18 @@ class CleanCourseController:
         if self.successor is not None:
             self._predict(self.successor, dt, body_rates)
 
+        # Engulfing-box anchor (flight bc8c6003): useless for scale/vertical
+        # servo, but its center still says "gate centered, very close", so it
+        # refreshes horizontal bearing/existence evidence and (below) blocks
+        # the PREDICT->SEARCH churn while flying through the gate plane.
+        anchor = _engulfing_anchor_track(update, self._current_track_id())
+        if anchor is not None:
+            self._last_engulfing_anchor_s = float(now_s)
+            self.last_reliable_bearing = (
+                float(anchor.center_norm[0]),
+                self.last_reliable_bearing[1],
+            )
+
         # COAST_FOR_CREDIT: only the same track_id may resume tracking; the
         # bounded wait itself is governed by note_race/command.
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
@@ -647,9 +677,19 @@ class CleanCourseController:
                     self.state = CleanCourseState.PREDICT
                 if gap > cfg.predict_frame_gap_s:
                     self.state = CleanCourseState.PREDICT
-                if self.state is CleanCourseState.PREDICT and (
-                    gap > cfg.predict_max_gap_s
-                    or self.current.position_std > cfg.search_covariance_std_norm
+                anchored = (
+                    self._last_engulfing_anchor_s is not None
+                    and now_s - self._last_engulfing_anchor_s
+                    <= ENGULFING_ANCHOR_MAX_AGE_S
+                )
+                if (
+                    not anchored
+                    and self.state is CleanCourseState.PREDICT
+                    and (
+                        gap > cfg.predict_max_gap_s
+                        or self.current.position_std
+                        > cfg.search_covariance_std_norm
+                    )
                 ):
                     self._enter_search(now_s)
 
@@ -877,6 +917,12 @@ class CleanCourseController:
         else:
             if self._collective is None:
                 self._collective = support
+            # Flight bc8c6003: a phantom vy (+0.38 norm/s, seeded as the gate
+            # sank through the frame) random-walked unmeasured for 5.4 s and
+            # commanded an unrecoverable descent.  A stale rate is never
+            # reused: zero it while vertical is unqualified; the next real
+            # measurement reseeds it through the filter coupling.
+            current.y_axis.v = 0.0
             alpha = min(1.0, dt / cfg.collective_decay_tau_s)
             self._collective += (support - self._collective) * alpha
             collective = self._collective
@@ -973,7 +1019,7 @@ class CleanCourseController:
 
     def _hypothesis_from_track(self, track: Any, now_s: float) -> _Hypothesis:
         center, log_scale, _stds = _track_measurement(track)
-        return _Hypothesis(
+        hypothesis = _Hypothesis(
             track_id=str(track.track_id),
             x=center[0],
             y=center[1],
@@ -982,6 +1028,19 @@ class CleanCourseController:
             pos_var=INITIAL_POS_VAR_NORM,
             now_s=now_s,
         )
+        # Flight bc8c6003: a censored axis on the creating detection is not a
+        # measurement.  Never claim measurement freshness from it on adoption
+        # or promotion rebind (the rate itself already seeds at zero); the
+        # axis requalifies only when a real uncensored measurement arrives.
+        clipping = getattr(track, "clipping", FrameEdge.NONE)
+        if type(clipping) is not FrameEdge:
+            clipping = FrameEdge.NONE
+        center_censored = bool(getattr(track, "center_censored", False))
+        if center_censored or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)):
+            hypothesis.last_x_measurement_s = NEVER_MEASURED_S
+        if center_censored or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)):
+            hypothesis.last_y_measurement_s = NEVER_MEASURED_S
+        return hypothesis
 
     def _predict(
         self,
@@ -1232,6 +1291,29 @@ def _is_engulfing_detection(track: Any) -> bool:
         or height >= ENGULFING_BBOX_SPAN_FRACTION
         or width * height >= ENGULFING_BBOX_AREA_FRACTION
     )
+
+
+def _engulfing_anchor_track(update: Any, track_id: Optional[str]) -> Optional[Any]:
+    """Best engulfing box in one update for bearing/existence anchoring.
+
+    Bearing/existence evidence only: the box never updates any filter axis.
+    Prefers the current track_id, then the most confident engulfing box.
+    """
+
+    if update is None:
+        return None
+    engulfing = [
+        track
+        for track in (getattr(update, "tracks", ()) or ())
+        if _is_engulfing_detection(track)
+    ]
+    if not engulfing:
+        return None
+    if track_id is not None:
+        for track in engulfing:
+            if track.track_id == track_id:
+                return track
+    return max(engulfing, key=lambda track: float(getattr(track, "confidence", 0.0)))
 
 
 def _visible_tracks(update: Any) -> List[Any]:

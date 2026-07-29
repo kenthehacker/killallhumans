@@ -5,7 +5,10 @@ vertical sign, decay-toward-support on vertical loss, a cut 0.30 x 0.40 s
 launch boost, a disabled-then-tested gate-0 climb bias that never lifts the
 aim point above image center, full-authority image-rate D bounded by an
 IMU world-vertical-rate climb governor (alive in TRACK, PREDICT, and
-SEARCH), degenerate engulfing detections rejected as measurements,
+SEARCH), phantom vertical rates zeroed when the accepted-y measurement
+ages out (reseeded only by real measurements, never seeded by censored or
+engulfing detections), degenerate engulfing detections rejected as
+measurements but kept as bearing/existence anchors that block SEARCH,
 verified yaw/roll directions, clipping uncertainty (not abort),
 PREDICT->SEARCH on fresh empty frames, frozen-frame stalls that predict and
 never coast, a real bounded yaw sweep, finite bounded output, absolute race
@@ -411,6 +414,106 @@ def test_engulfing_full_frame_bbox_is_not_a_measurement():
     assert controller.current.x_axis.p == x_before
     assert controller.current.y_axis.p == y_before
     assert controller.current.last_y_measurement_s == meas_before
+
+
+def test_vertical_unqualified_zeroes_phantom_rate_and_holds_support():
+    # Flight 20260729T104947Z-visual-course-bc8c6003: a phantom vy (+0.38
+    # norm/s, seeded as the gate sank through the frame) random-walked
+    # unmeasured for 5.4 s and commanded an unrecoverable descent.  Once the
+    # last accepted y measurement ages out, the retained rate is zeroed and
+    # the collective holds tilt-compensated support.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller.current.y_axis.v = 0.38  # phantom rate from the crossing
+    output = _command(controller, 100.45)  # last y measurement 0.42 s stale
+    assert not output.vertical_qualified
+    assert controller.current.y_axis.v == 0.0
+    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+
+
+def test_qualification_regain_reseeds_rate_from_real_measurement():
+    # After the phantom zeroing, qualification returns only through real
+    # measurements and the rate reseeds from them (never the stale value).
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller.current.y_axis.v = 0.38
+    _command(controller, 100.45)  # ages out + zeroes the phantom rate
+    assert controller.current.y_axis.v == 0.0
+    now = 100.46
+    for frame, y in enumerate((0.02, 0.04, 0.06, 0.08)):
+        controller.observe(
+            _update([_track("A", 0.0, y)], frame_id=10 + frame), now_s=now
+        )
+        now += 0.033
+    output = _command(controller, now)
+    assert output.vertical_qualified
+    reseeded = controller.current.y_axis.v
+    assert reseeded > 0.05  # reseeded from the descending measurements
+    assert reseeded != pytest.approx(0.38, abs=1e-9)  # never the stale rate
+
+
+def test_censored_adoption_never_claims_fresh_vertical():
+    # A censored-axis detection must not seed rate state or measurement
+    # freshness, including on adoption/rebind: a TB-clipped fragment adopted
+    # out of SEARCH leaves vertical unqualified (collective holds support)
+    # instead of servoing on a phantom.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    now = 100.10
+    for _ in range(40):
+        now += 0.033
+        controller.observe(_update([], frame_id=9), now_s=now)
+        if controller.state is CleanCourseState.SEARCH:
+            break
+    assert controller.state is CleanCourseState.SEARCH
+    now += 0.033
+    controller.observe(
+        _update(
+            [
+                _track(
+                    "G",
+                    0.05,
+                    0.0,
+                    clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+                )
+            ],
+            frame_id=50,
+        ),
+        now_s=now,
+    )
+    assert controller.state is CleanCourseState.TRACK  # re-adopted
+    output = _command(controller, now + 0.02)
+    # The censored creation box is not a y measurement.
+    assert not output.vertical_qualified
+    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+
+
+def test_engulfing_anchor_blocks_search_and_keeps_vertical_unqualified():
+    # Flight bc8c6003: 181 ticks of engulfing boxes cycled TRACK<->SEARCH
+    # five times on phantom yaw sweeps while flying through the gate plane.
+    # Fresh engulfing evidence now anchors the horizontal bearing and blocks
+    # SEARCH while vertical stays unqualified (collective holds support).
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    engulfing = _track(
+        "A",
+        0.30,
+        0.10,
+        scale=1.0,  # bbox spans the whole frame
+        clipping=(
+            FrameEdge.LEFT | FrameEdge.RIGHT | FrameEdge.TOP | FrameEdge.BOTTOM
+        ),
+    )
+    now = 100.06
+    output = None
+    for frame in range(45):  # ~1.5 s of engulfed frames
+        controller.observe(_update([engulfing], frame_id=10 + frame), now_s=now)
+        output = _command(controller, now + 0.005)
+        assert controller.state is not CleanCourseState.SEARCH
+        assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+        now += 0.033
+    assert controller.state is CleanCourseState.PREDICT
+    # Bearing anchored to the engulfing center; vertical never qualified
+    # beyond the accepted-measurement horizon.
+    assert controller.last_reliable_bearing[0] == pytest.approx(0.30)
+    assert controller.current.y_axis.v == 0.0
+    assert not output.vertical_qualified
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():
