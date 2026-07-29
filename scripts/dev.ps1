@@ -140,6 +140,7 @@ interactive confirmation.
                 'tests/test_aigp_vq2_course_cohort.py',
                 'tests/test_aigp_vq2_build_reference.py',
                 'tests/test_aigp_vq2_calibration_target.py',
+                'tests/test_aigp_vq2_clean_course_stage.py',
                 'tests/test_aigp_vq2_fast_cycle.py',
                 'tests/test_aigp_vq2_passive_probe.py',
                 'tests/test_aigp_vq2_passive_timing_script.py',

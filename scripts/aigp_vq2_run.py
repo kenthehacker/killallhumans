@@ -127,11 +127,7 @@ from planning.vq2_gate_graph import (
     RollingVisualGateGraph,
 )
 from planning.vq2_dynamic_course import ImuAttitudeSample
-from planning.vq2_dynamic_visual_approach import (
-    DynamicRollingVisualApproachServo,
-    DynamicVisualCourseSession,
-    production_dynamic_course_config,
-)
+from planning.vq2_dynamic_visual_approach import DynamicVisualCourseSession
 from planning.vq2_visual_approach import (
     MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S,
     MAX_PASSAGE_SUSPENSION_EPOCHS,
@@ -229,12 +225,14 @@ from scripts.aigp_vq2_visual_alignment_stage import (
     VisualAlignmentStageRuntime,
     run_visual_alignment_stage,
 )
+from scripts.aigp_vq2_clean_course_stage import (
+    CleanCourseRuntime,
+    run_clean_course_stage,
+)
 from scripts.aigp_vq2_visual_course_stage import (
     DEFAULT_VISUAL_COURSE_LIMITS,
     VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON,
-    VisualCourseStageRuntime,
     VisualCourseYawProfile,
-    run_visual_course_stage,
 )
 from scripts.aigp_vq2_yaw_profile import (
     YAW_CALIBRATION_PROFILE_SHA256,
@@ -16582,7 +16580,7 @@ class VQ2Runner:
         self,
         context: StartContext,
     ) -> Dict[str, Any]:
-        """Delegate the generic lifecycle with exact tracked yaw authority."""
+        """Run the clean single-law course stage under absolute race authority."""
 
         if (
             self.yaw_calibration_profile is None
@@ -16606,75 +16604,45 @@ class VQ2Runner:
                 "visual-course runtime limits differ from calibrated yaw "
                 "authority"
             )
-        dynamic_session = DynamicVisualCourseSession(
-            production_dynamic_course_config()
-        )
-        attitude_history = tuple(self._dynamic_attitude_history)
-        if len(attitude_history) < 2:
-            raise SafetyAbort(
-                "visual-course dynamic controller lacks timestamped IMU "
-                "history"
-            )
-        for sample in attitude_history:
-            dynamic_session.record_imu(sample)
-        self._dynamic_course_session = dynamic_session
         try:
-            summary = await run_visual_course_stage(
+            summary = await run_clean_course_stage(
                 self,
                 context,
-                runtime=VisualCourseStageRuntime(
+                runtime=CleanCourseRuntime(
                     safety_abort_type=SafetyAbort,
-                    cancelled_error_type=asyncio.CancelledError,
                     monotonic=time.monotonic,
-                    perf_counter_ns=time.perf_counter_ns,
                     sleep=asyncio.sleep,
                     next_control_deadline=next_control_deadline,
                     attitude_rate_command=attitude_rate_command,
-                    limit_command_rates=limit_command_rates,
+                    attitude_rate_command_type=AttitudeRateCommand,
                     validate_command=validate_command,
-                    yaw_profile=course_yaw_profile,
-                    expected_yaw_profile_sha256=(
-                        self.yaw_calibration_profile_evidence["sha256"]
+                    skipped_result=(
+                        FlightCommandSendResult.SKIPPED_RACE_BOUNDARY_CHANGED
                     ),
-                    limits=DEFAULT_VISUAL_COURSE_LIMITS,
-                    servo_factory=partial(
-                        DynamicRollingVisualApproachServo,
-                        session=dynamic_session,
+                    control_period_s=CONTROL_PERIOD_S,
+                    hard_duration_s=(
+                        DEFAULT_VISUAL_COURSE_LIMITS.course_hard_duration_s
                     ),
-                    dynamic_controller=dynamic_session,
+                    max_yaw_rate_rad_s=min(
+                        DEFAULT_VISUAL_COURSE_LIMITS.max_yaw_rate_rad_s,
+                        course_yaw_profile.max_abs_yaw_rate_command_rad_s,
+                    ),
+                    max_command_rate_rad_s=MAX_COMMAND_RATE_RAD_S,
+                    min_thrust=DEFAULT_VISUAL_COURSE_LIMITS.min_thrust,
+                    max_thrust=DEFAULT_VISUAL_COURSE_LIMITS.max_thrust,
                 ),
             )
             if not isinstance(summary, Mapping):
                 raise SafetyAbort(
-                    "visual-course coordinator returned an invalid summary"
+                    "visual-course clean stage returned an invalid summary"
                 )
             self._visual_course_summary = dict(summary)
             return dict(summary)
         except BaseException as exc:
             if self._visual_course_summary is None:
-                graph = self.visual_gate_graph.latest_snapshot
                 race = self.adapter.race_status
-                transitions = (
-                    [
-                        {
-                            "from_gate_index": item.from_gate_index,
-                            "to_gate_index": item.to_gate_index,
-                            "retired_track_id": item.retired_track_id,
-                            "promoted_track_id": item.promoted_track_id,
-                        }
-                        for item in graph.confirmed_transitions
-                    ]
-                    if graph is not None
-                    else []
-                )
                 gate_index = (
-                    int(race.active_gate_index)
-                    if race is not None
-                    else (
-                        graph.current_gate_index
-                        if graph is not None
-                        else None
-                    )
+                    int(race.active_gate_index) if race is not None else None
                 )
                 self._visual_course_summary = {
                     "stage": VISUAL_COURSE_STAGE,
@@ -16687,7 +16655,7 @@ class VQ2Runner:
                     "initial_gate_index": 0,
                     "maximum_authoritative_gate_index": gate_index,
                     "final_gate_index": gate_index,
-                    "authoritative_transitions": transitions,
+                    "authoritative_transitions": [],
                     "segments": [],
                     "visual_navigation_command_count": None,
                     "exact_zero_command_count": None,

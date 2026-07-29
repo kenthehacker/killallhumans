@@ -72,6 +72,7 @@ _HEX40_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 _RUNTIME_SOURCE_PATHS = (
     "scripts/aigp_live_lease.py",
+    "scripts/aigp_vq2_clean_course_stage.py",
     "scripts/aigp_vq2_controller_config.py",
     "scripts/aigp_vq2_visual_config.py",
     "scripts/aigp_vq2_visual_alignment_stage.py",
