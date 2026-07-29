@@ -2141,6 +2141,184 @@ def test_near_plane_stale_x_keeps_derotated_steering():
     assert out.target_roll_rad == 0.0
 
 
+def _commit_controller(now_s=100.10):
+    """Gate-1 TRACK controller one sustain window short of COMMIT entry:
+    near plane (outer log scale -0.50 >= -0.9), aligned, fresh uncensored
+    measurements on both axes."""
+
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller, now_s=now_s)
+    controller._alt_est_m = 2.0  # honest altitude (floor quiet)
+    current = controller.current
+    current.x_axis.p = 0.10
+    current.y_axis.p = 0.05
+    current.outer_log_scale = -0.50
+    return controller
+
+
+def _drive_commit_window(controller, now, ticks=12):
+    """Tick command() with fresh uncensored stamps (what an uncensored
+    same-id track produces) at the level spawn attitude."""
+
+    out = None
+    for _ in range(ticks):
+        now += 0.033
+        controller.current.last_measurement_s = now
+        controller.current.last_x_measurement_s = now
+        controller.current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    return out, now
+
+
+def test_commit_entry_fires_sustained_aligned_near_plane():
+    # F53 (20260729T233602Z-visual-course-072c8a7b): the misalignment brake
+    # self-locked the F52 drone into a hover 1-2 m short of gate 1's plane.
+    # A sustained (~0.3 s), aligned, freshly measured near-plane regime on
+    # a gate-1+ leg commits to an inertial crossing instead.
+    controller = _commit_controller()
+    out, now = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.COMMIT
+    assert out.state is CleanCourseState.COMMIT
+    assert out.yaw_rate_rad_s == 0.0
+
+
+def test_commit_entry_requires_fresh_uncensored_both_axes():
+    # The entry freshness window (0.30 s) is tighter than the crossing
+    # horizon: the bearing moves ~0.33 norm in 0.7 s at the plane.  A stale
+    # x-axis past the commit window (but inside the 0.5 s x-steer horizon,
+    # so the main law keeps steering normally) blocks entry.
+    stale = _commit_controller()
+    now = 100.10
+    for _ in range(15):
+        now += 0.033
+        stale.current.last_measurement_s = now
+        stale.current.last_y_measurement_s = now
+        stale.current.last_x_measurement_s = now - 0.40
+        _command(stale, now, pitch=SPAWN_PITCH)
+    assert stale.state is CleanCourseState.TRACK
+    # Censored axes never refresh the measurement stamp; a hypothesis with
+    # no uncensored x measurement at all can never commit.
+    censored = _commit_controller()
+    now = 100.10
+    for _ in range(15):
+        now += 0.033
+        censored.current.last_measurement_s = now
+        censored.current.last_y_measurement_s = now
+        censored.current.last_x_measurement_s = NEVER_MEASURED_S
+        _command(censored, now, pitch=SPAWN_PITCH)
+    assert censored.state is CleanCourseState.TRACK
+
+
+def test_commit_entry_requires_alignment_proximity_and_gate_one():
+    # |ex| beyond the crossing bound: no commit.
+    off_axis = _commit_controller()
+    off_axis.current.x_axis.p = 0.30
+    _drive_commit_window(off_axis, 100.10)
+    assert off_axis.state is CleanCourseState.TRACK
+    # Far range (outer log scale below the -0.9 near bound): the sustain
+    # timer never starts.
+    far = _commit_controller()
+    far.current.outer_log_scale = -1.20
+    _drive_commit_window(far, 100.10)
+    assert far.state is CleanCourseState.TRACK
+    # Gate 0 is deliberately excluded — its climb-bias path is working.
+    gate0 = _tracked_controller(_track("A", 0.10, 0.05))
+    gate0._alt_est_m = 2.0
+    gate0.current.outer_log_scale = -0.50
+    _drive_commit_window(gate0, 100.10)
+    assert gate0.state is CleanCourseState.TRACK
+
+
+def test_commit_law_holds_heading_advances_and_bounds_vertical():
+    controller = _commit_controller()
+    out, now = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.COMMIT
+    controller._prev_target_roll = 0.20  # pre-wound bank to unwind
+    controller._prev_target_pitch = SPAWN_PITCH - 0.15  # braking attitude
+    for _ in range(25):
+        now += 0.033
+        controller.current.last_measurement_s = now
+        controller.current.last_x_measurement_s = now
+        controller.current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    # Inertial heading hold: yaw exactly zero, bank fully unwound.
+    assert out.yaw_rate_rad_s == 0.0
+    assert out.target_roll_rad == 0.0
+    # The coast advance nudge, not the brake attitude, carries the plane.
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.05, abs=1e-9)
+    # Bounded vertical servo on the compensated ey (0.05 -> -0.004).
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.004, abs=1e-9)
+    # The servo tracks inside the band (0.50 -> -0.04)...
+    controller.current.y_axis.p = 0.50
+    out = _command(controller, now + 0.033, pitch=SPAWN_PITCH)
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.04, abs=1e-9)
+    # ...and is BOUNDED to the +/-0.05 band around support: slammed
+    # bottom-bar dive evidence (-0.08 raw) cannot descend harder than the
+    # band (the 0.21 envelope clamp sits just above the band bottom here).
+    controller.current.y_axis.p = 1.0
+    out = _command(controller, now + 0.066, pitch=SPAWN_PITCH)
+    assert out.thrust >= SPAWN_SUPPORT - 0.05
+    assert out.thrust < SPAWN_SUPPORT - 0.03
+    # Slammed climb evidence is capped at the band top exactly.
+    controller.current.y_axis.p = -1.0
+    out = _command(controller, now + 0.099, pitch=SPAWN_PITCH)
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-9)
+    # The progress-removers stay bypassed: a bearing that would fully
+    # engage the misalignment brake (and F52-A steering) in TRACK changes
+    # nothing — no yaw, no brake pitch, the advance continues.
+    controller.current.y_axis.p = 0.05
+    controller.current.x_axis.p = 0.80
+    out = _command(controller, now + 0.132, pitch=SPAWN_PITCH)
+    assert out.yaw_rate_rad_s == 0.0
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.05, abs=1e-9)
+
+
+def test_commit_timeout_drops_hypothesis_and_searches():
+    # ~1.5 s without authoritative credit: arrest and SEARCH, with the
+    # hypothesis DROPPED — the innovation gate permanently rejects the true
+    # gate while the frozen hypothesis lives (association lock-out).
+    controller = _commit_controller()
+    out, now = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.COMMIT
+    for _ in range(50):  # ~1.65 s > the 1.5 s commit window
+        now += 0.033
+        if controller.current is not None:  # dropped at the timeout
+            controller.current.last_measurement_s = now
+            controller.current.last_x_measurement_s = now
+            controller.current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.SEARCH
+    assert controller.current is None
+    assert out.state is CleanCourseState.SEARCH
+
+
+def test_commit_credit_promotion_exits_to_next_leg():
+    controller = _commit_controller()
+    out, now = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.COMMIT
+    # The COMMIT observe branch keeps the successor fresh for credit.
+    now += 0.033
+    controller.observe(
+        _update(
+            [
+                _track("B", 0.10, 0.05, scale=0.60),
+                _track("C", -0.20, 0.0, scale=0.08),
+            ],
+            frame_id=30,
+        ),
+        now_s=now,
+    )
+    assert controller.state is CleanCourseState.COMMIT
+    controller._track_first_seen_s["C"] = now - 1.0
+    promoted = controller.note_race(
+        gate_index=2, race_boot_ms=3000, now_s=now + 0.02
+    )
+    assert promoted
+    assert controller.gate_index == 2
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.current.track_id == "C"
+
+
 def test_promotion_rejects_successor_with_unmeasured_x_axis():
     # F40: the promoted successor was a left-edge-clipped splinter of the
     # just-crossed gate's frame whose x-axis had never been measured

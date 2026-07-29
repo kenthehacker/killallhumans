@@ -2,10 +2,11 @@
 
 This module replaces the retired ``aigp_vq2_visual_course_stage`` coordinator
 as the navigation owner for the powered ``visual-course`` stage.  It carries
-exactly four runtime states (``TRACK``, ``PREDICT``, ``COAST_FOR_CREDIT``,
-``SEARCH``), one small variable-dt estimator per retained target hypothesis,
-one continuous control law, one attitude PD, one explicit yaw channel, one
-transparent final clamp, and one atomic race-active send per tick.
+exactly five runtime states (``TRACK``, ``PREDICT``, ``COAST_FOR_CREDIT``,
+``COMMIT``, ``SEARCH``), one small variable-dt estimator per retained target
+hypothesis, one continuous control law, one attitude PD, one explicit yaw
+channel, one transparent final clamp, and one atomic race-active send per
+tick.
 
 Authority model:
 
@@ -332,6 +333,20 @@ CROSSING_MAX_ABS_EY_NORM = 0.25  # |ey| bound to arm the crossing coast
 # measurement can be this old at the loss).
 CROSSING_MEAS_MAX_AGE_S = 0.50
 CROSSING_CREDIT_WAIT_S = 0.40  # July-18 safety contract item 9
+# F53 (20260729T233602Z-visual-course-072c8a7b): past near_brake_log_scale
+# the misalignment brake self-locks — the brake attitude pushes the gate
+# image down, the raw ey reads as misalignment, advance goes to 0, and the
+# resulting hover starves the filter into a blind search (floor collision
+# in F52).  An aligned, fresh, SUSTAINED near-plane regime commits to an
+# inertial crossing (COMMIT state) instead.  Entry requires the close
+# regime to persist (the F52 span stalled at 0.56, well under CROSSING_MIN
+# -0.80), a fresh UNCENSORED both-axis measurement tighter than the
+# crossing horizon (the bearing moves ~0.33 norm in 0.7 s at the plane, so
+# a 0.5 s-old bearing is ~0.2 norm wrong), and crossing-coast alignment on
+# the F50 compensated ey — gate-1+ legs only for now.
+COMMIT_SUSTAIN_S = 0.30  # near-plane regime must persist this long to arm
+COMMIT_MEAS_MAX_AGE_S = 0.30  # fresh uncensored both-axis window at entry
+COMMIT_TIMEOUT_S = 1.5  # no credit this long -> arrest and search
 # F38 (18c0b35c): with the true (nose-up) brake the drone arrives at the
 # engulfed plane SLOW; a level coast ran out of residual closure and the
 # bounded wait expired into SEARCH without credit.  A small nose-down
@@ -639,11 +654,12 @@ CLEAN_COURSE_CONFIG_SCHEMA = "aigp-vq2-clean-course-config/1"
 
 
 class CleanCourseState(str, Enum):
-    """The exactly four runtime states of the clean course stage."""
+    """The exactly five runtime states of the clean course stage."""
 
     TRACK = "track"
     PREDICT = "predict"
     COAST_FOR_CREDIT = "coast_for_credit"
+    COMMIT = "commit"
     SEARCH = "search"
 
 
@@ -829,6 +845,9 @@ class CleanCourseConfig:
     crossing_max_abs_ey_norm: float = CROSSING_MAX_ABS_EY_NORM
     crossing_credit_wait_s: float = CROSSING_CREDIT_WAIT_S
     coast_advance_pitch_rad: float = COAST_ADVANCE_PITCH_RAD
+    commit_sustain_s: float = COMMIT_SUSTAIN_S
+    commit_meas_max_age_s: float = COMMIT_MEAS_MAX_AGE_S
+    commit_timeout_s: float = COMMIT_TIMEOUT_S
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
     x_steer_max_age_s: float = X_STEER_MAX_AGE_S
@@ -945,6 +964,10 @@ class CleanCourseController:
         self._search_base_yaw_rad: Optional[float] = None
         # F51: brake self-blinding relax latch (see BRAKE_RELAX_EY_NORM).
         self._brake_vision_relax = False
+        # F53: near-plane COMMIT sustain timer and entry stamp (see the
+        # COMMIT_* constant block).
+        self._near_plane_since_s: Optional[float] = None
+        self._commit_entry_s: Optional[float] = None
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
@@ -1125,6 +1148,18 @@ class CleanCourseController:
             return
 
         match = self._find(tracks, self._current_track_id())
+
+        # COMMIT (F53): the near-plane commit is an inertial crossing —
+        # keep the hypothesis and successor fresh for the credit/timeout
+        # exit (the vertical servo reads the live filter), but only
+        # note_race (credit) or the command() timeout may leave the state.
+        if self.state is CleanCourseState.COMMIT:
+            if match is not None:
+                self._update_hypothesis(self.current, match, now_s)
+                self._set_reliable_bearing(self.current.x, self.current.y)
+            self._refresh_successor(tracks, now_s)
+            return
+
         if match is not None:
             self._update_hypothesis(self.current, match, now_s)
             self.state = CleanCourseState.TRACK
@@ -1522,6 +1557,89 @@ class CleanCourseController:
                 current_track_id=self._current_track_id(),
                 successor_track_id=self._successor_track_id(),
             )
+
+        # F53 near-plane COMMIT (see the COMMIT_* constant block): the
+        # misalignment brake self-locks short of the plane, so a sustained,
+        # aligned, freshly measured close regime commits to an inertial
+        # crossing.  TRACK only; gate-1+ legs only (gate-0's climb-bias path
+        # is working and stays untouched).  The alt-floor override above
+        # still wins in every state except SEARCH.
+        near_plane_close = (
+            self.state is CleanCourseState.TRACK
+            and self.current is not None
+            and self.current.outer_log_scale >= cfg.near_brake_log_scale
+        )
+        if near_plane_close:
+            if self._near_plane_since_s is None:
+                self._near_plane_since_s = now_s
+        else:
+            self._near_plane_since_s = None
+        if (
+            near_plane_close
+            and self.gate_index >= 1
+            and now_s - self._near_plane_since_s >= cfg.commit_sustain_s
+            # Fresh UNCENSORED same-id measurement on BOTH axes (censored
+            # axes never refresh these stamps — see _update_hypothesis).
+            and now_s - self.current.last_x_measurement_s
+            <= cfg.commit_meas_max_age_s
+            and now_s - self.current.last_y_measurement_s
+            <= cfg.commit_meas_max_age_s
+            and abs(self.current.x) <= cfg.crossing_max_abs_ex_norm
+            and abs(self._compensated_ey(self.current.y, pitch_rad))
+            <= cfg.crossing_max_abs_ey_norm
+        ):
+            self.state = CleanCourseState.COMMIT
+            self._commit_entry_s = float(now_s)
+
+        if self.state is CleanCourseState.COMMIT:
+            commit_timed_out = (
+                self._commit_entry_s is None
+                or now_s - self._commit_entry_s > cfg.commit_timeout_s
+            )
+            if self.current is None or commit_timed_out:
+                # No authoritative credit inside the bounded commit window:
+                # arrest forward motion (the SEARCH branch below slews
+                # pitch back to level) and search.  Dropping the hypothesis
+                # is REQUIRED — the innovation gate permanently rejects the
+                # true gate while the frozen hypothesis lives (association
+                # lock-out).
+                self.current = None
+                self._commit_entry_s = None
+                self._enter_search(now_s)
+            else:
+                # Inertial crossing: heading hold, wings level — do NOT
+                # steer on the frozen hypothesis (_predict's derotation
+                # models rotation only, no parallax term; F52's held
+                # steering on frozen ex over-rotated ~25 deg while the true
+                # gate walked off).  The vertical channel keeps the F50
+                # compensated-ey servo BOUNDED to a small band around
+                # support (a flat support hold repeats the F33/F34
+                # bottom-bar death vertically); the vz governor stays the
+                # climb/sink limiter.  Only the progress-removers are
+                # bypassed: misalignment brake, closure governor, expansion
+                # factor, x-staleness zeroing (F52-A), brake-relax.  The
+                # engulfing anchor is never consulted for steering.
+                commit_correction = _clamp(
+                    cfg.vertical_feedback_sign
+                    * cfg.vertical_error_gain
+                    * self._compensated_ey(self.current.y, pitch_rad),
+                    -cfg.search_vertical_memory_band,
+                    cfg.search_vertical_memory_band,
+                )
+                commit_hold = support + commit_correction
+                self._collective = commit_hold
+                return NavigationOutput(
+                    target_roll_rad=self._slew_roll(0.0, dt),
+                    target_pitch_rad=self._slew_pitch(
+                        cfg.spawn_pitch_rad + cfg.coast_advance_pitch_rad, dt
+                    ),
+                    yaw_rate_rad_s=0.0,
+                    thrust=self._governed_collective(commit_hold, support),
+                    state=self.state,
+                    gate_index=self.gate_index,
+                    current_track_id=self._current_track_id(),
+                    successor_track_id=self._successor_track_id(),
+                )
 
         if self.state is CleanCourseState.SEARCH:
             # F49: absolute-heading sweep from the search-entry heading,
