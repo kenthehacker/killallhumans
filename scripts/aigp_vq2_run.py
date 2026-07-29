@@ -8741,6 +8741,11 @@ class VQ2Runner:
                     else "gate0_or_preflight"
                 ),
             )
+        self._dump_debug_frames(
+            snapshot=snapshot,
+            image=image,
+            detections=detections,
+        )
         if capture_enabled:
             # End-to-end passive frame work includes the synchronous
             # replay snapshot/copy enqueue above.  The asynchronous
@@ -8756,6 +8761,105 @@ class VQ2Runner:
                 work_end_monotonic_ns=time.perf_counter_ns(),
             )
             record_timing(observation)
+
+    def _dump_debug_frames(
+        self,
+        *,
+        snapshot: Any,
+        image: Any,
+        detections: List[Any],
+    ) -> None:
+        """Env-gated diagnostic frame dump for offline fragment labeling.
+
+        Active only when ``AIGP_VQ2_DEBUG_FRAME_DIR`` names a directory;
+        every second decoded frame is written as an annotated PNG plus one
+        JSONL sidecar row carrying the exact visual-tracker view the
+        controller consumed.  Best-effort: failures never affect flight.
+        """
+
+        cache = getattr(self, "_debug_frame_dump_cache", None)
+        if cache is None:
+            import os
+
+            directory = os.environ.get("AIGP_VQ2_DEBUG_FRAME_DIR") or None
+            cache = {"dir": directory, "count": 0}
+            self._debug_frame_dump_cache = cache
+        directory = cache["dir"]
+        if directory is None:
+            return
+        try:
+            cache["count"] += 1
+            if cache["count"] % 2 != 0:
+                return
+            import cv2
+
+            out_dir = Path(directory)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            height_px, width_px = (int(v) for v in image.shape[:2])
+            canvas = image.copy()
+            for detection in detections:
+                x, y, w, h = (int(v) for v in detection.bbox)
+                cv2.rectangle(canvas, (x, y), (x + w, y + h), (0, 255, 0), 1)
+            update = self._visual_latest_tracker_update
+            tracks = [] if update is None else list(update.tracks)
+            for track in tracks:
+                left, top, right, bottom = (
+                    float(v) for v in track.bbox_norm
+                )
+                x1 = int(round((1.0 - left) * 0.5 * width_px))
+                x2 = int(round((1.0 - right) * 0.5 * width_px))
+                y1 = int(round((top + 1.0) * 0.5 * height_px))
+                y2 = int(round((bottom + 1.0) * 0.5 * height_px))
+                x_lo, x_hi = sorted((x1, x2))
+                y_lo, y_hi = sorted((y1, y2))
+                cv2.rectangle(
+                    canvas, (x_lo, y_lo), (x_hi, y_hi), (0, 200, 255), 1
+                )
+                cx = int(
+                    round((1.0 - float(track.center_norm[0])) * 0.5 * width_px)
+                )
+                cy = int(
+                    round((float(track.center_norm[1]) + 1.0) * 0.5 * height_px)
+                )
+                cv2.drawMarker(
+                    canvas, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 10, 1
+                )
+                cv2.putText(
+                    canvas,
+                    f"{track.track_id}:{track.role.value}",
+                    (x_lo, max(12, y_lo - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    (0, 200, 255),
+                    1,
+                )
+            frame_id = int(snapshot.frame_id)
+            if not cv2.imwrite(str(out_dir / f"f{frame_id:06d}.png"), canvas):
+                return
+            race = self.adapter.race_status
+            estimate = self.estimate
+            row = {
+                "frame_id": frame_id,
+                "sim_time_ns": int(snapshot.sim_time_ns),
+                "received_monotonic_s": float(snapshot.received_monotonic_s),
+                "gate_index": (
+                    int(race.active_gate_index) if race is not None else None
+                ),
+                "rpy": (
+                    list(estimate.orientation.to_euler())
+                    if estimate is not None
+                    else None
+                ),
+                "estimator": self._replay_estimator_fields(),
+                "tracks": [
+                    self._visual_track_summary(track) for track in tracks
+                ],
+            }
+            with (out_dir / "frames.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, default=str) + "\n")
+        except Exception:
+            # Diagnostic-only path; never let it touch the flight.
+            pass
 
     def _powered_vision_readiness(
         self,
