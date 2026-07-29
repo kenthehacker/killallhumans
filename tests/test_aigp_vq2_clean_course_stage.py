@@ -783,6 +783,44 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
     assert released.target_pitch_rad <= 0.0
 
 
+def test_post_credit_brake_holds_despite_qualification_within_min_hold():
+    # Flight 4480d0a6: gate 1 was already accepted AND vertically qualified
+    # at the credit tick, so the instant qualification release fired within
+    # one 20 ms tick and the brake never engaged (flag False the whole
+    # flight; the attack closure was never killed).  Qualification may only
+    # release the brake after the minimum hold.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller.observe(
+        _update(
+            [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
+            frame_id=3,
+        ),
+        now_s=100.08,
+    )
+    promoted = controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
+    assert promoted
+    # Track stays vertically qualified with fresh y measurements throughout.
+    now = 100.10
+    for frame in range(20):  # ~0.66 s < the 1.0 s minimum hold
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=10 + frame),
+            now_s=now,
+        )
+        out = _command(controller, now)
+        assert out.vertical_qualified
+        assert controller._post_credit_deadline_s is not None
+    # Past the hold, continued qualification releases the brake.
+    for frame in range(20, 40):
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=10 + frame),
+            now_s=now,
+        )
+        _command(controller, now)
+    assert controller._post_credit_deadline_s is None
+
+
 def test_post_credit_brake_releases_on_timeout():
     # A lost gate cannot brake forever: with no credible successor the
     # promotion enters SEARCH, slews to the brake attitude, and resumes the

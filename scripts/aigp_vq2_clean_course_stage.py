@@ -254,6 +254,13 @@ PREDICT_STALL_FORCE_SEARCH_S = 1.50
 POST_CREDIT_BRAKE_PITCH_RAD = 0.12  # nose-up brake attitude (see block above)
 POST_CREDIT_BRAKE_TIMEOUT_S = 2.75  # bounded brake even with no reacquisition
 POST_CREDIT_CLIMB_CAP_M_S = 0.5  # climb cap while post-credit unqualified
+# Minimum brake hold (flight 20260729T125400Z-visual-course-4480d0a6): gate 1
+# is often already accepted AND vertically qualified at the credit tick, so
+# the qualification release fired within one 20 ms tick and the brake never
+# engaged — the flag stayed False for the entire F11 trace and the attack
+# closure was never killed.  The brake now holds for at least this long
+# regardless of qualification; qualification only releases it afterwards.
+POST_CREDIT_BRAKE_MIN_HOLD_S = 1.0
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 SEARCH_YAW_RATE_RAD_S = 0.12  # bounded sweep inside the 0.15 yaw cap
 SEARCH_SWEEP_PERIOD_S = 1.20  # bounded reversal schedule
@@ -510,6 +517,7 @@ class CleanCourseConfig:
     post_credit_brake_pitch_rad: float = POST_CREDIT_BRAKE_PITCH_RAD
     post_credit_brake_timeout_s: float = POST_CREDIT_BRAKE_TIMEOUT_S
     post_credit_climb_cap_m_s: float = POST_CREDIT_CLIMB_CAP_M_S
+    post_credit_brake_min_hold_s: float = POST_CREDIT_BRAKE_MIN_HOLD_S
     search_covariance_std_norm: float = SEARCH_COVARIANCE_STD_NORM
     search_yaw_rate_rad_s: float = SEARCH_YAW_RATE_RAD_S
     search_sweep_period_s: float = SEARCH_SWEEP_PERIOD_S
@@ -601,6 +609,7 @@ class CleanCourseController:
         # is accepted and vertically qualified.  While active, command()
         # pitches back genuinely and tightens the climb cap.
         self._post_credit_deadline_s: Optional[float] = None
+        self._post_credit_armed_s: Optional[float] = None
         self._active_climb_cap_m_s = VZ_CLIMB_CAP_M_S
 
     # -- initialization ----------------------------------------------------
@@ -846,6 +855,7 @@ class CleanCourseController:
         self._post_credit_deadline_s = (
             float(now_s) + self.config.post_credit_brake_timeout_s
         )
+        self._post_credit_armed_s = float(now_s)
         self._active_climb_cap_m_s = self.config.post_credit_climb_cap_m_s
         return True
 
@@ -1016,10 +1026,17 @@ class CleanCourseController:
             <= cfg.vertical_qualify_max_age_s
             and current.y_axis.std <= cfg.search_covariance_std_norm
         )
-        # Qualification release for the post-credit brake: the successor is
-        # accepted and vertically qualified, so normal advance and the full
-        # climb cap resume immediately (no waiting out the timeout).
-        if vertical_qualified and self._post_credit_deadline_s is not None:
+        # Qualification release for the post-credit brake, but only after the
+        # minimum hold (flight 4480d0a6): gate 1 is often already qualified at
+        # the credit tick, and an instant release made the brake a no-op while
+        # the gate-0 attack closure was still carried.
+        if (
+            vertical_qualified
+            and self._post_credit_deadline_s is not None
+            and self._post_credit_armed_s is not None
+            and now_s - self._post_credit_armed_s
+            >= cfg.post_credit_brake_min_hold_s
+        ):
             self._post_credit_deadline_s = None
             self._active_climb_cap_m_s = VZ_CLIMB_CAP_M_S
         post_credit_brake = self._post_credit_deadline_s is not None
