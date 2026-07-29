@@ -142,11 +142,12 @@ def _tracked_controller(track=None, *, config=None, now=100.0):
     return controller
 
 
-def _command(controller, now, *, roll=0.0, pitch=0.0, a_up=None, fh=None):
+def _command(controller, now, *, roll=0.0, pitch=0.0, yaw=None, a_up=None, fh=None):
     return controller.command(
         now_s=now,
         roll_rad=roll,
         pitch_rad=pitch,
+        yaw_rad=yaw,
         world_up_accel_m_s2=a_up,
         horizontal_specific_force_mps2=fh,
     )
@@ -1127,7 +1128,7 @@ def test_closure_governor_full_brake_at_high_expansion_rate():
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
-    assert out.target_pitch_rad == pytest.approx(0.08, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
     assert now - 100.10 <= 0.5  # fast slew, not the generic 0.30 rad/s
     assert out.yaw_rate_rad_s > 0.0  # x=+0.20 pursuit stays alive
     assert out.thrust > 0.0  # the vz governor keeps the collective alive
@@ -1145,7 +1146,7 @@ def test_closure_governor_does_not_brake_below_target_rate():
 
 def test_closure_governor_is_a_continuous_blend():
     # Mid-band rate (0.475/s -> closure 0.5): the pitch target blends
-    # halfway from the advance law (<= -0.02) toward the +0.08 brake
+    # halfway from the advance law (<= -0.02) toward the +0.15 brake
     # attitude, without latching the fast-slew brake flag.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller.current.scale_axis.v = 0.475
@@ -1155,7 +1156,7 @@ def test_closure_governor_is_a_continuous_blend():
         now += 0.033
         out = _command(controller, now)
     assert not controller._pre_cross_brake_active
-    assert -0.02 + 1e-9 < out.target_pitch_rad < 0.08 - 1e-9
+    assert -0.02 + 1e-9 < out.target_pitch_rad < 0.15 - 1e-9
 
 
 def test_closure_governor_brakes_in_predict():
@@ -1178,7 +1179,53 @@ def test_closure_governor_brakes_in_predict():
         out = _command(controller, now)
     assert controller.state is CleanCourseState.PREDICT
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(0.08, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
+
+
+def test_heading_anchor_clamps_outward_yaw_only():
+    # F31: post-loss search/edge-chase wound the heading +2.63 rad off the
+    # course bearing, then the drone flew sideways into structure it never
+    # saw.  The anchor is captured lazily on the first yaw tick; outward
+    # steering past the 0.9 rad cap is blocked, return steering is free.
+    controller = _tracked_controller(_track("A", 0.30, 0.0, scale=0.10))
+    out = _command(controller, 100.10, yaw=0.0)  # lazy anchor = 0.0
+    assert controller._course_anchor_yaw_rad == pytest.approx(0.0)
+    assert out.yaw_rate_rad_s > 0.0  # x=+0.30 pursuit steers freely
+    # Heading wound past the cap: the same positive pursuit is blocked.
+    out = _command(controller, 100.143, yaw=1.0)
+    assert out.yaw_rate_rad_s <= 0.0
+    # Return steering (target left of center) is always free at the cap.
+    controller.current.x_axis.p = -0.30
+    out = _command(controller, 100.176, yaw=1.0)
+    assert out.yaw_rate_rad_s < 0.0
+    # Wrapped excursion: yaw just past -pi relative to a +pi anchor is a
+    # small positive excursion, not a full revolution.
+    controller2 = _tracked_controller(_track("A", -0.30, 0.0, scale=0.10))
+    _command(controller2, 100.10, yaw=math.pi - 0.1)
+    out = _command(controller2, 100.143, yaw=-math.pi + 0.05)
+    assert out.yaw_rate_rad_s < 0.0  # excursion +0.15: steering unaffected
+    # Promotion re-arms the anchor for the new leg.
+    _promote_to_gate_one(controller)
+    assert controller._course_anchor_yaw_rad is None
+
+
+def test_search_commands_brake_attitude_when_blind_and_fast():
+    # F31: blind legs were where speed ran away (the closure governor has
+    # no expansion signal in SEARCH).  Above fh 1.5 SEARCH commands the
+    # brake attitude; slow (takeoff) SEARCH stays near level.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    controller._enter_search(100.10)
+    controller._fh_mps2 = 0.5  # slow: near-level target
+    out = _command(controller, 100.143)
+    assert out.target_pitch_rad <= 0.0
+    controller._fh_mps2 = 3.0  # blind and fast: brake
+    now = 100.143
+    for _ in range(20):  # generic slew converges to the brake attitude
+        now += 0.033
+        out = _command(controller, now)
+    assert out.state is CleanCourseState.SEARCH
+    assert out.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
+    assert abs(out.yaw_rate_rad_s) > 0.0  # the sweep stays alive
 
 
 def test_pre_cross_brake_does_not_suppress_crossing_detection():
@@ -1461,7 +1508,7 @@ def test_finite_bounded_output_across_states():
         assert abs(output.yaw_rate_rad_s) <= 0.25 + 1e-9
         assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
         assert abs(output.target_roll_rad) <= 0.25 + 1e-9
-        assert -0.35 <= output.target_pitch_rad <= 0.10 + 1e-9
+        assert -0.35 <= output.target_pitch_rad <= 0.15 + 1e-9
         if output.thrust == 0.0:
             assert output.state is CleanCourseState.COAST_FOR_CREDIT
 

@@ -287,8 +287,24 @@ PREDICT_STALL_FORCE_SEARCH_S = 1.50
 # were themselves VRS generators).
 CLOSURE_TARGET_RATE_S = 0.35  # log-scale rate the governor holds (TTC ~3 s)
 CLOSURE_FULL_BRAKE_RATE_S = 0.60  # rate at which the full brake pitch applies
-PRE_CROSS_BRAKE_PITCH_RAD = 0.08  # gentle brake attitude (F29 VRS lesson)
+PRE_CROSS_BRAKE_PITCH_RAD = 0.15  # brake attitude (F31: +0.08 gave only
+# ~0.84 m/s^2 rearward, ~5x too weak against the gravity-powered glide;
+# fh grew 4.1 -> 6.0 through 1.7 s of fully-attained brake)
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
+# Blind-at-speed brake (F31): SEARCH has no expansion signal, so the
+# governor cannot run there — and F31's blind legs were where the speed
+# ran away.  Above this fh (drag ~ speed proxy) SEARCH commands the brake
+# attitude instead of the near-level one.  Takeoff SEARCH (fh ~ 0) is
+# unaffected.
+SEARCH_FH_BRAKE_MPS2 = 1.5
+# Course-heading anchor (F31): after losing the gate-1 track the drone
+# search-swept and edge-chased its heading +2.63 rad off the course
+# bearing, then flew sideways/backwards at ~0.65g drag into structure it
+# never squarely saw.  The yaw channel is clamped so cumulative excursion
+# from the leg anchor (initial yaw, re-anchored on every authoritative
+# promotion) can never exceed this; only return steering is allowed at
+# the cap.
+COURSE_HEADING_ANCHOR_CAP_RAD = 0.9
 # Pre-gate-1 altitude floor (terrain insurance; flights F10/F11/F12 all
 # flew their final 6-10 s below 0.7 m with thrust pinned at the clamp into
 # terrain hits).  alt_est integrates the governor's IMU vz_est from course
@@ -606,6 +622,8 @@ class CleanCourseConfig:
     closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
+    search_fh_brake_mps2: float = SEARCH_FH_BRAKE_MPS2
+    course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
     alt_floor_release_m: float = ALT_FLOOR_RELEASE_M
     alt_floor_climb_margin: float = ALT_FLOOR_CLIMB_MARGIN
@@ -725,6 +743,11 @@ class CleanCourseController:
         self._fh_mps2 = 0.0
         self._fh_untrusted = False
         self._fh_above_since_s: Optional[float] = None
+        # Course-heading anchor (F31): yaw at the leg start (lazily
+        # captured on the first command tick with a live yaw measurement,
+        # re-armed on every authoritative promotion).  Yaw commands that
+        # would wind the heading past the anchor cap are clamped.
+        self._course_anchor_yaw_rad: Optional[float] = None
 
     # -- initialization ----------------------------------------------------
 
@@ -974,6 +997,8 @@ class CleanCourseController:
         # Re-seed the collective tracker so a retained saturated sub-support
         # command can never survive into the next gate.
         self._collective = None
+        # Re-arm the course-heading anchor for the new leg (F31).
+        self._course_anchor_yaw_rad = None
         return True
 
     # -- the one continuous control law -------------------------------------
@@ -984,6 +1009,7 @@ class CleanCourseController:
         now_s: float,
         roll_rad: float,
         pitch_rad: float,
+        yaw_rad: Optional[float] = None,
         world_up_accel_m_s2: Optional[float] = None,
         horizontal_specific_force_mps2: Optional[float] = None,
     ) -> NavigationOutput:
@@ -991,6 +1017,8 @@ class CleanCourseController:
 
         cfg = self.config
         self._pre_cross_brake_active = False  # main path recomputes below
+        if yaw_rad is not None and self._course_anchor_yaw_rad is None:
+            self._course_anchor_yaw_rad = float(yaw_rad)
         if self._last_command_s is None:
             dt = cfg.control_period_s
         else:
@@ -1160,7 +1188,7 @@ class CleanCourseController:
             )
 
         if self.state is CleanCourseState.SEARCH:
-            sweep_yaw = self._search_yaw(dt)
+            sweep_yaw = self._anchor_clamped_yaw(self._search_yaw(dt), yaw_rad)
             # Flight 25361816: the unqualified hold margin must apply here
             # too — SEARCH at bare support in the fh-untrusted regime sank
             # ~1 m/s for real into terrain (the margin only covered the
@@ -1170,8 +1198,16 @@ class CleanCourseController:
             )
             self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
+            # Blind-at-speed brake (F31): the closure governor cannot run
+            # in SEARCH (no expansion signal), so above the fh threshold a
+            # blind leg commands the brake attitude instead of near level.
+            search_pitch = (
+                cfg.pre_cross_brake_pitch_rad
+                if self._fh_mps2 > cfg.search_fh_brake_mps2
+                else cfg.brake_pitch_rad
+            )
             target_pitch = self._slew_pitch(
-                cfg.brake_pitch_rad,
+                search_pitch,
                 dt,
             )
             return NavigationOutput(
@@ -1349,6 +1385,7 @@ class CleanCourseController:
             -cfg.max_yaw_rate_rad_s * steer_cap,
             cfg.max_yaw_rate_rad_s * steer_cap,
         )
+        yaw_rate = self._anchor_clamped_yaw(yaw_rate, yaw_rad)
         target_roll = _clamp(
             cfg.roll_error_sign * cfg.roll_error_gain * ex,
             -cfg.max_target_roll_rad * steer_cap,
@@ -1656,6 +1693,26 @@ class CleanCourseController:
         # 20260729T115619Z-visual-course-039186c8.
         return _clamp(collective, self.config.min_thrust, self.config.max_thrust)
 
+    def _anchor_clamped_yaw(
+        self, yaw_rate: float, yaw_rad: Optional[float]
+    ) -> float:
+        """Block steering that winds the heading past the leg anchor (F31).
+
+        Only the outward direction is blocked; return steering is always
+        free.  No-op without a live yaw measurement or an anchor.
+        """
+        if yaw_rad is None or self._course_anchor_yaw_rad is None:
+            return yaw_rate
+        excursion = math.remainder(
+            float(yaw_rad) - self._course_anchor_yaw_rad, 2.0 * math.pi
+        )
+        cap = self.config.course_heading_anchor_cap_rad
+        if excursion > cap:
+            return min(yaw_rate, 0.0)
+        if excursion < -cap:
+            return max(yaw_rate, 0.0)
+        return yaw_rate
+
     def _search_yaw(self, dt: float) -> float:
         cfg = self.config
         self._search_elapsed_s += dt
@@ -1857,6 +1914,14 @@ def _track_measurement(
     """
 
     aperture = getattr(track, "inner_aperture", None)
+    if aperture is None:
+        # Live VisualTrack carries the fit on its latest history sample, not
+        # as a top-level attribute (codex wiring finding): without this the
+        # aperture branch was dead and every measurement fell back to the
+        # outer bbox.
+        history = getattr(track, "history", None)
+        if history:
+            aperture = getattr(history[-1], "inner_aperture", None)
     if (
         aperture is not None
         and getattr(aperture, "center_norm", None) is not None
@@ -2026,6 +2091,7 @@ def _clean_course_tick_trace(
         ),
         "post_credit_brake": False,
         "pre_cross_brake": controller._pre_cross_brake_active,
+        "course_anchor_yaw_rad": controller._course_anchor_yaw_rad,
         "alt_est_m": controller._alt_est_m,
         "alt_floor_active": controller._alt_floor_active,
         "fh_mps2": controller._fh_mps2,
@@ -2147,7 +2213,7 @@ async def run_clean_course_stage(
                 raise rt.safety_abort_type(
                     "visual-course lost the IMU attitude estimate"
                 )
-            roll_rad, pitch_rad, _yaw = estimate.orientation.to_euler()
+            roll_rad, pitch_rad, yaw_rad = estimate.orientation.to_euler()
             # IMU world-up acceleration for the climb governor: HIGHRES_IMU
             # specific force (FRD) rotated by the estimator quaternion,
             # minus gravity.  Same telemetry seam _record_tick already logs.
@@ -2163,6 +2229,7 @@ async def run_clean_course_stage(
                 now_s=now,
                 roll_rad=roll_rad,
                 pitch_rad=pitch_rad,
+                yaw_rad=yaw_rad,
                 world_up_accel_m_s2=world_up_accel,
                 horizontal_specific_force_mps2=getattr(
                     estimate, "horizontal_specific_force_mps2", None
