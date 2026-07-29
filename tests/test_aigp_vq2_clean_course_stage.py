@@ -1923,6 +1923,28 @@ def test_search_heading_sweep_starts_at_entry_heading_and_stays_alive():
     assert abs(math.remainder(headings[-1] - 0.4, 2.0 * math.pi)) > 0.3
 
 
+def test_search_keeps_sweep_and_carries_floor_margin_under_alt_floor():
+    # F52 (20260729T232037Z-visual-course-dedf1915): SEARCH entry at t=7.44
+    # latched the alt-floor on the sagged gate-0 integrator and the
+    # override parked the sweep (yaw=0/roll=0, thrust=support+margin) until
+    # t=10.25 while the gates slid behind; the drone hit terrain at 13.7 s.
+    # The floor must not preempt SEARCH: the sweep keeps full yaw authority
+    # and the collective still carries the floor climb margin.
+    controller = _tracked_controller(_track("A", 0.40, 0.0, scale=0.10))
+    _promote_to_gate_one(controller)
+    controller._enter_search(100.10)
+    controller._alt_est_m = 0.5  # sagged integrator, below the trigger
+    controller.last_reliable_bearing = (0.30, 0.0)  # zero vertical memory
+    _blind_current(controller, 100.10)  # F51: the floor arms only blind
+    out = _command(controller, 100.12)
+    assert out.state is CleanCourseState.SEARCH
+    assert controller._alt_floor_active
+    # The sweep runs under the active floor (image-right bearing first).
+    assert out.yaw_rate_rad_s > 0.0
+    # ...and the collective carries the floor climb margin, not bare hold.
+    assert out.thrust == pytest.approx(SUPPORT + 0.05, abs=1e-9)
+
+
 def test_search_reacquisition_allows_same_track_id():
     controller = _tracked_controller(_track("A", 0.20, 0.0, scale=0.10))
     now = 100.10
@@ -2092,6 +2114,31 @@ def test_track_never_steers_on_unmeasured_x_axis():
     controller.current.last_x_measurement_s = 100.10
     out = _command(controller, 100.12)
     assert out.yaw_rate_rad_s > 0.0
+
+
+def test_near_plane_stale_x_keeps_derotated_steering():
+    # F52 (20260729T232037Z-visual-course-dedf1915): at gate 1's plane the
+    # aim track went frame-censored (t=5.78, correctly — censored axes do
+    # not update the filter), the derotated filter held the last good
+    # bearing (ex=-0.17), and when x_qualified expired (t=6.25) the F40
+    # zeroing parked yaw/roll — the drone flew ballistic from a still
+    # 0.3-off heading and crossed the plane displaced, no credit.  Near the
+    # plane a stale x keeps steering on the derotated hypothesis (the
+    # crossing completes in <1 s); the same staleness at FAR range still
+    # zeroes steering (F40).
+    near = _tracked_controller(_track("A", -0.17, 0.0, scale=0.50))
+    near.current.last_x_measurement_s = 100.10 - 1.0  # past X_STEER_MAX_AGE_S
+    out = _command(near, 100.10)
+    assert out.state is CleanCourseState.TRACK
+    # yaw gain 0.90 on the held ex=-0.17 bearing keeps centering.
+    assert out.yaw_rate_rad_s == pytest.approx(-0.153, abs=1e-9)
+    assert out.target_roll_rad < 0.0  # slewing toward the 0.50*ex bank
+    # FAR target, identical staleness: the F40 zeroing still applies.
+    far = _tracked_controller(_track("A", -0.17, 0.0, scale=0.10))
+    far.current.last_x_measurement_s = 100.10 - 1.0
+    out = _command(far, 100.10)
+    assert out.yaw_rate_rad_s == 0.0
+    assert out.target_roll_rad == 0.0
 
 
 def test_promotion_rejects_successor_with_unmeasured_x_axis():

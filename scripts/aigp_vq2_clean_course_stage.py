@@ -1475,7 +1475,7 @@ class CleanCourseController:
             self._alt_floor_latch_s = None
             self._alt_floor_cooldown = False
             self._alt_floor_above_release_since_s = None
-        if self._alt_floor_active:
+        if self._alt_floor_active and self.state is not CleanCourseState.SEARCH:
             # Terrain recovery override: governed climb collective at the
             # level (spawn) attitude.  F51: the override keeps LATERAL
             # authority — the F50 gi 0->1 promotion latched the floor on
@@ -1484,6 +1484,11 @@ class CleanCourseController:
             # gate-1 track walked off the frame.  The floor now owns ONLY
             # the collective and the level pitch; yaw/roll use the standard
             # x-qualified pursuit (stale x -> heading hold, wings level).
+            # F52 (20260729T232037Z-visual-course-dedf1915): the override
+            # must NOT preempt SEARCH — the F51 search entry latched the
+            # floor on the sagged integrator and parked the sweep for 2.8 s
+            # while the gates slid behind.  SEARCH keeps its sweep and adds
+            # the floor climb margin to its collective instead (below).
             floor_yaw = 0.0
             floor_roll = 0.0
             floor_current = self.current
@@ -1550,6 +1555,14 @@ class CleanCourseController:
                     cfg.search_vertical_memory_band,
                 )
             search_hold = support + correction + margin
+            if self._alt_floor_active:
+                # F52: the floor override no longer preempts SEARCH, but it
+                # still guards altitude — the sweep keeps full yaw
+                # authority while the collective carries the floor climb
+                # margin.
+                search_hold = max(
+                    search_hold, support + cfg.alt_floor_climb_margin
+                )
             self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
             # F49: SEARCH always holds the LEVEL (spawn-attitude) pitch.
@@ -1614,7 +1627,9 @@ class CleanCourseController:
         # x-axis without a fresh accepted measurement — an unmeasured or
         # stale x (edge-clipped splinter, censored axis) is a garbage aim
         # point.  The y/vertical path is deliberately untouched (F35 servos
-        # on censored-y by design).
+        # on censored-y by design).  F52: the near-plane regime is excepted
+        # at the zeroing site below — there the derotated hypothesis is the
+        # best aim evidence and the crossing completes in <1 s.
         x_qualified = (
             now_s - current.last_x_measurement_s <= cfg.x_steer_max_age_s
         )
@@ -1781,10 +1796,18 @@ class CleanCourseController:
             -cfg.max_target_roll_rad * steer_cap,
             cfg.max_target_roll_rad * steer_cap,
         )
-        if not x_qualified:
+        if not x_qualified and current.log_scale < cfg.near_brake_log_scale:
             # F40: no fresh x measurement -> no yaw/roll authority; hold
             # heading and wings level (slewing toward 0) instead of chasing
-            # a phantom bearing off the frame.
+            # a phantom bearing off the frame.  F52 near-plane exception
+            # (20260729T232037Z-visual-course-dedf1915): the F40 rationale
+            # covers FAR targets lost off-frame.  At the gate plane the
+            # derotated hypothesis bearing is the best aim evidence and the
+            # crossing completes in <1 s — zeroing steering there (the aim
+            # track went frame-censored at t=5.78, x_qualified expired at
+            # t=6.25) flew ballistic from a still 0.3-off heading and
+            # crossed gate 1's plane displaced, no credit.  Near the plane,
+            # keep steering on the derotated hypothesis.
             yaw_rate = 0.0
             target_roll = 0.0
 
