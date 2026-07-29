@@ -42,6 +42,10 @@ SUPPORT_THRUST = 0.275
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 _NS_PER_SECOND = 1_000_000_000
 _EPSILON = 1e-12
+# Run 27 briefly estimated +0.002 normalized/s after a strong inward
+# intercept and mistook estimator noise for a true outward reversal.  Run 25
+# established that +0.057 normalized/s is already enough evidence to unload.
+_INTERCEPT_REVERSAL_MIN_RATE_NORM_S = 0.04
 
 
 class DynamicCourseError(ValueError):
@@ -3477,6 +3481,8 @@ class DynamicCourseCore:
         if (
             intercept_motion_qualified
             and intercept_motion_product < -_EPSILON
+            and abs(residual_rate_norm[0])
+            >= _INTERCEPT_REVERSAL_MIN_RATE_NORM_S
         ):
             # Build lateral momentum through the qualified inward phase.
             self._current_intercept_inward_observed = True
@@ -3484,6 +3490,8 @@ class DynamicCourseCore:
             intercept_motion_qualified
             and self._current_intercept_inward_observed
             and intercept_motion_product > _EPSILON
+            and abs(residual_rate_norm[0])
+            >= _INTERCEPT_REVERSAL_MIN_RATE_NORM_S
         ):
             # The first outward reversal after inward translation is the
             # evidence-backed point to unload.  Lock ordinary PD for the rest

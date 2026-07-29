@@ -1453,8 +1453,14 @@ def test_off_axis_steering_holds_inward_then_locks_pd_on_reversal(
     # The first qualified outward reversal permanently hands this continuous
     # approach to bounded proportional/rate control.
     reversal_decisions = []
+    reversal_states = []
     reversal_state = None
-    for sequence, x in ((12, 0.330), (13, 0.350), (14, 0.390)):
+    for sequence, x in (
+        (12, 0.330),
+        (13, 0.350),
+        (14, 0.352),
+        (15, 0.390),
+    ):
         observation_time = 1.0 + (sequence - 1) * 0.040
         _imu(core, observation_time)
         reversal_state = core.observe_track(
@@ -1467,6 +1473,7 @@ def test_off_axis_steering_holds_inward_then_locks_pd_on_reversal(
                 aperture=(0.14, 0.11),
             )
         )
+        reversal_states.append(reversal_state)
         decision_time = observation_time + 0.005
         _imu(core, decision_time)
         reversal_decision = core.guide(round(decision_time * NS))
@@ -1485,6 +1492,14 @@ def test_off_axis_steering_holds_inward_then_locks_pd_on_reversal(
     assert reversal_decisions[1].proposed_command.target_roll_rad == (
         pytest.approx(MAX_TARGET_ROLL_RAD)
     )
+    assert reversal_decisions[2].proposed_command.target_roll_rad == (
+        pytest.approx(MAX_TARGET_ROLL_RAD)
+    )
+    near_zero_reversal_rate_norm_s = (
+        reversal_states[2].residual_translational_rate_rad_s[0]
+        / core.config.horizontal_angle_scale_rad
+    )
+    assert 0.0 < near_zero_reversal_rate_norm_s < 0.04
     assert (
         0.0
         < reversal_decisions[-1].proposed_command.target_roll_rad
@@ -1492,7 +1507,7 @@ def test_off_axis_steering_holds_inward_then_locks_pd_on_reversal(
     )
 
     centered_decision = None
-    for sequence, x in ((15, 0.20), (16, 0.10), (17, 0.05)):
+    for sequence, x in ((16, 0.20), (17, 0.10), (18, 0.05)):
         observation_time = 1.0 + (sequence - 1) * 0.040
         _imu(core, observation_time)
         core.observe_track(

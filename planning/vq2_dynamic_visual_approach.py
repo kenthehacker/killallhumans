@@ -2751,10 +2751,11 @@ class DynamicVisualCourseSession:
 
         The rolling graph keeps authoritative identity while independently
         withholding visual-measurement authority.  Each exact newer camera
-        publication proves the stream is live, so a clipped-edge miss may
+        publication proves the stream is live.  A clipped-edge miss may
         continue the last bounded same-gate command that actually reached the
-        wire.  No bearing, aperture, scale, TTC, passage, race, or advance
-        geometry is renewed through blindness.
+        wire; any other exact miss is a normal active-search transition.  No
+        bearing, aperture, scale, TTC, passage, race, or advance geometry is
+        renewed through blindness.
         """
 
         if type(track) is not VisualTrack:
@@ -2788,7 +2789,6 @@ class DynamicVisualCourseSession:
             or type(missed_count) is not int
             or missed_count <= 0
             or sample.token != track.latest_token
-            or sample.clipping == FrameEdge.NONE
             or track.clipping != sample.clipping
             or type(sample.observation_monotonic_ns) is not int
             or sample.observation_monotonic_ns < 0
@@ -2808,6 +2808,15 @@ class DynamicVisualCourseSession:
         ):
             raise DynamicCourseError(
                 "propagated visibility gap is not an exact clipped miss"
+            )
+        if sample.clipping == FrameEdge.NONE:
+            # A clean full-frame rebound can disappear again on its very next
+            # publication.  Run 27 hit exactly that normal detector dropout
+            # after a successful same-gate rebind.  It has no clipped-edge
+            # continuity to propagate, so retire the hold into active search
+            # instead of treating the new loss as a controller fault.
+            raise PropagatedCurrentVisibilityGapUnavailable(
+                "propagated visibility gap lacks clipped-edge continuity"
             )
 
         state = self.core.course_state()

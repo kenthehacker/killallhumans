@@ -2486,7 +2486,10 @@ def test_fresh_clipped_misses_keep_accepted_same_gate_steering() -> None:
         history=tracker.track(current_id).history[:-1]
         + (replace(last_visible, clipping=FrameEdge.NONE),),
     )
-    with pytest.raises(DynamicCourseError, match="exact clipped miss"):
+    with pytest.raises(
+        PropagatedCurrentVisibilityGapUnavailable,
+        match="lacks clipped-edge continuity",
+    ):
         session.propagated_current_visibility_gap_authority(
             track=unclipped_track,
             camera_token=update.token,
