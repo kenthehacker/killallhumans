@@ -673,6 +673,13 @@ MAX_PITCH_RAD = math.radians(10.0)
 MAX_BODY_RATE_RAD_S = 2.0
 IMMEDIATE_MAX_BODY_RATE_RAD_S = 3.0
 MAX_COMMAND_RATE_RAD_S = 0.25
+# F36/F39: the visual-course yaw channel commands up to the calibrated
+# measured authority (0.5 rad/s, config/aigp_vq2_yaw_calibration_build3385.json)
+# — the F38/F39 aborts ("commanded body rate exceeded conservative clamp")
+# fired the legacy 0.25 yaw ceiling at every validation call site on the
+# first long pursuit.  The measured-authority guard at the visual-course
+# entry already refuses to run when the code limits exceed the profile.
+MAX_YAW_COMMAND_RATE_RAD_S = 0.5
 # Gate-1 live traces showed sustained target-roll error while the attitude loop
 # used only about 0.04 rad/s of the calibrated 0.25-rad/s wire authority.  Keep
 # the final wire governor authoritative and increase only the roll error
@@ -7443,7 +7450,7 @@ def attitude_rate_command(
 def validate_command(
     command: AttitudeRateCommand,
     *,
-    max_yaw_rate_rad_s: float = MAX_COMMAND_RATE_RAD_S,
+    max_yaw_rate_rad_s: float = MAX_YAW_COMMAND_RATE_RAD_S,
 ) -> None:
     values = (
         command.roll_rate,
@@ -12949,18 +12956,7 @@ class VQ2Runner:
                     next_control_deadline=next_control_deadline,
                     attitude_rate_command=attitude_rate_command,
                     attitude_rate_command_type=AttitudeRateCommand,
-                    validate_command=partial(
-                        validate_command,
-                        # F36 raised the yaw authority to the calibrated
-                        # 0.5 rad/s measured cap; the F38 abort ("commanded
-                        # body rate exceeded conservative clamp") fired the
-                        # legacy 0.25 yaw ceiling on the first long
-                        # pursuit.  Roll/pitch keep the wire clamp.
-                        max_yaw_rate_rad_s=min(
-                            DEFAULT_VISUAL_COURSE_LIMITS.max_yaw_rate_rad_s,
-                            course_yaw_profile.max_abs_measured_yaw_rate_rad_s,
-                        ),
-                    ),
+                    validate_command=validate_command,
                     skipped_result=(
                         FlightCommandSendResult.SKIPPED_RACE_BOUNDARY_CHANGED
                     ),
