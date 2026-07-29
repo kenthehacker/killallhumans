@@ -1159,7 +1159,8 @@ class DynamicCourseCore:
         self._successor_clearance_positive_since_ns: int | None = None
         self._last_applied_command: DynamicCourseCommand | None = None
         self._current_intercept_key: tuple[int, str] | None = None
-        self._current_intercept_inward_established = False
+        self._current_intercept_inward_observed = False
+        self._current_intercept_pd_locked = False
 
     @property
     def track_states(self) -> tuple[TrackDynamicState, ...]:
@@ -2632,7 +2633,8 @@ class DynamicCourseCore:
         intercept_key = (current_gate_index, current_track_id)
         if intercept_key != self._current_intercept_key:
             self._current_intercept_key = intercept_key
-            self._current_intercept_inward_established = False
+            self._current_intercept_inward_observed = False
+            self._current_intercept_pd_locked = False
         return self.course_state()
 
     def course_state(self) -> CourseDynamicState:
@@ -3133,7 +3135,8 @@ class DynamicCourseCore:
             to_gate_index,
             promoted_track_id,
         )
-        self._current_intercept_inward_established = False
+        self._current_intercept_inward_observed = False
+        self._current_intercept_pd_locked = False
         self._successor_clearance_key = None
         self._successor_clearance_positive_since_ns = None
         self._promotion_count += 1
@@ -3457,7 +3460,7 @@ class DynamicCourseCore:
         stable_horizontal_bearing = math.atan(
             passage_error[0] * self.config.horizontal_angle_scale_rad
         )
-        if (
+        intercept_motion_qualified = bool(
             current.visible
             and current.missed_count == 0
             and current.state_monotonic_ns
@@ -3467,12 +3470,25 @@ class DynamicCourseCore:
             and current.bearing_rate_qualified[0]
             and abs(stable_horizontal_bearing)
             >= self.config.off_axis_brake_rad
-            and passage_error[0] * residual_rate_norm[0] < -_EPSILON
+        )
+        intercept_motion_product = (
+            passage_error[0] * residual_rate_norm[0]
+        )
+        if (
+            intercept_motion_qualified
+            and intercept_motion_product < -_EPSILON
         ):
-            # Qualified inward translation ends the full-bank launch
-            # transient.  A later rate reversal must not discontinuously
-            # re-arm saturation on this same continuous current-gate approach.
-            self._current_intercept_inward_established = True
+            # Build lateral momentum through the qualified inward phase.
+            self._current_intercept_inward_observed = True
+        elif (
+            intercept_motion_qualified
+            and self._current_intercept_inward_observed
+            and intercept_motion_product > _EPSILON
+        ):
+            # The first outward reversal after inward translation is the
+            # evidence-backed point to unload.  Lock ordinary PD for the rest
+            # of this continuous gate/track approach; never re-arm saturation.
+            self._current_intercept_pd_locked = True
         proposal, braking, reason, yaw_contribution = self._propose_command(
             current,
             successor,
@@ -3488,9 +3504,7 @@ class DynamicCourseCore:
             current_yaw_release,
             successor_weight,
             successor_prediction,
-            inward_intercept_established=(
-                self._current_intercept_inward_established
-            ),
+            intercept_pd_locked=self._current_intercept_pd_locked,
             horizontal_alignment_unsettled=(
                 horizontal_alignment_unsettled
             ),
@@ -4484,7 +4498,7 @@ class DynamicCourseCore:
         successor_weight: float,
         successor_prediction: _SuccessorPrediction | None,
         *,
-        inward_intercept_established: bool,
+        intercept_pd_locked: bool,
         horizontal_alignment_unsettled: bool,
         vertical_alignment_unsettled: bool,
     ) -> tuple[DynamicCourseCommand, bool, str | None, float]:
@@ -4614,16 +4628,16 @@ class DynamicCourseCore:
             and current.bearing_rate_qualified[0]
             and abs(stable_passage_bearing[0])
             >= self.config.off_axis_brake_rad
-            and not inward_intercept_established
+            and not intercept_pd_locked
             and abs(yaw) >= 0.90 * MAX_YAW_RATE_RAD_S
             and abs(self.config.roll_guidance_sign) > _EPSILON
         )
         if off_axis_full_bank:
-            # Hold the launch transient until qualified image motion first
-            # turns inward.  The proportional/rate command above then owns the
-            # remainder of this continuous approach and may taper or
-            # counter-bank.  Re-arming full bank at the first reversal made
-            # both 2ac822f and e556638 escape right.
+            # Hold full bank while the gate first moves inward.  Its first
+            # qualified outward reversal proves that usable lateral momentum
+            # has been built; ordinary proportional/rate control then owns the
+            # remainder of this continuous approach and can brake without
+            # re-arming saturation.
             roll = math.copysign(
                 MAX_TARGET_ROLL_RAD,
                 self.config.roll_guidance_sign

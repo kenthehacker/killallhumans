@@ -8212,7 +8212,7 @@ def test_current_aperture_collective_uses_admitted_dynamic_top_state():
     assert retained.held_last_observable_collective is True
 
 
-def test_later_gate_collective_uses_measured_support_not_pixel_y_feedback():
+def test_run25_later_gate_collective_closes_rxpi_vertical_error():
     state = course_stage._CurrentApertureProvedCollectiveState(
         track_id="track-1",
         fixed_support_thrust=course_stage.LATER_GATE_SUPPORT_THRUST,
@@ -8236,16 +8236,17 @@ def test_later_gate_collective_uses_measured_support_not_pixel_y_feedback():
         control_basis=(
             course_stage.CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
         ),
+        subsupport_collective_authorized=True,
     )
 
     assert proposal.requested_thrust == pytest.approx(
-        course_stage.LATER_GATE_SUPPORT_THRUST
+        course_stage.MIN_VISUAL_THRUST
     )
     assert proposal.unconstrained_requested_thrust == pytest.approx(
-        course_stage.LATER_GATE_SUPPORT_THRUST
+        course_stage.MIN_VISUAL_THRUST
     )
     assert state.retained_or_wire(0.21) == pytest.approx(
-        course_stage.LATER_GATE_SUPPORT_THRUST
+        course_stage.MIN_VISUAL_THRUST
     )
     assert proposal.noncommitted_support_floor_applied is False
     assert proposal.vertical_censored is False

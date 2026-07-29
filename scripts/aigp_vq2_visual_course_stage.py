@@ -122,11 +122,13 @@ GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE = 5.0 / 3.0
 GATE0_PROVED_COLLECTIVE_RATE_FILTER_ALPHA = 0.35
 GATE0_PROVED_COLLECTIVE_BASIS = "proved-gate0-normalized-collective-v1"
 # Build-3385 Gate-1 IMU data brackets level vertical acceleration between
-# 0.300 and 0.303 at the measured alignment attitude.  The legacy pixel-y
-# collective law has the opposite response under the calibrated Rx(pi)
-# camera boundary, so later gates use this measured support value while
-# pitch owns vertical image alignment.
+# 0.300 and 0.303 at the measured alignment attitude.  Under the calibrated
+# Rx(pi) boundary, collective above support moves the stable gate bearing
+# toward image TOP.  Later gates therefore use the opposite feedback sign
+# from Gate 0 around this measured support point.
 LATER_GATE_SUPPORT_THRUST = 0.3025
+LATER_GATE_COLLECTIVE_ERROR_GAIN = GATE0_PROVED_COLLECTIVE_ERROR_GAIN
+LATER_GATE_COLLECTIVE_RATE_GAIN = GATE0_PROVED_COLLECTIVE_RATE_GAIN
 CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS = (
     "imu-derotated-current-center-proved-law-v2"
 )
@@ -3463,6 +3465,47 @@ def _gate0_proved_vertical_collective(
     )
 
 
+def _later_gate_vertical_collective(
+    vertical: float,
+    filtered_vertical_rate: float,
+    *,
+    support_thrust: float,
+) -> float:
+    """Close stable vertical error with the identified later-gate sign."""
+
+    vertical = float(vertical)
+    filtered_vertical_rate = float(filtered_vertical_rate)
+    support = float(support_thrust)
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (vertical, filtered_vertical_rate, support)
+        )
+        or not MIN_VISUAL_THRUST <= support <= MAX_VISUAL_THRUST
+    ):
+        raise ValueError("later-gate collective inputs must be finite")
+    bounded_vertical = max(
+        -GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR,
+        min(GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR, vertical),
+    )
+    bounded_rate = max(
+        -GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE,
+        min(
+            GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE,
+            filtered_vertical_rate,
+        ),
+    )
+    requested = (
+        support
+        + LATER_GATE_COLLECTIVE_ERROR_GAIN * bounded_vertical
+        + LATER_GATE_COLLECTIVE_RATE_GAIN * bounded_rate
+    )
+    return max(
+        MIN_VISUAL_THRUST,
+        min(MAX_VISUAL_THRUST, requested),
+    )
+
+
 def _gate0_proved_next_preview_collective_delta(
     *,
     proved_collective: float,
@@ -3591,10 +3634,11 @@ def _gate0_proved_collective_with_exact_next_preview(
 class _CurrentApertureProvedCollectiveState:
     """Exact-frame collective state bound to one authoritative aperture.
 
-    The gains remain the flight-proved Gate-0 law.  The state itself is
-    gate-agnostic and is recreated at each authoritative gate transition.
-    Raw censorship cannot synthesize a new collective request.  An already
-    admitted IMU-derotated dynamic state remains usable because its caller has
+    Gate 0 uses its flight-proved law.  Later gates reuse the bounded gains
+    with the empirically identified opposite sign around measured support.
+    The state is recreated at each authoritative gate transition.  Raw
+    censorship cannot synthesize a new collective request.  An already
+    admitted IMU-derotated dynamic state remains usable because its caller
     separately proved current identity, visibility, and uncensored axes.
     """
 
@@ -3822,7 +3866,11 @@ class _CurrentApertureProvedCollectiveState:
                 self.filtered_vertical_rate,
             )
             if self.fixed_support_thrust is None
-            else self.fixed_support_thrust
+            else _later_gate_vertical_collective(
+                vertical,
+                self.filtered_vertical_rate,
+                support_thrust=self.fixed_support_thrust,
+            )
         )
         self.last_observable_thrust = thrust
         return thrust, self.filtered_vertical_rate
@@ -7989,7 +8037,10 @@ async def _run_visual_course_stage_impl(
                                 requested_thrust=(
                                     retained_current_aperture_collective(
                                         LATER_GATE_SUPPORT_THRUST,
-                                        subsupport_collective_authorized=False,
+                                        subsupport_collective_authorized=(
+                                            current_gate_index
+                                            > initial_gate_index
+                                        ),
                                     )
                                 ),
                                 fresh_boundary_current_authority=(
@@ -8687,13 +8738,13 @@ async def _run_visual_course_stage_impl(
                     subsupport_collective_authorized=(
                         top_fov_transition_owned
                         or (
-                            # Later gates may descend only from the qualified
-                            # dynamic state saying the gate is below.  A new
-                            # censored gate with no such evidence keeps lift.
+                            # Under Rx(pi), negative stable image-down error
+                            # needs less collective.  Only a qualified,
+                            # uncensored current-gate state may request it.
                             current_gate_index > initial_gate_index
                             and current_aperture_observable
                             and control_vertical_error_image_down is not None
-                            and control_vertical_error_image_down > 0.0
+                            and control_vertical_error_image_down < 0.0
                         )
                     ),
                 )
@@ -9236,7 +9287,10 @@ async def _run_visual_course_stage_impl(
                             requested_thrust=(
                                 retained_current_aperture_collective(
                                     LATER_GATE_SUPPORT_THRUST,
-                                    subsupport_collective_authorized=False,
+                                    subsupport_collective_authorized=(
+                                        current_gate_index
+                                        > initial_gate_index
+                                    ),
                                 )
                                 if deferred_top_fov_error is not None
                                 else command_thrust
@@ -13307,7 +13361,10 @@ async def _run_visual_course_stage_impl(
                                 requested_thrust=(
                                     retained_current_aperture_collective(
                                         LATER_GATE_SUPPORT_THRUST,
-                                        subsupport_collective_authorized=False,
+                                        subsupport_collective_authorized=(
+                                            current_gate_index
+                                            > initial_gate_index
+                                        ),
                                     )
                                 ),
                                 fresh_boundary_current_authority=boundary,
@@ -14904,7 +14961,10 @@ async def _run_visual_course_stage_impl(
                             requested_thrust=(
                                 retained_current_aperture_collective(
                                     accepted.command.thrust,
-                                    subsupport_collective_authorized=False,
+                                    subsupport_collective_authorized=(
+                                        current_gate_index
+                                        > initial_gate_index
+                                    ),
                                 )
                             ),
                             minimum_brake_pitch_rad=float(

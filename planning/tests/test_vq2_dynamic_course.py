@@ -1315,7 +1315,7 @@ def test_negative_clearance_near_center_cannot_invent_full_bank() -> None:
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
 
-def test_off_axis_steering_tapers_full_bank_once_rate_turns_inward(
+def test_off_axis_steering_holds_inward_then_locks_pd_on_reversal(
 ) -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
@@ -1411,18 +1411,15 @@ def test_off_axis_steering_tapers_full_bank_once_rate_turns_inward(
     assert recovered.time_to_contact_s is None
     assert recovered_decision.current_time_to_contact_s is None
     assert not recovered_decision.passage_committed
-    assert (
-        0.0
-        < recovered_decision.proposed_command.target_roll_rad
-        < MAX_TARGET_ROLL_RAD
+    assert recovered_decision.proposed_command.target_roll_rad == pytest.approx(
+        MAX_TARGET_ROLL_RAD
     )
     assert math.isfinite(
         recovered_decision.proposed_command.target_roll_rad
     )
 
-    # Qualified inward motion unloads the full-bank override before the gate
-    # reaches center.  The ordinary proportional/rate law remains bounded and
-    # is recomputed from each fresh publication.
+    # Qualified inward motion must retain full bank long enough to build
+    # lateral momentum; run 25 released after only one weak inward sample.
     improving_decisions = []
     for sequence, x in ((10, 0.340), (11, 0.320)):
         observation_time = 1.0 + (sequence - 1) * 0.040
@@ -1448,14 +1445,13 @@ def test_off_axis_steering_tapers_full_bank_once_rate_turns_inward(
         )
 
     assert all(
-        abs(item.proposed_command.target_roll_rad)
-        < MAX_TARGET_ROLL_RAD
+        item.proposed_command.target_roll_rad
+        == pytest.approx(MAX_TARGET_ROLL_RAD)
         for item in improving_decisions
     )
 
-    # Once this continuous approach has established inward translation, a
-    # later outward-rate reversal cannot discontinuously re-arm the one-shot
-    # full-bank intercept transient.
+    # The first qualified outward reversal permanently hands this continuous
+    # approach to bounded proportional/rate control.
     reversal_decisions = []
     reversal_state = None
     for sequence, x in ((12, 0.330), (13, 0.350), (14, 0.390)):
@@ -1483,10 +1479,16 @@ def test_off_axis_steering_tapers_full_bank_once_rate_turns_inward(
 
     assert reversal_state is not None
     assert reversal_state.residual_translational_rate_rad_s[0] > 0.0
-    assert all(
-        abs(item.proposed_command.target_roll_rad)
+    assert reversal_decisions[0].proposed_command.target_roll_rad == (
+        pytest.approx(MAX_TARGET_ROLL_RAD)
+    )
+    assert reversal_decisions[1].proposed_command.target_roll_rad == (
+        pytest.approx(MAX_TARGET_ROLL_RAD)
+    )
+    assert (
+        0.0
+        < reversal_decisions[-1].proposed_command.target_roll_rad
         < MAX_TARGET_ROLL_RAD
-        for item in reversal_decisions
     )
 
     centered_decision = None
