@@ -286,7 +286,13 @@ MAX_COURSE_YAW_RATE_RAD_S = 0.50  # runner runtime cap = min(this, profile 0.5)
 # and why fh (thrust-tilt magnitude) always "grew through the brake".
 ADVANCE_PITCH_RAD = 0.08  # nose-down closure target when aligned/confident
 BRAKE_PITCH_RAD = 0.02  # near-level braking target
-ANGULAR_FULL_BRAKE_NORM = 0.60  # angular error that fully suppresses advance
+ANGULAR_FULL_BRAKE_NORM = 0.35  # angular error that fully suppresses advance
+# F46 (20260729T211439Z-visual-course-4356c153): err ~0.5 gave brake demand
+# ~0.85 -> target pitch -0.11, attained, but the approach still closed
+# ~2.6x in 1.2 s and the bearing stalled at -0.37 — velocity never bent
+# (nose chased the LOS, path orbited past the gate's left side).  Speed is
+# what beats yaw/roll authority via parallax, so saturate the brake early:
+# at err >= 0.35 the approach is a hover-turn, not a powered flyby.
 EXPANSION_BRAKE_FREE_S = 1.5  # expansion rate below which no braking applies
 EXPANSION_BRAKE_SPAN_S = 3.0  # span from free advance to full expansion brake
 NEAR_FREE_LOG_SCALE = -1.5  # far enough that near-plane risk does not brake
@@ -383,10 +389,13 @@ FRAGMENT_CREEP_PITCH_RAD = 0.03  # creep while centering a lone fragment
 # climb budget; F32's climb-into-frame came from the fh floor and the
 # high-gate bias, which this band still caps.
 BRAKE_CEILING_BAND = 0.04
-PRE_CROSS_BRAKE_PITCH_RAD = -0.15  # TRUE nose-up brake attitude under the
+PRE_CROSS_BRAKE_PITCH_RAD = -0.28  # TRUE nose-up brake attitude under the
 # verified F38 convention.  (Pre-F38 this was +0.15 — a powered DIVE into
 # the gate; F31's "5x too weak brake" was the sign error, not the
-# magnitude.)
+# magnitude.)  F46: -0.15 (~1.5 m/s^2 + drag) could not kill the approach
+# speed inside the last 1.2 s to the gate-1 plane — the drone crossed the
+# threshold still fast and 0.37 norm off-center.  -0.28 roughly doubles
+# the deceleration authority so a misaligned approach actually stops.
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
 # Blind-at-speed brake (F31): SEARCH has no expansion signal, so the
 # governor cannot run there — and F31's blind legs were where the speed
