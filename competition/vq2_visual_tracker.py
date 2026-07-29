@@ -956,7 +956,7 @@ class _AssignmentPlan:
 @dataclass(frozen=True, slots=True)
 class _FragmentUnionAssignment:
     detection: VisualDetection
-    component_detection_indexes: tuple[int, int]
+    component_detection_indexes: tuple[int, ...]
     pair_score: _PairScore
 
 
@@ -1363,6 +1363,18 @@ class MultiTargetVisualTracker:
                 continue
             valid.append((detection_index, detection, bbox_px))
 
+        single_fragment_projection = (
+            self._select_top_right_single_fragment_projection(
+                state,
+                valid=valid,
+                frame=frame,
+            )
+            if required_component_detection_index is None
+            else None
+        )
+        if single_fragment_projection is not None:
+            return single_fragment_projection
+
         candidates: list[
             tuple[
                 float,
@@ -1592,6 +1604,156 @@ class MultiTargetVisualTracker:
         if not candidates:
             return None
         return min(candidates, key=lambda item: item[:3])[3]
+
+    def _select_top_right_single_fragment_projection(
+        self,
+        state: _TrackState,
+        *,
+        valid: list[
+            tuple[int, VisualDetection, tuple[int, int, int, int]]
+        ],
+        frame: VisualDetectionFrame,
+    ) -> Optional[_FragmentUnionAssignment]:
+        """Retain one live gate when only its lower-left contour survives.
+
+        A near-plane build-3385 gate can lose its upper/right contour one
+        frame before the camera loses the gate entirely.  For an already
+        authoritative CURRENT track whose prior box was clipped at exactly
+        TOP|RIGHT, the remaining lower-left contour still observes the full
+        gate's left and bottom anchors.  Project only the two already-censored
+        edges and require the resulting box to remain strongly prior
+        consistent.  The projection is guidance-only and never carries inner
+        aperture or passage authority.
+        """
+
+        if (
+            state.latest.clipping
+            != (FrameEdge.TOP | FrameEdge.RIGHT)
+            or len(valid) != 1
+        ):
+            return None
+
+        width_px, height_px = frame.image_size_px
+        prior_x, prior_y, prior_width, prior_height = _bbox_to_pixels(
+            state.latest.bbox_norm,
+            frame.image_size_px,
+        )
+        prior_right = prior_x + prior_width
+        prior_bottom = prior_y + prior_height
+        if (
+            prior_y > _FRAGMENT_UNION_EDGE_MARGIN_PX
+            or prior_right
+            < width_px - _FRAGMENT_UNION_EDGE_MARGIN_PX
+        ):
+            return None
+
+        detection_index, component, component_bbox = valid[0]
+        (
+            component_x,
+            component_y,
+            component_width,
+            component_height,
+        ) = component_bbox
+        component_right = component_x + component_width
+        component_bottom = component_y + component_height
+        component_center_x = component_x + 0.5 * component_width
+        component_center_y = component_y + 0.5 * component_height
+        prior_center_x = prior_x + 0.5 * prior_width
+        prior_center_y = prior_y + 0.5 * prior_height
+        if (
+            component.clipping != FrameEdge.NONE
+            or component.center_censored
+            or component_y <= _FRAGMENT_UNION_EDGE_MARGIN_PX
+            or component_right
+            >= width_px - _FRAGMENT_UNION_EDGE_MARGIN_PX
+            or component_bottom
+            >= height_px - _FRAGMENT_UNION_EDGE_MARGIN_PX
+            or component_center_x >= prior_center_x
+            or component_center_y <= prior_center_y
+            or abs(component_x - prior_x)
+            > _FRAGMENT_UNION_MAX_CENTER_JUMP_PX
+            or abs(component_bottom - prior_bottom)
+            > _FRAGMENT_UNION_MAX_CENTER_JUMP_PX
+        ):
+            return None
+
+        projected_x = component_x
+        projected_right = width_px
+        projected_bottom = component_bottom
+        projected_width = projected_right - projected_x
+        projected_height = projected_bottom
+        if (
+            projected_width < _FRAGMENT_UNION_MIN_DIMENSION_PX
+            or projected_height < _FRAGMENT_UNION_MIN_DIMENSION_PX
+        ):
+            return None
+
+        prior_aspect = prior_width / prior_height
+        projected_aspect = projected_width / projected_height
+        relative_aspect = projected_aspect / prior_aspect
+        projected_bbox_norm = (
+            projected_x / width_px,
+            0.0,
+            1.0,
+            projected_bottom / height_px,
+        )
+        overlap = _bbox_iou(
+            projected_bbox_norm,
+            state.latest.bbox_norm,
+        )
+        projected_center_x = projected_x + projected_width // 2
+        projected_center_y = projected_height // 2
+        center_jump = math.hypot(
+            projected_center_x - prior_center_x,
+            projected_center_y - prior_center_y,
+        )
+        area_ratio = (
+            projected_width * projected_height
+            / (prior_width * prior_height)
+        )
+        if (
+            not (
+                _FRAGMENT_UNION_MIN_PRIOR_ASPECT_RATIO
+                <= relative_aspect
+                <= _FRAGMENT_UNION_MAX_PRIOR_ASPECT_RATIO
+            )
+            or overlap < _FRAGMENT_UNION_MIN_IOU
+            or center_jump > _FRAGMENT_UNION_MAX_CENTER_JUMP_PX
+            or not 0.70 <= area_ratio <= 1.35
+        ):
+            return None
+
+        composite = VisualDetection(
+            source_index=component.source_index,
+            center_norm=(
+                2.0 * projected_center_x / width_px - 1.0,
+                2.0 * projected_center_y / height_px - 1.0,
+            ),
+            bbox_norm=projected_bbox_norm,
+            confidence=component.confidence,
+            clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+            center_censored=True,
+            detection_method=(
+                "vq2_tracked_top_right_single_fragment_projection"
+            ),
+            appearance=None,
+            inner_aperture=None,
+        )
+        pair_score = self._pair_score(
+            state,
+            composite,
+            frame.observation_monotonic_ns,
+        )
+        if (
+            pair_score is None
+            or pair_score.cost > self.config.max_assignment_cost
+        ):
+            return None
+        return _FragmentUnionAssignment(
+            detection=composite,
+            component_detection_indexes=(detection_index,),
+            pair_score=pair_score,
+        )
 
     def assign_role(self, track_id: str, role: VisualTrackRole) -> None:
         """Assign a camera lifecycle role without inventing a gate index."""

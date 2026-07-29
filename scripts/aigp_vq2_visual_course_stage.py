@@ -121,6 +121,12 @@ GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR = 0.50
 GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE = 5.0 / 3.0
 GATE0_PROVED_COLLECTIVE_RATE_FILTER_ALPHA = 0.35
 GATE0_PROVED_COLLECTIVE_BASIS = "proved-gate0-normalized-collective-v1"
+# Build-3385 Gate-1 IMU data brackets level vertical acceleration between
+# 0.300 and 0.303 at the measured alignment attitude.  The legacy pixel-y
+# collective law has the opposite response under the calibrated Rx(pi)
+# camera boundary, so later gates use this measured support value while
+# pitch owns vertical image alignment.
+LATER_GATE_SUPPORT_THRUST = 0.3025
 CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS = (
     "imu-derotated-current-center-proved-law-v2"
 )
@@ -3602,6 +3608,20 @@ class _CurrentApertureProvedCollectiveState:
     last_control_basis: str = RAW_CURRENT_APERTURE_COLLECTIVE_BASIS
     last_observation_vertical_censored: bool = False
     last_hold_reason: Optional[str] = None
+    fixed_support_thrust: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.fixed_support_thrust is None:
+            return
+        fixed = float(self.fixed_support_thrust)
+        if (
+            not math.isfinite(fixed)
+            or not MIN_VISUAL_THRUST <= fixed <= MAX_VISUAL_THRUST
+        ):
+            raise ValueError(
+                "fixed current-aperture support thrust is invalid"
+            )
+        self.fixed_support_thrust = fixed
 
     def retained_or_wire(self, fallback_wire_thrust: float) -> float:
         """Use the latest observable request, or the accepted current wire."""
@@ -3612,6 +3632,8 @@ class _CurrentApertureProvedCollectiveState:
                 "current-aperture collective wire fallback must be finite"
             )
         if self.last_observable_thrust is None:
+            if self.fixed_support_thrust is not None:
+                return self.fixed_support_thrust
             return fallback
         retained = float(self.last_observable_thrust)
         if not math.isfinite(retained):
@@ -3635,7 +3657,11 @@ class _CurrentApertureProvedCollectiveState:
             reason == "vertical_censored"
         )
         thrust = (
-            GATE0_PROVED_COLLECTIVE_BASE
+            (
+                GATE0_PROVED_COLLECTIVE_BASE
+                if self.fixed_support_thrust is None
+                else self.fixed_support_thrust
+            )
             if self.last_observable_thrust is None
             else self.last_observable_thrust
         )
@@ -3790,9 +3816,13 @@ class _CurrentApertureProvedCollectiveState:
             return self.hold(
                 reason="vertical_censored",
             )
-        thrust = _gate0_proved_vertical_collective(
-            vertical,
-            self.filtered_vertical_rate,
+        thrust = (
+            _gate0_proved_vertical_collective(
+                vertical,
+                self.filtered_vertical_rate,
+            )
+            if self.fixed_support_thrust is None
+            else self.fixed_support_thrust
         )
         self.last_observable_thrust = thrust
         return thrust, self.filtered_vertical_rate
@@ -4657,12 +4687,6 @@ def _approach_expired_geometry_search_authority(
         observed_source_index = int(observed.history[-1].source_index)
         horizontal = float(observed.center_norm[0])
         source = "sole-fresh-post-search-track"
-    elif retained_horizontal_edge is FrameEdge.LEFT:
-        horizontal = -1.0
-        source = "retained-left-edge-bit"
-    elif retained_horizontal_edge is FrameEdge.RIGHT:
-        horizontal = 1.0
-        source = "retained-right-edge-bit"
     else:
         horizontal = 0.0
         source = "neutral-no-unique-horizontal-evidence"
@@ -7874,7 +7898,12 @@ async def _run_visual_course_stage_impl(
                                 fov_protected_target_pitch_rad=(
                                     target_pitch_rad
                                 ),
-                                requested_thrust=float(limits.max_thrust),
+                                requested_thrust=(
+                                    retained_current_aperture_collective(
+                                        LATER_GATE_SUPPORT_THRUST,
+                                        subsupport_collective_authorized=False,
+                                    )
+                                ),
                                 fresh_boundary_current_authority=(
                                     recovery_boundary
                                 ),
@@ -9117,7 +9146,10 @@ async def _run_visual_course_stage_impl(
                                 .protected_target_pitch_rad
                             ),
                             requested_thrust=(
-                                float(limits.max_thrust)
+                                retained_current_aperture_collective(
+                                    LATER_GATE_SUPPORT_THRUST,
+                                    subsupport_collective_authorized=False,
+                                )
                                 if deferred_top_fov_error is not None
                                 else command_thrust
                             ),
@@ -10756,7 +10788,12 @@ async def _run_visual_course_stage_impl(
         )
         current_aperture_collective_state = (
             _CurrentApertureProvedCollectiveState(
-                track_id=current_track_id
+                track_id=current_track_id,
+                fixed_support_thrust=(
+                    None
+                    if current_gate_index == initial_gate_index
+                    else LATER_GATE_SUPPORT_THRUST
+                ),
             )
             if launch_enabled or runtime.dynamic_controller is not None
             else None
@@ -12543,7 +12580,15 @@ async def _run_visual_course_stage_impl(
                             )
                             current_aperture_collective_state = (
                                 _CurrentApertureProvedCollectiveState(
-                                    track_id=current_track_id
+                                    track_id=current_track_id,
+                                    fixed_support_thrust=(
+                                        None
+                                        if (
+                                            current_gate_index
+                                            == initial_gate_index
+                                        )
+                                        else LATER_GATE_SUPPORT_THRUST
+                                    ),
                                 )
                             )
                             latest_accepted_current_wire = None
@@ -12744,8 +12789,16 @@ async def _run_visual_course_stage_impl(
                                         dynamic_controller.core.config
                                         .brake_pitch_rad
                                     ),
-                                    brake_thrust=float(
-                                        host.visual_config.servo.brake_thrust
+                                    brake_thrust=(
+                                        LATER_GATE_SUPPORT_THRUST
+                                        if (
+                                            current_gate_index
+                                            > initial_gate_index
+                                        )
+                                        else float(
+                                            host.visual_config.servo
+                                            .brake_thrust
+                                        )
                                     ),
                                 )
                             )
@@ -13099,8 +13152,11 @@ async def _run_visual_course_stage_impl(
                                 fov_protected_target_pitch_rad=float(
                                     hold["target_pitch_rad"]
                                 ),
-                                requested_thrust=float(
-                                    limits.max_thrust
+                                requested_thrust=(
+                                    retained_current_aperture_collective(
+                                        LATER_GATE_SUPPORT_THRUST,
+                                        subsupport_collective_authorized=False,
+                                    )
                                 ),
                                 fresh_boundary_current_authority=boundary,
                             )

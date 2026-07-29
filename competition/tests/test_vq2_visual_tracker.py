@@ -988,6 +988,86 @@ def test_authoritative_current_keeps_thin_near_plane_frame_fragments() -> None:
     )
 
 
+def test_authoritative_current_projects_live_top_right_single_fragment() -> None:
+    """Keep the exact run-23 Gate 1 lower-left contour as CURRENT."""
+
+    tracker = MultiTargetVisualTracker()
+    prior = VisualDetection(
+        source_index=0,
+        center_norm=(0.478125, -0.5666666666666667),
+        bbox_norm=(0.478125, 0.0, 1.0, 0.4361111111111111),
+        confidence=0.30975,
+        clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+        center_censored=True,
+    )
+    first = tracker.update(_frame(224, (prior,)))
+    current_id = first.visible_track_ids[0]
+    tracker.assign_role(current_id, VisualTrackRole.CURRENT)
+    tracker.confirm_authoritative_gate(
+        current_id,
+        gate_index=1,
+        race_status_sequence=1529,
+        race_status_boot_ms=6300,
+    )
+
+    live_fragments = (
+        VisualDetection(
+            source_index=0,
+            center_norm=(0.021875, -0.34444444444444444),
+            bbox_norm=(
+                0.484375,
+                0.21388888888888888,
+                0.5390625,
+                0.4444444444444444,
+            ),
+            confidence=0.23960786,
+        ),
+        VisualDetection(
+            source_index=0,
+            center_norm=(0.03125, -0.3388888888888889),
+            bbox_norm=(
+                0.4890625,
+                0.21388888888888888,
+                0.5421875,
+                0.45,
+            ),
+            confidence=0.22285254,
+        ),
+        VisualDetection(
+            source_index=0,
+            center_norm=(0.04375, -0.3222222222222222),
+            bbox_norm=(
+                0.496875,
+                0.21666666666666667,
+                0.546875,
+                0.46111111111111114,
+            ),
+            confidence=0.17275413,
+        ),
+    )
+    expected_projected_boxes = (
+        (0.484375, 0.0, 1.0, 0.4444444444444444),
+        (0.4890625, 0.0, 1.0, 0.45),
+        (0.496875, 0.0, 1.0, 0.46111111111111114),
+    )
+
+    for sequence, (fragment, expected_bbox) in enumerate(
+        zip(live_fragments, expected_projected_boxes, strict=True),
+        start=225,
+    ):
+        continued = tracker.update(_frame(sequence, (fragment,)))
+        current = continued.track(current_id)
+        assert current.visible
+        assert current.missed_frame_count == 0
+        assert current.bbox_norm == pytest.approx(expected_bbox)
+        assert current.clipping == FrameEdge.TOP | FrameEdge.RIGHT
+        assert current.center_censored
+        assert current.history[-1].inner_aperture is None
+        assert continued.associated_track_ids == (current_id,)
+        assert continued.created_track_ids == ()
+        assert continued.associations[0].bbox_iou > 0.96
+
+
 def test_edge_transition_quarantines_only_censored_box_derivatives() -> None:
     tracker = MultiTargetVisualTracker()
     first = tracker.update(

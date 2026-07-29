@@ -153,6 +153,9 @@ def production_dynamic_course_config() -> DynamicCourseConfig:
         roll_gain=0.18,
         lateral_rate_gain=0.045,
         roll_to_lateral_bearing_accel=0.0,
+        # Build-3385 IMU/vision residuals show that collective above support
+        # moves the stable gate bearing toward image TOP under Rx(pi).
+        thrust_to_vertical_bearing_accel=-1.5,
     )
 
 

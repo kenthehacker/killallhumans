@@ -82,6 +82,7 @@ def test_production_camera_boundary_uses_live_axis_calibration() -> None:
     # stable/image bearing.
     assert config.roll_guidance_sign == -1.0
     assert config.brake_pitch_rad == pytest.approx(0.12)
+    assert config.thrust_to_vertical_bearing_accel == pytest.approx(-1.5)
 
 
 def test_successor_pitch_reference_steers_from_predicted_vertical_geometry():

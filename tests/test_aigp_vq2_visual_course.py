@@ -6749,7 +6749,7 @@ def test_expired_geometry_search_uses_sole_fresh_horizontal_detection():
     assert authority.command.requested_thrust == pytest.approx(0.275)
 
 
-def test_expired_geometry_search_uses_only_side_bit_when_fresh_view_is_not_unique():
+def test_expired_geometry_search_neutralizes_expired_side_bit():
     snapshot = _expired_geometry_search_snapshot()
     token = snapshot.latest_camera_token
     tracks = (
@@ -6769,11 +6769,11 @@ def test_expired_geometry_search_uses_only_side_bit_when_fresh_view_is_not_uniqu
         tuning=default_visual_config().servo,
     )
 
-    assert authority.source == "retained-right-edge-bit"
+    assert authority.source == "neutral-no-unique-horizontal-evidence"
     assert authority.observed_track_id is None
     assert authority.observed_source_index is None
-    assert authority.horizontal_norm == 1.0
-    assert authority.command.yaw_rate_rad_s < 0.0
+    assert authority.horizontal_norm == 0.0
+    assert authority.command.yaw_rate_rad_s == 0.0
     assert authority.command.target_roll_rad == 0.0
 
 
@@ -6818,11 +6818,11 @@ def test_expired_geometry_search_ignores_tracks_present_at_search_start():
         tuning=default_visual_config().servo,
     )
 
-    assert authority.source == "retained-right-edge-bit"
+    assert authority.source == "neutral-no-unique-horizontal-evidence"
     assert authority.observed_track_id is None
-    assert authority.horizontal_norm == 1.0
+    assert authority.horizontal_norm == 0.0
     assert authority.command.target_roll_rad == 0.0
-    assert authority.command.yaw_rate_rad_s < 0.0
+    assert authority.command.yaw_rate_rad_s == 0.0
 
 
 def test_missing_local_state_transitions_directly_to_fresh_search():
@@ -8067,6 +8067,45 @@ def test_current_aperture_collective_uses_admitted_dynamic_top_state():
     )
     assert retained.current_aperture_dropout is True
     assert retained.held_last_observable_collective is True
+
+
+def test_later_gate_collective_uses_measured_support_not_pixel_y_feedback():
+    state = course_stage._CurrentApertureProvedCollectiveState(
+        track_id="track-1",
+        fixed_support_thrust=course_stage.LATER_GATE_SUPPORT_THRUST,
+    )
+    target = replace(
+        _target(_snapshot(1, "track-1", 181), "track-1"),
+        received_monotonic_s=14.0,
+        normalized_y_down=-0.75,
+        normalized_y_rate_down_s=-1.0,
+        clipped=True,
+        center_censored=True,
+        vertical_censored=True,
+    )
+
+    proposal = course_stage._propose_current_aperture_collective(
+        state,
+        target,
+        authoritative_current_track_id="track-1",
+        control_vertical_error_image_down=-0.75,
+        control_vertical_rate_down_s=-1.0,
+        control_basis=(
+            course_stage.CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
+        ),
+    )
+
+    assert proposal.requested_thrust == pytest.approx(
+        course_stage.LATER_GATE_SUPPORT_THRUST
+    )
+    assert proposal.unconstrained_requested_thrust == pytest.approx(
+        course_stage.LATER_GATE_SUPPORT_THRUST
+    )
+    assert state.retained_or_wire(0.21) == pytest.approx(
+        course_stage.LATER_GATE_SUPPORT_THRUST
+    )
+    assert proposal.noncommitted_support_floor_applied is False
+    assert proposal.vertical_censored is False
 
 
 def test_faa7cee6_collective_uses_derotated_state_not_pitch_motion():
