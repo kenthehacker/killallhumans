@@ -58,6 +58,13 @@ Control-law constant sources:
   governor stay active.  The COAST latch also bypasses the runner's
   attitude PD on the wire so coast sends are exact zeros (F11 sent nonzero
   roll/pitch rates at zero thrust).
+- ``FH_UNTRUSTED_*``: the F14 inflow-regime gate.  vz_est is invalidated
+  by REGIME (a smooth fh-proportional thrust deficit), not attitude or
+  vibration, so sustained fh > 3.0 freezes the vz/alt integrators, blocks
+  alt-floor arming, suppresses every vz-based governor floor/cap, and
+  falls back to the camera-qualified vertical PD (support + margin when
+  unqualified); the latch releases below fh 2.0.  ``EDGE_PARK_*`` caps the
+  edge-parked zero-advance dwell (F14's last 4 s) with a forced SEARCH.
 - Thrust envelope ``[MIN_COURSE_THRUST, MAX_COURSE_THRUST]`` and yaw cap: the
   accepted v3 yaw profile and the visual-course thrust envelope from the
   July-18 safety contract (max raised 0.32 -> 0.34 under the 0.35 hard
@@ -327,6 +334,35 @@ ALT_FLOOR_CLIMB_MARGIN = 0.05  # support + margin -> governed recovery climb
 ALT_FLOOR_MAX_LATCH_S = 2.5  # unconditional per-episode release (F13)
 ALT_FLOOR_REARM_S = 1.0  # alt_est must hold above release this long to re-arm
 ALT_EST_MIN_M = -2.0  # biased-integrator clamp on the altitude estimate
+# F14 inflow-regime gate (agent-10, verified with the actuator/estimator
+# tick fields): identical delivered rotor output 0.34 gives accz -13.0 in
+# the slow regime (real climb, t=2.59) and -8.0 in the fast regime (t=8.5)
+# — vz_est is invalidated by REGIME, a smooth fh-proportional DC deficit
+# (~0.9*fh - 0.5), NOT vibration (accz std 0.19, the cleanest of the
+# flight) and NOT attitude (kp=0, gyro drift <= 0.2 rad).  Trusted fh <
+# ~2.0, biased fh > ~3.0.  While untrusted the stage freezes vz_est (the
+# leak relaxes it toward 0; the biased a_up is never integrated), holds
+# alt_est, blocks alt-floor arming (an active latch still times out
+# normally), falls back to the camera-qualified vertical PD (support +
+# margin when unqualified — bare support historically sinks for real at
+# -0.8...-1.9), and suppresses every vz-based governor floor/cap so the
+# descent feedforward cannot fire from the frozen estimate.  This breaks
+# the F14 self-locking loop: governor pinned 0.34 on the phantom sink, the
+# floor flew biased-"level".
+FH_UNTRUSTED_TRIGGER_MPS2 = 3.0  # biased regime above this horizontal force
+FH_TRUSTED_RELEASE_MPS2 = 2.0  # hysteresis release below this
+FH_UNTRUSTED_SUSTAIN_S = 0.3  # transients shorter than this never latch
+FH_UNTRUSTED_VERTICAL_MARGIN = 0.02  # unqualified hold: support + margin
+# Edge-parked advance stall (F14, agent-10 Q5): a track parked at the frame
+# edge (angular error at/past angular_full_brake_norm) forces align = 0 ->
+# advance = 0 -> perpetual near-level pitch.  F14 chased edge-parked tracks
+# for its last 4 s, never resumed advance, and held fh ~= 6 with the regime
+# gate latched.  Cap the dwell: parked this long without the track
+# re-centering (angular error back below 0.5*norm) or log_scale growing
+# (approach progress) forces SEARCH so the sweep reacquires a centered
+# track.  The align/advance law itself is unchanged.
+EDGE_PARK_MAX_DWELL_S = 1.5
+EDGE_PARK_PROGRESS_LOG_SCALE = 0.05  # log_scale growth that re-anchors dwell
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 SEARCH_YAW_RATE_RAD_S = 0.12  # bounded sweep inside the 0.15 yaw cap
 SEARCH_SWEEP_PERIOD_S = 1.20  # bounded reversal schedule
@@ -595,6 +631,12 @@ class CleanCourseConfig:
     alt_floor_max_latch_s: float = ALT_FLOOR_MAX_LATCH_S
     alt_floor_rearm_s: float = ALT_FLOOR_REARM_S
     alt_est_min_m: float = ALT_EST_MIN_M
+    fh_untrusted_trigger_mps2: float = FH_UNTRUSTED_TRIGGER_MPS2
+    fh_trusted_release_mps2: float = FH_TRUSTED_RELEASE_MPS2
+    fh_untrusted_sustain_s: float = FH_UNTRUSTED_SUSTAIN_S
+    fh_untrusted_vertical_margin: float = FH_UNTRUSTED_VERTICAL_MARGIN
+    edge_park_max_dwell_s: float = EDGE_PARK_MAX_DWELL_S
+    edge_park_progress_log_scale: float = EDGE_PARK_PROGRESS_LOG_SCALE
     search_covariance_std_norm: float = SEARCH_COVARIANCE_STD_NORM
     search_yaw_rate_rad_s: float = SEARCH_YAW_RATE_RAD_S
     search_sweep_period_s: float = SEARCH_SWEEP_PERIOD_S
@@ -703,6 +745,15 @@ class CleanCourseController:
         # Pre-crossing expansion brake latch for the tick trace; recomputed
         # every main-path tick (see the PRE_CROSS_BRAKE_* constant block).
         self._pre_cross_brake_active = False
+        # F14 inflow-regime gate state (see the FH_* constant block):
+        # sustained-high-fh timer, latched untrusted flag, and the last fh
+        # seen (0.0 = trusted until the first host estimate arrives).
+        self._fh_mps2 = 0.0
+        self._fh_untrusted = False
+        self._fh_above_since_s: Optional[float] = None
+        # Edge-parked advance-stall dwell (see the EDGE_PARK_* block).
+        self._edge_park_since_s: Optional[float] = None
+        self._edge_park_log_scale: Optional[float] = None
 
     # -- initialization ----------------------------------------------------
 
@@ -960,6 +1011,7 @@ class CleanCourseController:
         roll_rad: float,
         pitch_rad: float,
         world_up_accel_m_s2: Optional[float] = None,
+        horizontal_specific_force_mps2: Optional[float] = None,
     ) -> NavigationOutput:
         """Produce the single navigation request for one tick."""
 
@@ -970,19 +1022,43 @@ class CleanCourseController:
         else:
             dt = _clamp(now_s - self._last_command_s, 1e-3, 0.10)
         self._last_command_s = float(now_s)
+
+        # F14 inflow-regime gate (see the FH_* constant block): vz_est is
+        # invalidated by REGIME (fh-proportional DC thrust deficit), not by
+        # attitude or vibration.  Sustained fh above the trigger latches the
+        # untrusted state; it clears below the release hysteresis.
+        if horizontal_specific_force_mps2 is not None:
+            self._fh_mps2 = float(horizontal_specific_force_mps2)
+        if self._fh_untrusted:
+            if self._fh_mps2 < cfg.fh_trusted_release_mps2:
+                self._fh_untrusted = False
+                self._fh_above_since_s = None
+        elif self._fh_mps2 > cfg.fh_untrusted_trigger_mps2:
+            if self._fh_above_since_s is None:
+                self._fh_above_since_s = now_s
+            elif now_s - self._fh_above_since_s >= cfg.fh_untrusted_sustain_s:
+                self._fh_untrusted = True
+        else:
+            self._fh_above_since_s = None
+
         if world_up_accel_m_s2 is not None:
-            # Leaky world-vertical-rate integrator for the climb governor;
-            # IMU-fed so it stays alive in every state, including COAST.
-            self._vz_est_m_s += float(world_up_accel_m_s2) * dt
+            if not self._fh_untrusted:
+                # Leaky world-vertical-rate integrator for the climb
+                # governor; IMU-fed so it stays alive in every state,
+                # including COAST.
+                self._vz_est_m_s += float(world_up_accel_m_s2) * dt
+            # While fh-untrusted the integration is SUSPENDED (a biased
+            # regime a_up is never integrated) and only the leak relaxes
+            # the frozen estimate toward 0.
             self._vz_est_m_s -= self._vz_est_m_s * dt / VZ_LEAK_TAU_S
-        # IMU altitude estimate from course start (takeoff pad = 0), clamped
-        # below (F13: a biased integrator reached -10.7 m, physically
-        # impossible, and drove the floor deeper than its guard band needs).
-        # Feeds only the pre-gate-1 altitude floor; bounded drift is
-        # acceptable inside that short window (see the ALT_FLOOR_* block).
-        self._alt_est_m = max(
-            cfg.alt_est_min_m, self._alt_est_m + self._vz_est_m_s * dt
-        )
+        if not self._fh_untrusted:
+            # IMU altitude estimate from course start (takeoff pad = 0),
+            # clamped below (F13: a biased integrator reached -10.7 m,
+            # physically impossible, and drove the floor deeper than its
+            # guard band needs).  Held while fh-untrusted (F14).
+            self._alt_est_m = max(
+                cfg.alt_est_min_m, self._alt_est_m + self._vz_est_m_s * dt
+            )
 
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             assert self._coast_entry_s is not None
@@ -1016,6 +1092,37 @@ class CleanCourseController:
             > PREDICT_STALL_FORCE_SEARCH_S
         ):
             self._enter_search(now_s)
+
+        # Edge-parked advance stall (F14, agent-10 Q5; see the EDGE_PARK_*
+        # constant block): a track parked at the frame edge forces
+        # align = 0 -> advance = 0 -> perpetual near-level pitch.  A dwell
+        # this long without re-centering (angular error back below
+        # 0.5*norm) or log_scale growth (approach progress) forces SEARCH
+        # so the sweep reacquires a centered track.  The align/advance law
+        # itself is unchanged.
+        if self.state is CleanCourseState.TRACK and self.current is not None:
+            edge_angular_error = math.hypot(self.current.x, self.current.y)
+            if edge_angular_error >= cfg.angular_full_brake_norm:
+                if self._edge_park_since_s is None:
+                    self._edge_park_since_s = now_s
+                    self._edge_park_log_scale = self.current.log_scale
+                elif (
+                    self.current.log_scale
+                    > self._edge_park_log_scale + cfg.edge_park_progress_log_scale
+                ):
+                    # Approach progress: re-anchor the dwell window.
+                    self._edge_park_since_s = now_s
+                    self._edge_park_log_scale = self.current.log_scale
+                elif now_s - self._edge_park_since_s > cfg.edge_park_max_dwell_s:
+                    self._edge_park_since_s = None
+                    self._edge_park_log_scale = None
+                    self._enter_search(now_s)
+            elif edge_angular_error < 0.5 * cfg.angular_full_brake_norm:
+                self._edge_park_since_s = None
+                self._edge_park_log_scale = None
+        else:
+            self._edge_park_since_s = None
+            self._edge_park_log_scale = None
 
         # Post-credit brake window (flights 039186c8/F10): timeout release
         # here (a lost gate cannot brake forever); the qualification release
@@ -1076,7 +1183,10 @@ class CleanCourseController:
                         and now_s - since >= cfg.alt_floor_rearm_s
                     ):
                         self._alt_floor_cooldown = False
-                if not self._alt_floor_cooldown:
+                if not self._alt_floor_cooldown and not self._fh_untrusted:
+                    # Arming is blocked while fh-untrusted (F14: a biased
+                    # vz/alt estimate must never START a floor episode); an
+                    # already-active latch still times out normally above.
                     self._alt_floor_active = (
                         self._alt_est_m < cfg.alt_floor_trigger_m
                     )
@@ -1253,8 +1363,15 @@ class CleanCourseController:
             )
             self._collective = collective
         else:
+            # F14: while fh-untrusted the camera is the only honest vertical
+            # channel; when it is unqualified, hold support + margin instead
+            # of bare support, which historically sinks for real (-0.8...
+            # -1.9 m/s against the biased-regime thrust deficit).
+            hold = support + (
+                cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
+            )
             if self._collective is None:
-                self._collective = support
+                self._collective = hold
             # Flight bc8c6003: a phantom vy (+0.38 norm/s, seeded as the gate
             # sank through the frame) random-walked unmeasured for 5.4 s and
             # commanded an unrecoverable descent.  A stale rate is never
@@ -1262,7 +1379,7 @@ class CleanCourseController:
             # measurement reseeds it through the filter coupling.
             current.y_axis.v = 0.0
             alpha = min(1.0, dt / cfg.collective_decay_tau_s)
-            self._collective += (support - self._collective) * alpha
+            self._collective += (hold - self._collective) * alpha
             collective = self._collective
 
         # Gate-0 takeoff boost is feedforward only; it never changes the
@@ -1575,6 +1692,15 @@ class CleanCourseController:
         estimate instead of waiting on the leaky integrator.
         """
 
+        if self._fh_untrusted:
+            # F14: vz_est is frozen and regime-biased, so NO vz-based
+            # adjustment may fire — not the climb cap, and above all not
+            # the descent floor/feedforward, which pinned F14's thrust at
+            # the clamp on a phantom -4.36 m/s sink.  Camera-qualified PD
+            # output only, hard-clamped to the envelope.
+            return _clamp(
+                collective, self.config.min_thrust, self.config.max_thrust
+            )
         excess = self._vz_est_m_s - self._active_climb_cap_m_s
         if excess > 0.0:
             collective = min(collective, support - VZ_GOVERNOR_GAIN * excess)
@@ -1965,6 +2091,8 @@ def _clean_course_tick_trace(
         "pre_cross_brake": controller._pre_cross_brake_active,
         "alt_est_m": controller._alt_est_m,
         "alt_floor_active": controller._alt_floor_active,
+        "fh_mps2": controller._fh_mps2,
+        "fh_trusted": not controller._fh_untrusted,
     }
 
 
@@ -2099,6 +2227,9 @@ async def run_clean_course_stage(
                 roll_rad=roll_rad,
                 pitch_rad=pitch_rad,
                 world_up_accel_m_s2=world_up_accel,
+                horizontal_specific_force_mps2=getattr(
+                    estimate, "horizontal_specific_force_mps2", None
+                ),
             )
             if (
                 nav.state is CleanCourseState.COAST_FOR_CREDIT

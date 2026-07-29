@@ -24,7 +24,12 @@ detection unsuppressed), a pre-gate-1 altitude floor
 (vz_est-integrated alt_est clamped at >= -2.0 m, 0.7 -> 1.2 m hysteresis)
 overriding everything but the exact-zero coast latch with a level
 attitude, zero yaw, and a governed climb collective, bounded to a 2.5 s
-latch with a 1.0 s above-release re-arm (F13), an exact-zero coast WIRE
+latch with a 1.0 s above-release re-arm (F13), an fh inflow-regime gate
+(sustained fh > 3.0 for 0.3 s freezes vz/alt integration, blocks floor
+arming, suppresses the vz governor, holds support + 0.02 unqualified;
+hysteresis release below 2.0), an edge-parked advance-stall cap forcing
+SEARCH after 1.5 s without re-centering or approach progress, an
+exact-zero coast WIRE
 that bypasses the attitude PD so no rates leak at zero thrust, a raised
 0.34 thrust envelope
 under the runner's 0.35 hard abort,
@@ -136,12 +141,13 @@ def _tracked_controller(track=None, *, config=None, now=100.0):
     return controller
 
 
-def _command(controller, now, *, roll=0.0, pitch=0.0, a_up=None):
+def _command(controller, now, *, roll=0.0, pitch=0.0, a_up=None, fh=None):
     return controller.command(
         now_s=now,
         roll_rad=roll,
         pitch_rad=pitch,
         world_up_accel_m_s2=a_up,
+        horizontal_specific_force_mps2=fh,
     )
 
 
@@ -1109,6 +1115,216 @@ def test_alt_est_clamped_so_biased_integrator_cannot_deepen_floor():
         _command(controller, now)
     assert controller._alt_est_m == -2.0
     assert controller._alt_floor_active  # still guards inside the band
+
+
+def test_fh_gate_engages_only_after_sustained_excess_not_a_transient():
+    # F14: the regime gate latches only on fh > 3.0 SUSTAINED for 0.3 s; a
+    # transient excursion must never freeze the vertical estimate.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    now = 100.10
+    for _ in range(7):  # 0.23 s above the trigger: transient, no latch
+        now += 0.033
+        _command(controller, now, fh=4.0)
+    assert not controller._fh_untrusted
+    now += 0.033
+    _command(controller, now, fh=1.0)  # below the trigger: timer resets
+    for _ in range(7):  # another 0.23 s: still only a transient
+        now += 0.033
+        _command(controller, now, fh=4.0)
+    assert not controller._fh_untrusted
+    for _ in range(4):  # 0.36 s continuous: the gate latches
+        now += 0.033
+        _command(controller, now, fh=4.0)
+    assert controller._fh_untrusted
+
+
+def test_fh_gate_releases_only_below_hysteresis_band():
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    now = 100.10
+    for _ in range(11):  # sustained: latch untrusted
+        now += 0.033
+        _command(controller, now, fh=4.0)
+    assert controller._fh_untrusted
+    # Inside the 2.0-3.0 hysteresis band the latch holds.
+    now += 0.033
+    _command(controller, now, fh=2.5)
+    assert controller._fh_untrusted
+    # Below the release it clears and the sustain timer resets.
+    now += 0.033
+    _command(controller, now, fh=1.5)
+    assert not controller._fh_untrusted
+    assert controller._fh_above_since_s is None
+
+
+def test_fh_freeze_suspends_vz_integration_leaks_to_zero_holds_alt():
+    # F14: identical delivered rotor output gave accz -13.0 (slow regime,
+    # real climb) vs -8.0 (fast regime) — a smooth fh-proportional DC
+    # deficit.  While untrusted the biased a_up is never integrated: only
+    # the 2.5 s leak relaxes the frozen vz toward 0, and alt_est is held.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller._vz_est_m_s = -4.36  # F14's phantom sink
+    now = 100.10
+    for _ in range(11):  # latch untrusted (a_up=None: vz held)
+        now += 0.033
+        _command(controller, now, fh=4.0)
+    assert controller._fh_untrusted
+    controller._alt_est_m = -1.0
+    for _ in range(10):
+        now += 0.033
+        _command(controller, now, fh=4.0, a_up=-2.5)  # biased regime sample
+    # Leak-only decay: -4.36 * (1 - dt/2.5)^10; integration would have
+    # driven it to -5.19 instead.
+    assert controller._vz_est_m_s == pytest.approx(
+        -4.36 * (1.0 - 0.033 / 2.5) ** 10, abs=1e-9
+    )
+    assert controller._alt_est_m == -1.0  # frozen exactly
+
+
+def test_alt_floor_never_arms_while_fh_untrusted_but_active_latch_times_out():
+    # F14's self-locking loop: the governor pinned 0.34 on the phantom sink
+    # and the floor flew biased-"level".  A biased estimate must never
+    # START a floor episode; an already-active latch still times out.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 0.5
+    now = 100.10
+    frame = 10
+    _command(controller, now)  # trusted: the floor arms normally
+    assert controller._alt_floor_active
+    # Going fh-untrusted must not clear the active latch...
+    for _ in range(11):
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
+            now_s=now,
+        )
+        _command(controller, now, fh=4.0)
+        frame += 1
+    assert controller._fh_untrusted
+    assert controller._alt_floor_active
+    # ...and the latch still times out normally (alt frozen at 0.5).
+    while now <= 100.10 + 2.6:
+        now += 0.033
+        controller.observe(
+            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
+            now_s=now,
+        )
+        _command(controller, now, fh=4.0)
+        frame += 1
+    assert not controller._alt_floor_active
+    # With the regime still untrusted the floor cannot re-arm even though
+    # alt_est is below the trigger.
+    now += 0.033
+    _command(controller, now, fh=4.0)
+    assert not controller._alt_floor_active
+
+
+def test_unqualified_vertical_holds_support_plus_margin_while_fh_untrusted():
+    # While fh-untrusted the camera is the only honest vertical channel;
+    # when it is unqualified the hold is support + 0.02 — bare support
+    # historically sinks for real at -0.8...-1.9 m/s.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller.current.last_y_measurement_s = 99.0  # vertical unqualified
+    now = 100.10
+    for _ in range(11):
+        now += 0.033
+        _command(controller, now, fh=4.0)
+    assert controller._fh_untrusted
+    out = None
+    for _ in range(30):  # the decay converges onto the hold
+        now += 0.033
+        out = _command(controller, now, fh=4.0)
+    assert not out.vertical_qualified
+    assert out.thrust == pytest.approx(SUPPORT + 0.02, abs=1e-3)
+
+
+def test_descent_floor_cannot_fire_from_frozen_vz_est():
+    # A frozen phantom sink must not fire the descent floor/feedforward:
+    # with a qualified camera vertical the thrust is the plain PD output.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller._vz_est_m_s = -4.0  # frozen F14-scale phantom sink
+    now = 100.10
+    for frame in range(11):
+        now += 0.033
+        controller.observe(
+            _update([_track("A", 0.0, 0.0)], frame_id=10 + frame), now_s=now
+        )
+        _command(controller, now, fh=4.0)
+    assert controller._fh_untrusted
+    now += 0.033
+    controller.observe(
+        _update([_track("A", 0.0, 0.0)], frame_id=21), now_s=now
+    )
+    out = _command(controller, now, fh=4.0)
+    assert out.vertical_qualified  # fresh camera y
+    # Governor suppressed: centered target -> bare support, NOT the
+    # descent-floor boost that would clamp at 0.34.
+    assert out.thrust == pytest.approx(SUPPORT, abs=1e-9)
+
+
+def test_edge_parked_stall_forces_search_after_dwell_without_progress():
+    # F14 (agent-10 Q5): a track parked at the frame edge forces align = 0
+    # -> advance = 0 -> perpetual near-level pitch; F14 never resumed
+    # advance for its last 4 s.  The dwell is capped at 1.5 s: without
+    # re-centering or approach progress the stage forces SEARCH so the
+    # sweep reacquires a centered track.
+    controller = _tracked_controller(_track("A", 0.70, 0.10, scale=0.10))
+    now = 100.10
+    states = []
+    for frame in range(60):  # ~2.0 s parked, frozen apparent size
+        now += 0.033
+        controller.observe(
+            _update([_track("A", 0.70, 0.10, scale=0.10)], frame_id=10 + frame),
+            now_s=now,
+        )
+        _command(controller, now)
+        states.append(controller.state)
+    assert CleanCourseState.SEARCH in states
+    first_search = states.index(CleanCourseState.SEARCH)
+    assert 1.5 < (first_search + 1) * 0.033 < 1.8
+
+
+def test_edge_park_dwell_resets_on_recentering():
+    # Re-centering below 0.5*angular_full_brake_norm clears the dwell: a
+    # pursuit that keeps recovering the gate must never be forced to
+    # SEARCH.
+    controller = _tracked_controller(_track("A", 0.70, 0.0, scale=0.10))
+    now = 100.10
+    states = []
+    frame = 10
+    for x, ticks in ((0.70, 30), (0.20, 5), (0.70, 40)):
+        for _ in range(ticks):
+            now += 0.033
+            controller.observe(
+                _update([_track("A", x, 0.0, scale=0.10)], frame_id=frame),
+                now_s=now,
+            )
+            _command(controller, now)
+            states.append(controller.state)
+            frame += 1
+    # 2.2 s parked in total, but split by a genuine re-centering: no
+    # forced SEARCH.
+    assert CleanCourseState.SEARCH not in states
+    assert controller.state is CleanCourseState.TRACK
+
+
+def test_edge_park_dwell_reanchors_on_approach_progress():
+    # Growing log_scale IS approach progress even at the frame edge: the
+    # dwell re-anchors and the stage keeps tracking toward the crossing.
+    controller = _tracked_controller(_track("A", 0.70, 0.0, scale=0.10))
+    now = 100.10
+    states = []
+    for frame in range(60):  # log_scale grows 0.10 -> 0.25 over ~2 s
+        now += 0.033
+        scale = 0.10 * math.exp(math.log(2.5) * frame / 60)
+        controller.observe(
+            _update([_track("A", 0.70, 0.0, scale=scale)], frame_id=10 + frame),
+            now_s=now,
+        )
+        _command(controller, now)
+        states.append(controller.state)
+    assert CleanCourseState.SEARCH not in states
+    assert controller.state is CleanCourseState.TRACK
 
 
 def test_pre_cross_brake_engages_near_with_fast_slew_and_lateral_alive():
