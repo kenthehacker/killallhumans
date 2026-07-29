@@ -4589,6 +4589,94 @@ def _approach_propagated_visibility_gap_command_deadline_s(
     return deadline_s
 
 
+def _raise_if_hold_command_deadline_expired(
+    *,
+    now_s: float,
+    command_deadline_s: float,
+    hold_basis: str,
+    abort_type: type[BaseException],
+) -> None:
+    """Classify a hold lease that expires while awaiting its wire slot."""
+
+    if float(now_s) < float(command_deadline_s):
+        return
+    if hold_basis == APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS:
+        raise _ApproachPropagatedVisibilityGapExpired(
+            "approach visibility gap exhausted its local-state horizon "
+            "while awaiting the command slot"
+        )
+    raise abort_type("visual-course censored passage coast expired")
+
+
+def _raise_if_hold_wire_slot_unavailable(
+    *,
+    validation_ns: int,
+    not_before_ns: Optional[int],
+    effective_deadline_ns: int,
+    hold_deadline_ns: int,
+    hold_basis: str,
+    abort_type: type[BaseException],
+) -> None:
+    """Classify a hold deadline that makes the next wire slot impossible."""
+
+    if (
+        effective_deadline_ns > validation_ns
+        and (
+            not_before_ns is None
+            or not_before_ns < effective_deadline_ns
+        )
+    ):
+        return
+    if (
+        hold_basis == APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+        and effective_deadline_ns == hold_deadline_ns
+    ):
+        raise _ApproachPropagatedVisibilityGapExpired(
+            "approach visibility gap exhausted its local-state horizon "
+            "before a bounded wire slot"
+        )
+    raise abort_type(
+        "visual-course supersession leaves no bounded wire slot"
+    )
+
+
+def _raise_if_hold_wire_deadline_failure(
+    exc: BaseException,
+    *,
+    effective_deadline_ns: int,
+    hold_deadline_ns: int,
+    hold_basis: str,
+    abort_type: type[BaseException],
+) -> None:
+    """Convert only an owned pre-wire gap deadline into active search."""
+
+    deadline_failure = bool(
+        (
+            isinstance(exc, abort_type)
+            and str(exc)
+            in {
+                "visual receiver publication lease acquisition expired",
+                "visual receiver publication lease missed the wire deadline",
+            }
+        )
+        or (
+            isinstance(exc, TimeoutError)
+            and str(exc)
+            == "attitude-target call-start deadline was reached"
+        )
+    )
+    if (
+        deadline_failure
+        and hold_basis
+        == APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+        and effective_deadline_ns == hold_deadline_ns
+    ):
+        raise _ApproachPropagatedVisibilityGapExpired(
+            "approach visibility gap exhausted its local-state horizon "
+            "during pre-wire deadline admission"
+        ) from exc
+
+
 def _approach_expired_geometry_search_authority(
     *,
     snapshot: Any,
@@ -10439,10 +10527,12 @@ async def _run_visual_course_stage_impl(
                 profile=runtime.yaw_profile,
                 abort_type=abort_type,
             )
-        if float(runtime.monotonic()) >= coast_deadline_s:
-            raise abort_type(
-                "visual-course censored passage coast expired"
-            )
+        _raise_if_hold_command_deadline_expired(
+            now_s=float(runtime.monotonic()),
+            command_deadline_s=coast_deadline_s,
+            hold_basis=hold_basis,
+            abort_type=abort_type,
+        )
         base = runtime.attitude_rate_command(
             host.estimate,
             target_roll_rad=authority.target_roll_rad,
@@ -10515,7 +10605,7 @@ async def _run_visual_course_stage_impl(
             else host._last_flight_command_started_ns
             + round(limits.control_period_s * 1_000_000_000)
         )
-        deadline_ns = validation_ns + round(
+        validation_deadline_ns = validation_ns + round(
             limits.max_validation_to_wire_delay_s * 1_000_000_000
         )
         coast_deadline_ns = _perf_counter_deadline_from_monotonic(
@@ -10523,17 +10613,18 @@ async def _run_visual_course_stage_impl(
             now_monotonic_s=float(runtime.monotonic()),
             validation_perf_counter_ns=validation_ns,
         )
-        deadline_ns = min(deadline_ns, coast_deadline_ns)
-        if (
-            deadline_ns <= validation_ns
-            or (
-                not_before_ns is not None
-                and not_before_ns >= deadline_ns
-            )
-        ):
-            raise abort_type(
-                "visual-course supersession leaves no bounded wire slot"
-            )
+        deadline_ns = min(
+            validation_deadline_ns,
+            coast_deadline_ns,
+        )
+        _raise_if_hold_wire_slot_unavailable(
+            validation_ns=validation_ns,
+            not_before_ns=not_before_ns,
+            effective_deadline_ns=deadline_ns,
+            hold_deadline_ns=coast_deadline_ns,
+            hold_basis=hold_basis,
+            abort_type=abort_type,
+        )
         try:
             receipt = await host._send_flight_command(
                 command,
@@ -10544,7 +10635,26 @@ async def _run_visual_course_stage_impl(
                 wire_race_gate_index=current_gate_index,
             )
         except abort_type as exc:
-            return drop_superseded_coast(exc)
+            try:
+                return drop_superseded_coast(exc)
+            except abort_type as admitted_exc:
+                _raise_if_hold_wire_deadline_failure(
+                    admitted_exc,
+                    effective_deadline_ns=deadline_ns,
+                    hold_deadline_ns=coast_deadline_ns,
+                    hold_basis=hold_basis,
+                    abort_type=abort_type,
+                )
+                raise
+        except TimeoutError as exc:
+            _raise_if_hold_wire_deadline_failure(
+                exc,
+                effective_deadline_ns=deadline_ns,
+                hold_deadline_ns=coast_deadline_ns,
+                hold_basis=hold_basis,
+                abort_type=abort_type,
+            )
+            raise
         if (
             not isinstance(receipt, Mapping)
             or not isinstance(
@@ -12942,6 +13052,48 @@ async def _run_visual_course_stage_impl(
                                 APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
                             ),
                         )
+                    except _ApproachPropagatedVisibilityGapExpired:
+                        transition_now_s = float(runtime.monotonic())
+                        try:
+                            (
+                                approach_expired_geometry_search_horizontal_edge
+                            ) = _begin_approach_expired_geometry_search(
+                                snapshot=snapshot,
+                                camera_token=token,
+                                now_s=transition_now_s,
+                                propagated_started_s=(
+                                    approach_propagated_visibility_gap_started_s
+                                ),
+                                propagated_authority=replace(
+                                    gap_authority,
+                                    remaining_horizon_s=0.0,
+                                ),
+                                unavailable_reason=None,
+                                segment=segment,
+                            )
+                            if approach_same_gate_rebind_search is None:
+                                approach_same_gate_rebind_search = (
+                                    host.visual_gate_graph
+                                    .begin_same_gate_rebind_search(
+                                        host.visual_tracker,
+                                        race_status=race,
+                                        camera_token_at_start=token,
+                                    )
+                                )
+                        except (
+                            GateGraphError,
+                            TypeError,
+                            ValueError,
+                        ) as search_exc:
+                            raise abort_type(
+                                "visual-course post-slot expired-geometry "
+                                "active search transition refused: "
+                                f"{search_exc}"
+                            ) from search_exc
+                        approach_expired_geometry_search_started_s = (
+                            transition_now_s
+                        )
+                        continue
                     except RaceActiveBoundaryChangedBeforeWire as race_exc:
                         credited_race = accept_no_wire_race_boundary(
                             race_exc,

@@ -6671,6 +6671,149 @@ def test_ninth_visibility_gap_command_uses_live_state_horizon():
         )
 
 
+def test_run24_post_slot_gap_expiry_is_a_normal_search_transition():
+    deadline_s = 181_039.671 + 0.0213881
+
+    course_stage._raise_if_hold_command_deadline_expired(
+        now_s=deadline_s - 1e-9,
+        command_deadline_s=deadline_s,
+        hold_basis=(
+            course_stage.APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+        ),
+        abort_type=SafetyAbort,
+    )
+    with pytest.raises(
+        course_stage._ApproachPropagatedVisibilityGapExpired,
+        match="awaiting the command slot",
+    ):
+        course_stage._raise_if_hold_command_deadline_expired(
+            # The run-24 wire slot became available about 29.5 ms after the
+            # last fresh publication, beyond its remaining 21.3881 ms lease.
+            now_s=181_039.671 + 0.0295,
+            command_deadline_s=deadline_s,
+            hold_basis=(
+                course_stage.APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+            ),
+            abort_type=SafetyAbort,
+        )
+    with pytest.raises(
+        SafetyAbort,
+        match="censored passage coast expired",
+    ):
+        course_stage._raise_if_hold_command_deadline_expired(
+            now_s=deadline_s,
+            command_deadline_s=deadline_s,
+            hold_basis=course_stage.CENSORED_PASSAGE_COAST_BASIS,
+            abort_type=SafetyAbort,
+        )
+
+
+def test_run24_owned_gap_deadline_with_no_wire_slot_is_normal_expiry():
+    with pytest.raises(
+        course_stage._ApproachPropagatedVisibilityGapExpired,
+        match="before a bounded wire slot",
+    ):
+        course_stage._raise_if_hold_wire_slot_unavailable(
+            validation_ns=200,
+            not_before_ns=220,
+            effective_deadline_ns=210,
+            hold_deadline_ns=210,
+            hold_basis=(
+                course_stage.APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+            ),
+            abort_type=SafetyAbort,
+        )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="supersession leaves no bounded wire slot",
+    ):
+        course_stage._raise_if_hold_wire_slot_unavailable(
+            validation_ns=200,
+            not_before_ns=220,
+            # The generic validation deadline, not the gap lease, owns this
+            # impossible slot.
+            effective_deadline_ns=210,
+            hold_deadline_ns=240,
+            hold_basis=(
+                course_stage.APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+            ),
+            abort_type=SafetyAbort,
+        )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    (
+        SafetyAbort(
+            "visual receiver publication lease acquisition expired"
+        ),
+        SafetyAbort(
+            "visual receiver publication lease missed the wire deadline"
+        ),
+        TimeoutError(
+            "attitude-target call-start deadline was reached"
+        ),
+    ),
+)
+def test_run24_owned_gap_pre_wire_deadline_failure_is_normal_expiry(exc):
+    with pytest.raises(
+        course_stage._ApproachPropagatedVisibilityGapExpired,
+        match="during pre-wire deadline admission",
+    ):
+        course_stage._raise_if_hold_wire_deadline_failure(
+            exc,
+            effective_deadline_ns=210,
+            hold_deadline_ns=210,
+            hold_basis=(
+                course_stage.APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+            ),
+            abort_type=SafetyAbort,
+        )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    (
+        SafetyAbort(
+            course_stage.VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+        ),
+        RaceActiveBoundaryChangedBeforeWire(
+            "race-active send boundary changed before wire"
+        ),
+        SafetyAbort("unrelated watchdog refusal"),
+        TimeoutError(
+            "attitude-target call began before its pacing window"
+        ),
+    ),
+)
+def test_run24_non_deadline_wire_failures_are_not_reclassified(exc):
+    course_stage._raise_if_hold_wire_deadline_failure(
+        exc,
+        effective_deadline_ns=210,
+        hold_deadline_ns=210,
+        hold_basis=(
+            course_stage.APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+        ),
+        abort_type=SafetyAbort,
+    )
+
+
+def test_run24_generic_wire_deadline_failure_is_not_gap_expiry():
+    course_stage._raise_if_hold_wire_deadline_failure(
+        SafetyAbort(
+            "visual receiver publication lease missed the wire deadline"
+        ),
+        # The generic validation deadline is earlier than the gap lease.
+        effective_deadline_ns=210,
+        hold_deadline_ns=240,
+        hold_basis=(
+            course_stage.APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+        ),
+        abort_type=SafetyAbort,
+    )
+
+
 def _expired_geometry_search_snapshot(sequence: int = 241):
     token = _token(sequence)
     current = SimpleNamespace(

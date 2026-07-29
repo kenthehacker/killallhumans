@@ -1315,7 +1315,7 @@ def test_negative_clearance_near_center_cannot_invent_full_bank() -> None:
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
 
-def test_off_axis_steering_holds_intercept_bank_until_position_corridor(
+def test_off_axis_steering_tapers_full_bank_once_rate_turns_inward(
 ) -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
@@ -1411,16 +1411,18 @@ def test_off_axis_steering_holds_intercept_bank_until_position_corridor(
     assert recovered.time_to_contact_s is None
     assert recovered_decision.current_time_to_contact_s is None
     assert not recovered_decision.passage_committed
-    assert recovered_decision.proposed_command.target_roll_rad == pytest.approx(
-        MAX_TARGET_ROLL_RAD
+    assert (
+        0.0
+        < recovered_decision.proposed_command.target_roll_rad
+        < MAX_TARGET_ROLL_RAD
     )
     assert math.isfinite(
         recovered_decision.proposed_command.target_roll_rad
     )
 
-    # Inward image motion alone cannot unload the bank while fresh position
-    # remains well outside the corridor.  The controller retains no timer or
-    # latch: a centered publication releases this position-owned authority.
+    # Qualified inward motion unloads the full-bank override before the gate
+    # reaches center.  The ordinary proportional/rate law remains bounded and
+    # is recomputed from each fresh publication.
     improving_decisions = []
     for sequence, x in ((10, 0.340), (11, 0.320)):
         observation_time = 1.0 + (sequence - 1) * 0.040
@@ -1446,13 +1448,49 @@ def test_off_axis_steering_holds_intercept_bank_until_position_corridor(
         )
 
     assert all(
-        item.proposed_command.target_roll_rad
-        == pytest.approx(MAX_TARGET_ROLL_RAD)
+        abs(item.proposed_command.target_roll_rad)
+        < MAX_TARGET_ROLL_RAD
         for item in improving_decisions
     )
 
+    # Once this continuous approach has established inward translation, a
+    # later outward-rate reversal cannot discontinuously re-arm the one-shot
+    # full-bank intercept transient.
+    reversal_decisions = []
+    reversal_state = None
+    for sequence, x in ((12, 0.330), (13, 0.350), (14, 0.390)):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        reversal_state = core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=x,
+                log_scale=-1.40,
+                aperture=(0.14, 0.11),
+            )
+        )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        reversal_decision = core.guide(round(decision_time * NS))
+        reversal_decisions.append(reversal_decision)
+        _commit_decision(
+            core,
+            decision_time,
+            reversal_decision.command,
+        )
+
+    assert reversal_state is not None
+    assert reversal_state.residual_translational_rate_rad_s[0] > 0.0
+    assert all(
+        abs(item.proposed_command.target_roll_rad)
+        < MAX_TARGET_ROLL_RAD
+        for item in reversal_decisions
+    )
+
     centered_decision = None
-    for sequence, x in ((12, 0.20), (13, 0.10), (14, 0.05)):
+    for sequence, x in ((15, 0.20), (16, 0.10), (17, 0.05)):
         observation_time = 1.0 + (sequence - 1) * 0.040
         _imu(core, observation_time)
         core.observe_track(

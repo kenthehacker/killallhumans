@@ -1158,6 +1158,8 @@ class DynamicCourseCore:
         ) = None
         self._successor_clearance_positive_since_ns: int | None = None
         self._last_applied_command: DynamicCourseCommand | None = None
+        self._current_intercept_key: tuple[int, str] | None = None
+        self._current_intercept_inward_established = False
 
     @property
     def track_states(self) -> tuple[TrackDynamicState, ...]:
@@ -2627,6 +2629,10 @@ class DynamicCourseCore:
         self._current_track_id = current_track_id
         self._current_gate_index = current_gate_index
         self._successor_track_id = successor_track_id
+        intercept_key = (current_gate_index, current_track_id)
+        if intercept_key != self._current_intercept_key:
+            self._current_intercept_key = intercept_key
+            self._current_intercept_inward_established = False
         return self.course_state()
 
     def course_state(self) -> CourseDynamicState:
@@ -3123,6 +3129,11 @@ class DynamicCourseCore:
         self._current_gate_index = to_gate_index
         self._current_track_id = promoted_track_id
         self._successor_track_id = next_successor_track_id
+        self._current_intercept_key = (
+            to_gate_index,
+            promoted_track_id,
+        )
+        self._current_intercept_inward_established = False
         self._successor_clearance_key = None
         self._successor_clearance_positive_since_ns = None
         self._promotion_count += 1
@@ -3443,6 +3454,25 @@ class DynamicCourseCore:
             horizontal_alignment_unsettled
             or vertical_alignment_unsettled
         )
+        stable_horizontal_bearing = math.atan(
+            passage_error[0] * self.config.horizontal_angle_scale_rad
+        )
+        if (
+            current.visible
+            and current.missed_count == 0
+            and current.state_monotonic_ns
+            == current.last_measurement_monotonic_ns
+            and not current.ambiguous
+            and not current.censored_axes[0]
+            and current.bearing_rate_qualified[0]
+            and abs(stable_horizontal_bearing)
+            >= self.config.off_axis_brake_rad
+            and passage_error[0] * residual_rate_norm[0] < -_EPSILON
+        ):
+            # Qualified inward translation ends the full-bank launch
+            # transient.  A later rate reversal must not discontinuously
+            # re-arm saturation on this same continuous current-gate approach.
+            self._current_intercept_inward_established = True
         proposal, braking, reason, yaw_contribution = self._propose_command(
             current,
             successor,
@@ -3458,6 +3488,9 @@ class DynamicCourseCore:
             current_yaw_release,
             successor_weight,
             successor_prediction,
+            inward_intercept_established=(
+                self._current_intercept_inward_established
+            ),
             horizontal_alignment_unsettled=(
                 horizontal_alignment_unsettled
             ),
@@ -4451,6 +4484,7 @@ class DynamicCourseCore:
         successor_weight: float,
         successor_prediction: _SuccessorPrediction | None,
         *,
+        inward_intercept_established: bool,
         horizontal_alignment_unsettled: bool,
         vertical_alignment_unsettled: bool,
     ) -> tuple[DynamicCourseCommand, bool, str | None, float]:
@@ -4580,19 +4614,16 @@ class DynamicCourseCore:
             and current.bearing_rate_qualified[0]
             and abs(stable_passage_bearing[0])
             >= self.config.off_axis_brake_rad
+            and not inward_intercept_established
             and abs(yaw) >= 0.90 * MAX_YAW_RATE_RAD_S
             and abs(self.config.roll_guidance_sign) > _EPSILON
         )
         if off_axis_full_bank:
-            # Position, not a noisy one-frame image-rate sign, owns the
-            # intercept while a fresh gate remains outside the corridor and
-            # yaw is saturated.  Run 2ac822f briefly reduced Gate-1 bank from
-            # -0.35 to about -0.10 as the image started moving inward; the
-            # vehicle had not established lateral velocity yet, so the target
-            # immediately reversed and escaped right.  Hold the available
-            # position-directed bank until fresh geometry actually reaches the
-            # corridor.  This remains stateless and releases on the very next
-            # centered publication.
+            # Hold the launch transient until qualified image motion first
+            # turns inward.  The proportional/rate command above then owns the
+            # remainder of this continuous approach and may taper or
+            # counter-bank.  Re-arming full bank at the first reversal made
+            # both 2ac822f and e556638 escape right.
             roll = math.copysign(
                 MAX_TARGET_ROLL_RAD,
                 self.config.roll_guidance_sign
