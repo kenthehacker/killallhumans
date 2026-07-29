@@ -281,6 +281,11 @@ NEAR_BRAKE_LOG_SCALE = -0.9  # close enough that closure is fully braked
 
 CROSSING_MIN_LOG_SCALE = -0.80  # retired stage crossing_arm_min_log_scale
 CROSSING_CREDIT_WAIT_S = 0.40  # July-18 safety contract item 9
+# F38 (18c0b35c): with the true (nose-up) brake the drone arrives at the
+# engulfed plane SLOW; a level coast ran out of residual closure and the
+# bounded wait expired into SEARCH without credit.  A small nose-down
+# (positive, per the F38 convention) nudge carries it through the plane.
+COAST_ADVANCE_PITCH_RAD = 0.05
 
 PREDICT_FRAME_GAP_S = 0.25  # ~8 camera frames; 0.06 (~2) flapped TRACK/SEARCH
 # 7 times in the 4.2 s F35 gate-1 leg, each flap dumping the pursuit fix.
@@ -665,6 +670,7 @@ class CleanCourseConfig:
     near_brake_log_scale: float = NEAR_BRAKE_LOG_SCALE
     crossing_min_log_scale: float = CROSSING_MIN_LOG_SCALE
     crossing_credit_wait_s: float = CROSSING_CREDIT_WAIT_S
+    coast_advance_pitch_rad: float = COAST_ADVANCE_PITCH_RAD
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
     closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
@@ -1125,13 +1131,17 @@ class CleanCourseController:
                 # +11.8 "bar graze" at the coast is the drone dropping onto
                 # the bottom bar), so the post-credit phase always started
                 # in a dive inside the fast-regime deficit trap.  The coast
-                # now holds the tilt-compensated support collective with the
-                # same level attitude / zero yaw: no closure is added (the
-                # gate is engulfed and lateral/vertical steering is off),
-                # but no ballistic dive either.  It is deliberately NOT
-                # vz-governed: the engulfed window is blind, and a phantom
-                # sink must not pin a climb into the top bar.  Exact-zero
-                # thrust remains reserved for abort and cleanup.
+                # holds the tilt-compensated support collective with zero
+                # yaw.  F38 (18c0b35c): with the TRUE brake the drone now
+                # arrives SLOW, and a level coast ran out of residual
+                # closure short of the plane — the wait expired into
+                # SEARCH without credit.  A small nose-down nudge keeps
+                # carrying the drone through the engulfed gate plane (the
+                # crossing it was armed for is dead ahead); steering stays
+                # off.  It is deliberately NOT vz-governed: the engulfed
+                # window is blind, and a phantom sink must not pin a climb
+                # into the top bar.  Exact-zero thrust remains reserved for
+                # abort and cleanup.
                 coast_support = _clamp(
                     cfg.support_collective
                     / max(0.85, math.cos(roll_rad) * math.cos(pitch_rad)),
@@ -1140,7 +1150,7 @@ class CleanCourseController:
                 )
                 return NavigationOutput(
                     target_roll_rad=0.0,
-                    target_pitch_rad=0.0,
+                    target_pitch_rad=cfg.coast_advance_pitch_rad,
                     yaw_rate_rad_s=0.0,
                     thrust=coast_support,
                     state=self.state,

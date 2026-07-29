@@ -7440,7 +7440,11 @@ def attitude_rate_command(
     return command
 
 
-def validate_command(command: AttitudeRateCommand) -> None:
+def validate_command(
+    command: AttitudeRateCommand,
+    *,
+    max_yaw_rate_rad_s: float = MAX_COMMAND_RATE_RAD_S,
+) -> None:
     values = (
         command.roll_rate,
         command.pitch_rate,
@@ -7449,9 +7453,9 @@ def validate_command(command: AttitudeRateCommand) -> None:
     )
     if not all(math.isfinite(value) for value in values):
         raise SafetyAbort("non-finite command")
-    if max(abs(command.roll_rate), abs(command.pitch_rate), abs(command.yaw_rate)) > (
+    if max(abs(command.roll_rate), abs(command.pitch_rate)) > (
         MAX_COMMAND_RATE_RAD_S + 1e-9
-    ):
+    ) or abs(command.yaw_rate) > (max_yaw_rate_rad_s + 1e-9):
         raise SafetyAbort("commanded body rate exceeded conservative clamp")
     if not 0.0 <= command.thrust <= 0.35:
         raise SafetyAbort("commanded thrust exceeded conservative VQ2 envelope")
@@ -12945,7 +12949,18 @@ class VQ2Runner:
                     next_control_deadline=next_control_deadline,
                     attitude_rate_command=attitude_rate_command,
                     attitude_rate_command_type=AttitudeRateCommand,
-                    validate_command=validate_command,
+                    validate_command=partial(
+                        validate_command,
+                        # F36 raised the yaw authority to the calibrated
+                        # 0.5 rad/s measured cap; the F38 abort ("commanded
+                        # body rate exceeded conservative clamp") fired the
+                        # legacy 0.25 yaw ceiling on the first long
+                        # pursuit.  Roll/pitch keep the wire clamp.
+                        max_yaw_rate_rad_s=min(
+                            DEFAULT_VISUAL_COURSE_LIMITS.max_yaw_rate_rad_s,
+                            course_yaw_profile.max_abs_measured_yaw_rate_rad_s,
+                        ),
+                    ),
                     skipped_result=(
                         FlightCommandSendResult.SKIPPED_RACE_BOUNDARY_CHANGED
                     ),

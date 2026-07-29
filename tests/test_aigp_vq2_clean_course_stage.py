@@ -478,7 +478,7 @@ def test_vz_phantom_sink_cannot_move_coast_support_hold():
     assert out.thrust == pytest.approx(SUPPORT, abs=1e-9)
     assert (out.target_roll_rad, out.target_pitch_rad, out.yaw_rate_rad_s) == (
         0.0,
-        0.0,
+        0.05,  # F38 coast advance nudge: carry through the engulfed plane
         0.0,
     )
 
@@ -1367,7 +1367,7 @@ def test_pre_cross_brake_does_not_suppress_crossing_detection():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-    ) == (0.0, 0.0, 0.0)
+    ) == (0.0, 0.05, 0.0)
     assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
 
 
@@ -1477,7 +1477,7 @@ def test_fresh_close_loss_still_coasts_and_holds_support():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-    ) == (0.0, 0.0, 0.0)
+    ) == (0.0, 0.05, 0.0)
     assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
 
 
@@ -1535,7 +1535,7 @@ def test_crossing_loss_latches_coast_and_waits_for_newer_race_packet():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-    ) == (0.0, 0.0, 0.0)
+    ) == (0.0, 0.05, 0.0)
     assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
     # A strictly newer race packet without credit ends the wait; vision never
     # declares the pass.
