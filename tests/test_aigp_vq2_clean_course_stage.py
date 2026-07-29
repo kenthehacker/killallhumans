@@ -1348,7 +1348,7 @@ def test_pre_cross_brake_engages_near_with_fast_slew_and_lateral_alive():
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
-    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(0.18, abs=1e-9)
     assert now - 100.10 <= 0.5  # fast slew, not the generic 0.30 rad/s
     assert out.yaw_rate_rad_s > 0.0  # x=+0.20 pursuit stays alive
     assert out.thrust > 0.0  # the vz governor keeps the collective alive
@@ -1381,7 +1381,7 @@ def test_pre_cross_brake_expansion_ttc_trigger_in_near_field():
         now += 0.033
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(0.12, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(0.18, abs=1e-9)
     assert out.yaw_rate_rad_s > 0.0  # lateral pursuit alive under braking
 
 
@@ -1665,7 +1665,7 @@ def test_finite_bounded_output_across_states():
         assert abs(output.yaw_rate_rad_s) <= 0.15 + 1e-9
         assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
         assert abs(output.target_roll_rad) <= 0.12 + 1e-9
-        assert -0.35 <= output.target_pitch_rad <= 0.15
+        assert -0.35 <= output.target_pitch_rad <= 0.18 + 1e-9
         if output.thrust == 0.0:
             assert output.state is CleanCourseState.COAST_FOR_CREDIT
 

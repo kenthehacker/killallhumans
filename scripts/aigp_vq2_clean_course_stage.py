@@ -331,8 +331,17 @@ POST_CREDIT_BRAKE_SLEW_RAD_S = 1.0
 # (advance -> brake_pitch_rad) remains as the far-field shaping; the
 # post-credit brake window is unchanged and becomes the cleanup for
 # residual closure.
-PRE_CROSS_BRAKE_PITCH_RAD = 0.12  # genuine nose-up pre-plane brake attitude
-PRE_CROSS_BRAKE_TTC_S = 2.5  # expansion-rate time-to-contact trigger (F13)
+# TTC 2.5 -> 4.0 s and pitch 0.12 -> 0.18 (flights F19-F24, root-cause
+# chain): every post-credit kill since F19 is the same trap — cross gate 0
+# at fh ~= 2-3, enter the fast regime where the vertical deficit
+# (~0.9*fh - 0.5 m/s^2) exceeds the 0.325 floor, and the sink powers a
+# glide that worsens the deficit.  Post-gate physics has no headroom
+# (full deficit compensation needs >0.34 at fh 5.5+), so the crossing
+# itself must be slower: brake earlier and harder while still in the
+# trusted regime with working vz/alt/vision, targeting fh ~= 1 at the
+# plane instead of 2.0-2.2.
+PRE_CROSS_BRAKE_PITCH_RAD = 0.18  # genuine nose-up pre-plane brake attitude
+PRE_CROSS_BRAKE_TTC_S = 4.0  # expansion-rate time-to-contact trigger (F13)
 PRE_CROSS_BRAKE_NEAR_LOG_SCALE = -1.8  # near-field gate for the TTC trigger
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew, shared with the brake window
 # Pre-gate-1 altitude floor (terrain insurance; flights F10/F11/F12 all
