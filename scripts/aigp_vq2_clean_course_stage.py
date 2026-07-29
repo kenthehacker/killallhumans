@@ -277,7 +277,12 @@ PREDICT_STALL_FORCE_SEARCH_S = 1.50
 # the same unqualified window (F10 climbed at vz +1.0 for ~1.4 s chasing
 # an unqualified low-conf bearing, spending ~0.7 m of altitude); the full
 # 1.0 m/s cap returns the moment vertical is qualified.
-POST_CREDIT_BRAKE_PITCH_RAD = 0.18  # nose-up brake attitude (see block above)
+# 0.18 -> 0.15 (flight 43f51a4d): with full intercept pitch authority on
+# brake ticks the target is now actually ATTAINED, and 0.18 rad = 10.3 deg
+# trips the runner's MAX_PITCH_RAD 10.0 deg abort.  0.15 (8.6 deg) keeps
+# ~1.4 deg of overshoot margin while g*tan(0.15) ~= 1.57 m/s^2 keeps ~87%
+# of the deceleration.
+POST_CREDIT_BRAKE_PITCH_RAD = 0.15  # nose-up brake attitude (see block above)
 # 2.75 -> 1.5 s (flights 99e093fa/25361816): with the pre-cross brake now
 # owning closure killing before the plane, the post-credit brake is a
 # settling pause, not the closure mechanism.  A long no-successor hold

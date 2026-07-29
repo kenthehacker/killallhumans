@@ -787,7 +787,7 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
     brake = _command(controller, now)
     assert not brake.vertical_qualified
     assert brake.yaw_rate_rad_s > 0.0  # x=+0.30 pursuit still steers
-    # Dedicated 1.0 rad/s brake slew: the +0.18 attitude is attained well
+    # Dedicated 1.0 rad/s brake slew: the +0.15 attitude is attained well
     # inside 0.5 s of window start (F12: the generic 0.30 rad/s slew moved
     # pitch only -0.085 -> ~=0 inside the 1.0 s hold, never braking).
     for _ in range(8):
@@ -795,7 +795,7 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
         brake = _command(controller, now)
     assert now - 100.10 <= 0.5
     assert not brake.vertical_qualified
-    assert brake.target_pitch_rad == pytest.approx(0.18, abs=1e-9)
+    assert brake.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
     # Fresh y measurements re-qualify, but the 1.0 s minimum hold keeps the
     # brake armed; the release fires only after the hold.
     frame = 10
@@ -809,7 +809,7 @@ def test_post_credit_brake_engages_and_releases_on_qualification():
         held = _command(controller, now)
         frame += 1
     assert held.vertical_qualified
-    assert held.target_pitch_rad == pytest.approx(0.18, abs=1e-9)  # still held
+    assert held.target_pitch_rad == pytest.approx(0.15, abs=1e-9)  # still held
     released = held
     while now < 100.10 + 1.2:
         now += 0.033
@@ -881,7 +881,7 @@ def test_post_credit_brake_releases_on_timeout():
     for _ in range(20):  # slew (1.0 rad/s) reaches the brake attitude
         now += 0.033
         output = _command(controller, now)
-    assert output.target_pitch_rad == pytest.approx(0.18, abs=1e-9)
+    assert output.target_pitch_rad == pytest.approx(0.15, abs=1e-9)
     # Past the deadline the window ends even with nothing reacquired.
     now = 100.10 + 2.80
     for _ in range(25):  # generic 0.30 rad/s slew returns to near level
@@ -1673,7 +1673,7 @@ def test_finite_bounded_output_across_states():
         assert abs(output.yaw_rate_rad_s) <= 0.15 + 1e-9
         assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
         assert abs(output.target_roll_rad) <= 0.12 + 1e-9
-        assert -0.35 <= output.target_pitch_rad <= 0.18 + 1e-9
+        assert -0.35 <= output.target_pitch_rad <= 0.15 + 1e-9
         if output.thrust == 0.0:
             assert output.state is CleanCourseState.COAST_FOR_CREDIT
 
