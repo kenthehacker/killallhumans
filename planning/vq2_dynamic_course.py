@@ -45,6 +45,9 @@ _EPSILON = 1e-12
 # Run 27 briefly estimated +0.002 normalized/s after a strong inward
 # intercept and mistook estimator noise for a true outward reversal.  Run 25
 # established that +0.057 normalized/s is already enough evidence to unload.
+# Any qualified inward sign may arm the hysteresis: run 28's real but weak
+# inward phase never reached 0.04 and therefore could not recognize its later
+# strong outward reversal.
 _INTERCEPT_REVERSAL_MIN_RATE_NORM_S = 0.04
 
 
@@ -3481,8 +3484,6 @@ class DynamicCourseCore:
         if (
             intercept_motion_qualified
             and intercept_motion_product < -_EPSILON
-            and abs(residual_rate_norm[0])
-            >= _INTERCEPT_REVERSAL_MIN_RATE_NORM_S
         ):
             # Build lateral momentum through the qualified inward phase.
             self._current_intercept_inward_observed = True

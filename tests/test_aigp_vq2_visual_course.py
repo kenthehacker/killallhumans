@@ -4710,6 +4710,47 @@ def test_fresh_raw_top_boundary_retains_tracking_only_inner_steering():
     assert _dd89_top_censored_recovery(**overrides) is None
 
 
+def test_run28_later_gate_top_recovery_retains_subsupport_collective():
+    state, decision, source, snapshot = (
+        _fresh_post_credit_top_boundary_case()
+    )
+    boundary = course_stage._fresh_post_credit_top_boundary_authority(
+        state=state,
+        decision=decision,
+        authority=source,
+        recovery_snapshot=snapshot,
+        current_gate_index=1,
+    )
+    overrides = {
+        "current_censored_axes": (False, False),
+        "current_aperture_propagated": False,
+        "current_aperture_dynamics_qualified": False,
+        "stable_center_norm": (0.3905, -0.9399),
+        "expansion_rate_s": 0.0237,
+        "time_to_contact_s": None,
+        "requested_thrust": 0.21,
+        "fresh_boundary_current_authority": boundary,
+    }
+
+    retained = _dd89_top_censored_recovery(
+        **overrides,
+        subsupport_collective_authorized=True,
+    )
+    floored = _dd89_top_censored_recovery(
+        **overrides,
+        subsupport_collective_authorized=False,
+    )
+
+    assert retained is not None
+    assert floored is not None
+    assert retained.allocated_thrust == pytest.approx(0.21)
+    assert retained.subsupport_collective_authorized is True
+    assert floored.allocated_thrust == pytest.approx(
+        course_stage.GATE0_PROVED_COLLECTIVE_BASE
+    )
+    assert floored.subsupport_collective_authorized is False
+
+
 def _latest_gate_one_top_pitch_arbitration_case():
     state, decision, source, snapshot = (
         _fresh_post_credit_top_boundary_case()
@@ -4765,7 +4806,7 @@ def _latest_gate_one_top_pitch_arbitration_case():
     return boundary, fov_proposal, recovery
 
 
-def test_latest_off_axis_exact_top_keeps_fov_pitch():
+def test_run28_exact_top_no_forward_brake_owns_over_fov():
     boundary, fov_proposal, recovery = (
         _latest_gate_one_top_pitch_arbitration_case()
     )
@@ -4781,11 +4822,34 @@ def test_latest_off_axis_exact_top_keeps_fov_pitch():
         )
     )
 
-    assert owns_pitch is True
+    assert owns_pitch is False
     assert fov_proposal.protected_target_pitch_rad == pytest.approx(-0.35)
+    assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
     assert recovery.forward_closure_authorized is False
     assert recovery.passage_authority is False
     assert recovery.advance_authority is False
+
+
+def test_top_fov_may_own_only_with_explicit_forward_closure():
+    boundary, fov_proposal, recovery = (
+        _latest_gate_one_top_pitch_arbitration_case()
+    )
+    recovery = replace(
+        recovery,
+        forward_closure_authorized=True,
+    )
+
+    assert (
+        course_stage._off_axis_top_fov_owns_pitch(
+            mode=VisualApproachMode.APPROACH,
+            current_gate_index=1,
+            initial_gate_index=0,
+            fov_proposal=fov_proposal,
+            fresh_top_boundary=boundary,
+            closure_recovery=recovery,
+        )
+        is True
+    )
 
 
 @pytest.mark.parametrize(
@@ -4796,12 +4860,12 @@ def test_latest_off_axis_exact_top_keeps_fov_pitch():
         "expected",
     ),
     (
-        (1, -0.23996546959183251, 0.12, -0.23996546959183251),
+        (1, -0.23996546959183251, 0.12, 0.12),
         (0, -0.23996546959183251, 0.12, 0.12),
         (1, 0.04, 0.12, 0.12),
     ),
 )
-def test_fresh_top_boundary_fallback_preserves_later_gate_fov_pitch(
+def test_fresh_top_boundary_fallback_preserves_no_forward_pitch(
     current_gate_index,
     continuity_pitch,
     brake_pitch,
@@ -4872,7 +4936,7 @@ def test_post_credit_top_pitch_carries_across_segment_and_next_frame():
         )
     )
 
-    assert transition_pitch == pytest.approx(-0.21088402976993187)
+    assert transition_pitch == pytest.approx(0.12)
     assert next_pitch == pytest.approx(transition_pitch)
     assert following_pitch == pytest.approx(transition_pitch)
 
@@ -4881,7 +4945,7 @@ def test_post_credit_top_pitch_carries_across_segment_and_next_frame():
     "retained",
     (False, True),
 )
-def test_post_credit_top_recovery_keeps_fov_pitch_ownership(
+def test_post_credit_top_recovery_keeps_no_forward_pitch_ownership(
     retained,
 ):
     boundary, fov_proposal, recovery = (
@@ -4914,7 +4978,7 @@ def test_post_credit_top_recovery_keeps_fov_pitch_ownership(
             closure_recovery=recovery,
             retained_raw_handoff=retained_handoff,
         )
-        is True
+        is False
     )
     assert fov_proposal.protected_target_pitch_rad == pytest.approx(-0.35)
     assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
@@ -4922,7 +4986,7 @@ def test_post_credit_top_recovery_keeps_fov_pitch_ownership(
     assert recovery.advance_authority is False
 
 
-def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
+def test_post_credit_propagated_top_fov_yields_to_no_forward_pitch():
     boundary, _exact_proposal, recovery = (
         _latest_gate_one_top_pitch_arbitration_case()
     )
@@ -4957,7 +5021,7 @@ def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
             closure_recovery=recovery,
             propagated_state_handoff=authority,
         )
-        is True
+        is False
     )
     assert propagated_proposal.limited is True
     assert (
@@ -4981,7 +5045,7 @@ def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
             closure_recovery=ordinary_off_axis,
             propagated_state_handoff=authority,
         )
-        is True
+        is False
     )
 
 
@@ -4993,7 +5057,7 @@ def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
         ({"expansion_rate_s": 0.44, "time_to_contact_s": 2.2},),
     ),
 )
-def test_post_credit_top_fov_owns_pitch_during_aligned_or_rapid_closure(
+def test_post_credit_no_forward_pitch_owns_during_alignment_or_closure(
     recovery_change,
 ):
     boundary, fov_proposal, recovery = (
@@ -5017,7 +5081,7 @@ def test_post_credit_top_fov_owns_pitch_during_aligned_or_rapid_closure(
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
         )
-        is True
+        is False
     )
     assert fov_proposal.protected_target_pitch_rad == pytest.approx(-0.35)
     assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
@@ -5025,7 +5089,7 @@ def test_post_credit_top_fov_owns_pitch_during_aligned_or_rapid_closure(
     assert recovery.advance_authority is False
 
 
-def test_exact_top_fov_owns_pitch_when_horizontally_aligned():
+def test_exact_top_no_forward_pitch_owns_when_horizontally_aligned():
     boundary, fov_proposal, recovery = (
         _latest_gate_one_top_pitch_arbitration_case()
     )
@@ -5044,7 +5108,7 @@ def test_exact_top_fov_owns_pitch_when_horizontally_aligned():
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
         )
-        is True
+        is False
     )
     assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
 
@@ -5061,7 +5125,7 @@ def test_exact_top_fov_owns_pitch_when_horizontally_aligned():
         },
     ),
 )
-def test_off_axis_top_fov_keeps_pitch_during_rapid_closure(
+def test_off_axis_no_forward_pitch_owns_during_rapid_closure(
     recovery_change,
 ):
     boundary, fov_proposal, recovery = (
@@ -5078,7 +5142,7 @@ def test_off_axis_top_fov_keeps_pitch_during_rapid_closure(
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
         )
-        is True
+        is False
     )
     assert recovery.horizontal_aligned is False
     assert fov_proposal.protected_target_pitch_rad < (
@@ -8257,6 +8321,72 @@ def test_run25_later_gate_collective_closes_rxpi_vertical_error():
     )
     assert proposal.noncommitted_support_floor_applied is False
     assert proposal.vertical_censored is False
+
+
+def test_run28_later_gate_subsupport_survives_censorship_and_dropout():
+    state = course_stage._CurrentApertureProvedCollectiveState(
+        track_id="track-1",
+        fixed_support_thrust=course_stage.LATER_GATE_SUPPORT_THRUST,
+    )
+    clean = replace(
+        _target(_snapshot(1, "track-1", 181), "track-1"),
+        received_monotonic_s=14.0,
+        normalized_y_down=-0.75,
+        normalized_y_rate_down_s=-1.0,
+    )
+    admitted = course_stage._propose_current_aperture_collective(
+        state,
+        clean,
+        authoritative_current_track_id="track-1",
+        control_vertical_error_image_down=-0.75,
+        control_vertical_rate_down_s=-1.0,
+        control_basis=(
+            course_stage.CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
+        ),
+        subsupport_collective_authorized=True,
+    )
+    censored = replace(
+        clean,
+        frame_token=replace(
+            clean.frame_token,
+            frame_id=clean.frame_token.frame_id + 1,
+            publication_sequence=(
+                clean.frame_token.publication_sequence + 1
+            ),
+        ),
+        received_monotonic_s=14.03,
+        clipped=True,
+        center_censored=True,
+        vertical_censored=True,
+    )
+    held_censored = course_stage._propose_current_aperture_collective(
+        state,
+        censored,
+        authoritative_current_track_id="track-1",
+    )
+    other = _target(
+        _snapshot(1, "other-track", 183),
+        "other-track",
+    )
+    held_dropout = course_stage._propose_current_aperture_collective(
+        state,
+        other,
+        authoritative_current_track_id="track-1",
+    )
+
+    assert admitted.requested_thrust == pytest.approx(
+        course_stage.MIN_VISUAL_THRUST
+    )
+    for held in (held_censored, held_dropout):
+        assert held.requested_thrust == pytest.approx(
+            course_stage.MIN_VISUAL_THRUST
+        )
+        assert held.unconstrained_requested_thrust == pytest.approx(
+            course_stage.MIN_VISUAL_THRUST
+        )
+        assert held.held_last_observable_collective is True
+        assert held.subsupport_collective_authorized is True
+        assert held.noncommitted_support_floor_applied is False
 
 
 def test_faa7cee6_collective_uses_derotated_state_not_pitch_motion():

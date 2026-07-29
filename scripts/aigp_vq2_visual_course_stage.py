@@ -714,6 +714,7 @@ class _FreshTopCensoredClosureRecovery:
     allocated_target_pitch_rad: float
     requested_thrust: float
     allocated_thrust: float
+    subsupport_collective_authorized: bool
     fresh_boundary_current_authority: bool
     forward_closure_authorized: bool
     steering_only: bool
@@ -1621,6 +1622,7 @@ def _allocate_fresh_top_censored_closure_recovery(
     requested_target_pitch_rad: float,
     fov_protected_target_pitch_rad: float,
     requested_thrust: float,
+    subsupport_collective_authorized: bool = False,
     fresh_boundary_current_authority: Optional[
         _FreshCurrentTopBoundaryAuthority
     ] = None,
@@ -1690,6 +1692,7 @@ def _allocate_fresh_top_censored_closure_recovery(
         or len(stable_center_norm) != 2
         or type(residual_rate_rad_s) is not tuple
         or len(residual_rate_rad_s) != 2
+        or type(subsupport_collective_authorized) is not bool
     ):
         raise ValueError("fresh TOP recovery structure is invalid")
     (
@@ -1825,7 +1828,11 @@ def _allocate_fresh_top_censored_closure_recovery(
         if boundary_authorized
         else min(requested_pitch, max(0.0, predicted_pitch))
     )
-    allocated_thrust = max(GATE0_PROVED_COLLECTIVE_BASE, thrust)
+    allocated_thrust = (
+        thrust
+        if subsupport_collective_authorized
+        else max(GATE0_PROVED_COLLECTIVE_BASE, thrust)
+    )
     residual_rate_norm = (
         residual_x / horizontal_scale,
         residual_y / vertical_scale,
@@ -1849,6 +1856,9 @@ def _allocate_fresh_top_censored_closure_recovery(
         allocated_target_pitch_rad=allocated_pitch,
         requested_thrust=thrust,
         allocated_thrust=allocated_thrust,
+        subsupport_collective_authorized=(
+            subsupport_collective_authorized
+        ),
         fresh_boundary_current_authority=boundary_authorized,
         forward_closure_authorized=False,
         steering_only=True,
@@ -1864,13 +1874,11 @@ def _select_fresh_top_boundary_recovery_pitch(
     continuity_target_pitch_rad: float,
     allocated_brake_target_pitch_rad: float,
 ) -> float:
-    """Keep a fresh later-gate TOP recovery from reversing pitch.
+    """Keep a fresh TOP recovery inside its non-forward allocation.
 
-    The geometry-refusal fallback has an exact, recent accepted-command
-    continuity reference but no expansion/TTC evidence.  On later gates a
-    negative reference is the active FOV recovery direction; replacing it
-    with the positive generic brake target immediately drives the clipped
-    gate farther out of view.  Gate 0 retains its proved launch schedule.
+    A continuity/FOV reference may preserve observation direction, but it
+    cannot reverse an exact fresh boundary's no-forward decision.  Choose the
+    more braking of the two bounded pitch references at every gate.
     """
 
     if (
@@ -1892,13 +1900,7 @@ def _select_fresh_top_boundary_recovery_pitch(
         <= MAX_VISUAL_TARGET_PITCH_RAD
     ):
         raise ValueError("fresh TOP recovery pitch is invalid")
-    if (
-        current_gate_index > initial_gate_index
-        and continuity_pitch < 0.0
-        and continuity_pitch < brake_pitch - 1e-12
-    ):
-        return continuity_pitch
-    return brake_pitch
+    return max(continuity_pitch, brake_pitch)
 
 
 def _fresh_top_boundary_continuity_pitch(
@@ -1934,18 +1936,15 @@ def _off_axis_top_fov_owns_pitch(
     retained_raw_handoff: Optional[Mapping[str, Any]] = None,
     propagated_state_handoff: Optional[Mapping[str, Any]] = None,
 ) -> bool:
-    """Keep a fresh later-gate TOP target in view while braking thrust.
+    """Allow FOV pitch only when fresh geometry permits forward closure.
 
-    During an off-axis approach, replacing the FOV-safe pitch reverses camera
-    observability before the horizontal intercept can take effect.  Expansion
-    and contact-time classifications cannot override that geometric fact:
-    collective retains the closure brake while pitch keeps the gate in view.
+    A fresh TOP boundary that explicitly removes forward-closure authority
+    owns over the older FOV reference.  Run 28 otherwise carried increasingly
+    forward pitch into a top-right gate corner despite an exact brake request.
 
     Exact, bounded propagated-state, and fixed nonrenewing retained-raw FOV
-    authority are admitted.  Post-credit recovery retains FOV pitch directly.
-    During ordinary later-gate approach it does the same.  None of these paths
-    has passage or advance authority.  Geometry-refusal paths never call this
-    policy.
+    references remain valid inputs, but none may turn a no-forward allocation
+    back into forward flight.  Passage and advance authority remain separate.
     """
 
     retained = retained_raw_handoff is not None
@@ -2030,7 +2029,7 @@ def _off_axis_top_fov_owns_pitch(
         pitch_ownership_mode
         and closure_recovery.fresh_boundary_current_authority
         and closure_recovery.steering_only
-        and not closure_recovery.forward_closure_authorized
+        and closure_recovery.forward_closure_authorized
         and not closure_recovery.passage_authority
         and not closure_recovery.advance_authority
         and fov_proposal.active_after
@@ -3988,6 +3987,17 @@ def _propose_current_aperture_collective(
             reason="current_aperture_dropout",
         )
     unconstrained_thrust = float(thrust)
+    retained_later_gate_subsupport = bool(
+        state.fixed_support_thrust is not None
+        and state.last_hold_reason is not None
+        and state.last_observable_thrust is not None
+        and state.last_observable_thrust
+        < GATE0_PROVED_COLLECTIVE_BASE
+    )
+    subsupport_collective_authorized = bool(
+        subsupport_collective_authorized
+        or retained_later_gate_subsupport
+    )
     support_floor_applied = bool(
         not subsupport_collective_authorized
         and unconstrained_thrust < GATE0_PROVED_COLLECTIVE_BASE
@@ -8043,6 +8053,10 @@ async def _run_visual_course_stage_impl(
                                         ),
                                     )
                                 ),
+                                subsupport_collective_authorized=(
+                                    current_gate_index
+                                    > initial_gate_index
+                                ),
                                 fresh_boundary_current_authority=(
                                     recovery_boundary
                                 ),
@@ -9294,6 +9308,9 @@ async def _run_visual_course_stage_impl(
                                 )
                                 if deferred_top_fov_error is not None
                                 else command_thrust
+                            ),
+                            subsupport_collective_authorized=(
+                                current_gate_index > initial_gate_index
                             ),
                             fresh_boundary_current_authority=(
                                 fresh_top_boundary
@@ -13366,6 +13383,10 @@ async def _run_visual_course_stage_impl(
                                             > initial_gate_index
                                         ),
                                     )
+                                ),
+                                subsupport_collective_authorized=(
+                                    current_gate_index
+                                    > initial_gate_index
                                 ),
                                 fresh_boundary_current_authority=boundary,
                             )

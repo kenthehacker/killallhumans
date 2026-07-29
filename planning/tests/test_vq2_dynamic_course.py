@@ -1541,6 +1541,73 @@ def test_off_axis_steering_holds_inward_then_locks_pd_on_reversal(
     )
 
 
+def test_weak_qualified_inward_motion_arms_reversal_hysteresis() -> None:
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            bearing_alpha=1.0,
+            bearing_beta=1.0,
+            scale_alpha=1.0,
+            scale_beta=1.0,
+            roll_guidance_sign=1.0,
+            roll_gain=0.18,
+            lateral_rate_gain=0.045,
+        )
+    )
+    core.record_applied_command(_command(0.90))
+    state = None
+    decision = None
+    for sequence, x in enumerate(
+        (
+            0.350,
+            0.354,
+            0.358,
+            0.362,
+            0.366,
+            0.370,
+            0.374,
+            0.360,
+            0.350,
+        ),
+        start=1,
+    ):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        state = core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=x,
+                log_scale=-1.40,
+                aperture=(0.14, 0.11),
+            )
+        )
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id=None,
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        _commit_decision(core, decision_time, decision.command)
+
+    assert state is not None
+    assert decision is not None
+    inward_rate_norm_s = (
+        state.residual_translational_rate_rad_s[0]
+        / core.config.horizontal_angle_scale_rad
+    )
+    assert -0.04 < inward_rate_norm_s < 0.0
+    assert core._current_intercept_inward_observed is True  # noqa: SLF001
+    assert core._current_intercept_pd_locked is False  # noqa: SLF001
+    assert decision.proposed_command.target_roll_rad == pytest.approx(
+        MAX_TARGET_ROLL_RAD
+    )
+
+
 def test_trace_3ff977f_successor_flips_cannot_hunt_current_gate_yaw() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     core.record_applied_command(_command(0.90))
