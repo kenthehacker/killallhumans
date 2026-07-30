@@ -1522,60 +1522,18 @@ class CleanCourseController:
             self._alt_floor_latch_s = None
             self._alt_floor_cooldown = False
             self._alt_floor_above_release_since_s = None
-        if self._alt_floor_active and self.state is not CleanCourseState.SEARCH:
-            # Terrain recovery override: governed climb collective at the
-            # level (spawn) attitude.  F51: the override keeps LATERAL
-            # authority — the F50 gi 0->1 promotion latched the floor on
-            # the sagged gate-0 integrator and the old override parked
-            # yaw/roll for the whole 2.5 s latch while a fresh visible
-            # gate-1 track walked off the frame.  The floor now owns ONLY
-            # the collective and the level pitch; yaw/roll use the standard
-            # x-qualified pursuit (stale x -> heading hold, wings level).
-            # F52 (20260729T232037Z-visual-course-dedf1915): the override
-            # must NOT preempt SEARCH — the F51 search entry latched the
-            # floor on the sagged integrator and parked the sweep for 2.8 s
-            # while the gates slid behind.  SEARCH keeps its sweep and adds
-            # the floor climb margin to its collective instead (below).
-            floor_yaw = 0.0
-            floor_roll = 0.0
-            floor_current = self.current
-            if floor_current is not None and (
-                now_s - floor_current.last_x_measurement_s
-                <= cfg.x_steer_max_age_s
-            ):
-                floor_ex = floor_current.x
-                floor_yaw = _clamp(
-                    cfg.yaw_error_sign * cfg.yaw_error_gain * floor_ex,
-                    -cfg.max_yaw_rate_rad_s,
-                    cfg.max_yaw_rate_rad_s,
-                )
-                floor_yaw = self._anchor_clamped_yaw(floor_yaw, yaw_rad)
-                floor_roll = _clamp(
-                    cfg.roll_error_sign * cfg.roll_error_gain * floor_ex,
-                    -cfg.max_target_roll_rad,
-                    cfg.max_target_roll_rad,
-                )
-            return NavigationOutput(
-                target_roll_rad=self._slew_roll(floor_roll, dt),
-                # F51: level is the SPAWN attitude, not absolute 0.0 (which
-                # is +0.31 rad physical nose-down under the F49 convention).
-                target_pitch_rad=self._slew_pitch(cfg.spawn_pitch_rad, dt),
-                yaw_rate_rad_s=floor_yaw,
-                thrust=self._governed_collective(
-                    support + cfg.alt_floor_climb_margin, support
-                ),
-                state=self.state,
-                gate_index=self.gate_index,
-                current_track_id=self._current_track_id(),
-                successor_track_id=self._successor_track_id(),
-            )
+        # F55 (20260730T000535Z-visual-course-36fb03a4): the floor's
+        # early-return override is DELETED — three plane-region deaths came
+        # from it preempting the active state's law (F50 promotion freeze,
+        # F51 search park, F54 commit climb-over).  The floor is now a pure
+        # collective floor inside _governed_collective: every state keeps
+        # its own attitude/lateral law and the floor only prevents descent.
 
         # F53 near-plane COMMIT (see the COMMIT_* constant block): the
         # misalignment brake self-locks short of the plane, so a sustained,
         # aligned, freshly measured close regime commits to an inertial
         # crossing.  TRACK only; gate-1+ legs only (gate-0's climb-bias path
-        # is working and stays untouched).  The alt-floor override above
-        # still wins in every state except SEARCH.  F54: proximity arms at
+        # is working and stays untouched).  F54: proximity arms at
         # commit_min_log_scale (-1.2), NOT near_brake_log_scale — censorship
         # onset coincides with the -0.9 crossing, killing the fresh-
         # uncensored window before the old threshold ever sustained.
@@ -1630,10 +1588,13 @@ class CleanCourseController:
                 # compensated-ey servo BOUNDED to a small band around
                 # support (a flat support hold repeats the F33/F34
                 # bottom-bar death vertically); the vz governor stays the
-                # climb/sink limiter.  Only the progress-removers are
-                # bypassed: misalignment brake, closure governor, expansion
-                # factor, x-staleness zeroing (F52-A), brake-relax.  The
-                # engulfing anchor is never consulted for steering.
+                # climb/sink limiter.  F55: the alt-floor collective bump
+                # does NOT apply here — a forced climb at the plane flies
+                # the drone OVER the gate (F54's commit climb-over).  Only
+                # the progress-removers are bypassed: misalignment brake,
+                # closure governor, expansion factor, x-staleness zeroing
+                # (F52-A), brake-relax.  The engulfing anchor is never
+                # consulted for steering.
                 commit_correction = _clamp(
                     cfg.vertical_feedback_sign
                     * cfg.vertical_error_gain
@@ -1645,11 +1606,19 @@ class CleanCourseController:
                 self._collective = commit_hold
                 return NavigationOutput(
                     target_roll_rad=self._slew_roll(0.0, dt),
+                    # F55: the advance attitude must actually be reached —
+                    # the generic 0.30 rad/s slew only moved rpy_p from
+                    # -0.42 to -0.32 across F54's whole 2 s commit.  Use
+                    # the braking-regime fast slew.
                     target_pitch_rad=self._slew_pitch(
-                        cfg.spawn_pitch_rad + cfg.coast_advance_pitch_rad, dt
+                        cfg.spawn_pitch_rad + cfg.coast_advance_pitch_rad,
+                        dt,
+                        slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
                     ),
                     yaw_rate_rad_s=0.0,
-                    thrust=self._governed_collective(commit_hold, support),
+                    thrust=self._governed_collective(
+                        commit_hold, support, alt_floor=False
+                    ),
                     state=self.state,
                     gate_index=self.gate_index,
                     current_track_id=self._current_track_id(),
@@ -1688,14 +1657,6 @@ class CleanCourseController:
                     cfg.search_vertical_memory_band,
                 )
             search_hold = support + correction + margin
-            if self._alt_floor_active:
-                # F52: the floor override no longer preempts SEARCH, but it
-                # still guards altitude — the sweep keeps full yaw
-                # authority while the collective carries the floor climb
-                # margin.
-                search_hold = max(
-                    search_hold, support + cfg.alt_floor_climb_margin
-                )
             self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
             # F49: SEARCH always holds the LEVEL (spawn-attitude) pitch.
@@ -2335,6 +2296,7 @@ class CleanCourseController:
         collective: float,
         support: float,
         gate_y: Optional[float] = None,
+        alt_floor: bool = True,
     ) -> float:
         """IMU climb/descent-rate governor: bound collective by estimated vz.
 
@@ -2438,6 +2400,17 @@ class CleanCourseController:
                         support + self.config.brake_ceiling_band,
                     ),
                 )
+        # F55 (20260730T000535Z-visual-course-36fb03a4): the altitude floor
+        # is a PURE COLLECTIVE floor — its early-return override is deleted
+        # after three plane-region deaths from state preemption (F50
+        # promotion freeze, F51 search park, F54 commit climb-over).  Every
+        # governed path keeps its own attitude/lateral law; the floor only
+        # prevents descent.  COMMIT opts out (alt_floor=False): a forced
+        # climb at the plane flies the drone over the gate.
+        if alt_floor and self._alt_floor_active:
+            governed = max(
+                governed, support + self.config.alt_floor_climb_margin
+            )
         return governed
 
     def _anchor_clamped_yaw(

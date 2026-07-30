@@ -875,11 +875,12 @@ def _promote_to_gate_one(controller, now_s=100.10):
 def test_altitude_floor_triggers_and_releases_with_hysteresis():
     # F10/F11/F12: the final 6-10 s before gate 1 ran below 0.7 m with
     # thrust pinned into terrain.  The pre-gate-1 floor (alt_est integrated
-    # from the governor's vz_est, seeded 0 at course start) overrides
-    # everything but the coast latch: level (spawn) attitude and a governed
-    # climb collective until the release hysteresis clears.  F51: it arms
-    # only while blind (driven here with aged measurements) and keeps
-    # x-qualified lateral authority while active.
+    # from the governor's vz_est, seeded 0 at course start) bumps the
+    # governed collective to support + margin until the release hysteresis
+    # clears (F55: pure collective floor — the attitude/lateral law is
+    # never overridden; the early-return override was deleted after the
+    # F50/F51/F54 plane-region deaths).  F51: it arms only while blind
+    # (driven here with aged measurements).
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     _promote_to_gate_one(controller)
     controller._alt_est_m = 2.0
@@ -954,8 +955,8 @@ def test_altitude_floor_is_gated_to_gate_one():
 
 def test_altitude_floor_respects_max_thrust():
     # F12's -4.3 m/s sink would demand support + 0.06*3.8 + 0.025 ~= 0.53;
-    # the governor's internal clamp keeps the override inside the course
-    # envelope (0.34, below the runner's 0.35 hard abort).
+    # the governor's internal clamp keeps the floored demand inside the
+    # course envelope (0.34, below the runner's 0.35 hard abort).
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     _promote_to_gate_one(controller)
     controller._alt_est_m = 0.5
@@ -1198,22 +1199,25 @@ def test_alt_floor_never_arms_while_fh_untrusted_but_active_latch_times_out():
     assert not controller._alt_floor_active
 
 
-def test_alt_floor_override_keeps_lateral_authority():
-    # F51: the floor owns ONLY the collective and the level pitch — while
-    # blind-armed, a fresh x measurement still steers yaw/roll toward the
-    # gate (F50 parked lateral authority for the whole 2.5 s latch and the
-    # gate-1 track walked off the frame).
+def test_alt_floor_bumps_collective_only_and_keeps_the_law():
+    # F55 (20260730T000535Z-visual-course-36fb03a4): the floor's
+    # early-return override is DELETED after three plane-region deaths from
+    # state preemption (F50 promotion freeze, F51 search park, F54 commit
+    # climb-over).  The active floor is now a pure collective floor: TRACK
+    # keeps its own attitude/lateral law and the governor only prevents
+    # descent.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     _promote_to_gate_one(controller)  # current = B at x=+0.30
     controller._alt_est_m = 0.5
     _blind_current(controller, 100.10)  # F51: the floor arms only blind
     out = _command(controller, 100.10)
     assert controller._alt_floor_active
-    # x aged with the rest: stale x -> heading hold, wings level.
+    # x aged with the rest: stale x -> heading hold, wings level (F40).
     assert out.yaw_rate_rad_s == 0.0
     assert out.target_roll_rad == 0.0
     # A fresh x measurement under the active floor restores the standard
-    # x-qualified pursuit gains (yaw 0.90, roll 0.50 on ex=+0.30).
+    # x-qualified pursuit gains (yaw 0.90, roll 0.50 on ex=+0.30) — no
+    # override parks the lateral law.
     now = 100.10
     for _ in range(20):  # slew the roll target out to its 0.15 command
         now += 0.033
@@ -1222,27 +1226,56 @@ def test_alt_floor_override_keeps_lateral_authority():
     assert controller._alt_floor_active
     assert out.yaw_rate_rad_s == pytest.approx(0.27, abs=1e-9)
     assert out.target_roll_rad == pytest.approx(0.15, abs=1e-9)
-    # The collective stays the governed recovery climb, above bare support.
+    # The pitch is the TRACK law's own target (the ex=0.30 misalignment
+    # brake pitches nose-up of spawn), NOT the deleted override's pinned
+    # spawn attitude.
+    assert out.target_pitch_rad < SPAWN_PITCH - 0.05
+    # ...and the floor's only effect is the collective bump, exactly.
+    assert controller._governed_collective(SUPPORT, SUPPORT) == pytest.approx(
+        SUPPORT + 0.05, abs=1e-9
+    )
     assert out.thrust > SUPPORT
 
 
-def test_alt_floor_override_pitches_to_spawn_not_absolute_zero():
-    # F51: "level" under the F49 spawn-relative convention is SPAWN_PITCH;
-    # an absolute 0.0 target is +0.31 rad physical nose-down.  The floor
-    # pitch target is the spawn attitude, slewed in from any prior target.
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
-    _promote_to_gate_one(controller)
+def test_alt_floor_does_not_bump_commit_thrust():
+    # F55: COMMIT opts out of the floor bump — a forced climb at the plane
+    # flies the drone OVER the gate (F54's commit climb-over, thrust pinned
+    # at support+margin while the gate slid out of the frame bottom).  The
+    # latched floor stays active but the commit thrust is the band servo +
+    # vz governor only.
+    controller = _commit_controller()  # gate 1, near-plane aligned
     controller._alt_est_m = 0.5
-    _blind_current(controller, 100.10)  # F51: the floor arms only blind
-    controller._prev_target_pitch = SPAWN_PITCH - 0.15  # braking attitude
-    now = 100.10
-    out = None
-    for _ in range(20):
-        now += 0.033
-        out = _command(controller, now)
+    _blind_current(controller, 100.10)  # arm the floor latch blind
+    _command(controller, 100.10)
     assert controller._alt_floor_active
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
-    assert out.target_pitch_rad != 0.0
+    out, now = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.COMMIT
+    assert controller._alt_floor_active  # latch held through entry
+    # Band servo on ey=0.05 (-0.004); a floor bump would read support+0.05.
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.004, abs=1e-9)
+
+
+def test_commit_timeout_fires_while_alt_floor_latched():
+    # The F54 regression: the floor's early return preempted COMMIT for
+    # 3.84 s, blocking the commit timeout until the floor released.  With
+    # the override deleted the timeout fires on schedule even though the
+    # latch outlasts the whole 2.0 s commit window (2.5 s max latch).
+    controller = _commit_controller()
+    controller._alt_est_m = 0.5
+    _blind_current(controller, 100.10)
+    _command(controller, 100.10)
+    assert controller._alt_floor_active
+    out, now = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.COMMIT
+    for _ in range(75):  # ~2.5 s > the 2.0 s commit window
+        now += 0.033
+        if controller.current is not None:  # dropped at the timeout
+            controller.current.last_measurement_s = now
+            controller.current.last_x_measurement_s = now
+            controller.current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.SEARCH
+    assert controller.current is None
 
 
 def test_unqualified_vertical_holds_support_plus_margin_while_fh_untrusted():
@@ -2265,7 +2298,16 @@ def test_commit_law_holds_heading_advances_and_bounds_vertical():
     assert controller.state is CleanCourseState.COMMIT
     controller._prev_target_roll = 0.20  # pre-wound bank to unwind
     controller._prev_target_pitch = SPAWN_PITCH - 0.15  # braking attitude
-    for _ in range(25):
+    # F55 fast slew: the advance attitude must actually be reached — the
+    # first tick alone moves ~0.033 rad (the generic 0.30 rad/s slew moved
+    # 0.0099/tick and never arrived across F54's whole 2 s commit).
+    now += 0.033
+    controller.current.last_measurement_s = now
+    controller.current.last_x_measurement_s = now
+    controller.current.last_y_measurement_s = now
+    out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert out.target_pitch_rad > SPAWN_PITCH - 0.15 + 0.025
+    for _ in range(24):
         now += 0.033
         controller.current.last_measurement_s = now
         controller.current.last_x_measurement_s = now
