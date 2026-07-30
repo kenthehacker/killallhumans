@@ -481,6 +481,36 @@ def test_vz_governor_caps_collective_above_climb_cap():
     )
 
 
+def test_vz_governor_course_leg_damps_climb_continuously():
+    # F68 (20260730T052644Z-visual-course-0d49884b): the gate-1 approach
+    # climbed at vz +1.0 (the gate-0 1.0 m/s cap) through the final 1.5 s,
+    # overshot ~0.4 m above the gate, and the aperture died at the frame
+    # bottom.  Gate-1+ legs get a 0.5 m/s bound, SUBTRACTIVE from the PD
+    # demand so the arrest is continuous (no min()-against-support
+    # chatter); the gate-0 envelope is unchanged.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller)
+    helper = controller._governed_collective
+    demand = SUPPORT + 0.07
+    controller._vz_est_m_s = 0.5  # at the course bound: demand untouched
+    assert helper(demand, SUPPORT) == pytest.approx(demand, abs=1e-9)
+    controller._vz_est_m_s = 1.0  # 0.5 over -> demand - 0.10*0.5
+    assert helper(demand, SUPPORT) == pytest.approx(demand - 0.05, abs=1e-9)
+    # Continuous across the bound: sweeping vz moves collective smoothly
+    # (the F64 descent-step bang-bang must not reappear on the climb side).
+    previous = None
+    steps = []
+    for k in range(21):  # vz +0.40 .. +0.60 in 0.01 m/s steps
+        controller._vz_est_m_s = 0.40 + 0.01 * k
+        value = helper(demand, SUPPORT)
+        if previous is not None:
+            assert value <= previous + 1e-12  # monotone nonincreasing
+            steps.append(previous - value)
+        previous = value
+    assert steps
+    assert max(steps) < 0.005  # 0.10 * 0.01 = 0.001 per step, no jump
+
+
 def test_vz_governor_applies_in_predict_and_search():
     # The governor is IMU-based precisely so vision loss cannot disable it.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))

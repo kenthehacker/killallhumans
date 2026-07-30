@@ -153,6 +153,19 @@ MAX_COURSE_THRUST = 0.34  # MAX_VISUAL_THRUST, below the 0.35 hard abort
 # censored or stalled.
 VZ_CLIMB_CAP_M_S = 1.0  # generous bound vs the ~0.9 m/s average requirement
 VZ_GOVERNOR_GAIN = 0.03  # collective per m/s over the cap (see block above)
+# F68 (20260730T052644Z-visual-course-0d49884b): the 1.0 m/s cap is a gate-0
+# climb-out bound, but gate-1+ legs inherit it — the gate-1 approach climbed
+# at vz +1.0 through the final 1.5 s and overshot ~0.4 m ABOVE the gate, the
+# aperture died at the frame bottom before the geometry could recover, and
+# the blind SEARCH drifted into the structure.  Inter-gate vertical
+# corrections are ~0.2-0.3 m/s, so course legs get a 0.5 m/s cap with real
+# teeth (0.10/m/s, SUBTRACTIVE from the PD demand — a min()-against-support
+# cap would bang-bang the demand the way the F64 descent step did).  The
+# vertical FEEDBACK law stays one global PD at every gate; this is a safety
+# envelope, and envelopes already differ by leg (the alt floor is inactive
+# at gate 0 for the same climb-out reason).
+VZ_CLIMB_CAP_COURSE_M_S = 0.5  # gate-1+ leg climb-rate bound
+VZ_GOVERNOR_COURSE_GAIN = 0.10  # continuous subtraction per m/s over it
 VZ_LEAK_TAU_S = 2.5  # leaky-integrator time constant (bias/noise guard)
 GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
 # Symmetric descent floor (flight 20260729T111003Z-visual-course-d52adcd4):
@@ -2629,9 +2642,20 @@ class CleanCourseController:
                 self.config.max_thrust,
             )
         else:
-            excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
-            if excess > 0.0:
-                collective = min(collective, support - VZ_GOVERNOR_GAIN * excess)
+            # F68: gate-0 keeps the proved 1.0/0.03 climb-out envelope;
+            # gate-1+ legs get the 0.5/0.10 course envelope, SUBTRACTIVE
+            # from the PD demand so the arrest is continuous (no cap
+            # chatter against the demand).
+            if self.gate_index == 0:
+                excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
+                if excess > 0.0:
+                    collective = min(
+                        collective, support - VZ_GOVERNOR_GAIN * excess
+                    )
+            else:
+                course_excess = self._vz_est_m_s - VZ_CLIMB_CAP_COURSE_M_S
+                if course_excess > 0.0:
+                    collective -= VZ_GOVERNOR_COURSE_GAIN * course_excess
             descent_excess = VZ_DESCENT_FLOOR_M_S - self._vz_est_m_s
             if descent_excess > 0.0:
                 collective = max(
