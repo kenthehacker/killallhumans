@@ -479,6 +479,20 @@ UNMEASURED_X_FORCE_SEARCH_S = 0.75
 # were themselves VRS generators).
 CLOSURE_TARGET_RATE_S = 0.35  # log-scale rate the governor holds (TTC ~3 s)
 CLOSURE_FULL_BRAKE_RATE_S = 0.60  # rate at which the full brake pitch applies
+# F77 (20260730T080147Z-visual-course-87a36ce9): four consecutive gate-1
+# deaths (F73/F74/F75/F76) share one mechanism — the leg inherits
+# 2.5-3.5 m/s from the gate-0 crossing and NEVER sheds it.  The brake
+# attitude is only ~8.6 deg off level (~0.4 m/s^2: nine seconds to stop
+# against a 15-20 m corridor) and every collective law floors at
+# support, so nothing ever removes the energy; the drone blows through
+# the plane off-center (yaw cap vs close-range parallax) with a
+# thrust-driven +2 m balloon into the censorship blackout.  Energy
+# control must be COLLECTIVE-signed, not pitch-signed: closure excess
+# above the governor target subtracts collective below support on
+# gate-1+ legs (the sim proves ~2 m/s^2 per 0.09 of deficit).  The
+# vz descent floor bounds the sag and the qualified-vision gate keeps
+# every blind-sink protection intact.  Gate 0 keeps its proved envelope.
+COURSE_CLOSURE_BRAKE_COLLECTIVE = 0.06  # max sub-support brake at full excess
 # Governor trust gate (F33): expansion from a tiny far track is sub-pixel
 # noise — post-credit, gate 1 (span 0.03-0.04, log_scale ~-2.9) "grew" at
 # 0.9/s and pinned a +0.12 brake with aw_fwd -5 m/s^2 for the whole leg,
@@ -1004,6 +1018,7 @@ class CleanCourseConfig:
     x_steer_max_age_s: float = X_STEER_MAX_AGE_S
     closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
     closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
+    course_closure_brake_collective: float = COURSE_CLOSURE_BRAKE_COLLECTIVE
     closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
     fragment_advance_min_log_scale: float = FRAGMENT_ADVANCE_MIN_LOG_SCALE
     fragment_creep_pitch_rad: float = FRAGMENT_CREEP_PITCH_RAD
@@ -2146,6 +2161,24 @@ class CleanCourseController:
             self._collective += (hold - self._collective) * alpha
             collective = self._collective
 
+        # F77 closure-excess collective braking (see the
+        # COURSE_CLOSURE_BRAKE_COLLECTIVE block): on gate-1+ legs with a
+        # QUALIFIED vertical channel, closure above the governor target
+        # subtracts collective BELOW support — attitude-only braking never
+        # decelerated (F74/F75/F76 all held fh 2.5-5 through the -0.46
+        # brake attitude into the plane).  Qualified-only, so every blind
+        # path keeps its support floors; the vz descent floor below bounds
+        # the sag; gate 0 keeps its proved envelope untouched.
+        if (
+            self.gate_index >= 1
+            and vertical_qualified
+            and closure_rate > cfg.closure_target_rate_s
+        ):
+            collective = min(
+                collective,
+                support - cfg.course_closure_brake_collective * closure_brake,
+            )
+
         # Gate-0 takeoff boost is feedforward only; it never changes the
         # closed-loop vertical sign.
         if (
@@ -2863,11 +2896,19 @@ class CleanCourseController:
         # climb uncapped; the ceiling only applies when the gate is NOT
         # above center (the only geometry where climbing is overshoot).
         # The sink floor applies either way.
+        # F77: the band is GATE-0 ONLY — its entire evidence base (F32,
+        # F34, F36) is gate-0 crossings, and on gate-1+ legs its lower
+        # side capped the closure-excess collective braking at support-0.04
+        # (a third of the authority) through F74/F75/F76's hot approaches.
         near_gate = (
             self.current is not None
             and self.current.log_scale >= self.config.closure_min_log_scale
         )
-        if self._pre_cross_brake_active and near_gate:
+        if (
+            self.gate_index == 0
+            and self._pre_cross_brake_active
+            and near_gate
+        ):
             band_lo = max(
                 self.config.min_thrust, support - self.config.brake_ceiling_band
             )

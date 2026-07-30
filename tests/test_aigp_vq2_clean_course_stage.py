@@ -2589,6 +2589,57 @@ def test_no_track_search_latches_altitude_support():
     assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
 
 
+def test_course_closure_excess_brakes_collective_below_support():
+    # F77 (20260730T080147Z-visual-course-87a36ce9): the F76 gate-1 leg
+    # adopted the left successor cleanly and STILL blew through the
+    # plane — fh 3-4 the whole leg, a +2.1 m balloon, and the gate
+    # walked out the bottom-left corner at the plane.  Attitude-only
+    # braking never decelerates (F74/F75/F76 all held fh 2.5-5 through
+    # the -0.46 brake attitude), and the (gate-0-evidenced) brake
+    # ceiling band floored the collective near support: nothing removed
+    # the energy.  Closure excess above the governor target subtracts
+    # collective BELOW support on gate-1+ legs; gate 0 keeps its proved
+    # envelope (and the brake band) untouched.
+    controller = _tracked_controller(_track("A", 0.0, 0.05, scale=0.20))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 2.0  # honest altitude (floor quiet)
+    current = controller.current
+    current.x_axis.p = 0.0
+    current.raw_x = 0.0
+    current.scale_axis.p = -1.6  # span ~0.20, outside the near-plane zone
+    current.scale_axis.v = 0.58  # F76-measured hot closure (target 0.35)
+    now = 100.10
+    out = None
+    for _ in range(15):  # converge the slews/governors
+        now += 0.033
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    assert out.thrust < SPAWN_SUPPORT - 0.03  # real deceleration authority
+    # Settled closure restores the normal support-level vertical law.
+    current.scale_axis.v = 0.10
+    for _ in range(15):
+        now += 0.033
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert out.thrust > SPAWN_SUPPORT - 0.03
+    # Gate 0 is untouched: the same hot closure keeps its envelope.
+    gate0 = _tracked_controller(_track("A", 0.0, 0.05, scale=0.20))
+    gate0.current.scale_axis.v = 0.58
+    now0 = 100.10
+    for _ in range(15):
+        now0 += 0.033
+        gate0.current.last_measurement_s = now0
+        gate0.current.last_x_measurement_s = now0
+        gate0.current.last_y_measurement_s = now0
+        out0 = _command(gate0, now0, pitch=SPAWN_PITCH)
+    assert out0.thrust > SPAWN_SUPPORT - 0.03
+
+
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
     # F54 (20260729T235858Z-visual-course-c92d42ce): censorship of the aim
     # track began ~0.2 s after outer_log_scale crossed -0.9, so the F53
