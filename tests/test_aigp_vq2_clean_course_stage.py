@@ -179,14 +179,6 @@ def _command(controller, now, *, roll=0.0, pitch=0.0, yaw=None, a_up=None, fh=No
     )
 
 
-def _blind_current(controller, now, age=1.0):
-    """Age the current hypothesis's measurements past the F51 floor-arming
-    freshness (and the x-steer horizon) so floor-mechanics tests drive the
-    floor while blind — the F51 floor arms only without a live gate."""
-    controller.current.last_measurement_s = now - age
-    controller.current.last_x_measurement_s = now - age
-
-
 # ---------------------------------------------------------------------------
 # Vertical law
 # ---------------------------------------------------------------------------
@@ -914,104 +906,6 @@ def _promote_to_gate_one(controller, now_s=100.10):
     assert controller.current.track_id == "B"
 
 
-def test_altitude_floor_triggers_and_releases_with_hysteresis():
-    # F10/F11/F12: the final 6-10 s before gate 1 ran below 0.7 m with
-    # thrust pinned into terrain.  The pre-gate-1 floor (alt_est integrated
-    # from the governor's vz_est, seeded 0 at course start) bumps the
-    # governed collective to support + margin until the release hysteresis
-    # clears (F55: pure collective floor — the attitude/lateral law is
-    # never overridden; the early-return override was deleted after the
-    # F50/F51/F54 plane-region deaths).  F51: it arms only while blind
-    # (driven here with aged measurements).
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
-    _promote_to_gate_one(controller)
-    controller._alt_est_m = 2.0
-    controller._vz_est_m_s = -1.0  # a_up=None holds the estimate constant
-    now = 100.10
-    frame = 10
-    out = None
-    while controller._alt_est_m >= 0.7:  # ~40 ticks of integrated sink
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        _blind_current(controller, now)  # F51: the floor arms only blind
-        out = _command(controller, now)
-        frame += 1
-    assert controller._alt_floor_active
-    assert out.yaw_rate_rad_s == 0.0
-    # F64: sinking at -1.0 m/s saturates the strengthened descent floor at
-    # the 0.34 envelope top (raw support + 0.065 + 0.04 = 0.352).
-    assert out.thrust == pytest.approx(
-        controller.config.max_thrust, abs=1e-9
-    )
-    # Hysteresis: climbing between 0.7 and 1.2 m keeps the floor active.
-    controller._vz_est_m_s = 1.0
-    while controller._alt_est_m < 1.0:
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        _blind_current(controller, now)
-        out = _command(controller, now)
-        frame += 1
-    assert controller._alt_floor_active
-    assert out.yaw_rate_rad_s == 0.0
-    # Above the 1.2 m release the normal pursuit law resumes.
-    while controller._alt_est_m <= 1.2:
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        out = _command(controller, now)
-        frame += 1
-    assert not controller._alt_floor_active
-    assert out.yaw_rate_rad_s > 0.0  # x=+0.30 pursuit steers again
-
-
-def test_altitude_floor_is_gated_to_gate_one():
-    # The floor protects only the measured pre-gate-1 window: gate 0 keeps
-    # the normal law at the same low altitude, and post-gate-1 flight is
-    # unaffected (re-anchoring alt_est after gate 1 is a follow-up).
-    controller = _tracked_controller(_track("A", 0.30, 0.0))
-    controller._alt_est_m = 0.5
-    out = _command(controller, 100.10)
-    assert not controller._alt_floor_active
-    assert out.yaw_rate_rad_s > 0.0  # normal x=+0.30 pursuit at gate 0
-    _promote_to_gate_one(controller, now_s=100.12)
-    # F51: the floor must NOT arm over the freshly promoted live gate — a
-    # fresh accepted track is better altitude evidence than the sagged
-    # integrator.
-    out = _command(controller, 100.14)
-    assert not controller._alt_floor_active
-    assert out.yaw_rate_rad_s > 0.0  # gate-1 pursuit keeps steering
-    # Blind at the same low altitude: the gate-1 window arms the floor.
-    _blind_current(controller, 100.16)
-    out = _command(controller, 100.16)
-    assert controller._alt_floor_active
-    assert out.yaw_rate_rad_s == 0.0
-    assert controller.note_race(gate_index=2, race_boot_ms=3000, now_s=100.18)
-    _command(controller, 100.20)
-    assert not controller._alt_floor_active
-
-
-def test_altitude_floor_respects_max_thrust():
-    # F12's -4.3 m/s sink would demand support + 0.06*3.8 + 0.025 ~= 0.53;
-    # the governor's internal clamp keeps the floored demand inside the
-    # course envelope (0.34, below the runner's 0.35 hard abort).
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
-    _promote_to_gate_one(controller)
-    controller._alt_est_m = 0.5
-    controller._vz_est_m_s = -4.3
-    _blind_current(controller, 100.14)  # F51: the floor arms only blind
-    out = _command(controller, 100.14)
-    assert controller._alt_floor_active
-    assert out.thrust == pytest.approx(controller.config.max_thrust, abs=1e-9)
-
-
 def test_gate_one_track_close_loss_predicts_instead_of_coasting():
     # 2026-07-30 unified crossing policy: the exact-zero credit wait
     # (COAST) is reserved for gate 0's proven close-loss path and for a
@@ -1046,90 +940,19 @@ def test_gate_one_track_close_loss_predicts_instead_of_coasting():
     assert CleanCourseState.PREDICT in seen
 
 
-def test_altitude_floor_latch_releases_unconditionally_and_rearms_after_hold():
-    # F13 (trace 20260729T134958Z-visual-course-82d72cb5): a biased
-    # estimator (alt_est -10.7 m, physically impossible) latched the floor
-    # at t=5.16 and pinned the profile at full thrust for 4.2 s into
-    # terrain.  An episode now releases unconditionally after 2.5 s and
-    # re-arms only after alt_est has held above the release altitude for a
-    # full second.
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
-    _promote_to_gate_one(controller)
-    controller._alt_est_m = 0.5  # below the trigger; vz = 0 holds it there
-    now = 100.10
-    frame = 10
-    _blind_current(controller, now)  # F51: the floor arms only blind
-    _command(controller, now)
-    assert controller._alt_floor_active
-    # The latch must not pin the profile: it releases after 2.5 s even
-    # though alt_est is still below the trigger.
-    while now <= 100.10 + 2.6:
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        _command(controller, now)
-        frame += 1
-    assert not controller._alt_floor_active
-    assert controller._alt_floor_cooldown
-    # Cooldown: still below the trigger, but no immediate re-trigger.
-    now += 0.033
-    _command(controller, now)
-    assert not controller._alt_floor_active
-    # Recover above the release altitude; the cooldown clears only after a
-    # full second of sustained recovery.
-    controller._vz_est_m_s = 1.0
-    while controller._alt_est_m <= 1.2:
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        _command(controller, now)
-        frame += 1
-    assert controller._alt_floor_cooldown  # not yet: needs 1.0 s above
-    hold_start = now
-    while now - hold_start < 1.0:
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        _command(controller, now)
-        frame += 1
-    assert not controller._alt_floor_cooldown
-    # Sink back below the trigger: the floor re-arms normally (blind, F51).
-    controller._vz_est_m_s = -1.0
-    out = None
-    while controller._alt_est_m >= 0.7:
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        _blind_current(controller, now)
-        out = _command(controller, now)
-        frame += 1
-    assert controller._alt_floor_active
-    assert out.thrust > 0.0
-
-
-def test_alt_est_clamped_so_biased_integrator_cannot_deepen_floor():
+def test_alt_est_clamped_so_biased_integrator_cannot_run_away():
     # F13's alt_est reached -10.7 m (physically impossible).  The estimate
-    # is clamped below at -2.0 m: deeper than the 0.7-1.2 m guard band
-    # ever needs, never deeper.
+    # is clamped below at -2.0 m — the F92 latch removal keeps the clamp:
+    # the estimate still feeds the trace and must stay physically bounded.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     _promote_to_gate_one(controller)
     controller._alt_est_m = 0.0
     controller._vz_est_m_s = -10.0  # F13-scale biased sink
     now = 100.10
-    _blind_current(controller, now)  # F51: the floor arms only blind
     for _ in range(10):  # unclamped integration would reach -3.3 m
         now += 0.033
         _command(controller, now)
     assert controller._alt_est_m == -2.0
-    assert controller._alt_floor_active  # still guards inside the band
 
 
 def test_fh_trigger_clears_the_brake_regime():
@@ -1211,126 +1034,6 @@ def test_fh_freeze_suspends_vz_integration_leaks_to_zero_holds_alt():
         -4.36 * (1.0 - 0.033 / 2.5) ** 10, abs=1e-9
     )
     assert controller._alt_est_m == -1.0  # frozen exactly
-
-
-def test_alt_floor_never_arms_while_fh_untrusted_but_active_latch_times_out():
-    # F14's self-locking loop: the governor pinned 0.34 on the phantom sink
-    # and the floor flew biased-"level".  A biased estimate must never
-    # START a floor episode; an already-active latch still times out.
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
-    _promote_to_gate_one(controller)
-    controller._alt_est_m = 0.5
-    now = 100.10
-    frame = 10
-    _blind_current(controller, now)  # F51: the floor arms only blind
-    _command(controller, now)  # trusted: the floor arms normally
-    assert controller._alt_floor_active
-    # Going fh-untrusted must not clear the active latch...
-    for _ in range(11):
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        _command(controller, now, fh=6.0)
-        frame += 1
-    assert controller._fh_untrusted
-    assert controller._alt_floor_active
-    # ...and the latch still times out normally (alt frozen at 0.5).
-    while now <= 100.10 + 2.6:
-        now += 0.033
-        controller.observe(
-            _update([_track("B", 0.30, 0.05, scale=0.05)], frame_id=frame),
-            now_s=now,
-        )
-        _command(controller, now, fh=6.0)
-        frame += 1
-    assert not controller._alt_floor_active
-    # With the regime still untrusted the floor cannot re-arm even though
-    # alt_est is below the trigger.
-    now += 0.033
-    _command(controller, now, fh=6.0)
-    assert not controller._alt_floor_active
-
-
-def test_alt_floor_bumps_collective_only_and_keeps_the_law():
-    # F55 (20260730T000535Z-visual-course-36fb03a4): the floor's
-    # early-return override is DELETED after three plane-region deaths from
-    # state preemption (F50 promotion freeze, F51 search park, F54 commit
-    # climb-over).  The active floor is now a pure collective floor: TRACK
-    # keeps its own attitude/lateral law and the governor only prevents
-    # descent.
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
-    _promote_to_gate_one(controller)  # current = B at x=+0.30
-    controller._alt_est_m = 0.5
-    _blind_current(controller, 100.10)  # F51: the floor arms only blind
-    out = _command(controller, 100.10)
-    assert controller._alt_floor_active
-    # x aged with the rest: stale x -> heading hold, wings level (F40).
-    assert out.yaw_rate_rad_s == 0.0
-    assert out.target_roll_rad == 0.0
-    # A fresh x measurement under the active floor restores the standard
-    # x-qualified pursuit gains (yaw 0.90*ex=0.27, clamped to the 0.15
-    # production command cap; roll 0.50 on ex=+0.30) — no override parks
-    # the lateral law.
-    now = 100.10
-    for _ in range(20):  # slew the roll target out to its 0.15 command
-        now += 0.033
-        controller.current.last_x_measurement_s = now
-        out = _command(controller, now)
-    assert controller._alt_floor_active
-    assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
-    assert out.target_roll_rad == pytest.approx(0.15, abs=1e-9)
-    # The pitch is the TRACK law's own target (the ex=0.30 misalignment
-    # brake pitches nose-up of spawn), NOT the deleted override's pinned
-    # spawn attitude.
-    assert out.target_pitch_rad < SPAWN_PITCH - 0.05
-    # ...and the floor's only effect is the collective bump, exactly.
-    assert controller._governed_collective(SUPPORT, SUPPORT) == pytest.approx(
-        SUPPORT + 0.05, abs=1e-9
-    )
-    assert out.thrust > SUPPORT
-
-
-def test_alt_floor_does_not_bump_commit_thrust():
-    # F55: COMMIT opts out of the floor bump — a forced climb at the plane
-    # flies the drone OVER the gate (F54's commit climb-over, thrust pinned
-    # at support+margin while the gate slid out of the frame bottom).  The
-    # latched floor stays active but the commit thrust is the band servo +
-    # vz governor only.
-    controller = _commit_controller()  # gate 1, near-plane aligned
-    controller._alt_est_m = 0.5
-    _blind_current(controller, 100.10)  # arm the floor latch blind
-    _command(controller, 100.10)
-    assert controller._alt_floor_active
-    out, now = _drive_commit_window(controller, 100.10)
-    assert controller.state is CleanCourseState.COMMIT
-    assert controller._alt_floor_active  # latch held through entry
-    # Band servo on ey=0.05 (-0.004); a floor bump would read support+0.05.
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.004, abs=1e-9)
-
-
-def test_commit_timeout_fires_while_alt_floor_latched():
-    # The F54 regression: the floor's early return preempted COMMIT for
-    # 3.84 s, blocking the commit timeout until the floor released.  With
-    # the override deleted the timeout fires on schedule at 3.0 s even
-    # with the floor latched through the first 2.5 s of the commit.
-    controller = _commit_controller()
-    controller._alt_est_m = 0.5
-    _blind_current(controller, 100.10)
-    _command(controller, 100.10)
-    assert controller._alt_floor_active
-    out, now = _drive_commit_window(controller, 100.10)
-    assert controller.state is CleanCourseState.COMMIT
-    for _ in range(100):  # ~3.3 s > the 3.0 s commit window
-        now += 0.033
-        if controller.current is not None:  # dropped at the timeout
-            controller.current.last_measurement_s = now
-            controller.current.last_x_measurement_s = now
-            controller.current.last_y_measurement_s = now
-        out = _command(controller, now, pitch=SPAWN_PITCH)
-    assert controller.state is CleanCourseState.SEARCH
-    assert controller.current is None
 
 
 def test_unqualified_vertical_holds_support_plus_margin_while_fh_untrusted():
@@ -2135,28 +1838,6 @@ def test_search_heading_sweep_starts_at_entry_heading_and_stays_alive():
     )
     assert worst < 1.20
     assert abs(math.remainder(headings[-1] - 0.4, 2.0 * math.pi)) > 0.3
-
-
-def test_search_keeps_sweep_and_carries_floor_margin_under_alt_floor():
-    # F52 (20260729T232037Z-visual-course-dedf1915): SEARCH entry at t=7.44
-    # latched the alt-floor on the sagged gate-0 integrator and the
-    # override parked the sweep (yaw=0/roll=0, thrust=support+margin) until
-    # t=10.25 while the gates slid behind; the drone hit terrain at 13.7 s.
-    # The floor must not preempt SEARCH: the sweep keeps full yaw authority
-    # and the collective still carries the floor climb margin.
-    controller = _tracked_controller(_track("A", 0.40, 0.0, scale=0.10))
-    _promote_to_gate_one(controller)
-    controller._enter_search(100.10)
-    controller._alt_est_m = 0.5  # sagged integrator, below the trigger
-    controller.last_reliable_bearing = (0.30, 0.0)  # zero vertical memory
-    _blind_current(controller, 100.10)  # F51: the floor arms only blind
-    out = _command(controller, 100.12)
-    assert out.state is CleanCourseState.SEARCH
-    assert controller._alt_floor_active
-    # The sweep runs under the active floor (image-right bearing first).
-    assert out.yaw_rate_rad_s > 0.0
-    # ...and the collective carries the floor climb margin, not bare hold.
-    assert out.thrust == pytest.approx(SUPPORT + 0.05, abs=1e-9)
 
 
 def test_search_reacquisition_allows_same_track_id():
@@ -2998,83 +2679,6 @@ def test_gate0_near_plane_arrest_shaves_censorship_entry_climb():
     assert far_climbing.thrust == pytest.approx(far_settled.thrust, abs=1e-3)
 
 
-def test_alt_floor_latch_yields_to_qualified_vision():
-    # F79 (20260730T092415Z-visual-course-1455ab3b): the proved gate-0
-    # crossing exits LOW (alt ~-1.0), so the <0.7 m pre-gate-1 altitude
-    # floor arms in the blind pending window (F51: correct there) — but
-    # the LATCHED episode's max() then pinned support+0.05 over the vz
-    # governor and the F78 arrest for the whole QUALIFIED gate-1 leg:
-    # vz +1.8 m/s, alt +2.3 m above a gate the live ey servo held at
-    # center (ey +0.02..+0.2), losing it out the frame bottom.  The
-    # floor is terrain insurance for BLIND flight; qualified vision owns
-    # the collective.  (F78 was the same balloon one candidate earlier.)
-    controller = _tracked_controller(_track("A", 0.0, 0.05, scale=0.20))
-    _promote_to_gate_one(controller)
-    controller._alt_est_m = -1.0  # proved low gate-0 exit
-    controller._alt_floor_active = True  # latched in the blind window
-    current = controller.current
-    current.y_axis.p = 0.05  # gate at center: the F78b geometry
-    current.raw_y = 0.05
-    current.y_axis.v = 0.0
-    current.scale_axis.p = -1.6
-    current.scale_axis.v = 0.10
-    now = 100.10
-    out = None
-    for _ in range(15):
-        now += 0.033
-        current.last_measurement_s = now
-        current.last_x_measurement_s = now
-        current.last_y_measurement_s = now
-        out = _command(controller, now, pitch=SPAWN_PITCH)
-    assert controller.state is CleanCourseState.TRACK
-    assert controller._alt_floor_active  # episode still latched...
-    # ...but qualified vision owns the collective — no support+0.05 pin.
-    assert out.thrust < SPAWN_SUPPORT + 0.02
-    # Blind again (stale/censored y): the terrain floor pin returns.
-    for _ in range(15):
-        now += 0.033
-        current.last_measurement_s = now
-        current.last_x_measurement_s = now
-        # last_y_measurement_s deliberately NOT refreshed -> unqualified
-        out = _command(controller, now, pitch=SPAWN_PITCH)
-    assert out.thrust > SPAWN_SUPPORT + 0.04
-
-
-def test_alt_floor_reengages_over_qualified_vision_while_sinking():
-    # F86 (20260730T124019Z-visual-course-1f7f89d7): the qualified ey
-    # servo is degenerate while SINKING toward a gate — approach +
-    # descent keeps the gate centered (ey ~0) as the altitude bleeds
-    # out: F86 tracked gate 1 centered for 3 s while sinking alt
-    # -0.4 -> -2.0 at vz ~-0.36 (the descent floor's -0.35 bound quiet),
-    # lost the gate, and SEARCHed into the ground (id 1002).  The
-    # latched altitude floor's max() re-engages over qualified vision
-    # at vz < 0; F79's yield above still covers the vz >= 0 balloon.
-    controller = _tracked_controller(_track("A", 0.0, 0.05, scale=0.20))
-    _promote_to_gate_one(controller)
-    controller._alt_est_m = -1.0  # proved low gate-0 exit
-    controller._alt_floor_active = True  # latched in the blind window
-    current = controller.current
-    current.y_axis.p = 0.05  # gate at center: the degenerate geometry
-    current.raw_y = 0.05
-    current.y_axis.v = 0.0
-    current.scale_axis.p = -1.6
-    current.scale_axis.v = 0.10
-    now = 100.10
-    out = None
-    for _ in range(15):
-        now += 0.033
-        controller._vz_est_m_s = -0.36  # F86's qualified-vision sink
-        current.last_measurement_s = now
-        current.last_x_measurement_s = now
-        current.last_y_measurement_s = now
-        out = _command(controller, now, pitch=SPAWN_PITCH)
-    assert controller.state is CleanCourseState.TRACK
-    assert out.vertical_qualified
-    # The ey PD asks for ~support (0.255); the re-engaged floor pins the
-    # bounded anti-sink hold instead.
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-3)
-
-
 def test_vz_center_trim_nulls_centered_sink():
     # F87 (20260730T125108Z-visual-course-95059527): the ey PD around
     # center is too weak to hold altitude (error gain 0.080/norm), so a
@@ -3164,6 +2768,46 @@ def test_vz_center_trim_nulls_centered_sink():
     assert out.state is CleanCourseState.SEARCH
     assert controller._vz_center_trim > trim_before + 0.005
     assert out.thrust > SPAWN_SUPPORT + 0.05
+
+
+def test_no_alt_floor_latch_overrides_blind_search():
+    # F91 (20260730T135630Z-visual-course-2aa541ba): the deleted
+    # pre-gate-1 altitude-floor latch armed blind at alt -0.09 and its
+    # max() pinned support+0.05 over the arrest and governor for the
+    # whole gate-1 leg — the fourth balloon from that latch (F78/F78b/
+    # F79).  Blind anti-sink is now owned by the vz-center trim and the
+    # continuous descent floor: a blind low-altitude gate-1 SEARCH must
+    # NOT emit a support+0.05 pin, only support + (winding) trim +
+    # descent-floor reaction.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.20))
+    _promote_to_gate_one(controller)
+    now = 100.10
+    controller._enter_search(now)
+    controller._alt_est_m = 0.2  # F91's blind low-altitude geometry
+    # F91's SEARCH was BLIND: age the retained hypothesis's measurements
+    # past the freshness horizon so the deleted latch would arm on the
+    # very first tick of this scenario on the parent.
+    current = controller.current
+    if current is not None:
+        current.last_measurement_s = now - 1.0
+        current.last_x_measurement_s = now - 1.0
+    first = None
+    out = None
+    for tick in range(30):  # ~1 s of the blind SEARCH sink
+        now += 0.033
+        controller._vz_est_m_s = -0.40
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+        if tick == 0:
+            first = out.thrust
+    assert out.state is CleanCourseState.SEARCH
+    # First tick: the descent floor's proportional reaction only
+    # (0.21*(0.40-0.35) = 0.0105 over support) — the deleted latch
+    # pinned exactly support+0.05 here for the whole leg.
+    assert first < SPAWN_SUPPORT + 0.045
+    # After ~1 s the wound trim lifts the blind hold: the anti-sink
+    # still works without the latch.
+    assert controller._vz_center_trim > 0.02
+    assert out.thrust > SPAWN_SUPPORT + 0.03
 
 
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():

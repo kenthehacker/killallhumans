@@ -64,8 +64,8 @@ Control-law constant sources:
   out of contract).
 - ``FH_UNTRUSTED_*``: the F14 inflow-regime gate.  vz_est is invalidated
   by REGIME (a smooth fh-proportional thrust deficit), not attitude or
-  vibration, so sustained fh > 5.0 freezes the vz/alt integrators, blocks
-  alt-floor arming, suppresses every vz-based governor floor/cap, and
+  vibration, so sustained fh > 5.0 freezes the vz/alt integrators,
+  suppresses every vz-based governor floor/cap, and
   falls back to the camera-qualified vertical PD (support + margin when
   unqualified); the latch releases below fh 2.0.  (Trigger raised 3.0 ->
   5.0 in F50: the F49 hard brake reads fh 3.0-3.4 and tripped its own
@@ -167,8 +167,7 @@ VZ_GOVERNOR_GAIN = 0.03  # collective per m/s over the cap (see block above)
 # teeth (0.10/m/s, SUBTRACTIVE from the PD demand — a min()-against-support
 # cap would bang-bang the demand the way the F64 descent step did).  The
 # vertical FEEDBACK law stays one global PD at every gate; this is a safety
-# envelope, and envelopes already differ by leg (the alt floor is inactive
-# at gate 0 for the same climb-out reason).
+# envelope, and envelopes already differ by leg.
 VZ_CLIMB_CAP_COURSE_M_S = 0.5  # gate-1+ leg climb-rate bound
 VZ_GOVERNOR_COURSE_GAIN = 0.10  # continuous subtraction per m/s over it
 VZ_LEAK_TAU_S = 2.5  # leaky-integrator time constant (bias/noise guard)
@@ -204,7 +203,8 @@ VZ_DESCENT_GOVERNOR_GAIN = 0.21  # collective per m/s below the floor
 # any sag, and the F14 fh-untrusted latch (frozen vz) keeps its
 # no-vz-adjustment contract.  F78b: gate-1+ legs only — on gate 0 it
 # arrested the proved climb-out and armed the pre-gate-1 altitude floor
-# (20260730T085104Z-visual-course-34b59dea).  F91: two-sided — F90
+# (20260730T085104Z-visual-course-34b59dea; the latch itself is deleted in
+# F92 after four ballooned gate-1 legs).  F91: two-sided — F90
 # climbed vz +0.3..+0.4 with the gate CENTERED (ey ~0, no climb command,
 # so the one-sided arrest never engaged), ballooned ~0.5 m over the gate
 # under the F14 latch, lost it out the frame bottom, and dove into the
@@ -673,34 +673,9 @@ NEAR_BRAKE_RELAX_COURSE_RESUME_EY_NORM = -0.10  # resume only above center
 # 1.33 for 2.4 s until a soft gate-1 graze).  1.5 still blocks F31's 2.63
 # rad wander with margin.
 COURSE_HEADING_ANCHOR_CAP_RAD = 1.5
-# Pre-gate-1 altitude floor (terrain insurance; flights F10/F11/F12 all
-# flew their final 6-10 s below 0.7 m with thrust pinned at the clamp into
-# terrain hits).  alt_est integrates the governor's IMU vz_est from course
-# start (takeoff pad = 0); drift is bounded inside this <15 s
-# gate-0-credit -> gate-1-credit window.  Hysteresis: trigger below 0.7 m,
-# release above 1.2 m.  Inactive at gate_index 0 (takeoff/climb-out) and
-# once gate_index >= 2 — post-gate-1 reference re-anchoring is a follow-up.
-# F13 bounds (trace 20260729T134958Z-visual-course-82d72cb5): a biased
-# estimator (vz_est -3.8, alt_est -10.7 m, physically impossible) latched
-# the floor at t=5.16 and pinned the profile at full thrust into terrain
-# for 4.2 s.  The floor stays, but it can no longer pin the profile: an
-# episode releases unconditionally after ALT_FLOOR_MAX_LATCH_S and re-arms
-# only after alt_est has held above the release altitude for
-# ALT_FLOOR_REARM_S, and alt_est is clamped below at ALT_EST_MIN_M so a
-# biased integrator cannot push the floor deeper than its 0.7-1.2 m guard
-# band ever needs.  F79 (20260730T092415Z-visual-course-1455ab3b): the
-# floor is TERRAIN insurance for blind flight — while vertical is
-# vision-qualified its latched max() must not override the PD/governor/
-# arrest.  F78/F78b both armed it in the blind pending window (alt -1.0
-# after the proved LOW gate-0 crossing) and its support+0.05 pin then
-# ballooned the whole qualified gate-1 leg (+1.8-1.9 m/s, +1.4-2.3 m)
-# above a gate the live ey servo held at center.  The F51 arming guard
-# already trusts a live gate over the integrator; the latch now does too.
-ALT_FLOOR_TRIGGER_M = 0.7
-ALT_FLOOR_RELEASE_M = 1.2
-ALT_FLOOR_CLIMB_MARGIN = 0.05  # support + margin -> governed recovery climb
-ALT_FLOOR_MAX_LATCH_S = 2.5  # unconditional per-episode release (F13)
-ALT_FLOOR_REARM_S = 1.0  # alt_est must hold above release this long to re-arm
+# F92: the pre-gate-1 altitude-floor latch (ALT_FLOOR_*) is DELETED — see
+# the removal note in command().  alt_est stays for the vz-center trim's
+# blind anti-sink, still clamped below at ALT_EST_MIN_M (F13).
 ALT_EST_MIN_M = -2.0  # biased-integrator clamp on the altitude estimate
 # F14 inflow-regime gate (agent-10, verified with the actuator/estimator
 # tick fields): identical delivered rotor output 0.34 gives accz -13.0 in
@@ -712,8 +687,7 @@ ALT_EST_MIN_M = -2.0  # biased-integrator clamp on the altitude estimate
 # trip the gate, so the trigger sits at 5.0 (see below).  While untrusted
 # the stage freezes vz_est (the
 # leak relaxes it toward 0; the biased a_up is never integrated), holds
-# alt_est, blocks alt-floor arming (an active latch still times out
-# normally), falls back to the camera-qualified vertical PD (support +
+# alt_est, falls back to the camera-qualified vertical PD (support +
 # margin when unqualified — bare support historically sinks for real at
 # -0.8...-1.9), and suppresses every vz-based governor floor/cap so the
 # descent feedforward cannot fire from the frozen estimate.  This breaks
@@ -1149,11 +1123,6 @@ class CleanCourseConfig:
     )
     brake_ceiling_band: float = BRAKE_CEILING_BAND
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
-    alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
-    alt_floor_release_m: float = ALT_FLOOR_RELEASE_M
-    alt_floor_climb_margin: float = ALT_FLOOR_CLIMB_MARGIN
-    alt_floor_max_latch_s: float = ALT_FLOOR_MAX_LATCH_S
-    alt_floor_rearm_s: float = ALT_FLOOR_REARM_S
     alt_est_min_m: float = ALT_EST_MIN_M
     fh_untrusted_trigger_mps2: float = FH_UNTRUSTED_TRIGGER_MPS2
     fh_trusted_release_mps2: float = FH_TRUSTED_RELEASE_MPS2
@@ -1285,16 +1254,10 @@ class CleanCourseController:
         self._last_engulfing_anchor_identity: Optional[Tuple[Any, Any]] = None
         # IMU altitude estimate (m) integrated from the governor's vz_est,
         # seeded 0 at course start (takeoff pad reference) and clamped below
-        # at alt_est_min_m (F13).  Guards only the
-        # bounded pre-gate-1 window; see the ALT_FLOOR_* constant block.
+        # at alt_est_min_m (F13).  F92: the pre-gate-1 altitude-floor latch
+        # it used to guard is deleted (see command()); the estimate stays
+        # for the trace and the vz-center trim's blind anti-sink.
         self._alt_est_m = 0.0
-        self._alt_floor_active = False
-        # F13 latch bounds: the episode start for the unconditional release,
-        # the post-timeout cooldown, and the continuous-above-release timer
-        # that clears the cooldown (re-arm).
-        self._alt_floor_latch_s: Optional[float] = None
-        self._alt_floor_cooldown = False
-        self._alt_floor_above_release_since_s: Optional[float] = None
         # Pre-crossing expansion brake latch for the tick trace; recomputed
         # every main-path tick (see the PRE_CROSS_BRAKE_* constant block).
         self._pre_cross_brake_active = False
@@ -1814,74 +1777,14 @@ class CleanCourseController:
             cfg.max_thrust,
         )
 
-        # Pre-gate-1 altitude floor (F10/F11/F12: the final 6-10 s ran below
-        # 0.7 m with thrust pinned into terrain).  Hysteresis 0.7 -> 1.2 m,
-        # gate-1 window only; the COAST latch above still wins.
-        # F13 bounds: an episode releases unconditionally after
-        # alt_floor_max_latch_s (a biased estimator pinned the F13 floor for
-        # 4.2 s into terrain) and re-arms only after alt_est has held above
-        # the release altitude for alt_floor_rearm_s.
-        if self.gate_index == 1:
-            if self._alt_est_m > cfg.alt_floor_release_m:
-                if self._alt_floor_above_release_since_s is None:
-                    self._alt_floor_above_release_since_s = now_s
-            else:
-                self._alt_floor_above_release_since_s = None
-            if self._alt_floor_active:
-                if self._alt_floor_latch_s is None:
-                    self._alt_floor_latch_s = now_s
-                timed_out = (
-                    now_s - self._alt_floor_latch_s > cfg.alt_floor_max_latch_s
-                )
-                self._alt_floor_active = (
-                    self._alt_est_m <= cfg.alt_floor_release_m and not timed_out
-                )
-                if not self._alt_floor_active:
-                    self._alt_floor_latch_s = None
-                    if timed_out:
-                        # Only a timeout release needs the re-arm cooldown;
-                        # the plain hysteresis release re-arms immediately.
-                        self._alt_floor_cooldown = True
-            else:
-                self._alt_floor_latch_s = None
-                if self._alt_floor_cooldown:
-                    since = self._alt_floor_above_release_since_s
-                    if (
-                        since is not None
-                        and now_s - since >= cfg.alt_floor_rearm_s
-                    ):
-                        self._alt_floor_cooldown = False
-                if not self._alt_floor_cooldown and not self._fh_untrusted:
-                    # Arming is blocked while fh-untrusted (F14: a biased
-                    # vz/alt estimate must never START a floor episode); an
-                    # already-active latch still times out normally above.
-                    # F51: never arm over a LIVE gate — a fresh accepted
-                    # track is better altitude evidence than the sagged
-                    # integrator (the F50 promotion armed the floor on the
-                    # gate-0 brake sag while gate 1 was freshly visible);
-                    # terrain recovery matters when blind, not while
-                    # tracking.
-                    self._alt_floor_active = (
-                        self._alt_est_m < cfg.alt_floor_trigger_m
-                        and (
-                            self.current is None
-                            or now_s - self.current.last_measurement_s
-                            > cfg.promote_max_age_s
-                        )
-                    )
-                    if self._alt_floor_active:
-                        self._alt_floor_latch_s = now_s
-        else:
-            self._alt_floor_active = False
-            self._alt_floor_latch_s = None
-            self._alt_floor_cooldown = False
-            self._alt_floor_above_release_since_s = None
-        # F55 (20260730T000535Z-visual-course-36fb03a4): the floor's
-        # early-return override is DELETED — three plane-region deaths came
-        # from it preempting the active state's law (F50 promotion freeze,
-        # F51 search park, F54 commit climb-over).  The floor is now a pure
-        # collective floor inside _governed_collective: every state keeps
-        # its own attitude/lateral law and the floor only prevents descent.
+        # F92 (20260730T135630Z-visual-course-2aa541ba): the pre-gate-1
+        # altitude-floor latch is DELETED.  Its max() pinned support+0.05
+        # over the governor and arrest for four ballooned gate-1 legs
+        # (F78/F78b/F79, then F91 armed blind at alt -0.09 and held the pin
+        # for the whole leg into a gate-1 structure hit); both yield
+        # patches (F79, F86) failed in flight.  Blind anti-sink is owned by
+        # the vz-center trim (F88/F89/F90) and the continuous vz descent
+        # floor, which arrested F90's blind -0.5 sink in ~0.5 s.
 
         # F53 near-plane COMMIT (see the COMMIT_* constant block): the
         # misalignment brake self-locks short of the plane, so a sustained,
@@ -1950,9 +1853,7 @@ class CleanCourseController:
                 # keeps the F50 compensated-ey servo BOUNDED to a small band
                 # around support (a flat support hold repeats the F33/F34
                 # bottom-bar death vertically); the vz governor stays the
-                # climb/sink limiter.  F55: the alt-floor collective bump
-                # does NOT apply here — a forced climb at the plane flies
-                # the drone OVER the gate (F54's commit climb-over).  Only
+                # climb/sink limiter.  Only
                 # the progress-removers are bypassed: misalignment brake,
                 # closure governor, expansion factor, x-staleness zeroing
                 # (F52-A), brake-relax.  The engulfing anchor is never
@@ -2034,9 +1935,7 @@ class CleanCourseController:
                         slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
                     ),
                     yaw_rate_rad_s=commit_yaw,
-                    thrust=self._governed_collective(
-                        commit_hold, support, alt_floor=False
-                    ),
+                    thrust=self._governed_collective(commit_hold, support),
                     state=self.state,
                     gate_index=self.gate_index,
                     current_track_id=self._current_track_id(),
@@ -2340,7 +2239,8 @@ class CleanCourseController:
             # ONLY.  Applied globally it arrested the PROVED gate-0
             # climb-out (thrust 0.21 at t=0.43), the drone crossed low
             # and sank to alt -0.57, the <0.7 m pre-gate-1 altitude floor
-            # latched, and its max() (applied after the vz-governor
+            # latched (F92 deletes that latch), and its max() (applied
+            # after the vz-governor
             # subtraction) pinned support+0.05 for the whole leg — a +1.9
             # m/s, +1.4 m balloon that overrode governor and arrest alike.
             # F86 (20260730T123020Z-visual-course-34c8dd71): ...but gate 0's
@@ -2442,28 +2342,12 @@ class CleanCourseController:
         # pursuit cannot (see the VZ_CLIMB_CAP_M_S constant block) and stays
         # alive through TRACK, PREDICT, and SEARCH alike.  The brake-ceiling
         # band inside classifies gate-high on the F50 compensated error.
-        # F79: the latched pre-gate-1 altitude floor yields to QUALIFIED
-        # vision (alt_floor=not vertical_qualified) — F51 already refuses
-        # to ARM over a live gate ("a fresh accepted track is better
-        # altitude evidence than the sagged integrator"), but the latched
-        # episode's max() pinned support+0.05 OVER the governor and the
-        # F78 arrest for two whole gate-1 legs: F78 (+1.9 m/s, +1.4 m)
-        # and F78b (+1.8 m/s, +2.3 m) both ballooned above a gate the
-        # qualified ey servo held at center, losing it out the bottom.
-        # The floor keeps every BLIND path (SEARCH, unqualified, PREDICT)
-        # and the F21 freshness gate already disqualifies frozen ghosts.
-        # F86 (20260730T124019Z-visual-course-1f7f89d7): the yield is
-        # vz-aware.  The qualified ey servo is degenerate while SINKING
-        # toward a gate — approach + descent keeps the gate centered
-        # (ey ~0) as the altitude bleeds out: F86 tracked gate 1 centered
-        # for 3 s while sinking alt -0.4 -> -2.0 (vz ~-0.36, the descent
-        # floor's -0.35 bound quiet), lost it, and SEARCHed into the
-        # ground.  F79's balloon was a CLIMBING overshoot (vz +1.8), so
-        # vision yields the floor only while NOT sinking; at vz < 0 the
-        # latched floor's max() re-engages over the ey servo.
+        # F92: the latched pre-gate-1 altitude floor and its F79/F86 yield
+        # kwarg are deleted (four ballooned gate-1 legs: F78/F78b/F79/F91);
+        # blind anti-sink is owned by the vz-center trim and the continuous
+        # vz descent floor.
         collective = self._governed_collective(
-            collective, support, gate_y=ey_vertical,
-            alt_floor=(not vertical_qualified) or self._vz_est_m_s < 0.0,
+            collective, support, gate_y=ey_vertical
         )
         thrust = _clamp(collective, cfg.min_thrust, cfg.max_thrust)
 
@@ -3124,7 +3008,6 @@ class CleanCourseController:
         collective: float,
         support: float,
         gate_y: Optional[float] = None,
-        alt_floor: bool = True,
     ) -> float:
         """IMU climb/descent-rate governor: bound collective by estimated vz.
 
@@ -3260,27 +3143,9 @@ class CleanCourseController:
                         support + self.config.brake_ceiling_band,
                     ),
                 )
-        # F55 (20260730T000535Z-visual-course-36fb03a4): the altitude floor
-        # is a PURE COLLECTIVE floor — its early-return override is deleted
-        # after three plane-region deaths from state preemption (F50
-        # promotion freeze, F51 search park, F54 commit climb-over).  Every
-        # governed path keeps its own attitude/lateral law; the floor only
-        # prevents descent.  COMMIT opts out (alt_floor=False): a forced
-        # climb at the plane flies the drone over the gate.
-        if alt_floor and self._alt_floor_active:
-            # F84/F86: the anti-sink deficit this floor insures against was
-            # measured at ~level attitude — at the -0.58 brake attitude the
-            # tilt-inflated support would pin the floor at MAX thrust, so
-            # the support term is bounded at the spawn-level tilt
-            # compensation (same bound as the F21 fh-untrusted floor).
-            level_support = self.config.support_collective / max(
-                0.85, math.cos(self.config.spawn_pitch_rad)
-            )
-            governed = max(
-                governed,
-                min(support, level_support)
-                + self.config.alt_floor_climb_margin,
-            )
+        # F92: the pre-gate-1 altitude-floor max() that used to apply here
+        # is deleted (F78/F78b/F79/F91 balloons); blind anti-sink is the
+        # vz-center trim plus the vz descent floor above.
         return governed
 
     def _anchor_clamped_yaw(
@@ -3776,7 +3641,6 @@ def _clean_course_tick_trace(
         "pre_cross_brake": controller._pre_cross_brake_active,
         "course_anchor_yaw_rad": controller._course_anchor_yaw_rad,
         "alt_est_m": controller._alt_est_m,
-        "alt_floor_active": controller._alt_floor_active,
         "vz_center_trim": controller._vz_center_trim,
         "fh_mps2": controller._fh_mps2,
         "fh_trusted": not controller._fh_untrusted,
