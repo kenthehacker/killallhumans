@@ -2882,7 +2882,13 @@ def test_vertical_arrival_arrest_shaves_climb_before_center():
     # Descending (or a descend command) is untouched: no blanket
     # reduction, no manufactured sink.
     sinking = _converged_gate_one_vertical(-0.30)
-    assert sinking.thrust == pytest.approx(settled.thrust, abs=1e-3)
+    # No blanket reduction, no manufactured sink: the output is never
+    # BELOW the settled case.  With the gate at/above center a sink is
+    # never the intent, so the F88 vertical centering trim may add its
+    # bounded support correction here — designed learning, capped by
+    # VZ_CENTER_TRIM_MAX, and never a subtraction.
+    assert sinking.thrust >= settled.thrust - 1e-3
+    assert sinking.thrust <= settled.thrust + 0.06 + 1e-3
     # F78b (20260730T085104Z-visual-course-34b59dea): gate 0 keeps its
     # PROVED climb-out — the same state at gate 0 must emit the plain PD
     # output (the global F78 arrest dropped it to 0.21 at t=0.43, sank
@@ -3023,6 +3029,61 @@ def test_alt_floor_reengages_over_qualified_vision_while_sinking():
     # The ey PD asks for ~support (0.255); the re-engaged floor pins the
     # bounded anti-sink hold instead.
     assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-3)
+
+
+def test_vz_center_trim_nulls_centered_sink():
+    # F87 (20260730T125108Z-visual-course-95059527): the ey PD around
+    # center is too weak to hold altitude (error gain 0.080/norm), so a
+    # slightly-underestimated support settled ON the -0.35 m/s descent
+    # floor as a stable equilibrium — the whole gate-0 final approach
+    # rode vz ~-0.35 with ey ~0, arrived ~0.3-0.4 m low, and the zero
+    # coast dropped it onto the lower lip (id 1001, no credit).  The
+    # bounded vertical centering trim learns the support correction:
+    # while TRACK holds the gate at/above center, a sustained sink winds
+    # the trim up until vz ~0; a real climb leaks it back out.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.20))
+    _promote_to_gate_one(controller)
+    current = controller.current
+    current.y_axis.p = 0.0  # gate exactly centered: the degenerate geometry
+    current.raw_y = 0.0
+    current.y_axis.v = 0.0
+    current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10
+    now = 100.10
+    out = None
+    for _ in range(60):  # ~2 s of the F87 centered-sink geometry
+        now += 0.033
+        controller._vz_est_m_s = -0.35
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    assert out.vertical_qualified
+    assert controller._vz_center_trim > 0.03
+    assert controller._vz_center_trim <= 0.06 + 1e-9  # anti-windup bound
+    # The PD alone asks for ~support; the learned trim lifts collective.
+    assert out.thrust > SPAWN_SUPPORT + 0.03
+    # A real climb leaks the trim back out instead of ratcheting.
+    for _ in range(120):
+        now += 0.033
+        controller._vz_est_m_s = +0.30
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller._vz_center_trim == pytest.approx(0.0, abs=1e-9)
+    # A demanded descent (gate below center) never winds the trim.
+    current.y_axis.p = 0.20
+    current.raw_y = 0.20
+    for _ in range(60):
+        now += 0.033
+        controller._vz_est_m_s = -0.35
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller._vz_center_trim == pytest.approx(0.0, abs=1e-9)
 
 
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():

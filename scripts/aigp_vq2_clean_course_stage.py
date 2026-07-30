@@ -476,6 +476,27 @@ PITCH_TARGET_MIN_RAD = math.radians(-33.0)
 EX_TRIM_GAIN = 0.30  # trim norm/s per norm of sustained ex
 EX_TRIM_MAX_NORM = 0.15  # anti-windup bound (~2x the measured equilibrium)
 EX_TRIM_ACTIVE_EX_NORM = 0.25  # integrate only inside the near regime
+# 2026-07-30 TRACK-phase vertical centering trim (the vertical EX_TRIM):
+# the ey PD around center is far too weak to hold altitude (error gain
+# 0.080/norm: the measured -0.03 droop yields +0.002 collective), so a
+# slightly-underestimated support settles ON the -0.35 m/s descent-floor
+# boundary as a STABLE equilibrium — continuous by F65 design, so the
+# floor adds exactly zero there.  F87 (20260730T125108Z-visual-course-
+# 95059527) rode vz ~-0.35 with ey ~0 through the whole gate-0 final
+# approach, arrived ~0.3-0.4 m low, and the credible-loss zero coast
+# dropped it onto the lower lip (id 1001, no credit); F86 sank the
+# gate-1 leg alt -0.4 -> -2.0 the same way (ey ~0 is degenerate:
+# approach + descent keeps the gate centered).  While TRACK holds the
+# gate at/above center with a qualified vertical channel, integrate a
+# bounded upward trim against the residual sink until vz ~0; hold it on
+# demanded descents (ey > 0, where the P law owns the descent) and leak
+# it on real climbs.  One-sided by design: the F78 arrest already owns
+# climb overshoot.
+VZ_CENTER_TRIM_GAIN = 0.08  # collective per (m/s of sink) per second
+VZ_CENTER_TRIM_MAX = 0.06  # anti-windup bound (~2x the measured deficit)
+VZ_CENTER_TRIM_ACTIVE_EY_NORM = 0.02  # integrate only at/above center
+VZ_CENTER_TRIM_SINK_M_S = -0.10  # deadband above estimator noise
+VZ_CENTER_TRIM_LEAK_S = 0.02  # collective/s release on real climbs
 
 PREDICT_FRAME_GAP_S = 0.25  # ~8 camera frames; 0.06 (~2) flapped TRACK/SEARCH
 # 7 times in the 4.2 s F35 gate-1 leg, each flap dumping the pursuit fix.
@@ -1076,6 +1097,11 @@ class CleanCourseConfig:
     ex_trim_gain: float = EX_TRIM_GAIN
     ex_trim_max_norm: float = EX_TRIM_MAX_NORM
     ex_trim_active_ex_norm: float = EX_TRIM_ACTIVE_EX_NORM
+    vz_center_trim_gain: float = VZ_CENTER_TRIM_GAIN
+    vz_center_trim_max: float = VZ_CENTER_TRIM_MAX
+    vz_center_trim_active_ey_norm: float = VZ_CENTER_TRIM_ACTIVE_EY_NORM
+    vz_center_trim_sink_m_s: float = VZ_CENTER_TRIM_SINK_M_S
+    vz_center_trim_leak_s: float = VZ_CENTER_TRIM_LEAK_S
     near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
@@ -1214,6 +1240,11 @@ class CleanCourseController:
         # small bounded integral on raw ex that nulls the off-axis pursuit
         # orbit equilibrium before entry; reset on target/promotion change.
         self._ex_trim: float = 0.0
+        # Vertical centering trim (see the VZ_CENTER_TRIM_* block): a
+        # bounded one-sided integral that learns the support correction
+        # needed to stop a centered-gate sink.  A vehicle/regime property,
+        # so it survives target/promotion changes; reset on start only.
+        self._vz_center_trim: float = 0.0
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
@@ -1276,6 +1307,7 @@ class CleanCourseController:
         self.max_gate_index = int(gate_index)
         self._course_start_s = float(now_s)
         self._ex_trim = 0.0
+        self._vz_center_trim = 0.0
         identity = _frame_identity(update)
         if identity is not None:
             self._last_frame_identity = identity
@@ -2242,9 +2274,50 @@ class CleanCourseController:
             # One GLOBAL vertical law at every gate (the F67 gate-dependent
             # D-removal was reverted): a high equilibrium is now refused at
             # the COMMIT entry budget instead of tuned out per-gate.
-            collective = support + cfg.vertical_feedback_sign * (
-                cfg.vertical_error_gain * bounded_error
-                + cfg.vertical_rate_gain * bounded_rate
+            # VZ_CENTER_TRIM (see the constant block): the PD is too weak
+            # around center to hold altitude, so an underestimated support
+            # settles ON the descent-floor boundary and the approach sinks
+            # with ey ~0.  Learn the support correction while TRACK holds
+            # the gate at/above center with a qualified, IMU-trusted
+            # vertical channel; hold on demanded descents (ey > active
+            # bound), leak on real climbs, and never wind into a saturated
+            # collective.  The trim is added AFTER the PD so every governor
+            # and floor below sees the corrected demand.
+            if (
+                self.state is CleanCourseState.TRACK
+                and not self._fh_untrusted
+                and dt > 0.0
+                and ey_vertical <= cfg.vz_center_trim_active_ey_norm
+            ):
+                saturated = (
+                    self._collective is not None
+                    and self._collective >= cfg.max_thrust - 0.005
+                )
+                if (
+                    self._vz_est_m_s < cfg.vz_center_trim_sink_m_s
+                    and not saturated
+                ):
+                    self._vz_center_trim = _clamp(
+                        self._vz_center_trim
+                        + cfg.vz_center_trim_gain
+                        * (-self._vz_est_m_s)
+                        * dt,
+                        0.0,
+                        cfg.vz_center_trim_max,
+                    )
+                elif self._vz_est_m_s > -cfg.vz_center_trim_sink_m_s:
+                    self._vz_center_trim = max(
+                        0.0,
+                        self._vz_center_trim - cfg.vz_center_trim_leak_s * dt,
+                    )
+            collective = (
+                support
+                + self._vz_center_trim
+                + cfg.vertical_feedback_sign
+                * (
+                    cfg.vertical_error_gain * bounded_error
+                    + cfg.vertical_rate_gain * bounded_rate
+                )
             )
             # F78 vertical arrival arrest (see the VERTICAL_ARREST_*
             # block): a commanded climb near center may not carry speed
@@ -3645,6 +3718,7 @@ def _clean_course_tick_trace(
         "course_anchor_yaw_rad": controller._course_anchor_yaw_rad,
         "alt_est_m": controller._alt_est_m,
         "alt_floor_active": controller._alt_floor_active,
+        "vz_center_trim": controller._vz_center_trim,
         "fh_mps2": controller._fh_mps2,
         "fh_trusted": not controller._fh_untrusted,
     }
