@@ -535,6 +535,18 @@ BRAKE_RELAX_RESUME_EY_NORM = 0.45  # measured ey that resumes the brake
 # pitch target to LEVEL rather than the brake attitude.
 NEAR_BRAKE_RELAX_EY_NORM = 0.30  # hypothesis ey that relaxes to level
 NEAR_BRAKE_RELAX_RESUME_EY_NORM = 0.20  # hypothesis ey that resumes brake
+# F71 (20260730T060005Z-visual-course-f05911e4): on the gate-1 leg the 0.30
+# engage bound sat a hair above the achieved hypothesis ey (0.22-0.30 for
+# the whole final second), so the relax never fired; the -0.41..-0.43 brake
+# attitude walked the gate down the FOV into engulfing at the plane and a
+# one-tick newborn corner splinter was adopted as the aim (collision id
+# 1001, impulse 5.86).  On course legs (gate_index >= 1) the relax engages
+# earlier and resumes only once the gate sits ABOVE center: leveling the
+# camera swings the image ~0.2 norm up, so any positive resume band smaller
+# than that swing would chatter brake/level every slew cycle.  Gate 0 keeps
+# the F65 bounds credited in F70.
+NEAR_BRAKE_RELAX_COURSE_EY_NORM = 0.18  # course-leg engage (hypothesis ey)
+NEAR_BRAKE_RELAX_COURSE_RESUME_EY_NORM = -0.10  # resume only above center
 # Course-heading anchor (F31): after losing the gate-1 track the drone
 # search-swept and edge-chased its heading +2.63 rad off the course
 # bearing, then flew sideways/backwards at ~0.65g drag into structure it
@@ -990,6 +1002,10 @@ class CleanCourseConfig:
     brake_relax_resume_ey_norm: float = BRAKE_RELAX_RESUME_EY_NORM
     near_brake_relax_ey_norm: float = NEAR_BRAKE_RELAX_EY_NORM
     near_brake_relax_resume_ey_norm: float = NEAR_BRAKE_RELAX_RESUME_EY_NORM
+    near_brake_relax_course_ey_norm: float = NEAR_BRAKE_RELAX_COURSE_EY_NORM
+    near_brake_relax_course_resume_ey_norm: float = (
+        NEAR_BRAKE_RELAX_COURSE_RESUME_EY_NORM
+    )
     brake_ceiling_band: float = BRAKE_CEILING_BAND
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
@@ -2189,13 +2205,18 @@ class CleanCourseController:
             now_s - current.last_measurement_s <= CROSSING_MEAS_MAX_AGE_S
             or commit_regime
         ):
+            course_leg = self.gate_index >= 1
             relax_bound = (
-                cfg.near_brake_relax_ey_norm
+                cfg.near_brake_relax_course_ey_norm
+                if commit_regime and course_leg
+                else cfg.near_brake_relax_ey_norm
                 if commit_regime
                 else cfg.brake_relax_ey_norm
             )
             resume_bound = (
-                cfg.near_brake_relax_resume_ey_norm
+                cfg.near_brake_relax_course_resume_ey_norm
+                if commit_regime and course_leg
+                else cfg.near_brake_relax_resume_ey_norm
                 if commit_regime
                 else cfg.brake_relax_resume_ey_norm
             )

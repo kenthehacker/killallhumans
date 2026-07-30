@@ -1865,6 +1865,52 @@ def test_near_plane_brake_relaxes_on_the_stale_hypothesis():
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
 
 
+def test_course_leg_near_plane_relax_engages_earlier_and_sticks():
+    # F71 (20260730T060005Z-visual-course-f05911e4): on the gate-1 leg the
+    # F65 0.30 engage bound sat just above the achieved hypothesis ey
+    # (0.22-0.30 through the final second), so the relax never fired and the
+    # brake attitude walked the gate into engulfing at the plane.  Course
+    # legs (gate_index >= 1) engage at 0.18 and resume only below -0.10:
+    # leveling the camera swings the image ~0.2 norm up, so a positive
+    # resume band would chatter brake/level every slew cycle.
+    controller = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
+    controller.gate_index = 1
+    controller.current.scale_axis.v = 0.7  # rapid expansion: full brake
+    now = 100.10
+    out = None
+    for _ in range(20):
+        now += 0.033
+        out = _command(controller, now)
+    # ey 0.22 is below the gate-0 0.30 bound but engages the course relax.
+    assert controller._pre_cross_brake_active
+    assert controller._brake_vision_relax
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    # Sticky through center: leveling swings the image up ~0.2 norm, so ey
+    # settling near zero must NOT resume the brake.
+    controller.current.y_axis.p = 0.05
+    for _ in range(20):
+        now += 0.033
+        out = _command(controller, now)
+    assert controller._brake_vision_relax
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    # The brake resumes only once the gate sits comfortably above center.
+    controller.current.y_axis.p = -0.15
+    for _ in range(20):
+        now += 0.033
+        out = _command(controller, now)
+    assert not controller._brake_vision_relax
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
+    # Gate 0 keeps the F65 bounds: ey 0.22 does NOT relax there.
+    gate0 = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
+    gate0.current.scale_axis.v = 0.7
+    now0 = 100.10
+    for _ in range(20):
+        now0 += 0.033
+        out0 = _command(gate0, now0)
+    assert not gate0._brake_vision_relax
+    assert out0.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
+
+
 def test_clipping_increases_uncertainty_but_does_not_abort():
     clipped = _tracked_controller(
         _track("A", 0.10, 0.0, clipping=FrameEdge.RIGHT)
