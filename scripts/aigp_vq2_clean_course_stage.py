@@ -2179,20 +2179,32 @@ class CleanCourseController:
         # servo, so the crossing energy must be controlled BEFORE
         # censorship: on a gate-1+ TRACK in the near-plane regime with a
         # false entry budget, cut the advance law and demand the full
-        # brake — hold OUTSIDE the blackout and re-center (the F71 course
-        # relax keeps the camera level for custody).  The same budget
+        # brake — hold OUTSIDE the blackout and re-center.  The same budget
         # passing arms COMMIT on the same tick; nothing else about the
         # crossing changes.
-        if (
+        near_plane_hold = (
             self.state is CleanCourseState.TRACK
             and self.gate_index >= 1
             and current.outer_log_scale >= cfg.near_brake_log_scale
             and not self._commit_entry_budget_ok(now_s, pitch_rad, cfg)
-        ):
+        )
+        if near_plane_hold:
             advance = 0.0
             brake_demand = 1.0
             pre_cross_brake = True
             self._pre_cross_brake_active = True
+        # F73b: while the hold is ARRESTING live closure, the brake
+        # attitude outranks F71 vision custody.  Leveling the camera (the
+        # F71 relax) keeps the gate in view but never reduces energy —
+        # F72 leveled at the plane and closed span 0.55 -> 0.78 straight
+        # into censorship, so in the decisive window advance=0/brake=1 was
+        # an emitted-command no-op (the relax overrode both to level).
+        # Brake blind on the derotated hypothesis instead; the hold ends
+        # via the budget or PREDICT, and custody returns the moment closure
+        # is at/below the governor target (stopped: re-center level).
+        arresting_closure = near_plane_hold and (
+            current.expansion_rate > cfg.closure_target_rate_s
+        )
         # Closure-rate governor (F31) + misalignment brake (F35): continuous
         # blend toward the TRUE brake attitude as either the vision expansion
         # rate rises past the target or the gate sits off-axis — speed is
@@ -2231,7 +2243,11 @@ class CleanCourseController:
         # held the -0.46 brake with the gate at ey +0.43 and stayed blind
         # for the rest of the flight.
         commit_regime = current.log_scale >= cfg.commit_min_log_scale
-        if not pre_cross_brake and not commit_regime:
+        if arresting_closure:
+            # F73b: live closure is being arrested — the brake attitude
+            # outranks vision custody (leveling never reduces energy).
+            self._brake_vision_relax = False
+        elif not pre_cross_brake and not commit_regime:
             self._brake_vision_relax = False
         elif (
             now_s - current.last_measurement_s <= CROSSING_MEAS_MAX_AGE_S

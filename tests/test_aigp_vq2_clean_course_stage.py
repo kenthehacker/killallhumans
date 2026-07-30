@@ -1872,10 +1872,15 @@ def test_course_leg_near_plane_relax_engages_earlier_and_sticks():
     # brake attitude walked the gate into engulfing at the plane.  Course
     # legs (gate_index >= 1) engage at 0.18 and resume only below -0.10:
     # leveling the camera swings the image ~0.2 norm up, so a positive
-    # resume band would chatter brake/level every slew cycle.
+    # resume band would chatter brake/level every slew cycle.  F73b: the
+    # relax acts only once closure is arrested (expansion at/below the
+    # governor target); while live closure is being arrested the brake
+    # attitude outranks custody.
     controller = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
     controller.gate_index = 1
-    controller.current.scale_axis.v = 0.7  # rapid expansion: full brake
+    # Stopped and re-centering (expansion 0): custody relax, not arrest.
+    # The brake demand comes from the ex 0.30 misalignment.
+    controller.current.scale_axis.v = 0.0
     now = 100.10
     out = None
     for _ in range(20):
@@ -2497,6 +2502,35 @@ def test_near_plane_track_holds_closure_while_commit_budget_false():
     gate0.current.last_x_measurement_s = 100.0 - 0.40
     out0 = _command(gate0, 100.10)
     assert out0.target_pitch_rad > SPAWN_PITCH - 0.15 + 1e-9
+
+
+def test_arresting_closure_overrides_vision_relax_with_true_brake():
+    # F73b decisive-window regression on the F72 t=5.0-5.5 s geometry
+    # (20260730T063739Z-visual-course-34c53413): gate-1 TRACK at the plane,
+    # ex -0.12, ey +0.31 (the F71 relax WOULD level the camera), span ~0.55
+    # expanding at 0.85/s, budget false.  On 37f26ce the emitted pitch here
+    # is LEVEL (the relax overrode the brake blend) — the drone closed span
+    # 0.55 -> 0.78 straight into censorship.  Arresting live closure must
+    # emit the TRUE brake attitude: leveling keeps custody but never
+    # reduces energy.  Once closure is arrested the custody relax returns
+    # (covered by test_course_leg_near_plane_relax_engages_earlier_and_
+    # sticks, expansion 0).
+    controller = _commit_controller()
+    current = controller.current
+    current.x_axis.p = -0.12
+    current.y_axis.p = 0.31
+    current.raw_x = -0.12
+    current.raw_y = 0.31
+    current.scale_axis.p = -0.60  # span ~0.55
+    current.scale_axis.v = 0.85  # F72's measured expansion
+    current.outer_log_scale = -0.60
+    current.aperture_half_x = 0.20
+    current.aperture_half_y = 0.20
+    out, _ = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.TRACK  # COMMIT never arms
+    assert controller._pre_cross_brake_active
+    assert not controller._brake_vision_relax  # arrest outranks custody
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
 
 
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
