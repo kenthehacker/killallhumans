@@ -552,6 +552,19 @@ PRE_CROSS_BRAKE_PITCH_RAD = -0.15  # nose-up brake OFFSET from spawn (F49).
 # as an offset: with level flight at -0.31, the effective -0.46 roughly
 # doubles it so a misaligned approach actually stops.
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
+# F80: course-leg brake authority (gate_index >= 1).  F79
+# (20260730T093737Z-visual-course-14d98732) held the -0.46 TRUE brake for
+# the whole gate-1 leg (misalignment demand saturated from the first tick)
+# and still closed log-scale -1.6 -> -0.57 in 2.4 s: the leg inherits the
+# gate-0 crossing's ~5 m/s, and ~1.5 m/s^2 of brake bleeds <3 m/s before
+# the plane, so the drone passed ~2 m right of the aperture with yaw at
+# the cap (parallax outran yaw authority again).  Course legs start hot by
+# construction (COMMIT drives through the previous plane), so they get
+# twice the brake offset: -0.30 from spawn (effective -0.61, ~3 m/s^2 +
+# drag), enough to stop inside the observed far window and re-center at
+# hover as the F54 hold intends.  The F51/F65 vision-custody relax still
+# outranks the brake near the plane; gate 0 keeps the proved -0.15.
+COURSE_PRE_CROSS_BRAKE_PITCH_RAD = -0.30
 # F51 near-plane brake self-blinding guard (F50 t=15 episode): the brake
 # attitude (rpy_p ~-0.45, ~0.14 rad nose-up from spawn) pitches the camera
 # up, so near the plane the gate slides DOWN the frame — measured ey
@@ -1055,6 +1068,7 @@ class CleanCourseConfig:
     fragment_advance_min_log_scale: float = FRAGMENT_ADVANCE_MIN_LOG_SCALE
     fragment_creep_pitch_rad: float = FRAGMENT_CREEP_PITCH_RAD
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
+    course_pre_cross_brake_pitch_rad: float = COURSE_PRE_CROSS_BRAKE_PITCH_RAD
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     brake_relax_ey_norm: float = BRAKE_RELAX_EY_NORM
     brake_relax_resume_ey_norm: float = BRAKE_RELAX_RESUME_EY_NORM
@@ -2445,8 +2459,17 @@ class CleanCourseController:
             law_pitch = min(
                 law_pitch, cfg.spawn_pitch_rad + cfg.fragment_creep_pitch_rad
             )
+        # F80 (see the COURSE_PRE_CROSS_BRAKE_PITCH_RAD block): course legs
+        # inherit the previous crossing's energy, so the TRUE brake doubles
+        # to -0.30 from spawn at gate_index >= 1; gate 0 keeps the proved
+        # -0.15.  Same single blend, same relax/custody machinery.
+        brake_pitch_offset = (
+            cfg.course_pre_cross_brake_pitch_rad
+            if self.gate_index >= 1
+            else cfg.pre_cross_brake_pitch_rad
+        )
         target_pitch = law_pitch + brake_demand * (
-            (cfg.spawn_pitch_rad + cfg.pre_cross_brake_pitch_rad) - law_pitch
+            (cfg.spawn_pitch_rad + brake_pitch_offset) - law_pitch
         )
         # F51 near-plane brake self-blinding guard (see the
         # BRAKE_RELAX_EY_NORM block): the brake attitude pitches the camera
