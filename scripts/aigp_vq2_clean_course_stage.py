@@ -2184,6 +2184,7 @@ class CleanCourseController:
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
         self._pre_cross_brake_active = pre_cross_brake
+        arrest_error: Optional[float] = None  # qualified branch sets this
         if vertical_qualified:
             bounded_error = _clamp(
                 ey_vertical - vertical_setpoint_offset,
@@ -2230,53 +2231,11 @@ class CleanCourseController:
                     + cfg.vertical_rate_gain * bounded_rate
                 )
             )
-            # F78 vertical arrival arrest (see the VERTICAL_ARREST_*
-            # block): a commanded climb near center may not carry speed
-            # INTO center — allowed climb scales with the remaining error,
-            # excess vz subtracts collective continuously.  Inactive on
-            # descents and under the F14 latch.
-            # F78b (20260730T085104Z-visual-course-34b59dea): GATE-1+
-            # ONLY.  Applied globally it arrested the PROVED gate-0
-            # climb-out (thrust 0.21 at t=0.43), the drone crossed low
-            # and sank to alt -0.57, the <0.7 m pre-gate-1 altitude floor
-            # latched (F92 deletes that latch), and its max() (applied
-            # after the vz-governor
-            # subtraction) pinned support+0.05 for the whole leg — a +1.9
-            # m/s, +1.4 m balloon that overrode governor and arrest alike.
-            # F86 (20260730T123020Z-visual-course-34c8dd71): ...but gate 0's
-            # NEAR-PLANE band needs the arrest too.  F85 arrived at gate-0
-            # censorship climbing +0.45 (the aperture fit died to clipping,
-            # so COMMIT could not arm and the F83 entry cap never ran);
-            # the credible-loss exact-zero coast converted the climb into a
-            # ballistic apex inside the frame and the drone fell into gate
-            # 0's LOWER panel (id 1001, no credit) — F82 died the same way
-            # at +0.64 (top bar).  Every credited gate-0 crossing entered
-            # with dead vertical energy.  The F78b failure was the FAR
-            # climb-out, so gate 0 joins the arrest only inside the COMMIT
-            # proximity regime; the climb-out envelope is untouched.
-            # F91 (20260730T134602Z-visual-course-6e302725): the arrest is
-            # TWO-SIDED.  F90's gate-1 leg inherited vz +0.18 and a 0.024
-            # support trim from the (credited) gate-0 credit wait, then
-            # climbed vz +0.3..+0.4 for 1.3 s with the gate vertically
-            # CENTERED (ey ~0) — the one-sided arrest required a climb
-            # COMMAND (ey < 0), the 0.5 m/s governor only caps rate, and
-            # the ey PD is ~zero at center, so nothing bled the climb.
-            # The F14 latch then pinned the climb 1.5 s more and the gate
-            # fell out the frame bottom; the recovery dove into the ground
-            # (id 1002).  With the gate at/below center ANY positive vz is
-            # energy away from the aim, so the |ey|-scaled allowance binds
-            # in both directions; a genuine high gate (ey < 0) keeps the
-            # exact same allowance it had.
-            near_plane = current.log_scale >= cfg.commit_min_log_scale
-            if (
-                (self.gate_index >= 1 or near_plane)
-                and not self._fh_untrusted
-                and self._vz_est_m_s > 0.0
-            ):
-                vz_allow = cfg.vertical_arrest_vz_per_norm * abs(bounded_error)
-                excess = self._vz_est_m_s - vz_allow
-                if excess > 0.0:
-                    collective -= cfg.vertical_arrest_collective_gain * excess
+            # The F78/F91/F93 vertical energy arrest applies AFTER the
+            # F77 closure brake below (a hot closure min() would re-open
+            # a sink the arrest just closed); it needs this branch's
+            # bounded error, hoisted here.
+            arrest_error = bounded_error
             self._collective = collective
         else:
             # F14: while fh-untrusted the camera is the only honest vertical
@@ -2328,6 +2287,54 @@ class CleanCourseController:
                 collective,
                 support - cfg.course_closure_brake_collective * closure_brake,
             )
+
+        # F78/F91/F93 vertical energy arrest (see the VERTICAL_ARREST_*
+        # block): near center the desired vertical velocity must approach
+        # zero — allowed |vz| scales with the remaining compensated error
+        # and any excess corrects collective continuously.  Applied AFTER
+        # the F77 closure brake: F93's descent side must be able to undo a
+        # hot-closure collective cut that re-opens a sink.  History:
+        # F78b (20260730T085104Z-visual-course-34b59dea): GATE-1+ ONLY —
+        # applied globally it arrested the PROVED gate-0 climb-out; the
+        # far climb-out envelope stays untouched (gate 0 joins only inside
+        # the COMMIT proximity regime, F86: every credited gate-0 crossing
+        # entered with dead vertical energy).
+        # F91 (20260730T134602Z-visual-course-6e302725): two-sided climb
+        # arrest — F90 climbed vz +0.3..+0.4 with the gate CENTERED (no
+        # climb command, so the one-sided arrest never engaged), ballooned
+        # and lost the gate out the frame bottom.
+        # F93 (20260730T142408Z-visual-course-7f4f48d1): the DESCENT side
+        # gets the same law.  F92's final gate-1 approach held the gate
+        # centered and closed to the plane, but the closure-brake
+        # collective cut plus the descent demand started a vz
+        # -0.36..-0.47 sink for the last ~1 s — the descent floor only
+        # reacts below -0.35 and the trim needs ~1.5 s to wind — so the
+        # drone reached the gate plane sinking, COMMIT's |vz| <= 0.25
+        # budget correctly refused entry, and it flew into the lower
+        # structure (id 1001).  Allowed sink scales with the DOWNWARD
+        # error (max(0, ey)): a genuinely low gate keeps a proportional
+        # descent, a centered/high gate gets an immediate proportional
+        # anti-sink — much faster than the trim's integral, complementary
+        # to it.  Qualified-vision paths only; blind paths keep the
+        # trim/floor anti-sink.
+        near_plane = current.log_scale >= cfg.commit_min_log_scale
+        if (
+            arrest_error is not None
+            and (self.gate_index >= 1 or near_plane)
+            and not self._fh_untrusted
+        ):
+            if self._vz_est_m_s > 0.0:
+                vz_allow = cfg.vertical_arrest_vz_per_norm * abs(arrest_error)
+                excess = self._vz_est_m_s - vz_allow
+                if excess > 0.0:
+                    collective -= cfg.vertical_arrest_collective_gain * excess
+            else:
+                vz_allow = cfg.vertical_arrest_vz_per_norm * max(
+                    0.0, arrest_error
+                )
+                excess = -self._vz_est_m_s - vz_allow
+                if excess > 0.0:
+                    collective += cfg.vertical_arrest_collective_gain * excess
 
         # Gate-0 takeoff boost is feedforward only; it never changes the
         # closed-loop vertical sign.

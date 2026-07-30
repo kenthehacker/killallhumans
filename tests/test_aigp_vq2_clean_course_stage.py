@@ -2638,6 +2638,57 @@ def test_two_sided_arrest_bleeds_centered_gate_climb():
     assert climbing.thrust < settled.thrust - 0.02
 
 
+def test_descent_arrest_bounds_sink_near_center():
+    # F92 (20260730T142408Z-visual-course-7f4f48d1): the final gate-1
+    # approach held the gate centered and closed to the plane, but the
+    # closure-brake collective cut plus the descent demand started a
+    # vz -0.36..-0.47 sink for the last ~1 s — the descent floor only
+    # reacts below -0.35 (+0.0105 at vz -0.40) and the trim needs ~1.5 s
+    # to wind — so the drone reached the gate plane sinking, COMMIT's
+    # |vz| <= 0.25 budget correctly refused entry, and it flew into the
+    # lower structure (id 1001).  The descent arrest adds an IMMEDIATE
+    # proportional anti-sink: allowed sink scales with the downward
+    # error, applied after the F77 closure brake.
+    def _approach_thrust(ey, vz_m_s, ticks=5):
+        controller = _tracked_controller(_track("A", 0.0, ey, scale=0.20))
+        _promote_to_gate_one(controller)
+        controller._alt_est_m = 2.0  # honest altitude
+        current = controller.current
+        current.x_axis.p = 0.0
+        current.raw_x = 0.0
+        current.y_axis.p = ey
+        current.raw_y = ey
+        current.y_axis.v = 0.0
+        current.scale_axis.p = -1.6
+        current.scale_axis.v = 0.10  # settled closure (brake quiet)
+        now = 100.10
+        out = None
+        for _ in range(ticks):  # few ticks: measure the IMMEDIATE response
+            now += 0.033
+            controller._vz_est_m_s = vz_m_s
+            current.last_measurement_s = now
+            current.last_x_measurement_s = now
+            current.last_y_measurement_s = now
+            out = _command(controller, now, pitch=SPAWN_PITCH)
+        assert controller.state is CleanCourseState.TRACK
+        return out
+
+    # A -0.40 m/s sink with the gate CENTERED (ey 0): allowance 0, so
+    # the arrest adds 0.15 * 0.40 = +0.060 immediately.  On the parent
+    # only the descent floor reacts (+0.0105) and the trim is still
+    # ~zero after 5 ticks.
+    centered = _approach_thrust(0.0, -0.40)
+    assert centered.thrust > SPAWN_SUPPORT + 0.05
+    # A slightly-low gate (ey +0.15, the F92 final-approach geometry):
+    # allowance 0.15, excess 0.25 -> +0.0375 immediately.
+    low = _approach_thrust(0.15, -0.40)
+    assert low.thrust > SPAWN_SUPPORT + 0.025
+    # A genuinely LOW gate keeps a proportional descent (allowance 0.30,
+    # excess 0.10 -> +0.015): no manufactured balloon.
+    very_low = _approach_thrust(0.30, -0.40)
+    assert very_low.thrust < SPAWN_SUPPORT + 0.02
+
+
 def test_gate0_near_plane_arrest_shaves_censorship_entry_climb():
     # F85 (20260730T123020Z-visual-course-34c8dd71): gate 0 arrived at
     # censorship climbing +0.45 m/s; the aperture fit had died to clipping,
