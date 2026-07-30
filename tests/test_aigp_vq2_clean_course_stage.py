@@ -2757,6 +2757,52 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
     assert far_out.thrust == pytest.approx(SPAWN_SUPPORT - 0.048, abs=1e-3)
 
 
+def test_raw_closure_brakes_when_the_filtered_rate_lags():
+    # F99 (20260730T164633Z-visual-course-cb4e1b9e): the closure governor
+    # read only the Kalman scale_axis.v, which lags ~1 s on a growing
+    # track — F98 braked only incidentally (misalignment) and arrived at
+    # +1.7..+3.5 log/s.  The raw outer-bbox rate (EMA, tau 0.2 s) sees a
+    # hot approach within a few frames and the governor brakes on the
+    # faster of the two signals.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.08))
+    now = 100.10
+    out = None
+    for frame in range(8):  # ~0.26 s of a 1.5 log/s approach
+        now += 0.033
+        controller.observe(
+            _update(
+                [_track("A", 0.0, 0.0, scale=0.08 * 1.05 ** (frame + 1))],
+                frame_id=10 + frame,
+            ),
+            now_s=now,
+        )
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    # The raw signal converged to the true hot closure...
+    assert controller.current.outer_expansion_rate > 0.5
+    # ...and the governor is braking on it (the parent's lagging filtered
+    # rate leaves the brake off here and fails both assertions).
+    assert controller._pre_cross_brake_active
+    assert out.target_pitch_rad < SPAWN_PITCH - 0.10
+
+
+def test_steady_track_keeps_raw_closure_calm():
+    # F99 guard: a stationary-size gate must not trip the raw-signal
+    # brake — the EMA reads ~0 and the advance/brake blend is unchanged
+    # from the filtered-only behavior.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.08))
+    now = 100.10
+    for frame in range(12):
+        now += 0.033
+        controller.observe(
+            _update([_track("A", 0.0, 0.0, scale=0.08)], frame_id=10 + frame),
+            now_s=now,
+        )
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert abs(controller.current.outer_expansion_rate) < 0.05
+    assert not controller._pre_cross_brake_active
+
+
 def test_blind_hold_tracks_zero_vz_when_fh_trusted():
     # F98 (20260730T162145Z-visual-course-e7628b9c): the gate-1 leg-start
     # plateau ran on the UNQUALIFIED hold — the new track's y-axis stayed

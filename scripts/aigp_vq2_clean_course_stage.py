@@ -618,6 +618,19 @@ CLOSURE_FULL_BRAKE_RATE_S = 0.60  # rate at which the full brake pitch applies
 # (far-field real closure at our speeds never exceeds the target anyway:
 # 4 m/s at 10 m is 0.4/s with scale already >= ~0.08).
 CLOSURE_MIN_LOG_SCALE = -2.6
+# F99 (20260730T164633Z-visual-course-cb4e1b9e): the closure governor's
+# signal is the Kalman scale_axis.v, which lags ~1 s on a fresh/adopted
+# track — F98 braked only incidentally (misalignment), the governor never
+# saw the true closure, and the leg arrived at expansion +1.7..+3.5 log/s
+# through every centered fresh frame (COMMIT's 0.35 entry limit vetoed
+# first; gate 0's hot 2.5-3.5 m/s crossings are the same lag).  The raw
+# outer-bbox log-scale rate (EMA over uncensored frames) is fast enough;
+# the governor takes the FASTER of the two, so braking never goes below
+# today's.  Physics: holding the 0.35 log/s cap over a 15 m leg from
+# 3 m/s needs ~0.3 m/s^2 — inside the measured 0.4-0.7 brake authority,
+# so the signal, not the airframe, was the bottleneck.
+OUTER_EXPANSION_TAU_S = 0.20  # EMA time constant for the raw closure rate
+OUTER_EXPANSION_MAX_AGE_S = 0.15  # freshness bound on the raw signal
 # Fragment advance gate (F43, 20260729T202844Z-visual-course-ee8fd1e5): the
 # gate-1 leg advanced at full +0.08 on a LONE span-(0.04,0.10) fragment
 # (log_scale ~-3.7), built fh 3-4 mps2, and parallax outran yaw authority
@@ -978,6 +991,8 @@ class _Hypothesis:
         "scale_axis",
         "confidence",
         "outer_log_scale",
+        "outer_log_scale_s",
+        "outer_expansion_rate",
         "outer_half_span_x",
         "clipped",
         "created_s",
@@ -1007,6 +1022,8 @@ class _Hypothesis:
         self.scale_axis = _AxisFilter(log_scale, 0.0, pos_var, INITIAL_RATE_VAR)
         self.confidence = _clamp01(confidence)
         self.outer_log_scale = float(log_scale)
+        self.outer_log_scale_s = float(now_s)
+        self.outer_expansion_rate = 0.0
         # F56: outer bbox x half-width in norm — the COMMIT corridor bound
         # is measured in gate units.  Square-box proxy from the area scale
         # here; the real bbox half-width overwrites it on every uncensored
@@ -1143,6 +1160,8 @@ class CleanCourseConfig:
     closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
     closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
     closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
+    outer_expansion_tau_s: float = OUTER_EXPANSION_TAU_S
+    outer_expansion_max_age_s: float = OUTER_EXPANSION_MAX_AGE_S
     fragment_advance_min_log_scale: float = FRAGMENT_ADVANCE_MIN_LOG_SCALE
     fragment_creep_pitch_rad: float = FRAGMENT_CREEP_PITCH_RAD
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
@@ -2217,9 +2236,20 @@ class CleanCourseController:
         # TRACK and PREDICT alike (the SEARCH path returned above).
         # F33 trust gate: expansion from tiny far tracks is sub-pixel noise,
         # so the governor only runs above CLOSURE_MIN_LOG_SCALE.
+        # F99: the Kalman rate lags ~1 s on a fresh/adopted track (see the
+        # OUTER_EXPANSION_* block) — the governor only braked incidentally
+        # and every leg arrived hot.  Take the FASTER of the filtered rate
+        # and the raw outer-bbox rate (fresh only): braking never goes
+        # below what the filtered signal alone would command.
+        raw_closure = (
+            current.outer_expansion_rate
+            if now_s - current.last_measurement_s
+            <= cfg.outer_expansion_max_age_s
+            else 0.0
+        )
         closure_rate = (
-            current.expansion_rate
-            if current.log_scale >= cfg.closure_min_log_scale
+            max(current.expansion_rate, raw_closure)
+            if current.outer_log_scale >= cfg.closure_min_log_scale
             else 0.0
         )
         closure_brake = _clamp01(
@@ -2868,9 +2898,22 @@ class CleanCourseController:
             hypothesis.x_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
             hypothesis.y_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
         hypothesis.last_measurement_s = float(now_s)
-        hypothesis.outer_log_scale = math.log(
-            max(1e-6, float(track.apparent_scale))
-        )
+        new_outer_log_scale = math.log(max(1e-6, float(track.apparent_scale)))
+        # F99: fast raw closure signal (see the OUTER_EXPANSION_* block) —
+        # EMA of the per-frame outer log-scale rate, so the closure
+        # governor does not wait ~1 s for the Kalman scale_axis.v to
+        # tighten on a fresh/adopted track.
+        dt_outer = float(now_s) - hypothesis.outer_log_scale_s
+        if dt_outer > 1e-6:
+            raw_rate = (
+                new_outer_log_scale - hypothesis.outer_log_scale
+            ) / dt_outer
+            alpha = dt_outer / (self.config.outer_expansion_tau_s + dt_outer)
+            hypothesis.outer_expansion_rate += alpha * (
+                raw_rate - hypothesis.outer_expansion_rate
+            )
+        hypothesis.outer_log_scale = new_outer_log_scale
+        hypothesis.outer_log_scale_s = float(now_s)
         if not x_censored:
             # F56: the corridor bound needs the gate's true half-width; a
             # censored-x bbox underreports it, so only uncensored frames
