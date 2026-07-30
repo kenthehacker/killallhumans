@@ -10251,3 +10251,28 @@ def test_calibration_main_consumes_capability_before_lazy_live_import(monkeypatc
     assert published_stdout == [b'{"schema":"test-process-result"}\n']
     assert len(retained) == 1
     assert handle_close_calls == [(retained[0].exit_deadline_monotonic_ns, 200)]
+
+
+
+def test_validate_command_enforces_the_0p15_yaw_command_cap():
+    # 2026-07-30 contract correction: the production yaw COMMAND cap is
+    # +/-0.15 rad/s everywhere.  The v3 yaw-calibration profile's 0.50
+    # rad/s was measured PLANT RESPONSE, not command authority — final
+    # validation must reject anything above the cap and pass the cap
+    # itself.  Controller output and the visual-course final clamp are
+    # covered in tests/test_aigp_vq2_clean_course_stage.py.
+    assert vq2_module.MAX_YAW_COMMAND_RATE_RAD_S == pytest.approx(0.15)
+    vq2_module.validate_command(
+        vq2_module.AttitudeRateCommand(0.0, 0.0, 0.15, 0.25)
+    )
+    vq2_module.validate_command(
+        vq2_module.AttitudeRateCommand(0.0, 0.0, -0.15, 0.25)
+    )
+    with pytest.raises(SafetyAbort, match="body rate"):
+        vq2_module.validate_command(
+            vq2_module.AttitudeRateCommand(0.0, 0.0, 0.151, 0.25)
+        )
+    with pytest.raises(SafetyAbort, match="body rate"):
+        vq2_module.validate_command(
+            vq2_module.AttitudeRateCommand(0.0, 0.0, 0.50, 0.25)
+        )

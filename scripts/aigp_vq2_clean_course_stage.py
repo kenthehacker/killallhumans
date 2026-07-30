@@ -44,7 +44,7 @@ Control-law constant sources:
   top-bar collision showed bearing pursuit builds unbounded vz; see the
   comment at its definition.  It supersedes the removed flight-2
   D-direction limiter as the honest rate-limit mechanism.  A symmetric
-  descent floor with hover feedforward extends it; see the constant blocks.
+  proportional descent floor extends it; see the constant blocks.
 - ``CLOSURE_TARGET_RATE_S`` / ``CLOSURE_FULL_BRAKE_RATE_S``: the vision
   closure-rate governor (F31).  The filtered log-scale expansion rate is
   the only honest closure signal — fh is a signless drag magnitude that
@@ -53,10 +53,10 @@ Control-law constant sources:
   ``PRE_CROSS_BRAKE_PITCH_RAD`` attitude as the expansion rate rises past
   the target.  This replaces the retired fh closure governor (wrong
   signal), the near-field log_scale/TTC triggers (late), and the
-  post-credit brake window (all deleted with F31).  The COAST latch holds
-  level attitude at the support collective through the normal PD (F25: the
-  old exact-zero coast made every crossing ballistic, vz -2.79 m/s by
-  credit).
+  post-credit brake window (all deleted with F31).  The COAST latch is
+  exact wire zero on every channel (July-18 contract item 9, restored
+  2026-07-30; the F25/F26 support-thrust coast through the attitude PD is
+  out of contract).
 - ``FH_UNTRUSTED_*``: the F14 inflow-regime gate.  vz_est is invalidated
   by REGIME (a smooth fh-proportional thrust deficit), not attitude or
   vibration, so sustained fh > 5.0 freezes the vz/alt integrators, blocks
@@ -159,24 +159,18 @@ GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
 # a 6.1 s frozen-camera stall blinded the loop while a_up ~= -1.9 m/s^2 sank
 # it into a ground graze.  The hover regime shifts ~0.275 -> ~0.30 support
 # in fast/descending flight.  F63 (20260730T015429Z-visual-course-5e550551)
-# proved the original floor too weak AND too late: a deliberate ey-servo
-# descent at t=5.0 built an established -0.5..-1.5 m/s sink that the
-# 0.06/m/s gain could not arrest (thrust peaked 0.33 while the fast-regime
-# hover is ~=0.32) — the drone passed UNDER gate 1 and spun blind into the
-# floor.  Engage at -0.35 m/s (before momentum builds) with 0.10/m/s so the
-# command reaches the 0.34 envelope top by vz ~= -1.0.
+# proved the original floor too weak AND too late: an established -0.5..-1.5
+# sink ran ~5 s unarrested at thrust 0.30-0.33 (fast-regime hover ~=0.32)
+# and the drone passed UNDER gate 1 into the floor.  F67: the F64 law
+# (0.10/m/s plus a +0.04 step feedforward) bang-banged at the plane — F65's
+# last 0.5 s alternated 0.31 <-> 0.22 tick-to-tick as vz_est straddled the
+# floor, each high tick re-climbing toward the top panel — so the step is
+# DELETED and the gain raised 0.10 -> 0.21, which reproduces the F64
+# authority at vz -0.7 (support + 0.0735 ~= the proved 0.075) while staying
+# continuous at the boundary.  Engage at -0.35 m/s (before momentum builds);
+# the command saturates at the 0.34 envelope top by vz ~= -0.8.
 VZ_DESCENT_FLOOR_M_S = -0.35  # sink-rate bound, mirroring the climb cap
-VZ_DESCENT_GOVERNOR_GAIN = 0.10  # collective per m/s below the floor
-# Descent-regime hover feedforward (flight 20260729T112603Z-visual-course-
-# d5e89c2b): a ~-0.5 m/s^2 sink persisted ~4 s while the leaky vz estimate
-# (tau 2.5 s) wound up and the proportional floor alone reached only ~0.31
-# by ground contact; the effective fast-regime hover is ~=0.32.  F63
-# repeated the same shape (thrust 0.30-0.33, sink unarrested for ~5 s), so
-# the step is +0.04 whenever vz is below the floor: full arrest authority
-# arrives with the FIRST confirmed sub-floor estimate instead of seconds
-# later.  A shorter downward leak tau was rejected: steady-state vz_est =
-# a_up*tau would sit above the floor and the floor would never engage.
-VZ_DESCENT_HOVER_FEEDFORWARD = 0.04  # step feedforward while below the floor
+VZ_DESCENT_GOVERNOR_GAIN = 0.21  # collective per m/s below the floor
 
 # Launch boost is pure feedforward (it ignores ey).  Flight
 # 20260729T094736Z-visual-course-9d430a40: the 0.32 x 0.75 s boost alone
@@ -260,18 +254,14 @@ MAX_TARGET_ROLL_RAD = 0.35  # coordinated-turn lateral translation cap
 # slew (same value as the brake pitch slew).
 ROLL_PURSUIT_SLEW_RAD_S = 1.0  # fast roll slew while |ex| is large
 ROLL_PURSUIT_FAST_EX_NORM = 0.30  # |ex| above this engages the fast slew
-# Raised 0.15 -> 0.25 (flights 4ba3922b/89a175a9/d058b8a0): accepted gate-1
-# tracks repeatedly slid to the x ~= 0.95 frame edge with yaw pinned at the
-# cap while the v3 authority profile measured ~0.5 rad/s of plant capability.
-# Bearing rates of near off-axis gates at surviving closure exceed 0.15 rad/s.
-# 0.25 sits at the runner's hard MAX_COMMAND_RATE_RAD_S wire clamp and inside
-# the measured-authority envelope the runner now checks against.
-# 0.25 -> 0.50 (F35, d25f23fe): yaw saturated at the 0.25 cap for the entire
-# gate-1 leg and the gate still escaped right (+0.35 -> +0.95) — the turn
-# simply could not keep up with translation parallax.  0.50 is exactly the
-# calibrated profile's max_abs_measured_yaw_rate_rad_s, so the runner's
-# measured-authority guard still passes and the runtime cap becomes 0.50.
-MAX_COURSE_YAW_RATE_RAD_S = 0.50  # runner runtime cap = min(this, profile 0.5)
+# Contract correction (2026-07-30): the PRODUCTION yaw command cap is
+# restored to +/-0.15 rad/s.  The 0.50 carried here since F35 (itself raised
+# from 0.25 after flights 4ba3922b/89a175a9/d058b8a0) is the calibrated
+# profile's max_abs_MEASURED_yaw_rate (plant response to a 0.15 command
+# with the ~2.3x build-3385 overgain), never command authority — the v3
+# production profile commanded 0.15.  The runner's measured-authority
+# guard compares limits against the measured envelope, so 0.15 still passes.
+MAX_COURSE_YAW_RATE_RAD_S = 0.15  # production yaw COMMAND cap (v3 profile)
 
 # Softened -0.18 -> -0.12 (flight 4ba3922b), then -0.12 -> -0.08 (F29,
 # d8169633): fh is a SIGNLESS magnitude (hypot of world horizontal specific
@@ -381,41 +371,41 @@ COMMIT_ADVANCE_PITCH_RAD = 0.15  # real advance drive from standstill
 # F60's COMMIT_AIM vertical-aim pitch term was deleted in F66 (see the
 # commit law): it made the attitude a second vertical channel that fought
 # the collective servo at the plane (F63 dive-under, F65 top-panel slam).
-# F61 (20260730T012351Z-visual-course-5a0fe853): F60 entered COMMIT with
-# the bearing converging but still MOVING at ~-0.75 norm/s — the residual
-# tangential drift ran uncorrected through the 0.4 s close-range x
-# censorship blackout and the drone crossed beside the opening AGAIN
-# (F55's left-post death, same mechanism).  Entry now also requires a
-# QUIET derotated bearing: |dx/dt| over the recent fresh same-id window
-# stays under this bound (norm/s), so the blind finish starts aligned AND
-# translationally settled.
-COMMIT_ENTRY_MAX_EX_RATE_NORM_S = 0.20  # max |bearing rate| at commit entry
-# F62 (20260730T013923Z-visual-course-f941e3d1 + F59/F60/F61 traces):
-# every COMMIT crosses LEFT of the aim by a repeatable offset — entry ex
-# equilibrates at ~-0.08 all four flights and the crossing lands another
-# ~-0.1..-0.2 further left.  Steer the commit at a fixed RIGHT-side bias
-# instead of the image center (camera/parallax geometry at the plane is
-# not the body center); the bias is sized to the measured entry offset.
-COMMIT_EX_BIAS_NORM = 0.08  # steer the commit aim this far right of center
 COMMIT_TIMEOUT_S = 3.0  # no credit this long -> arrest and search
-# F56 (20260730T001902Z-visual-course-efb189d4 + f55/ debug frames): F55's
-# COMMIT ran cleanly but crossed BESIDE gate 1's left post — the nose was
-# ~0.22 norm off gate center while the gate's visible half-width was only
-# ~0.2 norm, and heading-hold commits whatever entry offset exists.  The
-# 0.20 frame-norm alignment bound is LOOSER than the gate's own half-width
-# at commit range, so the x-alignment bound is measured in GATE UNITS:
-# entry requires |ex| within this fraction of the outer bbox half-width
-# (never below the floor — the F52 approach reached ex -0.08, and the
-# floor keeps the bound achievable).  F55's ex -0.17..-0.22 at half-span
-# ~0.125 (bound 0.08) would have been BLOCKED; TRACK keeps centering.
-COMMIT_CORRIDOR_HALF_SPAN_FRAC = 0.6  # |ex| <= frac * outer half-width
-COMMIT_CORRIDOR_MIN_EX_NORM = 0.08  # corridor bound floor (frame-norm)
-# F38 (18c0b35c): with the true (nose-up) brake the drone arrives at the
-# engulfed plane SLOW; a level coast ran out of residual closure and the
-# bounded wait expired into SEARCH without credit.  A small nose-down
-# (positive, per the F38 convention) nudge carries it through the plane.
-# F49: an OFFSET from the spawn attitude (effective target ~-0.26).
-COAST_ADVANCE_PITCH_RAD = 0.05
+# ---------------------------------------------------------------------------
+# 2026-07-30 unified crossing-entry budget (replaces the F55/F56/F61/F62
+# patch stack — outer-bbox corridor, quiet-bearing rate gate, fixed ex bias
+# — which admitted entries at the post on 0.30 s-old axes: six gate-1
+# deaths, all at the plane).  ONE final-approach policy: TRACK holds/brakes
+# OUTSIDE the censorship blackout until the budget below passes; COMMIT is
+# the only gate-1+ crossing path; credible close loss inside an armed
+# COMMIT latches the exact-zero credit wait (no blind driving).
+# Entry requires, at the CURRENT frame (never a 0.30 s-old axis):
+#   * a currently usable inner aperture (passage_usable) — an unfit aperture
+#     at close range is the best available "about to go blind" signal;
+#   * uncensored same-id measurements on BOTH axes, this frame;
+#   * |error| + |rate| * COMMIT_BLACKOUT_S <= margin * aperture_half_extent
+#     on BOTH axes, evaluated on the WORST of the raw measurement and the
+#     filtered prediction — predicted blackout drift is part of the budget;
+#   * closure/expansion at or below the governor's target rate, so the
+#     crossing never starts at unarrested approach energy.
+# If any term fails, TRACK keeps braking/re-centering; the entry condition
+# is never loosened.
+COMMIT_ENTRY_MEAS_MAX_AGE_S = 0.06  # "current frame" at ~30 Hz camera
+COMMIT_BLACKOUT_S = 0.50  # measured close-range censorship window 0.3-0.6 s
+COMMIT_ENTRY_APERTURE_MARGIN_FRAC = 0.60  # error+drift within 60% of half
+COMMIT_ENTRY_MAX_EXPANSION_RATE_S = 0.35  # <= closure governor target
+# TRACK-phase lateral trim (2026-07-30): the gate-1 off-axis pursuit is a
+# P-loop orbiting the gate — it equilibrates at ex ~-0.08 EVERY flight
+# (yaw holds the bearing constant against translation parallax; the F57
+# gain boost only moved the equilibrium).  A small bounded integral on the
+# raw ex, active only near the linear regime and while x is fresh, learns
+# the feedforward that nulls the orbit so entries arrive centered.  This
+# replaces the COMMIT-only F62 0.08 bias, which compensated the entry
+# offset only during the blind finish.
+EX_TRIM_GAIN = 0.30  # trim norm/s per norm of sustained ex
+EX_TRIM_MAX_NORM = 0.15  # anti-windup bound (~2x the measured equilibrium)
+EX_TRIM_ACTIVE_EX_NORM = 0.25  # integrate only inside the near regime
 
 PREDICT_FRAME_GAP_S = 0.25  # ~8 camera frames; 0.06 (~2) flapped TRACK/SEARCH
 # 7 times in the 4.2 s F35 gate-1 leg, each flap dumping the pursuit fix.
@@ -626,9 +616,11 @@ SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 # Real scan, not a wiggle (post-credit pursuit redesign): 0.12 rad/s with a
 # 1.2 s reversal made +-8 deg legs that could never reach gate 1's typical
 # ~26-35 deg handoff bearing, and the reversal actively undid turn progress
-# (L18: 6.3 s of +-0.12 sweep achieving nothing).  0.20 rad/s with the 0.8
-# rad excursion bound gives ~46 deg legs, first leg toward the last bearing.
-SEARCH_YAW_RATE_RAD_S = 0.20  # bounded sweep rate
+# (L18: 6.3 s of +-0.12 sweep achieving nothing).  The 0.8 rad excursion
+# bound gives ~46 deg legs, first leg toward the last bearing.  2026-07-30:
+# the rate sits AT the 0.15 production yaw command cap — the fallback
+# incremental sweep is controller output and must not exceed it.
+SEARCH_YAW_RATE_RAD_S = 0.15  # bounded sweep rate (at the yaw command cap)
 SEARCH_SWEEP_PERIOD_S = 6.00  # reversal backstop; the excursion bound fires first
 SEARCH_MAX_EXCURSION_RAD = 0.80  # bounded sweep excursion before reversal
 # F40 (20260729T193134Z-visual-course-63ed6342): the SEARCH sweep integrated
@@ -816,6 +808,10 @@ class _Hypothesis:
         "last_measurement_s",
         "last_x_measurement_s",
         "last_y_measurement_s",
+        "raw_x",
+        "raw_y",
+        "aperture_half_x",
+        "aperture_half_y",
     )
 
     def __init__(
@@ -845,6 +841,14 @@ class _Hypothesis:
         self.last_measurement_s = float(now_s)
         self.last_x_measurement_s = float(now_s)
         self.last_y_measurement_s = float(now_s)
+        # Last uncensored RAW measurement per axis (the commit-entry budget
+        # evaluates the worst of raw vs filtered) and the CURRENT frame's
+        # usable inner-aperture half-extents (None when the fit is not
+        # passage-usable — itself the "about to go blind" signal).
+        self.raw_x = float(x)
+        self.raw_y = float(y)
+        self.aperture_half_x: Optional[float] = None
+        self.aperture_half_y: Optional[float] = None
 
     @property
     def x(self) -> float:
@@ -930,16 +934,18 @@ class CleanCourseConfig:
     crossing_max_abs_ex_norm: float = CROSSING_MAX_ABS_EX_NORM
     crossing_max_abs_ey_norm: float = CROSSING_MAX_ABS_EY_NORM
     crossing_credit_wait_s: float = CROSSING_CREDIT_WAIT_S
-    coast_advance_pitch_rad: float = COAST_ADVANCE_PITCH_RAD
     commit_sustain_s: float = COMMIT_SUSTAIN_S
     commit_meas_max_age_s: float = COMMIT_MEAS_MAX_AGE_S
     commit_timeout_s: float = COMMIT_TIMEOUT_S
     commit_min_log_scale: float = COMMIT_MIN_LOG_SCALE
     commit_advance_pitch_rad: float = COMMIT_ADVANCE_PITCH_RAD
-    commit_entry_max_ex_rate_norm_s: float = COMMIT_ENTRY_MAX_EX_RATE_NORM_S
-    commit_ex_bias_norm: float = COMMIT_EX_BIAS_NORM
-    commit_corridor_half_span_frac: float = COMMIT_CORRIDOR_HALF_SPAN_FRAC
-    commit_corridor_min_ex_norm: float = COMMIT_CORRIDOR_MIN_EX_NORM
+    commit_entry_meas_max_age_s: float = COMMIT_ENTRY_MEAS_MAX_AGE_S
+    commit_blackout_s: float = COMMIT_BLACKOUT_S
+    commit_entry_aperture_margin_frac: float = COMMIT_ENTRY_APERTURE_MARGIN_FRAC
+    commit_entry_max_expansion_rate_s: float = COMMIT_ENTRY_MAX_EXPANSION_RATE_S
+    ex_trim_gain: float = EX_TRIM_GAIN
+    ex_trim_max_norm: float = EX_TRIM_MAX_NORM
+    ex_trim_active_ex_norm: float = EX_TRIM_ACTIVE_EX_NORM
     near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
@@ -1063,11 +1069,10 @@ class CleanCourseController:
         # COMMIT_* constant block).
         self._near_plane_since_s: Optional[float] = None
         self._commit_entry_s: Optional[float] = None
-        # F61: fresh same-id x-sample ring for the quiet-bearing COMMIT
-        # entry gate (see COMMIT_ENTRY_MAX_EX_RATE_NORM_S).
-        self._commit_x_samples: List[Tuple[float, float]] = []
-        self._commit_x_track_id: Optional[str] = None
-        self._commit_x_last_meas_s: Optional[float] = None
+        # 2026-07-30 TRACK-phase lateral trim (see the EX_TRIM_* block): a
+        # small bounded integral on raw ex that nulls the off-axis pursuit
+        # orbit equilibrium before entry; reset on target/promotion change.
+        self._ex_trim: float = 0.0
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
@@ -1129,6 +1134,7 @@ class CleanCourseController:
         self.gate_index = int(gate_index)
         self.max_gate_index = int(gate_index)
         self._course_start_s = float(now_s)
+        self._ex_trim = 0.0
         identity = _frame_identity(update)
         if identity is not None:
             self._last_frame_identity = identity
@@ -1251,12 +1257,24 @@ class CleanCourseController:
 
         # COMMIT (F53): the near-plane commit is an inertial crossing —
         # keep the hypothesis and successor fresh for the credit/timeout
-        # exit (the vertical servo reads the live filter), but only
-        # note_race (credit) or the command() timeout may leave the state.
+        # exit (the vertical servo reads the live filter).  On a CREDIBLE
+        # CLOSE LOSS (fresh frame, close hypothesis, no match) the armed
+        # crossing stops all active blind driving and latches the exact-zero
+        # authoritative credit wait (July-18 contract, restored 2026-07-30);
+        # only note_race (credit) or the command() timeout may otherwise
+        # leave the state.
         if self.state is CleanCourseState.COMMIT:
             if match is not None:
                 self._update_hypothesis(self.current, match, now_s)
                 self._set_reliable_bearing(self.current.x, self.current.y)
+            elif (
+                fresh
+                and self.current is not None
+                and self.current.outer_log_scale >= cfg.commit_min_log_scale
+            ):
+                self.state = CleanCourseState.COAST_FOR_CREDIT
+                self._coast_entry_s = float(now_s)
+                self._coast_race_boot_ms = self._last_race_boot_ms
             self._refresh_successor(tracks, now_s)
             return
 
@@ -1268,11 +1286,20 @@ class CleanCourseController:
             if adopted is not None:
                 self.current = self._hypothesis_from_track(adopted, now_s)
                 self.state = CleanCourseState.TRACK
+                # New target, new geometry: relearn the orbit trim.
+                self._ex_trim = 0.0
         else:
             gap = now_s - self.current.last_measurement_s
             if (
                 self.state is CleanCourseState.TRACK
                 and fresh
+                # Gate-0 legs only (2026-07-30 unification): gate-1+
+                # crossings take ONE path — the aperture-budget COMMIT; a
+                # gate-1+ close loss without an armed commit is NOT a
+                # credible crossing and falls through to PREDICT/re-center.
+                # Gate-0 never commits (its climb-bias path credits every
+                # flight through this coast) and stays untouched.
+                and self.gate_index == 0
                 and self.current.outer_log_scale >= cfg.crossing_min_log_scale
                 # F45 (20260729T210351Z-visual-course-b1f5e89f): the coast is
                 # ballistic, so an OFF-CENTER close loss must not arm it —
@@ -1380,6 +1407,8 @@ class CleanCourseController:
         self.gate_index = int(gate_index)
         self.max_gate_index = max(self.max_gate_index, self.gate_index)
         self.transitions.append((previous, self.gate_index))
+        # Promotion: the next gate's pursuit gets a fresh orbit trim.
+        self._ex_trim = 0.0
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             self._exit_coast()
 
@@ -1491,37 +1520,20 @@ class CleanCourseController:
                 self._exit_coast()
                 self._enter_search(now_s)
             else:
-                # July-18 bounded credible-crossing wait.  F25 (22ceaa6f)
-                # cost accounting: the 0.4 s EXACT-ZERO latch made every
-                # crossing ballistic — vz collapsed -0.15 -> -2.79 m/s and
-                # alt 1.81 -> 1.44 m during the wait (the per-flight az
-                # +11.8 "bar graze" at the coast is the drone dropping onto
-                # the bottom bar), so the post-credit phase always started
-                # in a dive inside the fast-regime deficit trap.  The coast
-                # holds the tilt-compensated support collective with zero
-                # yaw.  F38 (18c0b35c): with the TRUE brake the drone now
-                # arrives SLOW, and a level coast ran out of residual
-                # closure short of the plane — the wait expired into
-                # SEARCH without credit.  A small nose-down nudge keeps
-                # carrying the drone through the engulfed gate plane (the
-                # crossing it was armed for is dead ahead); steering stays
-                # off.  It is deliberately NOT vz-governed: the engulfed
-                # window is blind, and a phantom sink must not pin a climb
-                # into the top bar.  Exact-zero thrust remains reserved for
-                # abort and cleanup.
-                coast_support = _clamp(
-                    cfg.support_collective
-                    / max(0.85, math.cos(roll_rad) * math.cos(pitch_rad)),
-                    cfg.min_thrust,
-                    cfg.max_thrust,
-                )
+                # July-18 contract item 9, RESTORED (2026-07-30): the
+                # bounded credible-crossing credit wait is EXACT WIRE ZERO
+                # on all four channels for at most crossing_credit_wait_s
+                # (0.40 s) while awaiting a newer authoritative race packet.
+                # The F25/F26 support-thrust coast through the attitude PD
+                # is out of contract: an actively driven blind wait is still
+                # blind driving.  The send path bypasses the attitude PD for
+                # this state so the wire is exactly 0/0/0/0; the wait stays
+                # bounded and credit remains the only passage authority.
                 return NavigationOutput(
                     target_roll_rad=0.0,
-                    target_pitch_rad=(
-                        cfg.spawn_pitch_rad + cfg.coast_advance_pitch_rad
-                    ),
+                    target_pitch_rad=0.0,
                     yaw_rate_rad_s=0.0,
-                    thrust=coast_support,
+                    thrust=0.0,
                     state=self.state,
                     gate_index=self.gate_index,
                     current_track_id=self._current_track_id(),
@@ -1635,54 +1647,18 @@ class CleanCourseController:
                 self._near_plane_since_s = now_s
         else:
             self._near_plane_since_s = None
-        # F61 quiet-bearing history: one sample per FRESH same-id x
-        # measurement, kept for the entry rate check below.
-        current_id = self.current.track_id if self.current is not None else None
-        if current_id != self._commit_x_track_id:
-            self._commit_x_track_id = current_id
-            self._commit_x_samples = []
-            self._commit_x_last_meas_s = None
-        if (
-            self.state is CleanCourseState.TRACK
-            and self.current is not None
-            and self.current.last_x_measurement_s != self._commit_x_last_meas_s
-        ):
-            self._commit_x_samples.append(
-                (self.current.last_x_measurement_s, float(self.current.x))
-            )
-            self._commit_x_last_meas_s = self.current.last_x_measurement_s
-        self._commit_x_samples = [
-            sample
-            for sample in self._commit_x_samples
-            if now_s - sample[0] <= 0.75
-        ]
+        # 2026-07-30 unified entry budget (see the COMMIT_ENTRY_* block):
+        # ONE crossing policy.  Entry requires the CURRENT frame to prove a
+        # usable inner aperture, uncensored both-axis measurements, low
+        # closure, and error+predicted-blackout-drift inside the aperture
+        # with margin — worst case of raw vs filtered.  A failed budget
+        # never loosens: TRACK keeps braking/re-centering outside the
+        # censorship blackout until the crossing is provably aligned.
         if (
             near_plane_close
             and self.gate_index >= 1
             and now_s - self._near_plane_since_s >= cfg.commit_sustain_s
-            # Fresh UNCENSORED same-id measurement on BOTH axes (censored
-            # axes never refresh these stamps — see _update_hypothesis).
-            and now_s - self.current.last_x_measurement_s
-            <= cfg.commit_meas_max_age_s
-            and now_s - self.current.last_y_measurement_s
-            <= cfg.commit_meas_max_age_s
-            # F56 corridor in gate units (see the COMMIT_CORRIDOR_* block):
-            # the 0.20 frame-norm cap alone is LOOSER than the gate's own
-            # half-width at commit range — heading-hold commits the entry
-            # offset, and F55 crossed beside the left post.  Entry requires
-            # BOTH the frame-norm cap and the corridor.
-            and abs(self.current.x) <= cfg.crossing_max_abs_ex_norm
-            and abs(self.current.x) <= max(
-                cfg.commit_corridor_min_ex_norm,
-                cfg.commit_corridor_half_span_frac
-                * self.current.outer_half_span_x,
-            )
-            and abs(self._compensated_ey(self.current.y, pitch_rad))
-            <= cfg.crossing_max_abs_ey_norm
-            # F61: the bearing must be QUIET, not just inside the corridor —
-            # residual tangential drift crosses beside the opening during
-            # the close-range censorship blackout (F55/F60).
-            and self._commit_x_quiet(now_s, cfg)
+            and self._commit_entry_budget_ok(now_s, pitch_rad, cfg)
         ):
             self.state = CleanCourseState.COMMIT
             self._commit_entry_s = float(now_s)
@@ -1737,11 +1713,12 @@ class CleanCourseController:
                 commit_steer_gain = 1.0
                 if self.current.log_scale >= cfg.commit_min_log_scale:
                     commit_steer_gain = cfg.near_plane_steer_gain_mult
-                # F63: steer at a fixed right-side bias (see
-                # COMMIT_EX_BIAS_NORM) — the camera-aimed center is not the
-                # body center at the plane, and all four crossings missed
-                # LEFT by a repeatable offset.
-                commit_ex = self.current.x - cfg.commit_ex_bias_norm
+                # 2026-07-30: the aim carries the TRACK-learned orbit trim
+                # (EX_TRIM_* block) instead of the F63 fixed 0.08 bias — the
+                # trim nulls the repeatable lateral P-loop equilibrium at
+                # its source, so the entry arrives centered about the true
+                # crossing point rather than compensating it blind.
+                commit_ex = self.current.x - self._ex_trim
                 commit_yaw = _clamp(
                     cfg.yaw_error_sign
                     * cfg.yaw_error_gain
@@ -1914,6 +1891,25 @@ class CleanCourseController:
         x_qualified = (
             now_s - current.last_x_measurement_s <= cfg.x_steer_max_age_s
         )
+        # 2026-07-30 TRACK-phase lateral trim (EX_TRIM_* block): the off-axis
+        # pursuit is a P-loop that equilibrates at ex ~-0.08 every flight
+        # (yaw holds the bearing constant against translation parallax).
+        # Integrate the raw ex while fresh and near the linear regime; the
+        # bounded trim learns the feedforward that nulls the orbit BEFORE
+        # entry, replacing the F62 COMMIT-only 0.08 bias.  Steady state of
+        # trim += ki*ex is ex -> 0, not ex -> trim.
+        if (
+            self.state is CleanCourseState.TRACK
+            and self.gate_index >= 1
+            and x_qualified
+            and abs(current.x) <= cfg.ex_trim_active_ex_norm
+        ):
+            self._ex_trim = _clamp(
+                self._ex_trim + cfg.ex_trim_gain * current.x * dt,
+                -cfg.ex_trim_max_norm,
+                cfg.ex_trim_max_norm,
+            )
+        ex -= self._ex_trim
 
         # Vertical: ONE GLOBAL SIGN at every gate (empirically confirmed by
         # the 2026-07-29 crossing-geometry analysis).  The gate-0 phase adds
@@ -2005,6 +2001,9 @@ class CleanCourseController:
             # tilt-compensated support through the decisive t=1.31-1.72
             # window at vz 2.7 m/s.  Honest climb-rate limiting now lives in
             # the IMU vz governor below, which cannot go blind with vision.
+            # One GLOBAL vertical law at every gate (the F67 gate-dependent
+            # D-removal was reverted): a high equilibrium is now refused at
+            # the COMMIT entry budget instead of tuned out per-gate.
             collective = support + cfg.vertical_feedback_sign * (
                 cfg.vertical_error_gain * bounded_error
                 + cfg.vertical_rate_gain * bounded_rate
@@ -2226,25 +2225,48 @@ class CleanCourseController:
         self.last_reliable_bearing = (float(x), float(y))
         self._bearing_memory_valid = True
 
-    def _commit_x_quiet(self, now_s: float, cfg: "CleanCourseConfig") -> bool:
-        """F61 quiet-bearing entry gate (see COMMIT_ENTRY_MAX_EX_RATE_NORM_S).
+    def _commit_entry_budget_ok(
+        self, now_s: float, pitch_rad: float, cfg: "CleanCourseConfig"
+    ) -> bool:
+        """2026-07-30 unified crossing-entry budget (COMMIT_ENTRY_* block).
 
-        True only when the recent fresh same-id x samples span >= 0.25 s
-        and the endpoint rate over the last 0.60 s stays under the bound.
-        Insufficient history is NOT quiet.
+        True only when the CURRENT frame proves: a passage-usable inner
+        aperture, uncensored both-axis same-id measurements (never a
+        0.30 s-old axis), closure at/below the governor target, and
+        |error| + |rate| * blackout inside the aperture half-extents with
+        margin on BOTH axes — the error evaluated as the WORST of the raw
+        measurement and the filtered prediction.  Anything less keeps
+        TRACK braking/re-centering outside the censorship blackout.
         """
-        window = [
-            sample
-            for sample in self._commit_x_samples
-            if now_s - sample[0] <= 0.60
-        ]
-        if len(window) < 2:
+
+        current = self.current
+        if current is None:
             return False
-        span = window[-1][0] - window[0][0]
-        if span < 0.25:
+        if (
+            now_s - current.last_x_measurement_s
+            > cfg.commit_entry_meas_max_age_s
+            or now_s - current.last_y_measurement_s
+            > cfg.commit_entry_meas_max_age_s
+        ):
             return False
-        rate = (window[-1][1] - window[0][1]) / span
-        return abs(rate) <= cfg.commit_entry_max_ex_rate_norm_s
+        if current.aperture_half_x is None or current.aperture_half_y is None:
+            return False
+        if current.expansion_rate > cfg.commit_entry_max_expansion_rate_s:
+            return False
+        ex = max(abs(current.x), abs(current.raw_x))
+        if ex + abs(current.vx) * cfg.commit_blackout_s > (
+            cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
+        ):
+            return False
+        ey = max(
+            abs(self._compensated_ey(current.y, pitch_rad)),
+            abs(self._compensated_ey(current.raw_y, pitch_rad)),
+        )
+        if ey + abs(current.vy) * cfg.commit_blackout_s > (
+            cfg.commit_entry_aperture_margin_frac * current.aperture_half_y
+        ):
+            return False
+        return True
 
     def _compensated_ey(self, ey: float, pitch_rad: float) -> float:
         """F50 pitch-attitude-compensated vertical error (image-down +).
@@ -2382,11 +2404,13 @@ class CleanCourseController:
         else:
             hypothesis.x_axis.update(zx, r_x)
             hypothesis.last_x_measurement_s = float(now_s)
+            hypothesis.raw_x = float(zx)
         if y_censored:
             hypothesis.y_axis.inflate(CENSOR_INFLATE_VAR_NORM)
         else:
             hypothesis.y_axis.update(zy, r_y)
             hypothesis.last_y_measurement_s = float(now_s)
+            hypothesis.raw_y = float(zy)
         if x_censored or y_censored:
             hypothesis.scale_axis.inflate(CENSOR_INFLATE_VAR_NORM)
         else:
@@ -2410,6 +2434,21 @@ class CleanCourseController:
                 hypothesis.outer_half_span_x = 0.5 * (
                     float(bbox[2]) - float(bbox[0])
                 )
+        # 2026-07-30 entry budget: the CURRENT frame's usable inner aperture
+        # (passage_usable) is recorded as half-extents; a missing/unusable
+        # fit clears them, so a close-range aperture loss is itself visible
+        # to the commit-entry check as "about to go blind".
+        aperture = _track_aperture(track)
+        if (
+            aperture is not None
+            and bool(getattr(aperture, "passage_usable", False))
+            and getattr(aperture, "half_size_norm", None) is not None
+        ):
+            hypothesis.aperture_half_x = 0.5 * float(aperture.half_size_norm[0])
+            hypothesis.aperture_half_y = 0.5 * float(aperture.half_size_norm[1])
+        else:
+            hypothesis.aperture_half_x = None
+            hypothesis.aperture_half_y = None
 
     def _refresh_successor(self, tracks: List[Any], now_s: float) -> None:
         current_id = self._current_track_id()
@@ -2557,15 +2596,14 @@ class CleanCourseController:
 
         Applied wherever a nonzero collective is emitted (TRACK, PREDICT,
         SEARCH, and the defensive fallback) so vision loss never disables
-        it; the COAST support hold and the abort/cleanup zeros bypass it by
-        construction.
+        it; the COAST exact-zero wait and the abort/cleanup zeros bypass it
+        by construction.
         Symmetric: caps collective above the climb cap and floors it below
         the descent floor (flight d52adcd4 sank ~-1.9 m/s^2 into a ground
-        graze while the frozen frame suppressed SEARCH).  Below the floor a
-        fixed descent-regime hover feedforward (flight d5e89c2b: effective
-        fast-regime hover ~=0.32, proportional floor alone reached only
-        ~0.31 by contact) steps in with the first confirmed sub-floor
-        estimate instead of waiting on the leaky integrator.
+        graze while the frozen frame suppressed SEARCH).  F67: the floor is
+        purely proportional (0.21/m/s) — the F64 +0.04 step feedforward
+        bang-banged against the ey servo at the plane (F65: thrust
+        0.31 <-> 0.22 tick-to-tick as vz_est straddled the floor).
         """
 
         if self._fh_untrusted:
@@ -2598,9 +2636,7 @@ class CleanCourseController:
             if descent_excess > 0.0:
                 collective = max(
                     collective,
-                    support
-                    + VZ_DESCENT_GOVERNOR_GAIN * descent_excess
-                    + VZ_DESCENT_HOVER_FEEDFORWARD,
+                    support + VZ_DESCENT_GOVERNOR_GAIN * descent_excess,
                 )
             # Hard clamp here, not only at the main-path call site: the SEARCH
             # and defensive-fallback returns emit the governed value directly,
@@ -2955,6 +2991,23 @@ def _world_up_accel_m_s2(
     return -ned_down - GRAVITY_M_S2
 
 
+def _track_aperture(track: Any) -> Any:
+    """The track's co-timed inner-aperture fit, or None.
+
+    Live VisualTrack carries the fit on its latest history sample, not
+    as a top-level attribute (codex wiring finding): without this the
+    aperture branch was dead and every measurement fell back to the
+    outer bbox.
+    """
+
+    aperture = getattr(track, "inner_aperture", None)
+    if aperture is None:
+        history = getattr(track, "history", None)
+        if history:
+            aperture = getattr(history[-1], "inner_aperture", None)
+    return aperture
+
+
 def _track_measurement(
     track: Any,
 ) -> Tuple[Tuple[float, float], float, Tuple[float, float, float]]:
@@ -2965,15 +3018,7 @@ def _track_measurement(
     placeholder and is never consulted.
     """
 
-    aperture = getattr(track, "inner_aperture", None)
-    if aperture is None:
-        # Live VisualTrack carries the fit on its latest history sample, not
-        # as a top-level attribute (codex wiring finding): without this the
-        # aperture branch was dead and every measurement fell back to the
-        # outer bbox.
-        history = getattr(track, "history", None)
-        if history:
-            aperture = getattr(history[-1], "inner_aperture", None)
+    aperture = _track_aperture(track)
     if (
         aperture is not None
         and getattr(aperture, "center_norm", None) is not None
@@ -3292,11 +3337,10 @@ async def run_clean_course_stage(
                 ),
             )
             # One attitude PD for roll/pitch; yaw stays an explicit
-            # channel.  The coast latch also takes this path (F26: it holds
-            # level attitude at support thrust; the old exact-zero coast
-            # wire and its PD bypass were retired — every crossing went
-            # ballistic, flight 22ceaa6f: vz -2.79 m/s and -0.37 m by the
-            # end of the 0.4 s wait, and the per-flight bottom-bar graze).
+            # channel.  COAST_FOR_CREDIT bypasses the PD entirely (July-18
+            # contract item 9, restored 2026-07-30): the bounded credible-
+            # crossing credit wait is EXACT WIRE ZERO on every channel —
+            # support-thrust coasting through the PD is out of contract.
             # F26 (e89a3aa2): the brake targets were never attained because
             # the default pitch kp (0.5) uses only ~0.03-0.08 of the 0.25
             # rad/s wire authority — fh grew 2.7 -> 8.7 through the
@@ -3305,20 +3349,23 @@ async def run_clean_course_stage(
             # intercept pitch response (kp 2.0, same as roll; the wire
             # governor stays authoritative); fine tracking keeps the gentle
             # default.
-            braking = controller._pre_cross_brake_active
-            pd_command = rt.attitude_rate_command(
-                estimate,
-                target_roll_rad=nav.target_roll_rad,
-                target_pitch_rad=nav.target_pitch_rad,
-                thrust=nav.thrust,
-                intercept_response_authority=1.0 if braking else 0.0,
-            )
-            command = rt.attitude_rate_command_type(
-                float(pd_command.roll_rate),
-                float(pd_command.pitch_rate),
-                float(nav.yaw_rate_rad_s),
-                float(pd_command.thrust),
-            )
+            if controller.state is CleanCourseState.COAST_FOR_CREDIT:
+                command = rt.attitude_rate_command_type(0.0, 0.0, 0.0, 0.0)
+            else:
+                braking = controller._pre_cross_brake_active
+                pd_command = rt.attitude_rate_command(
+                    estimate,
+                    target_roll_rad=nav.target_roll_rad,
+                    target_pitch_rad=nav.target_pitch_rad,
+                    thrust=nav.thrust,
+                    intercept_response_authority=1.0 if braking else 0.0,
+                )
+                command = rt.attitude_rate_command_type(
+                    float(pd_command.roll_rate),
+                    float(pd_command.pitch_rate),
+                    float(nav.yaw_rate_rad_s),
+                    float(pd_command.thrust),
+                )
             command = clamp_final_command(command, runtime=rt)
             rt.validate_command(command)
             result = await host._send_flight_command(

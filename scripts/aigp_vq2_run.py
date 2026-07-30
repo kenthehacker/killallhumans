@@ -699,13 +699,13 @@ MAX_PITCH_RAD = math.radians(10.0)
 MAX_BODY_RATE_RAD_S = 2.0
 IMMEDIATE_MAX_BODY_RATE_RAD_S = 3.0
 MAX_COMMAND_RATE_RAD_S = 0.25
-# F36/F39: the visual-course yaw channel commands up to the calibrated
-# measured authority (0.5 rad/s, config/aigp_vq2_yaw_calibration_build3385.json)
-# — the F38/F39 aborts ("commanded body rate exceeded conservative clamp")
-# fired the legacy 0.25 yaw ceiling at every validation call site on the
-# first long pursuit.  The measured-authority guard at the visual-course
-# entry already refuses to run when the code limits exceed the profile.
-MAX_YAW_COMMAND_RATE_RAD_S = 0.5
+# Contract correction (2026-07-30): the production yaw COMMAND cap is
+# +/-0.15 rad/s.  The 0.5 in config/aigp_vq2_yaw_calibration_build3385.json
+# is the calibrated max_abs_MEASURED_yaw_rate (plant response to the v3
+# profile's 0.15 command under the ~2.3x build-3385 overgain), not command
+# authority.  F36/F39 raised validation to the measured value; restore the
+# production command envelope here, in the stage cap, and on the wire.
+MAX_YAW_COMMAND_RATE_RAD_S = 0.15
 # Gate-1 live traces showed sustained target-roll error while the attitude loop
 # used only about 0.04 rad/s of the calibrated 0.25-rad/s wire authority.  Keep
 # the final wire governor authoritative and increase only the roll error
@@ -13081,13 +13081,13 @@ class VQ2Runner:
             != self.yaw_calibration_profile_evidence.get("sha256")
             or course_yaw_profile.profile_sha256
             != YAW_CALIBRATION_PROFILE_SHA256
-            # The course runtime may command up to the profile's MEASURED
-            # authority, not its conservative calibration command cap: the
-            # v3 profile commanded 0.15 while the plant tracked up to 0.5
-            # rad/s measured, and flights 4ba3922b/89a175a9/d058b8a0 showed
-            # 0.15 insufficient to hold near off-axis gates in frame.  The
-            # stage cap (0.25) also stays at the MAX_COMMAND_RATE_RAD_S wire
-            # clamp.
+            # The course runtime commands up to the PRODUCTION yaw command
+            # cap (0.15 rad/s, restored 2026-07-30), never the profile's
+            # max_abs_measured value: the v3 profile commanded 0.15 while
+            # the plant tracked up to 0.5 rad/s measured under the
+            # build-3385 overgain.  The guard below only verifies the code
+            # limits stay inside the measured envelope.  The stage roll/
+            # pitch cap (0.25) stays at the MAX_COMMAND_RATE_RAD_S clamp.
             or DEFAULT_VISUAL_COURSE_LIMITS.max_yaw_rate_rad_s
             > course_yaw_profile.max_abs_measured_yaw_rate_rad_s
             or DEFAULT_VISUAL_COURSE_LIMITS.max_measured_yaw_rate_rad_s

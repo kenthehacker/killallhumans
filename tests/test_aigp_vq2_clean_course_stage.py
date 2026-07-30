@@ -502,25 +502,27 @@ def test_vz_governor_floors_collective_below_descent_floor():
     # graze; the climb-only governor did nothing.  F63 (5e550551) proved the
     # original -0.5/0.06/+0.025 floor too weak: an established -1.0..-1.5
     # sink ran ~5 s unarrested at thrust 0.30-0.33 (fast-regime hover ~=0.32)
-    # and the drone passed under gate 1 into the floor.  The F64 floor
-    # engages at -0.35 m/s with 0.10/m/s plus a +0.04 step feedforward.
+    # and the drone passed under gate 1 into the floor.  F67: the F64
+    # 0.10/m/s + 0.04 step bang-banged at the plane (F65's thrust alternated
+    # 0.31 <-> 0.22 as vz_est straddled the floor), so the step is deleted
+    # and the floor is purely proportional at 0.21/m/s below -0.35 m/s.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     helper = controller._governed_collective
     max_thrust = controller.config.max_thrust
     controller._vz_est_m_s = -0.35  # at the floor boundary: no effect
     assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT, abs=1e-9)
-    controller._vz_est_m_s = -0.7  # 0.35 m/s below -> +0.035 + 0.04 feedforward
-    # support + 0.075: inside the raised 0.34 envelope (F9/F10 headroom
+    controller._vz_est_m_s = -0.7  # 0.35 m/s below -> +0.0735 (~F64's +0.075)
+    # support + 0.0735: inside the raised 0.34 envelope (F9/F10 headroom
     # restoration; the old 0.32 clamp clipped exactly this case).
-    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.075, abs=1e-9)
-    # F64: by vz -1.0 the arrest saturates at max_thrust (raw support +
-    # 0.065 + 0.04 = 0.352) — the F63 sink ran unarrested at 0.30-0.33
-    # while the fast-regime hover is ~=0.32.
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.0735, abs=1e-9)
+    # By vz -1.0 the arrest saturates at max_thrust (raw support + 0.1365)
+    # — the F63 sink ran unarrested at 0.30-0.33 while the fast-regime
+    # hover is ~=0.32.
     controller._vz_est_m_s = -1.0
     assert helper(SUPPORT, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
     # Deep sinks saturate at max_thrust (flight 039186c8: the unclamped
     # floor boost exceeded the runner's 0.35 envelope abort in SEARCH).
-    controller._vz_est_m_s = -1.7  # 1.35 m/s below -> +0.135 + 0.04 raw
+    controller._vz_est_m_s = -1.7  # 1.35 m/s below -> +0.2835 raw
     assert helper(SUPPORT, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
     # The floor only raises collective, but the governed output is still
     # clamped: a higher command saturates at max_thrust as well.
@@ -529,15 +531,13 @@ def test_vz_governor_floors_collective_below_descent_floor():
 
 
 def test_vz_descent_floor_raises_command_thrust():
-    # Command level (F64 law): vz = -0.7 m/s lifts the emitted collective to
-    # support + 0.035 (proportional) + 0.04 (feedforward) = 0.322; a deeper
-    # sink (vz -1.0, raw 0.352) clips at the 0.34 envelope top... the raw
-    # 0.352 still fits the assertion below the clamp here (support 0.247 +
-    # 0.105 = 0.352 -> clamped to 0.34 = max_thrust).
+    # Command level (F67 law): vz = -0.7 m/s lifts the emitted collective to
+    # support + 0.0735 (proportional 0.21/m/s, no step); a deeper sink
+    # (vz -1.0, raw 0.3835) clips at the 0.34 envelope top.
     controller = _tracked_controller(_track("A", 0.0, 0.0))  # e = 0, vy ~ 0
     controller._vz_est_m_s = -0.7
     assert _command(controller, 100.10).thrust == pytest.approx(
-        SUPPORT + 0.075, abs=1e-9
+        SUPPORT + 0.0735, abs=1e-9
     )
     controller._vz_est_m_s = -1.0
     assert _command(controller, 100.14).thrust == pytest.approx(
@@ -547,36 +547,37 @@ def test_vz_descent_floor_raises_command_thrust():
 
 def test_vz_descent_floor_applies_in_predict_and_search():
     # The floor is IMU-based for the same reason as the climb cap: vision
-    # loss (the d52adcd4 stall case) must not disable it.  F64 law: vz -0.7
-    # -> support + 0.035 proportional + 0.04 feedforward.
+    # loss (the d52adcd4 stall case) must not disable it.  F67 law: vz -0.7
+    # -> support + 0.0735 proportional.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller.observe(_update([], frame_id=2), now_s=100.12)  # superseded
     assert controller.state is CleanCourseState.PREDICT
     controller._vz_est_m_s = -0.7
     assert _command(controller, 100.16).thrust == pytest.approx(
-        SUPPORT + 0.075, abs=1e-9
+        SUPPORT + 0.0735, abs=1e-9
     )
     controller._enter_search(100.20)
     assert _command(controller, 100.22).thrust == pytest.approx(
-        SUPPORT + 0.075, abs=1e-9
+        SUPPORT + 0.0735, abs=1e-9
     )
 
 
-def test_vz_phantom_sink_cannot_move_coast_support_hold():
-    # The coast hold emits the tilt-compensated support collective,
-    # UNGOVERNED: a phantom sink must neither zero it (the old ballistic
-    # latch, flight 22ceaa6f) nor boost a climb into the top bar.
+def test_vz_phantom_sink_cannot_move_coast_exact_zero():
+    # 2026-07-30 contract correction: a credible close loss outputs EXACT
+    # wire zero (roll/pitch/yaw rates and thrust) for the bounded credit
+    # wait — support-thrust coasting through the attitude PD is out of
+    # contract.  A phantom sink must not change that: the coast is not a
+    # governed control law at all.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
     controller.observe(_update([], frame_id=3), now_s=100.12)  # fresh close loss
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     controller._vz_est_m_s = -1.0
     out = _command(controller, 100.14)
-    assert out.thrust == pytest.approx(SUPPORT, abs=1e-9)
+    assert out.thrust == 0.0
     assert (out.target_roll_rad, out.target_pitch_rad, out.yaw_rate_rad_s) == (
         0.0,
-        SPAWN_PITCH + 0.05,  # F38/F49 coast advance nudge (spawn-relative):
-        # carry through the engulfed plane
+        0.0,
         0.0,
     )
 
@@ -979,9 +980,12 @@ def test_altitude_floor_respects_max_thrust():
     assert out.thrust == pytest.approx(controller.config.max_thrust, abs=1e-9)
 
 
-def test_altitude_floor_never_overrides_coast_support_hold():
-    # The coast support-hold latch still wins over the floor: a fresh close
-    # loss inside the low-altitude window keeps the coast's own collective.
+def test_gate_one_track_close_loss_predicts_instead_of_coasting():
+    # 2026-07-30 unified crossing policy: the exact-zero credit wait
+    # (COAST) is reserved for gate 0's proven close-loss path and for a
+    # COMMIT-phase close loss at the plane.  A gate-1+ TRACK close loss is
+    # a tracking failure, not a crossing: the controller PREDICTs on the
+    # hypothesis instead of entering a blind zero-thrust wait mid-course.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.observe(
         _update(
@@ -997,11 +1001,17 @@ def test_altitude_floor_never_overrides_coast_support_hold():
     # F42: promotion requires a persistent successor; seed the age.
     controller._track_first_seen_s["B"] = 100.08 - 1.0
     assert controller.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
-    controller.observe(_update([], frame_id=4), now_s=100.12)  # fresh close loss
-    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
-    controller._alt_est_m = 0.3
-    controller._vz_est_m_s = -1.0
-    assert _command(controller, 100.14).thrust == pytest.approx(SUPPORT, abs=1e-9)
+    # Fresh empty frames past the predict gap: the gate-1+ close loss falls
+    # to PREDICT (and on to SEARCH as the gap grows) — it must NEVER latch
+    # the blind exact-zero credit wait.
+    now = 100.10
+    seen = set()
+    for frame in range(4, 14):  # ~0.33 s without a measurement
+        now += 0.033
+        controller.observe(_update([], frame_id=frame), now_s=now)
+        seen.add(controller.state)
+        assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
+    assert CleanCourseState.PREDICT in seen
 
 
 def test_altitude_floor_latch_releases_unconditionally_and_rearms_after_hold():
@@ -1228,15 +1238,16 @@ def test_alt_floor_bumps_collective_only_and_keeps_the_law():
     assert out.yaw_rate_rad_s == 0.0
     assert out.target_roll_rad == 0.0
     # A fresh x measurement under the active floor restores the standard
-    # x-qualified pursuit gains (yaw 0.90, roll 0.50 on ex=+0.30) — no
-    # override parks the lateral law.
+    # x-qualified pursuit gains (yaw 0.90*ex=0.27, clamped to the 0.15
+    # production command cap; roll 0.50 on ex=+0.30) — no override parks
+    # the lateral law.
     now = 100.10
     for _ in range(20):  # slew the roll target out to its 0.15 command
         now += 0.033
         controller.current.last_x_measurement_s = now
         out = _command(controller, now)
     assert controller._alt_floor_active
-    assert out.yaw_rate_rad_s == pytest.approx(0.27, abs=1e-9)
+    assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
     assert out.target_roll_rad == pytest.approx(0.15, abs=1e-9)
     # The pitch is the TRACK law's own target (the ex=0.30 misalignment
     # brake pitches nose-up of spawn), NOT the deleted override's pinned
@@ -1443,8 +1454,9 @@ def test_misaligned_far_gate_brakes_and_climbs():
     # support + 0.12 exceeds the old +0.065 hover-equivalent margin even
     # after the 0.34 thrust clamp, and the far brake must NOT band it.
     assert out.thrust >= 0.33
-    # Raised yaw gain/cap: 0.9 * 0.50 pursuit, inside the 0.50 cap.
-    assert out.yaw_rate_rad_s == pytest.approx(0.45, abs=1e-9)
+    # Raised yaw gain: 0.9 * 0.50 pursuit, clamped to the 0.15 production
+    # yaw command cap.
+    assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
 
 
 def test_closure_governor_brakes_in_predict():
@@ -1642,9 +1654,9 @@ def test_lone_small_fragment_creeps_instead_of_advancing():
 def test_crossing_loss_latches_coast_even_while_fh_untrusted():
     # F32 (8cc53db2): fh went untrusted from BRAKING drag at the engulfed
     # gate-0 plane, the fh guard blocked the coast latch, and the drone
-    # flew blind into the frame in PREDICT.  The coast holds the SUPPORT
-    # collective at level attitude (F25), so there is no zero-thrust drop
-    # to guard against: a credible close crossing loss coasts regardless.
+    # flew blind into the frame in PREDICT.  A credible close crossing loss
+    # coasts regardless.  2026-07-30: the coast is exact wire zero for the
+    # bounded credit wait — no support-thrust PD hold.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
     controller._fh_untrusted = True
@@ -1653,7 +1665,7 @@ def test_crossing_loss_latches_coast_even_while_fh_untrusted():
     controller.observe(_update([], frame_id=20), now_s=now)  # fresh close loss
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     output = _command(controller, now + 0.02)
-    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+    assert output.thrust == 0.0
 
 
 def test_brake_ceiling_band_bounds_collective_while_braking():
@@ -1741,8 +1753,8 @@ def test_pre_cross_brake_does_not_suppress_crossing_detection():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-    ) == (0.0, SPAWN_PITCH + 0.05, 0.0)
-    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+    ) == (0.0, 0.0, 0.0)
+    assert output.thrust == 0.0
 
 
 def test_pre_cross_brake_relaxes_near_bottom_censor_with_hysteresis():
@@ -1916,10 +1928,11 @@ def test_frozen_frame_stall_goes_to_predict_and_never_coasts():
         assert _command(controller, now + 0.005).thrust > 0.0
 
 
-def test_fresh_close_loss_still_coasts_and_holds_support():
+def test_fresh_close_loss_still_coasts_at_exact_zero():
     # The July-18 bounded credible-crossing wait is preserved: a genuine
     # close-range loss on a FRESH frame (new frame id) still arms the coast
-    # latch — now a level-attitude support hold, not a ballistic zero.
+    # latch.  2026-07-30 contract correction: the wait is exact wire zero —
+    # no roll/pitch/yaw rate, no thrust — for at most the credit window.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
     controller.observe(_update([], frame_id=3), now_s=100.12)  # fresh id
@@ -1929,8 +1942,8 @@ def test_fresh_close_loss_still_coasts_and_holds_support():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-    ) == (0.0, SPAWN_PITCH + 0.05, 0.0)
-    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+    ) == (0.0, 0.0, 0.0)
+    assert output.thrust == 0.0
 
 
 def test_search_issues_real_bounded_yaw_sweep():
@@ -1950,8 +1963,8 @@ def test_search_issues_real_bounded_yaw_sweep():
         now += 0.02
         yaws.append(_command(controller, now).yaw_rate_rad_s)
     # Real sweep: nonzero, at the bounded sweep rate, inside the yaw cap.
-    assert all(abs(value) == pytest.approx(0.20) for value in yaws)
-    assert all(abs(value) <= 0.25 for value in yaws)
+    assert all(abs(value) == pytest.approx(0.15) for value in yaws)
+    assert all(abs(value) <= 0.15 + 1e-9 for value in yaws)
     # Initialized from the last image-right bearing under the measured
     # 2026-07-29 convention: positive yaw recenters a right-side target.
     assert yaws[0] > 0.0
@@ -2115,8 +2128,8 @@ def test_crossing_loss_latches_coast_and_waits_for_newer_race_packet():
         output.target_roll_rad,
         output.target_pitch_rad,
         output.yaw_rate_rad_s,
-    ) == (0.0, SPAWN_PITCH + 0.05, 0.0)
-    assert output.thrust == pytest.approx(SUPPORT, abs=1e-9)
+    ) == (0.0, 0.0, 0.0)
+    assert output.thrust == 0.0
     # A strictly newer race packet without credit ends the wait; vision never
     # declares the pass.
     controller.note_race(gate_index=0, race_boot_ms=2250, now_s=100.20)
@@ -2205,8 +2218,9 @@ def test_near_plane_stale_x_keeps_derotated_steering():
     out = _command(near, 100.10)
     assert out.state is CleanCourseState.TRACK
     # The held ex=-0.17 bearing keeps centering — at this near-plane scale
-    # with the F57 boost (0.90 * 2.5 * -0.17).
-    assert out.yaw_rate_rad_s == pytest.approx(-0.3825, abs=1e-9)
+    # with the F57 boost (0.90 * 2.5 * -0.17 = -0.3825), clamped to the
+    # 0.15 production yaw command cap.
+    assert out.yaw_rate_rad_s == pytest.approx(-0.15, abs=1e-9)
     assert out.target_roll_rad < 0.0  # slewing toward the boosted bank
     # FAR target, identical staleness: the F40 zeroing still applies.
     far = _tracked_controller(_track("A", -0.17, 0.0, scale=0.10))
@@ -2238,9 +2252,10 @@ def test_near_plane_steering_boost_scales_both_lateral_gains():
     # unchanged and far range keeps the proved 0.9/0.5 gains.
     near = _tracked_controller(_track("A", -0.16, 0.0, scale=0.50))
     out = _command(near, 100.10)
-    # 0.90 * 2.5 * -0.16 = -0.36 (inside the 0.5 cap and the measured
-    # airframe response of >=0.42 rad/s).
-    assert out.yaw_rate_rad_s == pytest.approx(-0.36, abs=1e-9)
+    # 0.90 * 2.5 * -0.16 = -0.36, clamped to the 0.15 production yaw
+    # command cap (the cap is a COMMAND authority limit, not the measured
+    # >=0.42 rad/s airframe response).
+    assert out.yaw_rate_rad_s == pytest.approx(-0.15, abs=1e-9)
     far = _tracked_controller(_track("A", -0.16, 0.0, scale=0.10))
     out = _command(far, 100.10)
     assert out.yaw_rate_rad_s == pytest.approx(-0.144, abs=1e-9)  # 0.90*-0.16
@@ -2251,26 +2266,36 @@ def test_commit_fresh_steering_carries_the_near_plane_boost():
     boosted.current.scale_axis.p = math.log(0.35)  # log_scale -1.05 >= -1.2
     out, _ = _drive_commit_window(boosted, 100.10)
     assert boosted.state is CleanCourseState.COMMIT
-    # F63: the gains act on the biased error (0.10 - 0.08 = 0.02).
-    assert out.yaw_rate_rad_s == pytest.approx(0.045, abs=1e-9)  # 0.9*2.5*0.02
+    # Trim frozen by the helper: the gains act on ex=0.10 directly —
+    # 0.9*2.5*0.10 = 0.225, clamped to the 0.15 production yaw command cap.
+    assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
     plain = _commit_controller()  # scale_axis log ~-3.0: far-range gains
     out, _ = _drive_commit_window(plain, 100.10)
     assert plain.state is CleanCourseState.COMMIT
-    assert out.yaw_rate_rad_s == pytest.approx(0.018, abs=1e-9)  # 0.9*0.02
+    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)  # 0.9*0.10
 
 
 def _commit_controller(now_s=100.10):
     """Gate-1 TRACK controller one sustain window short of COMMIT entry:
-    near plane (outer log scale -0.50 >= -1.2), aligned inside the F56
-    corridor (|ex| 0.10 <= 0.6 * half_span 0.25), fresh uncensored
-    measurements on both axes."""
+    near plane (outer log scale -0.50 >= -1.2), fresh uncensored
+    measurements on both axes, and the 2026-07-30 entry budget satisfied —
+    a usable inner aperture whose 60% margin admits error+blackout drift
+    (0.10 + 0 <= 0.6*0.25 on x; 0.05 + 0 <= 0.6*0.25 on y).  The lateral
+    trim integrator is frozen (gain 0) so steering-law assertions stay
+    exact; the dedicated trim test exercises the integrator itself."""
 
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller = _tracked_controller(
+        _track("A", 0.0, 0.0), config=_config(ex_trim_gain=0.0)
+    )
     _promote_to_gate_one(controller, now_s=now_s)
     controller._alt_est_m = 2.0  # honest altitude (floor quiet)
     current = controller.current
     current.x_axis.p = 0.10
     current.y_axis.p = 0.05
+    current.raw_x = 0.10
+    current.raw_y = 0.05
+    current.aperture_half_x = 0.25
+    current.aperture_half_y = 0.25
     current.outer_log_scale = -0.50
     current.outer_half_span_x = 0.25
     return controller
@@ -2294,64 +2319,56 @@ def test_commit_entry_fires_sustained_aligned_near_plane():
     # F53 (20260729T233602Z-visual-course-072c8a7b): the misalignment brake
     # self-locked the F52 drone into a hover 1-2 m short of gate 1's plane.
     # A sustained (~0.1 s, F54), aligned, freshly measured near-plane
-    # regime on a gate-1+ leg commits to an inertial crossing instead.
+    # regime on a gate-1+ leg commits to an inertial crossing instead —
+    # 2026-07-30: only once the unified aperture/drift budget passes.
     controller = _commit_controller()
     out, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
     assert out.state is CleanCourseState.COMMIT
-    # F56: COMMIT steers while x is fresh (yaw 0.90 on ex=+0.10).  F63:
-    # against the right-side aim bias (0.08): 0.90 * (0.10 - 0.08) = 0.018.
-    assert out.yaw_rate_rad_s == pytest.approx(0.018, abs=1e-9)
+    # COMMIT steers while x is fresh (yaw 0.90 on ex=+0.10, trim frozen by
+    # the helper).
+    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
 
 
-def test_commit_entry_requires_a_quiet_bearing():
-    # F61 (20260730T012351Z-visual-course-5a0fe853): F60 entered COMMIT
-    # with the bearing inside the corridor but still moving ~-0.75 norm/s;
-    # the drift ran uncorrected through the close-range censorship blackout
-    # and the drone crossed beside the opening.  A bearing that is aligned
-    # but still moving (rate above 0.20 norm/s) stays in TRACK; a settled
-    # bearing commits.
+def test_commit_entry_refuses_predicted_blackout_drift():
+    # F61 (20260730T012351Z-visual-course-5a0fe853): an entry with the
+    # bearing inside the corridor but still moving ran its drift
+    # uncorrected through the close-range censorship blackout and crossed
+    # beside the opening.  2026-07-30: the entry budget includes the
+    # PREDICTED blackout displacement — |error| + |rate| * 0.50 s of blind
+    # drift must fit inside 60% of the aperture half-extent.  A bearing
+    # aligned but drifting at 0.5 norm/s (0.10 + 0.25 > 0.6*0.25) is
+    # refused; the same geometry settled commits.
     drifting = _commit_controller()
-    now = 100.10
-    for k in range(12):
-        now += 0.033
-        drifting.current.x_axis.p = 0.02 + 0.12 * (k / 11.0)  # ~0.30 norm/s
-        drifting.current.last_measurement_s = now
-        drifting.current.last_x_measurement_s = now
-        drifting.current.last_y_measurement_s = now
-        _command(drifting, now, pitch=SPAWN_PITCH)
+    drifting.current.x_axis.v = 0.5
+    _drive_commit_window(drifting, 100.10)
     assert drifting.state is CleanCourseState.TRACK
-    # Same geometry, settled bearing: commits.
     settled = _commit_controller()
-    now = 100.10
-    for k in range(12):
-        now += 0.033
-        settled.current.x_axis.p = 0.02 + 0.06 * (k / 11.0)  # ~0.15 norm/s
-        settled.current.last_measurement_s = now
-        settled.current.last_x_measurement_s = now
-        settled.current.last_y_measurement_s = now
-        _command(settled, now, pitch=SPAWN_PITCH)
+    settled.current.x_axis.v = 0.0
+    out, _ = _drive_commit_window(settled, 100.10)
     assert settled.state is CleanCourseState.COMMIT
 
 
-def test_commit_entry_corridor_is_measured_in_gate_units():
-    # F56 (trace efb189d4 + f55/ frames): the 0.20 frame-norm bound is
-    # LOOSER than the gate's own half-width at commit range — F55 committed
-    # at ex ~-0.17..-0.22 with the gate half-width ~0.125 and crossed
-    # beside the left post.  The corridor bound is 0.6 * half-span (floored
-    # at 0.08): at the F55 geometry (half_span 0.125 -> bound 0.08) F55's
-    # offset is BLOCKED and TRACK keeps centering; a genuinely centered
-    # approach still commits.
-    blocked = _commit_controller()
-    blocked.current.x_axis.p = 0.17
-    blocked.current.outer_half_span_x = 0.125
-    _drive_commit_window(blocked, 100.10)
-    assert blocked.state is CleanCourseState.TRACK
-    centered = _commit_controller()
-    centered.current.x_axis.p = 0.06
-    centered.current.outer_half_span_x = 0.125
-    out, _ = _drive_commit_window(centered, 100.10)
-    assert centered.state is CleanCourseState.COMMIT
+def test_commit_entry_requires_inner_aperture_budget():
+    # F56 (trace efb189d4 + f55/ frames): an outer-bbox corridor bound
+    # LOOSER than the gate's own half-width committed F55 at ex ~-0.17
+    # with the gate half-width ~0.125 and crossed beside the left post.
+    # 2026-07-30: outer-bbox alignment is NOT the crossing authority — the
+    # entry budget is measured against the CURRENT usable inner aperture.
+    # An approach aligned inside the outer bbox but with an aperture too
+    # tight for the error budget (0.10 > 0.6*0.12) stays in TRACK; and
+    # with NO passage-usable aperture at all even a perfectly centered
+    # approach stays in TRACK.
+    tight = _commit_controller()
+    tight.current.aperture_half_x = 0.12
+    _drive_commit_window(tight, 100.10)
+    assert tight.state is CleanCourseState.TRACK
+    blind = _commit_controller()
+    blind.current.x_axis.p = 0.0
+    blind.current.raw_x = 0.0
+    blind.current.aperture_half_x = None  # fit not passage-usable this frame
+    _drive_commit_window(blind, 100.10)
+    assert blind.state is CleanCourseState.TRACK
 
 
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
@@ -2385,10 +2402,11 @@ def test_commit_entry_beats_censorship_onset_at_minus_1p2():
 
 
 def test_commit_entry_requires_fresh_uncensored_both_axes():
-    # The entry freshness window (0.30 s) is tighter than the crossing
-    # horizon: the bearing moves ~0.33 norm in 0.7 s at the plane.  A stale
-    # x-axis past the commit window (but inside the 0.5 s x-steer horizon,
-    # so the main law keeps steering normally) blocks entry.
+    # 2026-07-30: entry requires CURRENT-frame (<=0.06 s) uncensored
+    # measurements on BOTH axes — never a 0.30 s-old axis, only smoothed
+    # state, or the outer-bbox corridor.  A stale x-axis (0.40 s old, but
+    # inside the 0.5 s x-steer horizon so the main law keeps steering
+    # normally) blocks entry.
     stale = _commit_controller()
     now = 100.10
     for _ in range(15):
@@ -2398,6 +2416,17 @@ def test_commit_entry_requires_fresh_uncensored_both_axes():
         stale.current.last_x_measurement_s = now - 0.40
         _command(stale, now, pitch=SPAWN_PITCH)
     assert stale.state is CleanCourseState.TRACK
+    # Even a 0.10 s-old axis — fresh enough for the old 0.30 s entry
+    # window — cannot authorize a crossing.
+    aged = _commit_controller()
+    now = 100.10
+    for _ in range(15):
+        now += 0.033
+        aged.current.last_measurement_s = now
+        aged.current.last_y_measurement_s = now
+        aged.current.last_x_measurement_s = now - 0.10
+        _command(aged, now, pitch=SPAWN_PITCH)
+    assert aged.state is CleanCourseState.TRACK
     # Censored axes never refresh the measurement stamp; a hypothesis with
     # no uncensored x measurement at all can never commit.
     censored = _commit_controller()
@@ -2454,10 +2483,11 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
         out = _command(controller, now, pitch=SPAWN_PITCH)
     # F56: while x is FRESH the commit steers with the TRACK P gains on
     # the derotated hypothesis (yaw 0.90, roll 0.50) — the entry offset
-    # is finished, not frozen (F55 crossed beside the post).  F63: the
-    # gains act on the RIGHT-BIASED error (ex=+0.10 - 0.08 bias = 0.02).
-    assert out.yaw_rate_rad_s == pytest.approx(0.018, abs=1e-9)
-    assert out.target_roll_rad == pytest.approx(0.010, abs=1e-9)
+    # is finished, not frozen (F55 crossed beside the post).  2026-07-30:
+    # the gains act on the trim-corrected error (trim frozen at 0 by the
+    # helper, so ex=+0.10): yaw 0.09, roll 0.05.
+    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
+    assert out.target_roll_rad == pytest.approx(0.05, abs=1e-9)
     # F58: the real 0.15 rad advance drive, not the coast's 0.05 nudge.
     # F66: the F60 vertical-aim term is deleted — in commit the attitude is
     # the forward drive only; vertical translation is the servo's alone.
@@ -2484,7 +2514,7 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     # The progress-removers stay bypassed: a bearing that would fully
     # engage the misalignment brake in TRACK gets no brake pitch — the
     # advance continues; steering follows the fresh bearing (yaw gain
-    # 0.9*0.8 clamped to the 0.50 cap).
+    # 0.9*0.8 clamped to the 0.15 production yaw command cap).
     controller.current.y_axis.p = 0.05
     controller.current.x_axis.p = 0.80
     now += 0.132
@@ -2492,7 +2522,7 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     controller.current.last_x_measurement_s = now
     controller.current.last_y_measurement_s = now
     out = _command(controller, now, pitch=SPAWN_PITCH)
-    assert out.yaw_rate_rad_s == pytest.approx(0.50, abs=1e-9)
+    assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
     assert out.target_pitch_rad == pytest.approx(
         SPAWN_PITCH + 0.15, abs=1e-9
     )
@@ -2500,8 +2530,8 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     # hypothesis at FULL gain — heading-hold committed the residual drift
     # (F61 clipped the left post) and F62's half-gain derate
     # under-corrected (crossed -0.22 left); the prediction tracked the
-    # real bearing through the blackout.  ex=+0.10, biased error 0.02 ->
-    # yaw 0.90*0.02 = 0.018, roll 0.50*0.02 = 0.010 (boost off at this
+    # real bearing through the blackout.  ex=+0.10 (trim frozen at 0) ->
+    # yaw 0.90*0.10 = 0.09, roll 0.50*0.10 = 0.05 (boost off at this
     # log scale).
     controller.current.x_axis.p = 0.10
     for _ in range(18):
@@ -2510,8 +2540,8 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.COMMIT
-    assert out.yaw_rate_rad_s == pytest.approx(0.018, abs=1e-9)
-    assert out.target_roll_rad == pytest.approx(0.010, abs=1e-9)
+    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
+    assert out.target_roll_rad == pytest.approx(0.05, abs=1e-9)
 
 
 def test_commit_stale_y_never_climbs_on_a_frozen_bearing():
@@ -2779,7 +2809,7 @@ def test_finite_bounded_output_across_states():
             output.thrust,
         )
         assert all(math.isfinite(value) for value in values)
-        assert abs(output.yaw_rate_rad_s) <= 0.50 + 1e-9
+        assert abs(output.yaw_rate_rad_s) <= 0.15 + 1e-9
         assert output.thrust == 0.0 or 0.21 <= output.thrust <= 0.34
         assert abs(output.target_roll_rad) <= 0.35 + 1e-9
         # F49: pitch targets are offsets from the spawn attitude, so the
@@ -2967,10 +2997,10 @@ def test_loop_skipped_send_promotes_and_finishes():
     assert host._visual_course_summary is summary
     for command, _wire_index in host.sent:
         _validate(command)
-        assert abs(command.yaw_rate) <= 0.25 + 1e-9
+        assert abs(command.yaw_rate) <= 0.15 + 1e-9
 
 
-def test_loop_coast_holds_support_then_accepts_credit():
+def test_loop_coast_holds_exact_zero_then_accepts_credit():
     host = _Host(_update([_track("A", 0.0, 0.0, scale=0.50)]))
 
     def script(host):
@@ -2990,33 +3020,38 @@ def test_loop_coast_holds_support_then_accepts_credit():
     summary = asyncio.run(
         run_clean_course_stage(host, context, runtime=_test_runtime())
     )
-    # F26: the coast wait holds level attitude at the support collective —
-    # no ballistic zero, and the PD wire sends carry support thrust.
-    support_sends = [
-        command
-        for command, _index in host.sent
-        if command.thrust == pytest.approx(SUPPORT, abs=1e-6)
-        and command.yaw_rate == 0.0
-    ]
-    assert support_sends  # the support-hold coast happened
+    # 2026-07-30: the coast wait is EXACT WIRE ZERO — the PD is bypassed,
+    # no support thrust, no leveling rates.  Credit is still accepted
+    # during the wait.
+    saw_powered = False
+    zero_sends = []
+    for command, _index in host.sent:
+        if command.thrust > 0.05:
+            saw_powered = True
+        elif saw_powered and command.thrust == 0.0:
+            zero_sends.append(command)
+    assert zero_sends  # the exact-zero coast wait happened
+    for command in zero_sends:
+        assert (
+            command.roll_rate,
+            command.pitch_rate,
+            command.yaw_rate,
+            command.thrust,
+        ) == (0.0, 0.0, 0.0, 0.0)
     assert summary["final_gate_index"] == 1
 
 
-def test_loop_coast_levels_attitude_through_pd_at_support_thrust():
+def test_loop_coast_bypasses_the_pd_at_exact_zero():
     # F11 historically required exact-zero coast sends because the attitude
-    # PD leaked nonzero rates at zero thrust.  F26 retired the ballistic
-    # coast: the wait now goes through the PD with level targets at support
-    # thrust, so a nonzero attitude produces genuine LEVELING rates (that is
-    # the point — active attitude hold instead of a falling latch).
+    # PD leaked nonzero rates at zero thrust; F26 moved the wait through
+    # the PD at support thrust.  2026-07-30 contract correction: the wait
+    # is exact wire zero again and the PD is BYPASSED — a tilted attitude
+    # estimate cannot leak leveling rates or thrust onto the wire.
     host = _Host(_update([_track("A", 0.0, 0.0, scale=0.50)]))
     host.estimate = SimpleNamespace(
         orientation=SimpleNamespace(to_euler=lambda: (0.10, -0.08, 0.0)),
         body_rates=(0.0, 0.0, 0.0),
     )
-    probe = _fake_pd(
-        host.estimate, target_roll_rad=0.0, target_pitch_rad=0.0, thrust=SUPPORT
-    )
-    assert (probe.roll_rate, probe.pitch_rate) != (0.0, 0.0)  # PD levels it
 
     def script(host):
         if host.ticks == 3:
@@ -3035,15 +3070,149 @@ def test_loop_coast_levels_attitude_through_pd_at_support_thrust():
     summary = asyncio.run(
         run_clean_course_stage(host, context, runtime=_test_runtime())
     )
-    support_sends = [
-        command
-        for command, _index in host.sent
-        if command.thrust == pytest.approx(SUPPORT, abs=5e-3)
-    ]
-    assert support_sends  # the bounded coast wait emitted support sends
-    for command in support_sends:
-        assert math.isfinite(command.roll_rate)
-        assert math.isfinite(command.pitch_rate)
-        assert command.yaw_rate == 0.0
+    saw_powered = False
+    zero_sends = []
+    for command, _index in host.sent:
+        if command.thrust > 0.05:
+            saw_powered = True
+        elif saw_powered and command.thrust == 0.0:
+            zero_sends.append(command)
+    assert zero_sends  # the bounded coast wait emitted exact-zero sends
+    for command in zero_sends:
+        assert (
+            command.roll_rate,
+            command.pitch_rate,
+            command.yaw_rate,
+            command.thrust,
+        ) == (0.0, 0.0, 0.0, 0.0)
     assert summary["final_gate_index"] == 1
     assert summary["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-30 contract corrections: yaw command cap, unified crossing entry,
+# continuous descent floor, TRACK lateral trim
+# ---------------------------------------------------------------------------
+
+
+def test_yaw_command_output_never_exceeds_the_0p15_production_cap():
+    # The v3 profile's 0.50 rad/s was measured PLANT RESPONSE, not command
+    # authority.  Controller output clamps to +/-0.15 rad/s on both signs;
+    # the wire-side layers are covered by the final-clamp test above and
+    # the runner's validate_command regression.
+    assert CleanCourseConfig().max_yaw_rate_rad_s == pytest.approx(0.15)
+    right = _tracked_controller(_track("A", 0.90, 0.0, scale=0.10))
+    out = _command(right, 100.10)
+    assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
+    left = _tracked_controller(_track("A", -0.90, 0.0, scale=0.10))
+    out = _command(left, 100.10)
+    assert out.yaw_rate_rad_s == pytest.approx(-0.15, abs=1e-9)
+
+
+def test_commit_entry_refuses_excessive_closure():
+    # Arrival energy is the uncontrolled budget: an approach still closing
+    # faster than the governor target (expansion rate 0.50/s > 0.35) is
+    # refused even with a usable aperture and a centered, settled bearing —
+    # TRACK keeps controlling energy outside the censorship blackout
+    # instead of committing a hot crossing.
+    closing = _commit_controller()
+    closing.current.scale_axis.v = 0.50
+    _drive_commit_window(closing, 100.10)
+    assert closing.state is CleanCourseState.TRACK
+
+
+def test_descent_floor_is_continuous_across_its_threshold():
+    # F65/F66b: the on/off descent-floor step (+0.04 feedforward) bang-banged
+    # thrust 0.21<->0.31 at the gate plane as vz_est straddled the floor.
+    # The floor is now one proportional law: sweeping vz across the -0.35
+    # threshold moves collective smoothly — monotone, no step.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    helper = controller._governed_collective
+    previous = None
+    steps = []
+    for k in range(21):  # vz -0.30 .. -0.50 in 0.01 m/s steps
+        controller._vz_est_m_s = -0.30 - 0.01 * k
+        value = helper(SUPPORT, SUPPORT)
+        if previous is not None:
+            assert value >= previous - 1e-12  # monotone nondecreasing
+            steps.append(value - previous)
+        previous = value
+    assert steps
+    assert max(steps) < 0.005  # ~0.21 * 0.01 = 0.0021 per step, no jump
+
+
+def test_track_lateral_trim_integrates_bounded_and_nulls_the_orbit():
+    # The off-axis pursuit is a P-loop that equilibrates at ex ~-0.08 every
+    # flight (yaw holds the bearing against translation parallax).  The
+    # TRACK-phase trim integrates the sustained error on gate-1+ legs and
+    # nulls the orbit BEFORE entry, bounded at +/-0.15 — replacing the
+    # F63 COMMIT-only fixed bias.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 2.0
+    current = controller.current  # B: far scale, no commit arming, no boost
+    current.x_axis.p = 0.10
+    now = 100.10
+    first_yaw = None
+    out = None
+    for _ in range(60):  # ~2 s of sustained ex=+0.10
+        now += 0.033
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+        if first_yaw is None:
+            first_yaw = out.yaw_rate_rad_s
+    assert first_yaw == pytest.approx(0.09, abs=2e-3)  # 0.9 * 0.10 pre-trim
+    assert 0.04 < controller._ex_trim <= 0.15
+    assert out.yaw_rate_rad_s < first_yaw  # the trim eats the orbit error
+    # Anti-windup: an arbitrarily long sustained error cannot wind the trim
+    # past its bound.
+    for _ in range(400):
+        now += 0.033
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller._ex_trim <= 0.15 + 1e-12
+    # With the trim converged onto the orbit error, the steering law sees a
+    # nulled error and commands zero yaw.
+    frozen = _tracked_controller(
+        _track("A", 0.0, 0.0), config=_config(ex_trim_gain=0.0)
+    )
+    _promote_to_gate_one(frozen)
+    frozen._alt_est_m = 2.0
+    frozen.current.x_axis.p = 0.10
+    frozen._ex_trim = 0.10
+    now = 100.133
+    frozen.current.last_measurement_s = now
+    frozen.current.last_x_measurement_s = now
+    frozen.current.last_y_measurement_s = now
+    out = _command(frozen, now, pitch=SPAWN_PITCH)
+    assert out.yaw_rate_rad_s == pytest.approx(0.0, abs=1e-9)
+
+
+def test_commit_close_loss_latches_exact_zero_credit_wait():
+    # 2026-07-30: once a COMMIT crossing goes credibly blind at the plane
+    # (fresh loss at commit range), the controller stops active blind
+    # driving and enters the exact-zero authoritative credit wait — ONE
+    # crossing policy, no parallel blind path.
+    controller = _commit_controller()
+    out, now = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.COMMIT
+    now += 0.033
+    controller.observe(_update([], frame_id=42), now_s=now)  # fresh close loss
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    output = _command(controller, now + 0.02)
+    assert (
+        output.target_roll_rad,
+        output.target_pitch_rad,
+        output.yaw_rate_rad_s,
+        output.thrust,
+    ) == (0.0, 0.0, 0.0, 0.0)
+    # Authoritative credit during the wait still promotes.
+    promoted = controller.note_race(
+        gate_index=2, race_boot_ms=3000, now_s=now + 0.10
+    )
+    assert promoted
+    assert controller.gate_index == 2

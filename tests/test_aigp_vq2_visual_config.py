@@ -118,9 +118,10 @@ def test_immutable_safety_envelopes_are_not_configuration_fields():
     ):
         assert forbidden not in serialized
 
-    # F39 yaw-authority raise: the build-3385 calibration profile verified
-    # 0.5 rad/s measured yaw authority; the runtime cap is min(this, profile).
-    assert MAX_COURSE_YAW_RATE_RAD_S == 0.50
+    # 2026-07-30 contract correction: the production yaw COMMAND cap is
+    # 0.15 rad/s.  The build-3385 calibration profile's 0.5 rad/s was
+    # measured PLANT RESPONSE, not command authority.
+    assert MAX_COURSE_YAW_RATE_RAD_S == 0.15
     assert MAX_VISUAL_SEGMENT_DURATION_S == 120.0
     assert MIN_VISUAL_THRUST == 0.21
 
