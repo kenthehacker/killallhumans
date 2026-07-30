@@ -448,6 +448,16 @@ COMMIT_ENTRY_MEAS_MAX_AGE_S = 0.06  # "current frame" at ~30 Hz camera
 COMMIT_BLACKOUT_S = 0.50  # measured close-range censorship window 0.3-0.6 s
 COMMIT_ENTRY_APERTURE_MARGIN_FRAC = 0.60  # error+drift within 60% of half
 COMMIT_ENTRY_MAX_EXPANSION_RATE_S = 0.35  # <= closure governor target
+# IMU vertical velocity is part of the blackout-displacement budget too.
+# F82 (20260730T112130Z-visual-course-93a8eecf): the truthful panel-gate
+# aperture sits high at close range, so the gate-0 approach arrived
+# below-center still climbing; the vision-only vy term under-measured the
+# real +0.64 m/s, the budget admitted the entry, and the blind coast
+# carried the climb into the top bar (id 1001, no credit).  F80's proved
+# crossing entered at vz ~0.0 — the blackout must start with dead
+# vertical energy on EVERY gate, so entry refuses |vz| above this bound
+# and TRACK keeps holding/re-centering outside censorship until it dies.
+COMMIT_ENTRY_MAX_VZ_M_S = 0.25
 # TRACK-phase lateral trim (2026-07-30): the gate-1 off-axis pursuit is a
 # P-loop orbiting the gate — it equilibrates at ex ~-0.08 EVERY flight
 # (yaw holds the bearing constant against translation parallax; the F57
@@ -1054,6 +1064,7 @@ class CleanCourseConfig:
     commit_blackout_s: float = COMMIT_BLACKOUT_S
     commit_entry_aperture_margin_frac: float = COMMIT_ENTRY_APERTURE_MARGIN_FRAC
     commit_entry_max_expansion_rate_s: float = COMMIT_ENTRY_MAX_EXPANSION_RATE_S
+    commit_entry_max_vz_m_s: float = COMMIT_ENTRY_MAX_VZ_M_S
     ex_trim_gain: float = EX_TRIM_GAIN
     ex_trim_max_norm: float = EX_TRIM_MAX_NORM
     ex_trim_active_ex_norm: float = EX_TRIM_ACTIVE_EX_NORM
@@ -2592,6 +2603,11 @@ class CleanCourseController:
         if current.aperture_half_x is None or current.aperture_half_y is None:
             return False
         if current.expansion_rate > cfg.commit_entry_max_expansion_rate_s:
+            return False
+        # F82: the blackout-displacement budget includes IMU vz, not just
+        # vision vy — a +0.64 m/s climb carried a "passing" entry into the
+        # top bar.  Dead vertical energy only (see COMMIT_ENTRY_MAX_VZ_M_S).
+        if abs(self._vz_est_m_s) > cfg.commit_entry_max_vz_m_s:
             return False
         ex = max(abs(current.x), abs(current.raw_x))
         if ex + abs(current.vx) * cfg.commit_blackout_s > (

@@ -2586,6 +2586,25 @@ def test_commit_entry_refuses_predicted_blackout_drift():
     assert settled.state is CleanCourseState.COMMIT
 
 
+def test_commit_entry_refuses_unarrested_vertical_energy():
+    # F82 (20260730T112130Z-visual-course-93a8eecf): the truthful panel-gate
+    # aperture sits high at close range, so the gate-0 approach arrived
+    # below-center still climbing; the vision-only vy term under-measured
+    # the real +0.64 m/s, the budget admitted the entry, and the blind
+    # coast carried the climb into the top bar (id 1001, no credit).  F80's
+    # proved crossing entered at vz ~0.0.  The blackout must start with
+    # dead vertical energy: |vz_est| > 0.25 refuses entry; settled commits.
+    climbing = _commit_controller()
+    climbing._vz_est_m_s = 0.64
+    _drive_commit_window(climbing, 100.10)
+    assert climbing.state is CleanCourseState.TRACK  # COMMIT never arms
+    assert climbing._pre_cross_brake_active  # keeps holding outside censorship
+    settled = _commit_controller()
+    settled._vz_est_m_s = 0.10
+    out, _ = _drive_commit_window(settled, 100.10)
+    assert settled.state is CleanCourseState.COMMIT
+
+
 def test_commit_entry_requires_inner_aperture_budget():
     # F56 (trace efb189d4 + f55/ frames): an outer-bbox corridor bound
     # LOOSER than the gate's own half-width committed F55 at ex ~-0.17
