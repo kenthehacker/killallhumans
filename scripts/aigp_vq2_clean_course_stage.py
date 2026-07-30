@@ -378,18 +378,9 @@ COMMIT_MEAS_MAX_AGE_S = 0.30  # fresh uncensored both-axis window at entry
 # while tangential velocity carried it past the gate's face.  0.15 rad
 # (~1.5 m/s^2) covers the 3-4 m brake-stall drive inside a 3.0 s window.
 COMMIT_ADVANCE_PITCH_RAD = 0.15  # real advance drive from standstill
-# F60 (20260730T011151Z-visual-course-e9f0ebb8): F59's commit DROVE through
-# the plane but ~0.4-0.5 m high — the debug frames show the top bar filling
-# the view at the crossing instant and no credit.  The banded collective
-# trim (+-0.03 around support) cannot close the vertical gap inside the
-# commit window; pitch is the strong vertical actuator.  Aim the advance:
-# add the attitude-invariant opening depression angle (ey_comp / comp norm
-# per rad) to the pitch target so the velocity vector points AT the
-# opening, converging to the bare advance as the drone reaches opening
-# height.  Clamped >= 0: never pull UP on this term (F57 climb-over), and
-# zeroed on stale y (F58 frozen-bearing rule).  Capped so the dive stays
-# inside the pitch envelope.
-COMMIT_AIM_MAX_PITCH_RAD = 0.20  # cap on the vertical-aim pitch term
+# F60's COMMIT_AIM vertical-aim pitch term was deleted in F66 (see the
+# commit law): it made the attitude a second vertical channel that fought
+# the collective servo at the plane (F63 dive-under, F65 top-panel slam).
 # F61 (20260730T012351Z-visual-course-5a0fe853): F60 entered COMMIT with
 # the bearing converging but still MOVING at ~-0.75 norm/s — the residual
 # tangential drift ran uncorrected through the 0.4 s close-range x
@@ -945,7 +936,6 @@ class CleanCourseConfig:
     commit_timeout_s: float = COMMIT_TIMEOUT_S
     commit_min_log_scale: float = COMMIT_MIN_LOG_SCALE
     commit_advance_pitch_rad: float = COMMIT_ADVANCE_PITCH_RAD
-    commit_aim_max_pitch_rad: float = COMMIT_AIM_MAX_PITCH_RAD
     commit_entry_max_ex_rate_norm_s: float = COMMIT_ENTRY_MAX_EX_RATE_NORM_S
     commit_ex_bias_norm: float = COMMIT_EX_BIAS_NORM
     commit_corridor_half_span_frac: float = COMMIT_CORRIDOR_HALF_SPAN_FRAC
@@ -1788,18 +1778,16 @@ class CleanCourseController:
                     commit_correction = min(commit_correction, 0.0)
                 commit_hold = support + commit_correction
                 self._collective = commit_hold
-                # F60: aim the drive AT the opening vertically — the pitch
-                # target carries the opening's depression angle (see
-                # COMMIT_AIM_MAX_PITCH_RAD).  F62: the term also runs on the
-                # predicted y through censorship — it is clamped >= 0, so it
-                # can only ever DIVE, never climb (the F58 frozen-bearing
-                # climb rule stays enforced on the collective below).
-                commit_aim = _clamp(
-                    self._compensated_ey(self.current.y, pitch_rad)
-                    / cfg.vertical_pitch_comp_norm_per_rad,
-                    0.0,
-                    cfg.commit_aim_max_pitch_rad,
-                )
+                # F66: the F60 vertical-aim pitch term is DELETED.  In
+                # commit the attitude is the forward drive, not a second
+                # vertical channel — the aim and the collective servo read
+                # the same ey and fought at the plane: the dive rotated the
+                # camera down (growing ey -> more dive) while the body kept
+                # its pre-dive velocity vector.  F63 dove UNDER gate 1;
+                # F65 (11b13f53) slammed the top panel 0.47 s after entry
+                # with the opening 0.45 norm below the aim.  Vertical
+                # translation now lives ONLY in the bounded ey servo above
+                # (plus the vz descent floor).
                 return NavigationOutput(
                     target_roll_rad=self._slew_roll(commit_roll, dt),
                     # F55: the advance attitude must actually be reached —
@@ -1810,9 +1798,7 @@ class CleanCourseController:
                     # sized for a 0.4 s wait, not a 3-4 m brake-stall
                     # drive); the coast law's own offset is untouched.
                     target_pitch_rad=self._slew_pitch(
-                        cfg.spawn_pitch_rad
-                        + cfg.commit_advance_pitch_rad
-                        + commit_aim,
+                        cfg.spawn_pitch_rad + cfg.commit_advance_pitch_rad,
                         dt,
                         slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
                     ),

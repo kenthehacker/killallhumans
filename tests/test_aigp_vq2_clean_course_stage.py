@@ -2459,10 +2459,10 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     assert out.yaw_rate_rad_s == pytest.approx(0.018, abs=1e-9)
     assert out.target_roll_rad == pytest.approx(0.010, abs=1e-9)
     # F58: the real 0.15 rad advance drive, not the coast's 0.05 nudge.
-    # F60: plus the vertical-aim term (ey_comp 0.05 / 1.6 comp norm) while
-    # y is fresh — the drive points AT the opening, not just forward.
+    # F66: the F60 vertical-aim term is deleted — in commit the attitude is
+    # the forward drive only; vertical translation is the servo's alone.
     assert out.target_pitch_rad == pytest.approx(
-        SPAWN_PITCH + 0.15 + 0.05 / 1.6, abs=1e-9
+        SPAWN_PITCH + 0.15, abs=1e-9
     )
     # Bounded vertical servo on the compensated ey (0.05 -> -0.004).
     assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.004, abs=1e-9)
@@ -2494,7 +2494,7 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     out = _command(controller, now, pitch=SPAWN_PITCH)
     assert out.yaw_rate_rad_s == pytest.approx(0.50, abs=1e-9)
     assert out.target_pitch_rad == pytest.approx(
-        SPAWN_PITCH + 0.15 + 0.05 / 1.6, abs=1e-9
+        SPAWN_PITCH + 0.15, abs=1e-9
     )
     # F62/F63: once x goes STALE/censored the commit steers the PREDICTED
     # hypothesis at FULL gain — heading-hold committed the residual drift
