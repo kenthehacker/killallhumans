@@ -2262,6 +2262,36 @@ def test_commit_entry_fires_sustained_aligned_near_plane():
     assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
 
 
+def test_commit_entry_requires_a_quiet_bearing():
+    # F61 (20260730T012351Z-visual-course-5a0fe853): F60 entered COMMIT
+    # with the bearing inside the corridor but still moving ~-0.75 norm/s;
+    # the drift ran uncorrected through the close-range censorship blackout
+    # and the drone crossed beside the opening.  A bearing that is aligned
+    # but still moving (rate above 0.20 norm/s) stays in TRACK; a settled
+    # bearing commits.
+    drifting = _commit_controller()
+    now = 100.10
+    for k in range(12):
+        now += 0.033
+        drifting.current.x_axis.p = 0.02 + 0.12 * (k / 11.0)  # ~0.30 norm/s
+        drifting.current.last_measurement_s = now
+        drifting.current.last_x_measurement_s = now
+        drifting.current.last_y_measurement_s = now
+        _command(drifting, now, pitch=SPAWN_PITCH)
+    assert drifting.state is CleanCourseState.TRACK
+    # Same geometry, settled bearing: commits.
+    settled = _commit_controller()
+    now = 100.10
+    for k in range(12):
+        now += 0.033
+        settled.current.x_axis.p = 0.02 + 0.06 * (k / 11.0)  # ~0.15 norm/s
+        settled.current.last_measurement_s = now
+        settled.current.last_x_measurement_s = now
+        settled.current.last_y_measurement_s = now
+        _command(settled, now, pitch=SPAWN_PITCH)
+    assert settled.state is CleanCourseState.COMMIT
+
+
 def test_commit_entry_corridor_is_measured_in_gate_units():
     # F56 (trace efb189d4 + f55/ frames): the 0.20 frame-norm bound is
     # LOOSER than the gate's own half-width at commit range — F55 committed

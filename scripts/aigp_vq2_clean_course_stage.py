@@ -386,6 +386,15 @@ COMMIT_ADVANCE_PITCH_RAD = 0.15  # real advance drive from standstill
 # zeroed on stale y (F58 frozen-bearing rule).  Capped so the dive stays
 # inside the pitch envelope.
 COMMIT_AIM_MAX_PITCH_RAD = 0.20  # cap on the vertical-aim pitch term
+# F61 (20260730T012351Z-visual-course-5a0fe853): F60 entered COMMIT with
+# the bearing converging but still MOVING at ~-0.75 norm/s — the residual
+# tangential drift ran uncorrected through the 0.4 s close-range x
+# censorship blackout and the drone crossed beside the opening AGAIN
+# (F55's left-post death, same mechanism).  Entry now also requires a
+# QUIET derotated bearing: |dx/dt| over the recent fresh same-id window
+# stays under this bound (norm/s), so the blind finish starts aligned AND
+# translationally settled.
+COMMIT_ENTRY_MAX_EX_RATE_NORM_S = 0.20  # max |bearing rate| at commit entry
 COMMIT_TIMEOUT_S = 3.0  # no credit this long -> arrest and search
 # F56 (20260730T001902Z-visual-course-efb189d4 + f55/ debug frames): F55's
 # COMMIT ran cleanly but crossed BESIDE gate 1's left post — the nose was
@@ -916,6 +925,7 @@ class CleanCourseConfig:
     commit_min_log_scale: float = COMMIT_MIN_LOG_SCALE
     commit_advance_pitch_rad: float = COMMIT_ADVANCE_PITCH_RAD
     commit_aim_max_pitch_rad: float = COMMIT_AIM_MAX_PITCH_RAD
+    commit_entry_max_ex_rate_norm_s: float = COMMIT_ENTRY_MAX_EX_RATE_NORM_S
     commit_corridor_half_span_frac: float = COMMIT_CORRIDOR_HALF_SPAN_FRAC
     commit_corridor_min_ex_norm: float = COMMIT_CORRIDOR_MIN_EX_NORM
     near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
@@ -1039,6 +1049,11 @@ class CleanCourseController:
         # COMMIT_* constant block).
         self._near_plane_since_s: Optional[float] = None
         self._commit_entry_s: Optional[float] = None
+        # F61: fresh same-id x-sample ring for the quiet-bearing COMMIT
+        # entry gate (see COMMIT_ENTRY_MAX_EX_RATE_NORM_S).
+        self._commit_x_samples: List[Tuple[float, float]] = []
+        self._commit_x_track_id: Optional[str] = None
+        self._commit_x_last_meas_s: Optional[float] = None
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
@@ -1606,6 +1621,27 @@ class CleanCourseController:
                 self._near_plane_since_s = now_s
         else:
             self._near_plane_since_s = None
+        # F61 quiet-bearing history: one sample per FRESH same-id x
+        # measurement, kept for the entry rate check below.
+        current_id = self.current.track_id if self.current is not None else None
+        if current_id != self._commit_x_track_id:
+            self._commit_x_track_id = current_id
+            self._commit_x_samples = []
+            self._commit_x_last_meas_s = None
+        if (
+            self.state is CleanCourseState.TRACK
+            and self.current is not None
+            and self.current.last_x_measurement_s != self._commit_x_last_meas_s
+        ):
+            self._commit_x_samples.append(
+                (self.current.last_x_measurement_s, float(self.current.x))
+            )
+            self._commit_x_last_meas_s = self.current.last_x_measurement_s
+        self._commit_x_samples = [
+            sample
+            for sample in self._commit_x_samples
+            if now_s - sample[0] <= 0.75
+        ]
         if (
             near_plane_close
             and self.gate_index >= 1
@@ -1629,6 +1665,10 @@ class CleanCourseController:
             )
             and abs(self._compensated_ey(self.current.y, pitch_rad))
             <= cfg.crossing_max_abs_ey_norm
+            # F61: the bearing must be QUIET, not just inside the corridor —
+            # residual tangential drift crosses beside the opening during
+            # the close-range censorship blackout (F55/F60).
+            and self._commit_x_quiet(now_s, cfg)
         ):
             self.state = CleanCourseState.COMMIT
             self._commit_entry_s = float(now_s)
@@ -2150,6 +2190,26 @@ class CleanCourseController:
 
         self.last_reliable_bearing = (float(x), float(y))
         self._bearing_memory_valid = True
+
+    def _commit_x_quiet(self, now_s: float, cfg: "CleanCourseConfig") -> bool:
+        """F61 quiet-bearing entry gate (see COMMIT_ENTRY_MAX_EX_RATE_NORM_S).
+
+        True only when the recent fresh same-id x samples span >= 0.25 s
+        and the endpoint rate over the last 0.60 s stays under the bound.
+        Insufficient history is NOT quiet.
+        """
+        window = [
+            sample
+            for sample in self._commit_x_samples
+            if now_s - sample[0] <= 0.60
+        ]
+        if len(window) < 2:
+            return False
+        span = window[-1][0] - window[0][0]
+        if span < 0.25:
+            return False
+        rate = (window[-1][1] - window[0][1]) / span
+        return abs(rate) <= cfg.commit_entry_max_ex_rate_norm_s
 
     def _compensated_ey(self, ey: float, pitch_rad: float) -> float:
         """F50 pitch-attitude-compensated vertical error (image-down +).
