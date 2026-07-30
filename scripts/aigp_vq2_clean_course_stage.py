@@ -374,6 +374,18 @@ COMMIT_MEAS_MAX_AGE_S = 0.30  # fresh uncensored both-axis window at entry
 # while tangential velocity carried it past the gate's face.  0.15 rad
 # (~1.5 m/s^2) covers the 3-4 m brake-stall drive inside a 3.0 s window.
 COMMIT_ADVANCE_PITCH_RAD = 0.15  # real advance drive from standstill
+# F60 (20260730T011151Z-visual-course-e9f0ebb8): F59's commit DROVE through
+# the plane but ~0.4-0.5 m high — the debug frames show the top bar filling
+# the view at the crossing instant and no credit.  The banded collective
+# trim (+-0.03 around support) cannot close the vertical gap inside the
+# commit window; pitch is the strong vertical actuator.  Aim the advance:
+# add the attitude-invariant opening depression angle (ey_comp / comp norm
+# per rad) to the pitch target so the velocity vector points AT the
+# opening, converging to the bare advance as the drone reaches opening
+# height.  Clamped >= 0: never pull UP on this term (F57 climb-over), and
+# zeroed on stale y (F58 frozen-bearing rule).  Capped so the dive stays
+# inside the pitch envelope.
+COMMIT_AIM_MAX_PITCH_RAD = 0.20  # cap on the vertical-aim pitch term
 COMMIT_TIMEOUT_S = 3.0  # no credit this long -> arrest and search
 # F56 (20260730T001902Z-visual-course-efb189d4 + f55/ debug frames): F55's
 # COMMIT ran cleanly but crossed BESIDE gate 1's left post — the nose was
@@ -903,6 +915,7 @@ class CleanCourseConfig:
     commit_timeout_s: float = COMMIT_TIMEOUT_S
     commit_min_log_scale: float = COMMIT_MIN_LOG_SCALE
     commit_advance_pitch_rad: float = COMMIT_ADVANCE_PITCH_RAD
+    commit_aim_max_pitch_rad: float = COMMIT_AIM_MAX_PITCH_RAD
     commit_corridor_half_span_frac: float = COMMIT_CORRIDOR_HALF_SPAN_FRAC
     commit_corridor_min_ex_norm: float = COMMIT_CORRIDOR_MIN_EX_NORM
     near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
@@ -1705,6 +1718,20 @@ class CleanCourseController:
                     commit_correction = min(commit_correction, 0.0)
                 commit_hold = support + commit_correction
                 self._collective = commit_hold
+                # F60: aim the drive AT the opening vertically — the pitch
+                # target carries the opening's depression angle (see
+                # COMMIT_AIM_MAX_PITCH_RAD).  Zero on stale y.
+                commit_aim = 0.0
+                if (
+                    now_s - self.current.last_y_measurement_s
+                    <= cfg.commit_meas_max_age_s
+                ):
+                    commit_aim = _clamp(
+                        self._compensated_ey(self.current.y, pitch_rad)
+                        / cfg.vertical_pitch_comp_norm_per_rad,
+                        0.0,
+                        cfg.commit_aim_max_pitch_rad,
+                    )
                 return NavigationOutput(
                     target_roll_rad=self._slew_roll(commit_roll, dt),
                     # F55: the advance attitude must actually be reached —
@@ -1715,7 +1742,9 @@ class CleanCourseController:
                     # sized for a 0.4 s wait, not a 3-4 m brake-stall
                     # drive); the coast law's own offset is untouched.
                     target_pitch_rad=self._slew_pitch(
-                        cfg.spawn_pitch_rad + cfg.commit_advance_pitch_rad,
+                        cfg.spawn_pitch_rad
+                        + cfg.commit_advance_pitch_rad
+                        + commit_aim,
                         dt,
                         slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
                     ),

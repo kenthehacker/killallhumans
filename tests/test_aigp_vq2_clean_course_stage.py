@@ -2386,7 +2386,11 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
     assert out.target_roll_rad == pytest.approx(0.05, abs=1e-9)
     # F58: the real 0.15 rad advance drive, not the coast's 0.05 nudge.
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.15, abs=1e-9)
+    # F60: plus the vertical-aim term (ey_comp 0.05 / 1.6 comp norm) while
+    # y is fresh — the drive points AT the opening, not just forward.
+    assert out.target_pitch_rad == pytest.approx(
+        SPAWN_PITCH + 0.15 + 0.05 / 1.6, abs=1e-9
+    )
     # Bounded vertical servo on the compensated ey (0.05 -> -0.004).
     assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.004, abs=1e-9)
     # The servo tracks inside the band (0.50 -> -0.04)...
@@ -2416,7 +2420,9 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     controller.current.last_y_measurement_s = now
     out = _command(controller, now, pitch=SPAWN_PITCH)
     assert out.yaw_rate_rad_s == pytest.approx(0.50, abs=1e-9)
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.15, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(
+        SPAWN_PITCH + 0.15 + 0.05 / 1.6, abs=1e-9
+    )
     # Once x goes STALE/censored the commit holds heading (the frozen
     # bearing has no parallax term — F52): yaw zero, bank slewing to level.
     controller.current.x_axis.p = 0.10
