@@ -2179,11 +2179,13 @@ def test_crossing_wait_is_bounded_and_authoritative_credit_is_accepted():
     assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
     assert controller.transitions == [(0, 1)]
 
-    # The wait is bounded at 0.40 s even with no newer race packet.
+    # The wait is bounded at 0.10 s even with no newer race packet (F68:
+    # the ~4 Hz cruise race stream made a 0.25 s zero window a lethal
+    # ballistic drop at low altitude; the contract bound is AT MOST 0.40 s).
     controller2 = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller2.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
     controller2.observe(_update([], frame_id=5), now_s=100.12)
-    output = _command(controller2, 100.12 + 0.41)
+    output = _command(controller2, 100.12 + 0.11)
     assert controller2.state is CleanCourseState.SEARCH
     assert output.thrust > 0.0
 
