@@ -2937,6 +2937,30 @@ def test_search_reacquisition_falls_back_to_newborn_tracks():
     assert controller.current.track_id == "N"
 
 
+def test_near_plane_reacquisition_refuses_newborn_splinter():
+    # F74 (20260730T071207Z-visual-course-d38f869e): three flights in a row
+    # died adopting a one-tick newborn SPLINTER as the aim the instant the
+    # real track went engulfing at the gate plane (F70: 0008 at
+    # (+0.44,+0.89); F72: 0011 at (+0.49,+0.55); F73: 0010 at (+0.39,+0.67))
+    # — each followed by a blind wander into structure.  A FRESH engulfing
+    # anchor proves "AT the plane", where a brand-new track is debris:
+    # refuse adoption for the persistence window (SEARCH/PREDICT holds the
+    # derotated hypothesis).  Same-id re-adoption and the far-range newborn
+    # fallback (the F42 test above, no fresh anchor) are untouched.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
+    now = 100.10
+    splinter = _track("S", 0.40, 0.60, scale=0.07)  # corner debris, age 0
+    controller._last_engulfing_anchor_s = now
+    assert controller._select_search_reacquisition([splinter], now) is None
+    # The same track adopts once it has persisted through the window.
+    controller._track_first_seen_s["S"] = now - 1.0
+    assert controller._select_search_reacquisition([splinter], now) is splinter
+    # No fresh anchor (far range): the newborn fallback still fires.
+    controller._last_engulfing_anchor_s = now - 10.0
+    newborn = _track("N", 0.10, 0.0)
+    assert controller._select_search_reacquisition([newborn], now) is newborn
+
+
 # ---------------------------------------------------------------------------
 # Envelope
 # ---------------------------------------------------------------------------

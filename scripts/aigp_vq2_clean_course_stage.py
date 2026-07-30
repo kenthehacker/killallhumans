@@ -2654,7 +2654,24 @@ class CleanCourseController:
             for track in eligible
             if self._track_age_s(track.track_id, now_s) >= REACQUIRE_MIN_AGE_S
         ]
-        candidates = persistent or eligible
+        # F74 (20260730T071207Z-visual-course-d38f869e): at the gate plane a
+        # one-tick newborn SPLINTER was adopted as the aim the instant the
+        # real track went engulfing — the THIRD flight in a row killed this
+        # way (F70: 0008 at (+0.44,+0.89); F72: 0011 at (+0.49,+0.55); F73:
+        # 0010 at (+0.39,+0.67)), each followed by a blind wander into
+        # structure.  A fresh engulfing anchor proves "we are AT the plane",
+        # and AT the plane a brand-new track is debris, not the gate: hold
+        # SEARCH/PREDICT on the derotated hypothesis for the persistence
+        # window instead of adopting.  Same-id re-adoption (above) is
+        # untouched, and far-range cold start keeps the newborn fallback.
+        near_plane = (
+            self._last_engulfing_anchor_s is not None
+            and now_s - self._last_engulfing_anchor_s
+            <= ENGULFING_ANCHOR_MAX_AGE_S
+        )
+        candidates = persistent or ([] if near_plane else eligible)
+        if not candidates:
+            return None
         return min(
             candidates,
             key=lambda track: (
