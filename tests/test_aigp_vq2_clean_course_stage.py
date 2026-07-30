@@ -2176,7 +2176,8 @@ def test_near_plane_stale_x_keeps_derotated_steering():
 
 def _commit_controller(now_s=100.10):
     """Gate-1 TRACK controller one sustain window short of COMMIT entry:
-    near plane (outer log scale -0.50 >= -0.9), aligned, fresh uncensored
+    near plane (outer log scale -0.50 >= -1.2), aligned inside the F56
+    corridor (|ex| 0.10 <= 0.6 * half_span 0.25), fresh uncensored
     measurements on both axes."""
 
     controller = _tracked_controller(_track("A", 0.0, 0.0))
@@ -2186,6 +2187,7 @@ def _commit_controller(now_s=100.10):
     current.x_axis.p = 0.10
     current.y_axis.p = 0.05
     current.outer_log_scale = -0.50
+    current.outer_half_span_x = 0.25
     return controller
 
 
@@ -2212,7 +2214,28 @@ def test_commit_entry_fires_sustained_aligned_near_plane():
     out, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
     assert out.state is CleanCourseState.COMMIT
-    assert out.yaw_rate_rad_s == 0.0
+    # F56: COMMIT steers while x is fresh (yaw 0.90 on ex=+0.10).
+    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
+
+
+def test_commit_entry_corridor_is_measured_in_gate_units():
+    # F56 (trace efb189d4 + f55/ frames): the 0.20 frame-norm bound is
+    # LOOSER than the gate's own half-width at commit range — F55 committed
+    # at ex ~-0.17..-0.22 with the gate half-width ~0.125 and crossed
+    # beside the left post.  The corridor bound is 0.6 * half-span (floored
+    # at 0.08): at the F55 geometry (half_span 0.125 -> bound 0.08) F55's
+    # offset is BLOCKED and TRACK keeps centering; a genuinely centered
+    # approach still commits.
+    blocked = _commit_controller()
+    blocked.current.x_axis.p = 0.17
+    blocked.current.outer_half_span_x = 0.125
+    _drive_commit_window(blocked, 100.10)
+    assert blocked.state is CleanCourseState.TRACK
+    centered = _commit_controller()
+    centered.current.x_axis.p = 0.06
+    centered.current.outer_half_span_x = 0.125
+    out, _ = _drive_commit_window(centered, 100.10)
+    assert centered.state is CleanCourseState.COMMIT
 
 
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
@@ -2292,7 +2315,7 @@ def test_commit_entry_requires_alignment_proximity_and_gate_one():
     assert gate0.state is CleanCourseState.TRACK
 
 
-def test_commit_law_holds_heading_advances_and_bounds_vertical():
+def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     controller = _commit_controller()
     out, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
@@ -2313,9 +2336,11 @@ def test_commit_law_holds_heading_advances_and_bounds_vertical():
         controller.current.last_x_measurement_s = now
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
-    # Inertial heading hold: yaw exactly zero, bank fully unwound.
-    assert out.yaw_rate_rad_s == 0.0
-    assert out.target_roll_rad == 0.0
+    # F56: while x is FRESH the commit steers with the TRACK P gains on
+    # the derotated hypothesis (yaw 0.90, roll 0.50 on ex=+0.10) — the
+    # entry offset is finished, not frozen (F55 crossed beside the post).
+    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
+    assert out.target_roll_rad == pytest.approx(0.05, abs=1e-9)
     # The coast advance nudge, not the brake attitude, carries the plane.
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.05, abs=1e-9)
     # Bounded vertical servo on the compensated ey (0.05 -> -0.004).
@@ -2336,13 +2361,29 @@ def test_commit_law_holds_heading_advances_and_bounds_vertical():
     out = _command(controller, now + 0.099, pitch=SPAWN_PITCH)
     assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-9)
     # The progress-removers stay bypassed: a bearing that would fully
-    # engage the misalignment brake (and F52-A steering) in TRACK changes
-    # nothing — no yaw, no brake pitch, the advance continues.
+    # engage the misalignment brake in TRACK gets no brake pitch — the
+    # advance continues; steering follows the fresh bearing (yaw gain
+    # 0.9*0.8 clamped to the 0.50 cap).
     controller.current.y_axis.p = 0.05
     controller.current.x_axis.p = 0.80
-    out = _command(controller, now + 0.132, pitch=SPAWN_PITCH)
-    assert out.yaw_rate_rad_s == 0.0
+    now += 0.132
+    controller.current.last_measurement_s = now
+    controller.current.last_x_measurement_s = now
+    controller.current.last_y_measurement_s = now
+    out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert out.yaw_rate_rad_s == pytest.approx(0.50, abs=1e-9)
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.05, abs=1e-9)
+    # Once x goes STALE/censored the commit holds heading (the frozen
+    # bearing has no parallax term — F52): yaw zero, bank slewing to level.
+    controller.current.x_axis.p = 0.10
+    for _ in range(18):
+        now += 0.033
+        controller.current.last_measurement_s = now
+        controller.current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.COMMIT
+    assert out.yaw_rate_rad_s == 0.0
+    assert out.target_roll_rad == pytest.approx(0.0, abs=1e-9)
 
 
 def test_commit_timeout_drops_hypothesis_and_searches():

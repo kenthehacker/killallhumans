@@ -358,6 +358,18 @@ COMMIT_MIN_LOG_SCALE = -1.2  # entry proximity bound (span ~0.3)
 COMMIT_SUSTAIN_S = 0.10  # near-plane regime must persist this long to arm
 COMMIT_MEAS_MAX_AGE_S = 0.30  # fresh uncensored both-axis window at entry
 COMMIT_TIMEOUT_S = 2.0  # no credit this long -> arrest and search
+# F56 (20260730T001902Z-visual-course-efb189d4 + f55/ debug frames): F55's
+# COMMIT ran cleanly but crossed BESIDE gate 1's left post — the nose was
+# ~0.22 norm off gate center while the gate's visible half-width was only
+# ~0.2 norm, and heading-hold commits whatever entry offset exists.  The
+# 0.20 frame-norm alignment bound is LOOSER than the gate's own half-width
+# at commit range, so the x-alignment bound is measured in GATE UNITS:
+# entry requires |ex| within this fraction of the outer bbox half-width
+# (never below the floor — the F52 approach reached ex -0.08, and the
+# floor keeps the bound achievable).  F55's ex -0.17..-0.22 at half-span
+# ~0.125 (bound 0.08) would have been BLOCKED; TRACK keeps centering.
+COMMIT_CORRIDOR_HALF_SPAN_FRAC = 0.6  # |ex| <= frac * outer half-width
+COMMIT_CORRIDOR_MIN_EX_NORM = 0.08  # corridor bound floor (frame-norm)
 # F38 (18c0b35c): with the true (nose-up) brake the drone arrives at the
 # engulfed plane SLOW; a level coast ran out of residual closure and the
 # bounded wait expired into SEARCH without credit.  A small nose-down
@@ -741,6 +753,7 @@ class _Hypothesis:
         "scale_axis",
         "confidence",
         "outer_log_scale",
+        "outer_half_span_x",
         "clipped",
         "created_s",
         "last_measurement_s",
@@ -765,6 +778,11 @@ class _Hypothesis:
         self.scale_axis = _AxisFilter(log_scale, 0.0, pos_var, INITIAL_RATE_VAR)
         self.confidence = _clamp01(confidence)
         self.outer_log_scale = float(log_scale)
+        # F56: outer bbox x half-width in norm — the COMMIT corridor bound
+        # is measured in gate units.  Square-box proxy from the area scale
+        # here; the real bbox half-width overwrites it on every uncensored
+        # x measurement (see _update_hypothesis).
+        self.outer_half_span_x = 0.5 * math.exp(float(log_scale))
         self.clipped = False
         self.created_s = float(now_s)
         self.last_measurement_s = float(now_s)
@@ -860,6 +878,8 @@ class CleanCourseConfig:
     commit_meas_max_age_s: float = COMMIT_MEAS_MAX_AGE_S
     commit_timeout_s: float = COMMIT_TIMEOUT_S
     commit_min_log_scale: float = COMMIT_MIN_LOG_SCALE
+    commit_corridor_half_span_frac: float = COMMIT_CORRIDOR_HALF_SPAN_FRAC
+    commit_corridor_min_ex_norm: float = COMMIT_CORRIDOR_MIN_EX_NORM
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
     x_steer_max_age_s: float = X_STEER_MAX_AGE_S
@@ -1557,7 +1577,17 @@ class CleanCourseController:
             <= cfg.commit_meas_max_age_s
             and now_s - self.current.last_y_measurement_s
             <= cfg.commit_meas_max_age_s
+            # F56 corridor in gate units (see the COMMIT_CORRIDOR_* block):
+            # the 0.20 frame-norm cap alone is LOOSER than the gate's own
+            # half-width at commit range — heading-hold commits the entry
+            # offset, and F55 crossed beside the left post.  Entry requires
+            # BOTH the frame-norm cap and the corridor.
             and abs(self.current.x) <= cfg.crossing_max_abs_ex_norm
+            and abs(self.current.x) <= max(
+                cfg.commit_corridor_min_ex_norm,
+                cfg.commit_corridor_half_span_frac
+                * self.current.outer_half_span_x,
+            )
             and abs(self._compensated_ey(self.current.y, pitch_rad))
             <= cfg.crossing_max_abs_ey_norm
         ):
@@ -1580,13 +1610,17 @@ class CleanCourseController:
                 self._commit_entry_s = None
                 self._enter_search(now_s)
             else:
-                # Inertial crossing: heading hold, wings level — do NOT
-                # steer on the frozen hypothesis (_predict's derotation
-                # models rotation only, no parallax term; F52's held
-                # steering on frozen ex over-rotated ~25 deg while the true
-                # gate walked off).  The vertical channel keeps the F50
-                # compensated-ey servo BOUNDED to a small band around
-                # support (a flat support hold repeats the F33/F34
+                # Inertial crossing with a fresh-window finish (F56, trace
+                # efb189d4): while the x measurement is fresh the derotated
+                # hypothesis is the best aim evidence, so steer with the
+                # TRACK-style P gains to finish centering (F55 froze a
+                # ~0.22 norm entry offset and crossed beside the left post;
+                # ~0.25 s of uncensored measurements remained after entry).
+                # Once x is stale/censored, HOLD HEADING — the frozen
+                # bearing has no parallax term (F52's held steering on
+                # frozen ex over-rotated ~25 deg).  The vertical channel
+                # keeps the F50 compensated-ey servo BOUNDED to a small band
+                # around support (a flat support hold repeats the F33/F34
                 # bottom-bar death vertically); the vz governor stays the
                 # climb/sink limiter.  F55: the alt-floor collective bump
                 # does NOT apply here — a forced climb at the plane flies
@@ -1595,6 +1629,29 @@ class CleanCourseController:
                 # closure governor, expansion factor, x-staleness zeroing
                 # (F52-A), brake-relax.  The engulfing anchor is never
                 # consulted for steering.
+                commit_fresh_x = (
+                    now_s - self.current.last_x_measurement_s
+                    <= cfg.commit_meas_max_age_s
+                )
+                if commit_fresh_x:
+                    commit_yaw = _clamp(
+                        cfg.yaw_error_sign
+                        * cfg.yaw_error_gain
+                        * self.current.x,
+                        -cfg.max_yaw_rate_rad_s,
+                        cfg.max_yaw_rate_rad_s,
+                    )
+                    commit_yaw = self._anchor_clamped_yaw(commit_yaw, yaw_rad)
+                    commit_roll = _clamp(
+                        cfg.roll_error_sign
+                        * cfg.roll_error_gain
+                        * self.current.x,
+                        -cfg.max_target_roll_rad,
+                        cfg.max_target_roll_rad,
+                    )
+                else:
+                    commit_yaw = 0.0
+                    commit_roll = 0.0
                 commit_correction = _clamp(
                     cfg.vertical_feedback_sign
                     * cfg.vertical_error_gain
@@ -1605,7 +1662,7 @@ class CleanCourseController:
                 commit_hold = support + commit_correction
                 self._collective = commit_hold
                 return NavigationOutput(
-                    target_roll_rad=self._slew_roll(0.0, dt),
+                    target_roll_rad=self._slew_roll(commit_roll, dt),
                     # F55: the advance attitude must actually be reached —
                     # the generic 0.30 rad/s slew only moved rpy_p from
                     # -0.42 to -0.32 across F54's whole 2 s commit.  Use
@@ -1615,7 +1672,7 @@ class CleanCourseController:
                         dt,
                         slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
                     ),
-                    yaw_rate_rad_s=0.0,
+                    yaw_rate_rad_s=commit_yaw,
                     thrust=self._governed_collective(
                         commit_hold, support, alt_floor=False
                     ),
@@ -2066,8 +2123,19 @@ class CleanCourseController:
         if type(clipping) is not FrameEdge:
             clipping = FrameEdge.NONE
         center_censored = bool(getattr(track, "center_censored", False))
-        if center_censored or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)):
+        x_censored = (
+            center_censored or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
+        )
+        if x_censored:
             hypothesis.last_x_measurement_s = NEVER_MEASURED_S
+        else:
+            # F56: adoption with an uncensored x carries the creating
+            # detection's true bbox half-width for the COMMIT corridor.
+            bbox = getattr(track, "bbox_norm", None)
+            if bbox is not None and len(bbox) >= 4:
+                hypothesis.outer_half_span_x = 0.5 * (
+                    float(bbox[2]) - float(bbox[0])
+                )
         if center_censored or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)):
             hypothesis.last_y_measurement_s = NEVER_MEASURED_S
         return hypothesis
@@ -2155,6 +2223,15 @@ class CleanCourseController:
         hypothesis.outer_log_scale = math.log(
             max(1e-6, float(track.apparent_scale))
         )
+        if not x_censored:
+            # F56: the corridor bound needs the gate's true half-width; a
+            # censored-x bbox underreports it, so only uncensored frames
+            # refresh the span.
+            bbox = getattr(track, "bbox_norm", None)
+            if bbox is not None and len(bbox) >= 4:
+                hypothesis.outer_half_span_x = 0.5 * (
+                    float(bbox[2]) - float(bbox[0])
+                )
 
     def _refresh_successor(self, tracks: List[Any], now_s: float) -> None:
         current_id = self._current_track_id()
