@@ -16,8 +16,11 @@ test must not silently pick between.  When exactly one dominant *enclosed*
 dark region exists inside the support and it is bounded above by the
 component's top bar, that region names the opening and each scanline selects
 the unique gap overlapping it.  Comparable paired regions, regions touching
-the crop border, and regions without top-bar support (e.g. a pylon sponsor
-window) fall through to the unchanged legacy behaviour.
+the crop border, regions without top-bar support (e.g. a pylon sponsor
+window), and any clipped support fall through to the unchanged legacy
+behaviour; clipping panel gates migrate the true opening center far off the
+bbox center at close range (F81), so clipped supports never take the
+region-guided path.
 """
 
 from __future__ import annotations
@@ -1115,14 +1118,22 @@ def fit_vq2_aperture_mask(
     component = np.zeros(mask.shape, dtype=np.uint8)
     component[y : y + height, x : x + width] = labels == largest_label
     minimum_gap = max(config.min_gap_px, math.ceil(0.08 * min(width, height)))
-    region_crop = _enclosed_aperture_region(
-        component[y : y + height, x : x + width],
-        minimum_area=max(
-            config.min_aperture_region_pixels, minimum_gap * minimum_gap
-        ),
-        competing_ratio=config.competing_gap_ratio,
-        top_bar_margin=alignment_margin,
-    )
+    # The region proposal requires an unclipped support.  At close range a
+    # clipping panel gate's true opening center migrates far above the bbox
+    # center (F81: -0.06 -> -0.28 norm while half_size doubled), and those
+    # last frames before the blind coast must keep the pre-region legacy
+    # outcome — rejection or the legacy fit — rather than a new steerable
+    # aperture.  Unclipped fits are unaffected.
+    region_crop = None
+    if clipping == ApertureSide.NONE:
+        region_crop = _enclosed_aperture_region(
+            component[y : y + height, x : x + width],
+            minimum_area=max(
+                config.min_aperture_region_pixels, minimum_gap * minimum_gap
+            ),
+            competing_ratio=config.competing_gap_ratio,
+            top_bar_margin=alignment_margin,
+        )
     aperture_region = None
     if region_crop is not None:
         aperture_region = np.zeros(mask.shape, dtype=np.uint8)

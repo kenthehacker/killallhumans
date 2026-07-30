@@ -764,6 +764,37 @@ def test_panel_gate_below_opening_slit_fits_true_opening() -> None:
     assert passage_geometry_from_vq2_aperture_fit(fit) is not None
 
 
+def test_clipped_panel_gate_keeps_legacy_ambiguity_rejection() -> None:
+    """F81 close-range topology: the same panel gate as
+    ``test_panel_gate_below_opening_slit_fits_true_opening`` but with the
+    support clipped by the image bottom.  Clipped supports must never take
+    the region-guided path: at close range the true opening center migrates
+    far off the bbox center, and the frames before the blind coast must keep
+    the legacy outcome (here the ambiguity rejection) rather than a new
+    steerable aperture.
+    """
+    mask = np.zeros((240, 220), dtype=np.uint8)
+    cv2.rectangle(mask, (20, 20), (180, 40), 255, -1)
+    cv2.rectangle(mask, (20, 40), (40, 120), 255, -1)
+    cv2.rectangle(mask, (160, 40), (180, 120), 255, -1)
+    cv2.rectangle(mask, (20, 120), (180, 160), 255, -1)
+    cv2.rectangle(mask, (20, 160), (60, 220), 255, -1)
+    cv2.rectangle(mask, (150, 160), (180, 220), 255, -1)
+    cv2.rectangle(mask, (20, 220), (180, 239), 255, -1)
+
+    fit = fit_vq2_aperture_mask(
+        mask,
+        (18, 18, 164, 222),
+        detection_confidence=0.9,
+    )
+
+    assert fit.clipping == ApertureSide.BOTTOM
+    assert not fit.succeeded
+    assert fit.rejection_reason == "ambiguous_multiple_aperture_gaps"
+    assert fit.fitted_corners_px is None
+    assert passage_geometry_from_vq2_aperture_fit(fit) is None
+
+
 def test_enclosed_pylon_window_without_top_bar_is_not_an_aperture() -> None:
     """F80 f1640441 topology: the true opening leaks through the below-panel
     slit, so the only enclosed dark region is the pylon's sponsor window.
