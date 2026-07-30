@@ -189,6 +189,23 @@ GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
 # the command saturates at the 0.34 envelope top by vz ~= -0.8.
 VZ_DESCENT_FLOOR_M_S = -0.35  # sink-rate bound, mirroring the climb cap
 VZ_DESCENT_GOVERNOR_GAIN = 0.21  # collective per m/s below the floor
+# F78 vertical arrival arrest (20260730T082159Z-visual-course-7e18243d):
+# the gate-1 approach climbed at vz +0.65 THROUGH the opening — the
+# compensated error sat at ey ~-0.10 (gate just above center), the PD's
+# small P-term kept commanding climb, and the 0.5 m/s course governor
+# only caps the RATE, so the gate sank ey -0.10 -> +0.16/+0.27 before
+# censorship and the crossing went high.  The governor binds only at the
+# cap; what is missing is a STOPPING law: as the compensated error
+# approaches center the desired vertical velocity must approach zero.
+# While a climb is commanded (bounded_error < 0) and the IMU vz is
+# positive, allowed climb is proportional to the REMAINING error
+# (vz_allow = ARREST_VZ_PER_NORM * |ey|); any excess subtracts collective
+# continuously.  Descents (vz <= 0) and descend commands (ey >= 0) are
+# untouched — no blanket reduction, no sink; the descent floor below
+# still bounds any sag, and the F14 fh-untrusted latch (frozen vz) keeps
+# its no-vz-adjustment contract.
+VERTICAL_ARREST_VZ_PER_NORM = 1.0  # m/s allowed climb per norm of |ey|
+VERTICAL_ARREST_COLLECTIVE_GAIN = 0.15  # subtraction per m/s of excess
 
 # Launch boost is pure feedforward (it ignores ey).  Flight
 # 20260729T094736Z-visual-course-9d430a40: the 0.32 x 0.75 s boost alone
@@ -674,11 +691,15 @@ SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 # while the retained gate-1 successor sat LEFT (ex -0.43); every
 # detection died 0.4 s later and the leg pinned blind at the yaw cap
 # into the gate-1 structure (collision id 1002).  While authoritative
-# credit is still in flight the SEARCH holds the course heading — zero
-# yaw/roll, level pitch, governed altitude support — and note_race
-# re-acquires the retained successor evidence the moment the increment
-# lands.  Bounded: expiry without credit resumes the normal sweep (the
-# crossing was not authoritative).
+# credit is still in flight the SEARCH never runs the generic sweep, and
+# note_race re-acquires the retained successor evidence the moment the
+# increment lands.  F78 (20260730T082159Z-visual-course-7e18243d): the
+# neutral heading hold also DELAYED the turn — gate 1 sat visible at
+# x ~-0.51 the whole window — so a fresh/persistent/qualified successor
+# bearing now steers a bounded recentering inside the window (no roll,
+# no advance, no pre-credit adoption; absent/ambiguous evidence keeps
+# the neutral hold).  Bounded: expiry without credit resumes the normal
+# sweep (the crossing was not authoritative).
 PENDING_CREDIT_HOLD_S = 1.00  # post-one-zero heading-hold window
 # Real scan, not a wiggle (post-credit pursuit redesign): 0.12 rad/s with a
 # 1.2 s reversal made +-8 deg legs that could never reach gate 1's typical
@@ -973,6 +994,8 @@ class CleanCourseConfig:
     vertical_rate_gain: float = VERTICAL_RATE_GAIN
     vertical_max_abs_error_norm: float = VERTICAL_MAX_ABS_ERROR_NORM
     vertical_max_abs_rate_norm_s: float = VERTICAL_MAX_ABS_RATE_NORM_S
+    vertical_arrest_vz_per_norm: float = VERTICAL_ARREST_VZ_PER_NORM
+    vertical_arrest_collective_gain: float = VERTICAL_ARREST_COLLECTIVE_GAIN
     min_thrust: float = MIN_COURSE_THRUST
     max_thrust: float = MAX_COURSE_THRUST
     launch_boost_thrust: float = LAUNCH_BOOST_THRUST
@@ -1358,7 +1381,24 @@ class CleanCourseController:
             self._update_hypothesis(self.current, match, now_s)
             self.state = CleanCourseState.TRACK
         elif self.state is CleanCourseState.SEARCH or self.current is None:
-            adopted = self._select_search_reacquisition(tracks, now_s)
+            # F78 (20260730T082159Z-visual-course-7e18243d): while
+            # authoritative credit is still in flight the pending-credit
+            # SEARCH only RECENTERS on the successor bearing (see
+            # command()) — it never ADOPTS it as the aim, which would
+            # claim the next gate and start advancing before the credit
+            # that owns the leg.  (F77 escaped only circumstantially: the
+            # F74 near-plane newborn guard happened to cover the whole
+            # window.)  On credit note_race promotes the retained
+            # successor immediately; on expiry the normal pick resumes.
+            pending_credit = (
+                self._pending_credit_until_s is not None
+                and now_s < self._pending_credit_until_s
+            )
+            adopted = (
+                None
+                if pending_credit
+                else self._select_search_reacquisition(tracks, now_s)
+            )
             if adopted is not None:
                 self.current = self._hypothesis_from_track(adopted, now_s)
                 self.state = CleanCourseState.TRACK
@@ -1913,18 +1953,45 @@ class CleanCourseController:
             ):
                 # F76 pending-credit heading hold (see the
                 # PENDING_CREDIT_HOLD_S block): the authoritative packet is
-                # still in flight — zero yaw/roll, level pitch, governed
-                # altitude support.  NO generic sweep: F75 swept +0.15
+                # still in flight — level pitch, governed altitude support,
+                # NO generic sweep and NO forward advance: F75 swept +0.15
                 # away from the retained left-side successor and blinded
-                # the new leg within 0.4 s.
+                # the new leg within 0.4 s.  F78
+                # (20260730T082159Z-visual-course-7e18243d): the neutral
+                # hold also DELAYED the turn — gate 1 sat visible at
+                # x ~-0.51 for the whole window and steering only began at
+                # the delayed credit, handing the new leg a saturated
+                # constant-bearing pursuit it never centered.  While
+                # credit is in flight, a fresh/persistent/qualified
+                # successor's BEARING steers a bounded recentering (same
+                # gain and cap as the TRACK law, no roll, no advance, no
+                # promotion — authoritative ownership is unchanged);
+                # absent or ambiguous evidence keeps the neutral hold.
                 hold = support + margin
                 self._collective = hold
+                recenter_yaw = 0.0
+                successor = self.successor
+                if (
+                    successor is not None
+                    and successor.position_std <= cfg.promote_max_std_norm
+                    and now_s - successor.last_measurement_s
+                    <= cfg.promote_max_age_s
+                    and now_s - successor.last_x_measurement_s
+                    <= cfg.promote_max_age_s
+                    and self._track_age_s(successor.track_id, now_s)
+                    >= cfg.successor_min_age_s
+                ):
+                    recenter_yaw = _clamp(
+                        cfg.yaw_error_sign * cfg.yaw_error_gain * successor.x,
+                        -cfg.max_yaw_rate_rad_s,
+                        cfg.max_yaw_rate_rad_s,
+                    )
                 return NavigationOutput(
                     target_roll_rad=self._slew_roll(0.0, dt),
                     target_pitch_rad=self._slew_pitch(
                         cfg.spawn_pitch_rad + cfg.brake_pitch_rad, dt
                     ),
-                    yaw_rate_rad_s=0.0,
+                    yaw_rate_rad_s=recenter_yaw,
                     thrust=self._governed_collective(hold, support),
                     state=self.state,
                     gate_index=self.gate_index,
@@ -2131,6 +2198,20 @@ class CleanCourseController:
                 cfg.vertical_error_gain * bounded_error
                 + cfg.vertical_rate_gain * bounded_rate
             )
+            # F78 vertical arrival arrest (see the VERTICAL_ARREST_*
+            # block): a commanded climb near center may not carry speed
+            # INTO center — allowed climb scales with the remaining error,
+            # excess vz subtracts collective continuously.  Inactive on
+            # descents/descend commands and under the F14 latch.
+            if (
+                bounded_error < 0.0
+                and not self._fh_untrusted
+                and self._vz_est_m_s > 0.0
+            ):
+                vz_allow = cfg.vertical_arrest_vz_per_norm * (-bounded_error)
+                excess = self._vz_est_m_s - vz_allow
+                if excess > 0.0:
+                    collective -= cfg.vertical_arrest_collective_gain * excess
             self._collective = collective
         else:
             # F14: while fh-untrusted the camera is the only honest vertical

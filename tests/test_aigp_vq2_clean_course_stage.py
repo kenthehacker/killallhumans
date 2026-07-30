@@ -56,6 +56,7 @@ from scripts.aigp_vq2_clean_course_stage import (
     FH_UNTRUSTED_TRIGGER_MPS2,
     LAUNCH_BOOST_DURATION_S,
     LAUNCH_BOOST_THRUST,
+    MAX_COURSE_YAW_RATE_RAD_S,
     NEVER_MEASURED_S,
     PENDING_CREDIT_HOLD_S,
     ROTATION_COMP_FOCAL_NORM,
@@ -2237,11 +2238,15 @@ def test_pending_credit_hold_never_sweeps_before_delayed_credit():
     out = _command(controller, 100.14)  # the single wire-zero send (F72)
     assert out.thrust == 0.0
     # Pending-credit window (~0.33 s << PENDING_CREDIT_HOLD_S): heading
-    # held level, zero yaw/roll, governed altitude support — no sweep.
+    # held level, zero roll, governed altitude support — no sweep.  F78:
+    # the still-credible left successor may steer a BOUNDED leftward
+    # recentering (see test_pending_credit_recenters_toward_credible_
+    # successor), so the invariant here is only the F76 one: never yaw
+    # AWAY (positive) from the retained left-side successor.
     for tick in range(10):
         out = _command(controller, 100.18 + 0.033 * tick)
         assert controller.state is CleanCourseState.SEARCH
-        assert out.yaw_rate_rad_s == 0.0
+        assert out.yaw_rate_rad_s <= 0.0
         assert out.target_roll_rad == 0.0
         assert out.thrust > 0.0
     # Delayed credit inside the window: the retained left-side successor
@@ -2266,6 +2271,64 @@ def test_pending_credit_hold_never_sweeps_before_delayed_credit():
     assert out.yaw_rate_rad_s == 0.0
     out = _command(expiring, 100.18 + PENDING_CREDIT_HOLD_S + 1.0)
     assert out.yaw_rate_rad_s != 0.0
+
+
+def test_pending_credit_recenters_toward_credible_successor():
+    # F78 (20260730T082159Z-visual-course-7e18243d): the F76 neutral hold
+    # delayed the turn — gate 1 sat visible at x ~-0.51 under gate-0
+    # authority for the whole pending window, so the new leg inherited a
+    # saturated constant-bearing pursuit it never centered (crossed
+    # displaced, no credit).  While credit is in flight, a FRESH,
+    # persistent, qualified successor's bearing steers a bounded
+    # recentering: yaw left toward a left successor, at/below the 0.15
+    # command cap, with zero roll and no forward advance — and crucially
+    # WITHOUT promoting or changing authoritative gate ownership.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.observe(
+        _update(
+            [_track("A", 0.0, 0.0, scale=0.50), _track("B", -0.51, 0.05)],
+            frame_id=4,
+        ),
+        now_s=100.08,
+    )
+    controller._track_first_seen_s["B"] = 100.08 - 1.0  # persistent (F42)
+    controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.observe(_update([], frame_id=5), now_s=100.12)
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    out = _command(controller, 100.14)  # the single wire-zero send (F72)
+    assert out.thrust == 0.0
+    level_pitch = controller.config.spawn_pitch_rad + controller.config.brake_pitch_rad
+    for tick in range(6):
+        t = 100.18 + 0.05 * tick
+        # Fresh successor frames keep B credible through the window.
+        controller.observe(
+            _update([_track("B", -0.51, 0.05)], frame_id=6 + tick), now_s=t
+        )
+        out = _command(controller, t + 0.02)
+        assert controller.state is CleanCourseState.SEARCH
+        assert controller.gate_index == 0  # authoritative ownership intact
+        assert -MAX_COURSE_YAW_RATE_RAD_S <= out.yaw_rate_rad_s < 0.0
+        assert out.target_roll_rad == 0.0
+        # No forward advance before credit: the level/brake posture holds.
+        assert out.target_pitch_rad >= level_pitch - 1e-6
+        assert out.thrust > 0.0
+
+
+def test_pending_credit_holds_neutral_without_successor():
+    # F78: absent successor evidence the pending-credit window retains the
+    # F76 neutral heading hold (zero yaw/roll, governed support).
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.observe(_update([], frame_id=5), now_s=100.12)
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    out = _command(controller, 100.14)  # the single wire-zero send (F72)
+    assert out.thrust == 0.0
+    for tick in range(6):
+        out = _command(controller, 100.18 + 0.033 * tick)
+        assert controller.state is CleanCourseState.SEARCH
+        assert out.yaw_rate_rad_s == 0.0
+        assert out.target_roll_rad == 0.0
+        assert out.thrust > 0.0
 
 
 def test_authoritative_promotion_event_never_vetoed_by_vision():
@@ -2638,6 +2701,54 @@ def test_course_closure_excess_brakes_collective_below_support():
         gate0.current.last_y_measurement_s = now0
         out0 = _command(gate0, now0, pitch=SPAWN_PITCH)
     assert out0.thrust > SPAWN_SUPPORT - 0.03
+
+
+def _converged_gate_one_vertical(vz_m_s):
+    """Gate-1 TRACK controller, gate just above center, settled closure."""
+
+    controller = _tracked_controller(_track("A", 0.0, -0.10, scale=0.20))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 2.0  # honest altitude (floor quiet)
+    current = controller.current
+    current.x_axis.p = 0.0
+    current.raw_x = 0.0
+    current.y_axis.p = -0.10  # gate slightly ABOVE center -> climb demand
+    current.raw_y = -0.10
+    current.y_axis.v = 0.0
+    current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10  # settled closure (closure governor quiet)
+    now = 100.10
+    out = None
+    for _ in range(15):  # converge the slews/governors
+        now += 0.033
+        controller._vz_est_m_s = vz_m_s  # hold the IMU climb rate
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    return out
+
+
+def test_vertical_arrival_arrest_shaves_climb_before_center():
+    # F78 (20260730T082159Z-visual-course-7e18243d): the gate-1 approach
+    # climbed at vz +0.65 THROUGH the opening — ey sat ~-0.10 (gate just
+    # above center), the PD's small P-term kept the climb alive, and the
+    # 0.5 m/s course governor only caps the RATE, so the gate sank
+    # ey -0.10 -> +0.16/+0.27 before censorship and the crossing went
+    # high.  The arrest drives desired vz toward zero as the compensated
+    # error approaches center: allowed climb scales with |ey|.
+    climbing = _converged_gate_one_vertical(0.60)
+    settled = _converged_gate_one_vertical(0.0)
+    # A +0.6 m/s climb at |ey| 0.10 is arrested HARD (allowance 0.1 m/s):
+    # the subtraction dwarfs the F68 governor's 0.10*(0.6-0.5) = 0.01 —
+    # on the parent law the two outputs differ by only that governor
+    # term, so this margin proves the arrest changed the emitted command.
+    assert climbing.thrust < settled.thrust - 0.05
+    # Descending (or a descend command) is untouched: no blanket
+    # reduction, no manufactured sink.
+    sinking = _converged_gate_one_vertical(-0.30)
+    assert sinking.thrust == pytest.approx(settled.thrust, abs=1e-3)
 
 
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
