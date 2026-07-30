@@ -515,6 +515,16 @@ PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
 # outranks deceleration at the plane.
 BRAKE_RELAX_EY_NORM = 0.55  # measured ey that relaxes the brake to level
 BRAKE_RELAX_RESUME_EY_NORM = 0.45  # measured ey that resumes the brake
+# F65 near-plane extension (20260730T021149Z-visual-course-08f41050): AT
+# the plane the F51 guard never fired — F64's gate sat at ey +0.33..+0.43
+# (below the 0.55 fresh bound), censorship then froze measurement
+# freshness, and the -0.46 brake attitude pitched the gate out of the FOV
+# for the remaining ~7 s (blind wander into the floor/structure).  Inside
+# the commit proximity regime the relax runs on the derotated HYPOTHESIS
+# (the F52 best-evidence rationale), with a lower bound, and relaxes the
+# pitch target to LEVEL rather than the brake attitude.
+NEAR_BRAKE_RELAX_EY_NORM = 0.30  # hypothesis ey that relaxes to level
+NEAR_BRAKE_RELAX_RESUME_EY_NORM = 0.20  # hypothesis ey that resumes brake
 # Course-heading anchor (F31): after losing the gate-1 track the drone
 # search-swept and edge-chased its heading +2.63 rad off the course
 # bearing, then flew sideways/backwards at ~0.65g drag into structure it
@@ -953,6 +963,8 @@ class CleanCourseConfig:
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     brake_relax_ey_norm: float = BRAKE_RELAX_EY_NORM
     brake_relax_resume_ey_norm: float = BRAKE_RELAX_RESUME_EY_NORM
+    near_brake_relax_ey_norm: float = NEAR_BRAKE_RELAX_EY_NORM
+    near_brake_relax_resume_ey_norm: float = NEAR_BRAKE_RELAX_RESUME_EY_NORM
     brake_ceiling_band: float = BRAKE_CEILING_BAND
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_floor_trigger_m: float = ALT_FLOOR_TRIGGER_M
@@ -2151,16 +2163,37 @@ class CleanCourseController:
         # normal brake target resumes below the resume bound.  Hysteresis
         # holds the last state between the bounds and on stale
         # measurements; vision custody outranks deceleration at the plane.
-        if not pre_cross_brake:
+        # F65 (see the NEAR_BRAKE_RELAX_EY_NORM block): inside the commit
+        # proximity regime the relax runs on the derotated hypothesis (no
+        # freshness gate), with a lower bound, and relaxes to LEVEL — F64
+        # held the -0.46 brake with the gate at ey +0.43 and stayed blind
+        # for the rest of the flight.
+        commit_regime = current.log_scale >= cfg.commit_min_log_scale
+        if not pre_cross_brake and not commit_regime:
             self._brake_vision_relax = False
-        elif now_s - current.last_measurement_s <= CROSSING_MEAS_MAX_AGE_S:
-            if ey >= cfg.brake_relax_ey_norm:
+        elif (
+            now_s - current.last_measurement_s <= CROSSING_MEAS_MAX_AGE_S
+            or commit_regime
+        ):
+            relax_bound = (
+                cfg.near_brake_relax_ey_norm
+                if commit_regime
+                else cfg.brake_relax_ey_norm
+            )
+            resume_bound = (
+                cfg.near_brake_relax_resume_ey_norm
+                if commit_regime
+                else cfg.brake_relax_resume_ey_norm
+            )
+            if ey >= relax_bound:
                 self._brake_vision_relax = True
-            elif ey <= cfg.brake_relax_resume_ey_norm:
+            elif ey <= resume_bound:
                 self._brake_vision_relax = False
         if self._brake_vision_relax:
             target_pitch = max(
-                target_pitch, cfg.spawn_pitch_rad + cfg.brake_pitch_rad
+                target_pitch,
+                cfg.spawn_pitch_rad
+                + (0.0 if commit_regime else cfg.brake_pitch_rad),
             )
 
         return NavigationOutput(

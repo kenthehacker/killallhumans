@@ -1794,6 +1794,35 @@ def test_pre_cross_brake_relaxes_near_bottom_censor_with_hysteresis():
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
 
 
+def test_near_plane_brake_relaxes_on_the_stale_hypothesis():
+    # F65 (20260730T021149Z-visual-course-08f41050): AT the plane the F51
+    # guard never fired — the gate sat at ey +0.43 (below the 0.55 fresh
+    # bound) and censorship froze measurement freshness, so the -0.46
+    # pre-cross brake attitude pitched the gate out of the FOV; the drone
+    # wandered blind for ~7 s into the floor/structure.  Inside the commit
+    # proximity regime the relax runs on the STALE derotated hypothesis at
+    # the lower 0.30 bound and relaxes the pitch target to LEVEL.
+    controller = _tracked_controller(_track("A", 0.30, 0.43, scale=0.50))
+    controller.current.scale_axis.v = 0.7  # rapid expansion: full brake demand
+    now = 100.10
+    out = None
+    for _ in range(20):
+        now += 0.033
+        # Measurements stay STALE (frozen at construction) — the far-range
+        # freshness gate would never let the relax latch.
+        out = _command(controller, now)
+    assert controller._pre_cross_brake_active
+    assert controller._brake_vision_relax
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    # Below the 0.20 near-plane resume bound the brake target resumes.
+    controller.current.y_axis.p = 0.10
+    for _ in range(20):
+        now += 0.033
+        out = _command(controller, now)
+    assert not controller._brake_vision_relax
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
+
+
 def test_clipping_increases_uncertainty_but_does_not_abort():
     clipped = _tracked_controller(
         _track("A", 0.10, 0.0, clipping=FrameEdge.RIGHT)
