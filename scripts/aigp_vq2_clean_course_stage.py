@@ -1695,9 +1695,14 @@ class CleanCourseController:
                 # TRACK-style P gains to finish centering (F55 froze a
                 # ~0.22 norm entry offset and crossed beside the left post;
                 # ~0.25 s of uncensored measurements remained after entry).
-                # Once x is stale/censored, HOLD HEADING — the frozen
-                # bearing has no parallax term (F52's held steering on
-                # frozen ex over-rotated ~25 deg).  The vertical channel
+                # Once x is stale/censored, steer on the PREDICTED
+                # hypothesis at half gain (F62) — heading-hold commits the
+                # residual drift: F61's prediction tracked the real bearing
+                # (-0.02 -> -0.15 across the blackout) while heading-hold
+                # zeroed corrections and the drone clipped the left post.
+                # (F52's over-rotation was a frozen TRACK hold far from the
+                # plane; the COMMIT prediction is bounded by the 3.0 s
+                # timeout.)  The vertical channel
                 # keeps the F50 compensated-ey servo BOUNDED to a small band
                 # around support (a flat support hold repeats the F33/F34
                 # bottom-bar death vertically); the vz governor stays the
@@ -1712,33 +1717,33 @@ class CleanCourseController:
                     now_s - self.current.last_x_measurement_s
                     <= cfg.commit_meas_max_age_s
                 )
-                if commit_fresh_x:
-                    # F57: the near-plane boost applies here too — at
-                    # commit range the far-range gains limit-cycle against
-                    # parallax (see NEAR_PLANE_STEER_GAIN_MULT).
-                    commit_steer_gain = 1.0
-                    if self.current.log_scale >= cfg.commit_min_log_scale:
-                        commit_steer_gain = cfg.near_plane_steer_gain_mult
-                    commit_yaw = _clamp(
-                        cfg.yaw_error_sign
-                        * cfg.yaw_error_gain
-                        * commit_steer_gain
-                        * self.current.x,
-                        -cfg.max_yaw_rate_rad_s,
-                        cfg.max_yaw_rate_rad_s,
-                    )
-                    commit_yaw = self._anchor_clamped_yaw(commit_yaw, yaw_rad)
-                    commit_roll = _clamp(
-                        cfg.roll_error_sign
-                        * cfg.roll_error_gain
-                        * commit_steer_gain
-                        * self.current.x,
-                        -cfg.max_target_roll_rad,
-                        cfg.max_target_roll_rad,
-                    )
-                else:
-                    commit_yaw = 0.0
-                    commit_roll = 0.0
+                # F57: the near-plane boost applies here too — at
+                # commit range the far-range gains limit-cycle against
+                # parallax (see NEAR_PLANE_STEER_GAIN_MULT).  F62: stale x
+                # steers the prediction at HALF gain instead of holding
+                # heading.
+                commit_steer_gain = 1.0
+                if self.current.log_scale >= cfg.commit_min_log_scale:
+                    commit_steer_gain = cfg.near_plane_steer_gain_mult
+                if not commit_fresh_x:
+                    commit_steer_gain *= 0.5
+                commit_yaw = _clamp(
+                    cfg.yaw_error_sign
+                    * cfg.yaw_error_gain
+                    * commit_steer_gain
+                    * self.current.x,
+                    -cfg.max_yaw_rate_rad_s,
+                    cfg.max_yaw_rate_rad_s,
+                )
+                commit_yaw = self._anchor_clamped_yaw(commit_yaw, yaw_rad)
+                commit_roll = _clamp(
+                    cfg.roll_error_sign
+                    * cfg.roll_error_gain
+                    * commit_steer_gain
+                    * self.current.x,
+                    -cfg.max_target_roll_rad,
+                    cfg.max_target_roll_rad,
+                )
                 commit_correction = _clamp(
                     cfg.vertical_feedback_sign
                     * cfg.vertical_error_gain
@@ -1760,18 +1765,16 @@ class CleanCourseController:
                 self._collective = commit_hold
                 # F60: aim the drive AT the opening vertically — the pitch
                 # target carries the opening's depression angle (see
-                # COMMIT_AIM_MAX_PITCH_RAD).  Zero on stale y.
-                commit_aim = 0.0
-                if (
-                    now_s - self.current.last_y_measurement_s
-                    <= cfg.commit_meas_max_age_s
-                ):
-                    commit_aim = _clamp(
-                        self._compensated_ey(self.current.y, pitch_rad)
-                        / cfg.vertical_pitch_comp_norm_per_rad,
-                        0.0,
-                        cfg.commit_aim_max_pitch_rad,
-                    )
+                # COMMIT_AIM_MAX_PITCH_RAD).  F62: the term also runs on the
+                # predicted y through censorship — it is clamped >= 0, so it
+                # can only ever DIVE, never climb (the F58 frozen-bearing
+                # climb rule stays enforced on the collective below).
+                commit_aim = _clamp(
+                    self._compensated_ey(self.current.y, pitch_rad)
+                    / cfg.vertical_pitch_comp_norm_per_rad,
+                    0.0,
+                    cfg.commit_aim_max_pitch_rad,
+                )
                 return NavigationOutput(
                     target_roll_rad=self._slew_roll(commit_roll, dt),
                     # F55: the advance attitude must actually be reached —

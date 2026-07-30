@@ -2453,8 +2453,11 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     assert out.target_pitch_rad == pytest.approx(
         SPAWN_PITCH + 0.15 + 0.05 / 1.6, abs=1e-9
     )
-    # Once x goes STALE/censored the commit holds heading (the frozen
-    # bearing has no parallax term — F52): yaw zero, bank slewing to level.
+    # F62: once x goes STALE/censored the commit steers the PREDICTED
+    # hypothesis at HALF gain — heading-hold committed the residual drift
+    # and F61 clipped the left post; the prediction tracked the real
+    # bearing through the blackout.  ex=+0.10 -> yaw 0.5*0.90*0.10 = 0.045,
+    # roll 0.5*0.50*0.10 = 0.025 (boost off at this log scale).
     controller.current.x_axis.p = 0.10
     for _ in range(18):
         now += 0.033
@@ -2462,8 +2465,8 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.COMMIT
-    assert out.yaw_rate_rad_s == 0.0
-    assert out.target_roll_rad == pytest.approx(0.0, abs=1e-9)
+    assert out.yaw_rate_rad_s == pytest.approx(0.045, abs=1e-9)
+    assert out.target_roll_rad == pytest.approx(0.025, abs=1e-9)
 
 
 def test_commit_stale_y_never_climbs_on_a_frozen_bearing():
