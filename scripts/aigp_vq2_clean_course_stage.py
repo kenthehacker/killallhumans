@@ -203,7 +203,9 @@ VZ_DESCENT_GOVERNOR_GAIN = 0.21  # collective per m/s below the floor
 # continuously.  Descents (vz <= 0) and descend commands (ey >= 0) are
 # untouched — no blanket reduction, no sink; the descent floor below
 # still bounds any sag, and the F14 fh-untrusted latch (frozen vz) keeps
-# its no-vz-adjustment contract.
+# its no-vz-adjustment contract.  F78b: gate-1+ legs only — on gate 0 it
+# arrested the proved climb-out and armed the pre-gate-1 altitude floor
+# (20260730T085104Z-visual-course-34b59dea).
 VERTICAL_ARREST_VZ_PER_NORM = 1.0  # m/s allowed climb per norm of |ey|
 VERTICAL_ARREST_COLLECTIVE_GAIN = 0.15  # subtraction per m/s of excess
 
@@ -1377,7 +1379,17 @@ class CleanCourseController:
             self._refresh_successor(tracks, now_s)
             return
 
-        if match is not None:
+        # F78b: the pending-credit window is an authority overlay, not just
+        # a SEARCH-command posture — the same-track match path must not
+        # flip back to TRACK (and start advancing) before the credit that
+        # owns the leg, any more than the re-acquisition pick may (F78).
+        pending_credit = (
+            self._pending_credit_until_s is not None
+            and now_s < self._pending_credit_until_s
+        )
+        if match is not None and not (
+            self.state is CleanCourseState.SEARCH and pending_credit
+        ):
             self._update_hypothesis(self.current, match, now_s)
             self.state = CleanCourseState.TRACK
         elif self.state is CleanCourseState.SEARCH or self.current is None:
@@ -1390,10 +1402,6 @@ class CleanCourseController:
             # F74 near-plane newborn guard happened to cover the whole
             # window.)  On credit note_race promotes the retained
             # successor immediately; on expiry the normal pick resumes.
-            pending_credit = (
-                self._pending_credit_until_s is not None
-                and now_s < self._pending_credit_until_s
-            )
             adopted = (
                 None
                 if pending_credit
@@ -2203,8 +2211,16 @@ class CleanCourseController:
             # INTO center — allowed climb scales with the remaining error,
             # excess vz subtracts collective continuously.  Inactive on
             # descents/descend commands and under the F14 latch.
+            # F78b (20260730T085104Z-visual-course-34b59dea): GATE-1+
+            # ONLY.  Applied globally it arrested the PROVED gate-0
+            # climb-out (thrust 0.21 at t=0.43), the drone crossed low
+            # and sank to alt -0.57, the <0.7 m pre-gate-1 altitude floor
+            # latched, and its max() (applied after the vz-governor
+            # subtraction) pinned support+0.05 for the whole leg — a +1.9
+            # m/s, +1.4 m balloon that overrode governor and arrest alike.
             if (
-                bounded_error < 0.0
+                self.gate_index >= 1
+                and bounded_error < 0.0
                 and not self._fh_untrusted
                 and self._vz_est_m_s > 0.0
             ):

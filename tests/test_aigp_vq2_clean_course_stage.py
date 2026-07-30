@@ -2331,6 +2331,33 @@ def test_pending_credit_holds_neutral_without_successor():
         assert out.thrust > 0.0
 
 
+def test_pending_credit_match_reappearance_never_resumes_track():
+    # F78b: the pending-credit no-advance law is an authority overlay,
+    # not a SEARCH-command posture — the pre-credit gate's own track id
+    # reappearing in a fresh frame must NOT flip SEARCH back to TRACK
+    # through the same-track match path and start advancing before the
+    # authoritative credit that owns the leg.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.observe(_update([], frame_id=5), now_s=100.12)
+    out = _command(controller, 100.14)  # the single wire-zero send (F72)
+    assert out.thrust == 0.0
+    out = _command(controller, 100.17)  # coast exit -> pending SEARCH
+    assert controller.state is CleanCourseState.SEARCH
+    # Gate 0's track id reappears inside the pending window.
+    controller.observe(
+        _update([_track("A", 0.0, 0.0, scale=0.50)], frame_id=6), now_s=100.20
+    )
+    assert controller.state is CleanCourseState.SEARCH
+    assert controller.gate_index == 0
+    # After the window expires without credit the normal match resumes.
+    controller.observe(
+        _update([_track("A", 0.0, 0.0, scale=0.50)], frame_id=7),
+        now_s=100.14 + PENDING_CREDIT_HOLD_S + 0.5,
+    )
+    assert controller.state is CleanCourseState.TRACK
+
+
 def test_authoritative_promotion_event_never_vetoed_by_vision():
     controller = _tracked_controller(_track("A", 0.10, 0.0))
     controller.observe(
@@ -2749,6 +2776,28 @@ def test_vertical_arrival_arrest_shaves_climb_before_center():
     # reduction, no manufactured sink.
     sinking = _converged_gate_one_vertical(-0.30)
     assert sinking.thrust == pytest.approx(settled.thrust, abs=1e-3)
+    # F78b (20260730T085104Z-visual-course-34b59dea): gate 0 keeps its
+    # PROVED climb-out — the same state at gate 0 must emit the plain PD
+    # output (the global F78 arrest dropped it to 0.21 at t=0.43, sank
+    # the leg to alt -0.57, and latched the pre-gate-1 altitude floor
+    # whose max() pinned support+0.05 over governor and arrest alike).
+    gate0 = _tracked_controller(_track("A", 0.0, -0.10, scale=0.20))
+    gate0._alt_est_m = 2.0
+    current = gate0.current
+    current.y_axis.p = -0.10
+    current.raw_y = -0.10
+    current.y_axis.v = 0.0
+    current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10
+    now = 100.10
+    for _ in range(15):
+        now += 0.033
+        gate0._vz_est_m_s = 0.60
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out0 = _command(gate0, now, pitch=SPAWN_PITCH)
+    assert out0.thrust == pytest.approx(settled.thrust, abs=1e-3)
 
 
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
