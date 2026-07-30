@@ -458,6 +458,13 @@ COMMIT_ENTRY_MAX_EXPANSION_RATE_S = 0.35  # <= closure governor target
 # vertical energy on EVERY gate, so entry refuses |vz| above this bound
 # and TRACK keeps holding/re-centering outside censorship until it dies.
 COMMIT_ENTRY_MAX_VZ_M_S = 0.25
+# Every pitch target stays clear of the runner's MIN_PITCH_RAD (-35 deg)
+# watchdog.  F84 (20260730T121408Z-visual-course-533d563c): the F80 course
+# brake target (spawn -0.31 + course brake -0.30 = -0.61 rad) sat 0.001 rad
+# INSIDE the abort, and the sustained gate-1 misalignment brake slewed
+# straight into it ("pitch limit exceeded (-35.0deg)") after a credited
+# gate-0 crossing.  -33 deg keeps 2 deg of settling margin.
+PITCH_TARGET_MIN_RAD = math.radians(-33.0)
 # TRACK-phase lateral trim (2026-07-30): the gate-1 off-axis pursuit is a
 # P-loop orbiting the gate — it equilibrates at ex ~-0.08 EVERY flight
 # (yaw holds the bearing constant against translation parallax; the F57
@@ -1065,6 +1072,7 @@ class CleanCourseConfig:
     commit_entry_aperture_margin_frac: float = COMMIT_ENTRY_APERTURE_MARGIN_FRAC
     commit_entry_max_expansion_rate_s: float = COMMIT_ENTRY_MAX_EXPANSION_RATE_S
     commit_entry_max_vz_m_s: float = COMMIT_ENTRY_MAX_VZ_M_S
+    pitch_target_min_rad: float = PITCH_TARGET_MIN_RAD
     ex_trim_gain: float = EX_TRIM_GAIN
     ex_trim_max_norm: float = EX_TRIM_MAX_NORM
     ex_trim_active_ex_norm: float = EX_TRIM_ACTIVE_EX_NORM
@@ -3226,6 +3234,10 @@ class CleanCourseController:
         # Optional per-call slew rate: the closure-governor braking regime
         # uses a dedicated faster slew so the brake attitude is actually
         # attained (F12); everything else keeps the transparent target slew.
+        # F84: every target stays clear of the runner's -35 deg pitch
+        # watchdog (see PITCH_TARGET_MIN_RAD) — one clamp here covers all
+        # four call sites (advance, brake, commit-advance, fallback).
+        target = max(target, self.config.pitch_target_min_rad)
         limit = (
             slew_rad_s
             if slew_rad_s is not None

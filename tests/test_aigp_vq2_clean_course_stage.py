@@ -1454,6 +1454,10 @@ def test_course_leg_brake_doubles_authority():
     # Course legs (gate_index >= 1) get twice the brake offset (-0.30 from
     # spawn, effective -0.61); gate 0 keeps the proved -0.15 (asserted by
     # the governor tests above).
+    # F84 (20260730T121408Z-visual-course-533d563c): -0.61 rad sat 0.001 rad
+    # inside the runner's -35 deg pitch watchdog and the sustained brake
+    # slewed into the abort.  Every pitch target is now clamped at
+    # PITCH_TARGET_MIN_RAD (-33 deg), which keeps ~89% of the F80 offset.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     _promote_to_gate_one(controller)
     # F79 geometry: ex pinned far off-axis the whole leg (refreshed each
@@ -1469,11 +1473,16 @@ def test_course_leg_brake_doubles_authority():
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
-    assert out.target_pitch_rad == pytest.approx(
+    # The raw F80 target exceeds the clamp; the emitted target sits AT the
+    # floor, clear of the runner's MIN_PITCH_RAD (-35 deg) abort.
+    assert (
         controller.config.spawn_pitch_rad
-        + controller.config.course_pre_cross_brake_pitch_rad,
-        abs=1e-9,
+        + controller.config.course_pre_cross_brake_pitch_rad
+    ) < controller.config.pitch_target_min_rad
+    assert out.target_pitch_rad == pytest.approx(
+        controller.config.pitch_target_min_rad, abs=1e-9
     )
+    assert controller.config.pitch_target_min_rad > math.radians(-35.0)
     assert out.yaw_rate_rad_s == pytest.approx(-0.15, abs=1e-9)  # pursuit alive
 
 
@@ -1937,11 +1946,10 @@ def test_course_leg_near_plane_relax_engages_earlier_and_sticks():
         now += 0.033
         out = _command(controller, now)
     assert not controller._brake_vision_relax
-    # F80: the resumed course-leg brake uses the doubled -0.30 offset.
+    # F80: the resumed course-leg brake uses the doubled -0.30 offset,
+    # emitted at the F84 floor (-33 deg, clear of the -35 deg watchdog).
     assert out.target_pitch_rad == pytest.approx(
-        controller.config.spawn_pitch_rad
-        + controller.config.course_pre_cross_brake_pitch_rad,
-        abs=1e-9,
+        controller.config.pitch_target_min_rad, abs=1e-9
     )
     # Gate 0 keeps the F65 bounds: ey 0.22 does NOT relax there.
     gate0 = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
@@ -2733,11 +2741,14 @@ def test_early_arrest_brakes_before_censorship_without_self_blinding():
     assert early.state is CleanCourseState.TRACK  # COMMIT never arms
     assert early._pre_cross_brake_active
     assert not early._brake_vision_relax  # arrest outranks custody here
-    # F80: the course-leg arrest uses the doubled -0.30 brake offset.
-    assert out.target_pitch_rad == pytest.approx(
+    # F80: the course-leg arrest uses the doubled -0.30 brake offset —
+    # emitted at the F84 floor (-33 deg), clear of the -35 deg watchdog.
+    assert (
         early.config.spawn_pitch_rad
-        + early.config.course_pre_cross_brake_pitch_rad,
-        abs=1e-9,
+        + early.config.course_pre_cross_brake_pitch_rad
+    ) < early.config.pitch_target_min_rad
+    assert out.target_pitch_rad == pytest.approx(
+        early.config.pitch_target_min_rad, abs=1e-9
     )
     # Phase B (same leg at the -0.9 censorship onset, still hot): the
     # arrest no longer suppresses the F51/F65 relax — near-plane vision
