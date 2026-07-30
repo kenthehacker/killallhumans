@@ -597,6 +597,17 @@ UNMEASURED_X_FORCE_SEARCH_S = 0.75
 # were themselves VRS generators).
 CLOSURE_TARGET_RATE_S = 0.35  # log-scale rate the governor holds (TTC ~3 s)
 CLOSURE_FULL_BRAKE_RATE_S = 0.60  # rate at which the full brake pitch applies
+# F101 (20260730T173407Z-visual-course-7a862549): a range-flat 0.35
+# target permits 3+ m/s at leg start (0.35 log/s at 8-10 m), more than
+# custody-compatible attitude braking (~0.4-0.7 m/s^2, capped by the F94
+# floor near the plane) can dissipate inside the leg — F100's gate-1 leg
+# held pb=1 mid-leg and still ran away to ~1.2 log/s at the plane
+# (COMMIT veto, blind structure strike).  The target ramps from a low
+# far value (an implicit constant-speed cap while the full gate is
+# visible and custody is free) up to the unchanged 0.35 entry budget at
+# the commit regime.
+CLOSURE_FAR_TARGET_RATE_S = 0.15  # far-range closure target (~1.2 m/s at 8 m)
+CLOSURE_FAR_LOG_SCALE = -2.0  # ramp start; 0.35 target at commit_min_log_scale
 # F96: the F77 closure-excess collective brake (COURSE_CLOSURE_BRAKE_COLLECTIVE)
 # is deleted with its call site — under the unified vz-tracking law a
 # sub-support cut is immediately restored by the tracker (a masked no-op)
@@ -1148,6 +1159,8 @@ class CleanCourseConfig:
     x_steer_max_age_s: float = X_STEER_MAX_AGE_S
     closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
     closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
+    closure_far_target_rate_s: float = CLOSURE_FAR_TARGET_RATE_S
+    closure_far_log_scale: float = CLOSURE_FAR_LOG_SCALE
     closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
     outer_expansion_tau_s: float = OUTER_EXPANSION_TAU_S
     outer_expansion_max_age_s: float = OUTER_EXPANSION_MAX_AGE_S
@@ -2241,9 +2254,30 @@ class CleanCourseController:
             if current.outer_log_scale >= cfg.closure_min_log_scale
             else 0.0
         )
+        # F101 approach-energy profile (20260730T173407Z-...-7a862549):
+        # F100's gate-1 leg braked mid-leg (pb=1, pitch to -0.57) yet the
+        # closure held 0.43 log/s and then RAN AWAY to ~1.2 log/s at the
+        # plane once the F94 custody floor capped the brake attitude —
+        # attitude braking authority (~0.4-0.7 m/s^2, custody-limited to
+        # less near the plane) cannot kill 2.5-3.5 m/s inside the leg
+        # remainder, so the COMMIT expansion budget vetoed and the blind
+        # drone hit the gate-1 structure.  A constant 0.35 log/s target
+        # only bounds speed NEAR the plane; far out it permits 3+ m/s.
+        # The target now RAMPS with range: a low far target
+        # (constant-speed cap in log terms) bleeding energy while the
+        # full gate is visible and custody is free, rising to the
+        # unchanged 0.35 entry budget at the commit regime.  Same law on
+        # every leg — gate-0 entry energy is what the next leg inherits.
+        target_frac = _clamp01(
+            (current.outer_log_scale - cfg.closure_far_log_scale)
+            / (cfg.commit_min_log_scale - cfg.closure_far_log_scale)
+        )
+        closure_target = cfg.closure_far_target_rate_s + (
+            cfg.closure_target_rate_s - cfg.closure_far_target_rate_s
+        ) * target_frac
         closure_brake = _clamp01(
-            (closure_rate - cfg.closure_target_rate_s)
-            / (cfg.closure_full_brake_rate_s - cfg.closure_target_rate_s)
+            (closure_rate - closure_target)
+            / (cfg.closure_full_brake_rate_s - closure_target)
         )
         # Misalignment brake (F35, d25f23fe): a fully misaligned gate only
         # suppressed ADVANCE, leaving the pitch law at brake_pitch (near

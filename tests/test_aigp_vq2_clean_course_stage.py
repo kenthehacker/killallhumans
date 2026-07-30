@@ -1286,11 +1286,17 @@ def test_closure_governor_distrusts_tiny_track_expansion():
 
 
 def test_closure_governor_is_a_continuous_blend():
-    # Mid-band rate (0.475/s -> closure 0.5): the pitch target blends
-    # halfway from the advance law (spawn base) toward the spawn-0.15
-    # pre-cross brake attitude, without latching the fast-slew brake flag.
-    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
-    controller.current.scale_axis.v = 0.475
+    # Mid-band closure: the pitch target blends partway from the advance
+    # law (spawn base) toward the spawn-0.15 pre-cross brake attitude,
+    # without latching the fast-slew brake flag.
+    # F101: at log -1.40 the range-ramped target is 0.25 (halfway down
+    # the -2.0 -> -0.8 ramp), so 0.375/s sits mid-band.  (The commit
+    # regime itself levels a centered gate via the F94 custody floor —
+    # no blend is observable there.)
+    controller = _tracked_controller(
+        _track("A", 0.0, 0.0, scale=math.exp(-1.40))
+    )
+    controller.current.scale_axis.v = 0.375
     now = 100.10
     out = None
     for _ in range(25):  # generic slew converges to the blended target
@@ -2831,6 +2837,36 @@ def test_steady_track_keeps_raw_closure_calm():
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert abs(controller.current.outer_expansion_rate) < 0.05
     assert not controller._pre_cross_brake_active
+
+
+def test_closure_governor_demands_energy_reduction_early():
+    # F101 (20260730T173407Z-visual-course-7a862549): the flat 0.35 log/s
+    # target permits 3+ m/s at leg start (0.35 log/s at 8-10 m) — more
+    # than custody-compatible attitude braking can kill inside the leg.
+    # F100's gate-1 leg held pb=1 mid-leg and still ran away to ~1.2
+    # log/s at the plane (COMMIT expansion veto, blind structure strike).
+    # The target now ramps down with range: at the F100 mid-leg state
+    # (outer log -1.90, closure 0.43) the ramped target is 0.17, the
+    # governor LATCHES the brake (parent: flat 0.35 -> brake 0.32,
+    # pitch -0.386, no latch) and the pitch sits ~0.09 rad deeper.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.15))
+    controller._alt_est_m = 2.0
+    _promote_to_gate_one(controller)
+    now = 100.14
+    controller.observe(
+        _update([_track("B", 0.0, 0.0, scale=0.15)], frame_id=10),
+        now_s=now,
+    )
+    out = None
+    for _ in range(15):  # converge the slew on the blended target
+        now += 0.033
+        current = controller.current
+        current.scale_axis.v = 0.0  # settled filtered rate
+        current.outer_expansion_rate = 0.43  # F100 mid-leg closure
+        current.last_measurement_s = now  # raw signal fresh
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller._pre_cross_brake_active
+    assert out.target_pitch_rad < -0.44  # parent: -0.386, no latch
 
 
 def test_blind_hold_tracks_zero_vz_when_fh_trusted():
