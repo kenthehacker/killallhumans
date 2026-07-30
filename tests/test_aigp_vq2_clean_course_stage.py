@@ -2211,11 +2211,12 @@ def test_commit_fresh_steering_carries_the_near_plane_boost():
     boosted.current.scale_axis.p = math.log(0.35)  # log_scale -1.05 >= -1.2
     out, _ = _drive_commit_window(boosted, 100.10)
     assert boosted.state is CleanCourseState.COMMIT
-    assert out.yaw_rate_rad_s == pytest.approx(0.225, abs=1e-9)  # 0.9*2.5*0.10
+    # F63: the gains act on the biased error (0.10 - 0.08 = 0.02).
+    assert out.yaw_rate_rad_s == pytest.approx(0.045, abs=1e-9)  # 0.9*2.5*0.02
     plain = _commit_controller()  # scale_axis log ~-3.0: far-range gains
     out, _ = _drive_commit_window(plain, 100.10)
     assert plain.state is CleanCourseState.COMMIT
-    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)  # 0.9*0.10
+    assert out.yaw_rate_rad_s == pytest.approx(0.018, abs=1e-9)  # 0.9*0.02
 
 
 def _commit_controller(now_s=100.10):
@@ -2258,8 +2259,9 @@ def test_commit_entry_fires_sustained_aligned_near_plane():
     out, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
     assert out.state is CleanCourseState.COMMIT
-    # F56: COMMIT steers while x is fresh (yaw 0.90 on ex=+0.10).
-    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
+    # F56: COMMIT steers while x is fresh (yaw 0.90 on ex=+0.10).  F63:
+    # against the right-side aim bias (0.08): 0.90 * (0.10 - 0.08) = 0.018.
+    assert out.yaw_rate_rad_s == pytest.approx(0.018, abs=1e-9)
 
 
 def test_commit_entry_requires_a_quiet_bearing():
@@ -2411,10 +2413,11 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     # F56: while x is FRESH the commit steers with the TRACK P gains on
-    # the derotated hypothesis (yaw 0.90, roll 0.50 on ex=+0.10) — the
-    # entry offset is finished, not frozen (F55 crossed beside the post).
-    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
-    assert out.target_roll_rad == pytest.approx(0.05, abs=1e-9)
+    # the derotated hypothesis (yaw 0.90, roll 0.50) — the entry offset
+    # is finished, not frozen (F55 crossed beside the post).  F63: the
+    # gains act on the RIGHT-BIASED error (ex=+0.10 - 0.08 bias = 0.02).
+    assert out.yaw_rate_rad_s == pytest.approx(0.018, abs=1e-9)
+    assert out.target_roll_rad == pytest.approx(0.010, abs=1e-9)
     # F58: the real 0.15 rad advance drive, not the coast's 0.05 nudge.
     # F60: plus the vertical-aim term (ey_comp 0.05 / 1.6 comp norm) while
     # y is fresh — the drive points AT the opening, not just forward.
@@ -2453,11 +2456,13 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     assert out.target_pitch_rad == pytest.approx(
         SPAWN_PITCH + 0.15 + 0.05 / 1.6, abs=1e-9
     )
-    # F62: once x goes STALE/censored the commit steers the PREDICTED
-    # hypothesis at HALF gain — heading-hold committed the residual drift
-    # and F61 clipped the left post; the prediction tracked the real
-    # bearing through the blackout.  ex=+0.10 -> yaw 0.5*0.90*0.10 = 0.045,
-    # roll 0.5*0.50*0.10 = 0.025 (boost off at this log scale).
+    # F62/F63: once x goes STALE/censored the commit steers the PREDICTED
+    # hypothesis at FULL gain — heading-hold committed the residual drift
+    # (F61 clipped the left post) and F62's half-gain derate
+    # under-corrected (crossed -0.22 left); the prediction tracked the
+    # real bearing through the blackout.  ex=+0.10, biased error 0.02 ->
+    # yaw 0.90*0.02 = 0.018, roll 0.50*0.02 = 0.010 (boost off at this
+    # log scale).
     controller.current.x_axis.p = 0.10
     for _ in range(18):
         now += 0.033
@@ -2465,8 +2470,8 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.COMMIT
-    assert out.yaw_rate_rad_s == pytest.approx(0.045, abs=1e-9)
-    assert out.target_roll_rad == pytest.approx(0.025, abs=1e-9)
+    assert out.yaw_rate_rad_s == pytest.approx(0.018, abs=1e-9)
+    assert out.target_roll_rad == pytest.approx(0.010, abs=1e-9)
 
 
 def test_commit_stale_y_never_climbs_on_a_frozen_bearing():

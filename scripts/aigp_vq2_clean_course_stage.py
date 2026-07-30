@@ -395,6 +395,13 @@ COMMIT_AIM_MAX_PITCH_RAD = 0.20  # cap on the vertical-aim pitch term
 # stays under this bound (norm/s), so the blind finish starts aligned AND
 # translationally settled.
 COMMIT_ENTRY_MAX_EX_RATE_NORM_S = 0.20  # max |bearing rate| at commit entry
+# F62 (20260730T013923Z-visual-course-f941e3d1 + F59/F60/F61 traces):
+# every COMMIT crosses LEFT of the aim by a repeatable offset — entry ex
+# equilibrates at ~-0.08 all four flights and the crossing lands another
+# ~-0.1..-0.2 further left.  Steer the commit at a fixed RIGHT-side bias
+# instead of the image center (camera/parallax geometry at the plane is
+# not the body center); the bias is sized to the measured entry offset.
+COMMIT_EX_BIAS_NORM = 0.08  # steer the commit aim this far right of center
 COMMIT_TIMEOUT_S = 3.0  # no credit this long -> arrest and search
 # F56 (20260730T001902Z-visual-course-efb189d4 + f55/ debug frames): F55's
 # COMMIT ran cleanly but crossed BESIDE gate 1's left post — the nose was
@@ -926,6 +933,7 @@ class CleanCourseConfig:
     commit_advance_pitch_rad: float = COMMIT_ADVANCE_PITCH_RAD
     commit_aim_max_pitch_rad: float = COMMIT_AIM_MAX_PITCH_RAD
     commit_entry_max_ex_rate_norm_s: float = COMMIT_ENTRY_MAX_EX_RATE_NORM_S
+    commit_ex_bias_norm: float = COMMIT_EX_BIAS_NORM
     commit_corridor_half_span_frac: float = COMMIT_CORRIDOR_HALF_SPAN_FRAC
     commit_corridor_min_ex_norm: float = COMMIT_CORRIDOR_MIN_EX_NORM
     near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
@@ -1713,25 +1721,26 @@ class CleanCourseController:
                 # closure governor, expansion factor, x-staleness zeroing
                 # (F52-A), brake-relax.  The engulfing anchor is never
                 # consulted for steering.
-                commit_fresh_x = (
-                    now_s - self.current.last_x_measurement_s
-                    <= cfg.commit_meas_max_age_s
-                )
                 # F57: the near-plane boost applies here too — at
                 # commit range the far-range gains limit-cycle against
-                # parallax (see NEAR_PLANE_STEER_GAIN_MULT).  F62: stale x
-                # steers the prediction at HALF gain instead of holding
-                # heading.
+                # parallax (see NEAR_PLANE_STEER_GAIN_MULT).  F62/F63: stale
+                # x steers the prediction at FULL gain — F61/F62 proved the
+                # prediction tracks the real bearing through the blackout,
+                # and the F62 half-gain derate under-corrected (crossed
+                # -0.22 norm left at the plane).
                 commit_steer_gain = 1.0
                 if self.current.log_scale >= cfg.commit_min_log_scale:
                     commit_steer_gain = cfg.near_plane_steer_gain_mult
-                if not commit_fresh_x:
-                    commit_steer_gain *= 0.5
+                # F63: steer at a fixed right-side bias (see
+                # COMMIT_EX_BIAS_NORM) — the camera-aimed center is not the
+                # body center at the plane, and all four crossings missed
+                # LEFT by a repeatable offset.
+                commit_ex = self.current.x - cfg.commit_ex_bias_norm
                 commit_yaw = _clamp(
                     cfg.yaw_error_sign
                     * cfg.yaw_error_gain
                     * commit_steer_gain
-                    * self.current.x,
+                    * commit_ex,
                     -cfg.max_yaw_rate_rad_s,
                     cfg.max_yaw_rate_rad_s,
                 )
@@ -1740,7 +1749,7 @@ class CleanCourseController:
                     cfg.roll_error_sign
                     * cfg.roll_error_gain
                     * commit_steer_gain
-                    * self.current.x,
+                    * commit_ex,
                     -cfg.max_target_roll_rad,
                     cfg.max_target_roll_rad,
                 )
