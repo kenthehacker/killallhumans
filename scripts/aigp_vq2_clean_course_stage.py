@@ -655,6 +655,17 @@ VERTICAL_PITCH_COMP_NORM_PER_RAD = 1.6  # image-norm vertical shift per rad
 # re-acquisition.
 SEARCH_VERTICAL_MEMORY_BAND = 0.05  # collective band around support
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
+# F76 (20260730T074122Z-visual-course-3a505ef5): after the one-zero send
+# the pending-credit SEARCH ran the generic yaw sweep — +0.15 (right)
+# while the retained gate-1 successor sat LEFT (ex -0.43); every
+# detection died 0.4 s later and the leg pinned blind at the yaw cap
+# into the gate-1 structure (collision id 1002).  While authoritative
+# credit is still in flight the SEARCH holds the course heading — zero
+# yaw/roll, level pitch, governed altitude support — and note_race
+# re-acquires the retained successor evidence the moment the increment
+# lands.  Bounded: expiry without credit resumes the normal sweep (the
+# crossing was not authoritative).
+PENDING_CREDIT_HOLD_S = 1.00  # post-one-zero heading-hold window
 # Real scan, not a wiggle (post-credit pursuit redesign): 0.12 rad/s with a
 # 1.2 s reversal made +-8 deg legs that could never reach gate 1's typical
 # ~26-35 deg handoff bearing, and the reversal actively undid turn progress
@@ -1028,6 +1039,7 @@ class CleanCourseConfig:
     search_max_excursion_rad: float = SEARCH_MAX_EXCURSION_RAD
     search_sweep_rate_rad_s: float = SEARCH_SWEEP_RATE_RAD_S
     search_sweep_gain: float = SEARCH_SWEEP_GAIN
+    pending_credit_hold_s: float = PENDING_CREDIT_HOLD_S
     successor_blend_max: float = SUCCESSOR_BLEND_MAX
     blend_far_log_scale: float = BLEND_FAR_LOG_SCALE
     blend_near_log_scale: float = BLEND_NEAR_LOG_SCALE
@@ -1102,6 +1114,10 @@ class CleanCourseController:
         self._coast_zero_sent = False
         self._coast_race_boot_ms: Optional[int] = None
         self._last_race_boot_ms: Optional[int] = None
+        # F76: bounded post-one-zero heading-hold window (see
+        # PENDING_CREDIT_HOLD_S); set at the coast exit, cleared on any
+        # authoritative promotion.
+        self._pending_credit_until_s: Optional[float] = None
         self._search_direction = 1.0
         self._search_elapsed_s = 0.0
         self._search_excursion_rad = 0.0
@@ -1456,6 +1472,9 @@ class CleanCourseController:
         self._ex_trim = 0.0
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             self._exit_coast()
+        # F76: an authoritative increment settles the pending-credit hold.
+        pending_credit = self._pending_credit_until_s is not None
+        self._pending_credit_until_s = None
 
         successor = self.successor
         credible = (
@@ -1476,6 +1495,25 @@ class CleanCourseController:
             >= self.config.successor_min_age_s
         )
         if credible:
+            self.current = successor
+            self.successor = None
+            self.state = CleanCourseState.TRACK
+            self._set_reliable_bearing(self.current.x, self.current.y)
+        elif (
+            pending_credit
+            and successor is not None
+            and now_s - successor.last_x_measurement_s
+            <= ENGULFING_ANCHOR_MAX_AGE_S + self.config.pending_credit_hold_s
+            and self._track_age_s(successor.track_id, now_s)
+            >= self.config.successor_min_age_s
+        ):
+            # F76: delayed credit after a pending-credit hold.  The coast
+            # crossing swallowed fresh measurements, so the retained
+            # successor is stale by construction — but it is the only real
+            # bearing evidence on the new leg, and the F75 sweep away from
+            # it blinded the leg within 0.4 s.  Re-acquire it directly
+            # (persistence still required: newborn debris never qualifies)
+            # and let the normal TRACK law re-center on it.
             self.current = successor
             self.successor = None
             self.state = CleanCourseState.TRACK
@@ -1567,7 +1605,14 @@ class CleanCourseController:
                 # multi-tick ballistic drop.  Credit remains acceptable in
                 # EVERY state, so after the single zero the wait continues
                 # as a normal SEARCH.
+                # F76: ...but while the authoritative packet is still in
+                # flight the search HOLDS the course heading (bounded) —
+                # the generic sweep yawed away from the retained successor
+                # and blinded the new leg (see PENDING_CREDIT_HOLD_S).
                 self._exit_coast()
+                self._pending_credit_until_s = (
+                    now_s + cfg.pending_credit_hold_s
+                )
                 self._enter_search(now_s)
             else:
                 self._coast_zero_sent = True
@@ -1840,11 +1885,6 @@ class CleanCourseController:
                 )
 
         if self.state is CleanCourseState.SEARCH:
-            # F49: absolute-heading sweep from the search-entry heading,
-            # first toward the last reliable bearing — the F40 anchor-
-            # centered sweep re-centered the scan on the course heading
-            # instead of where the target was last seen.
-            sweep_yaw = self._search_yaw_heading(dt, yaw_rad)
             # Flight 25361816: the unqualified hold margin must apply here
             # too — SEARCH at bare support in the fh-untrusted regime sank
             # ~1 m/s for real into terrain (the margin only covered the
@@ -1852,6 +1892,35 @@ class CleanCourseController:
             margin = (
                 cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
             )
+            if (
+                self._pending_credit_until_s is not None
+                and now_s < self._pending_credit_until_s
+            ):
+                # F76 pending-credit heading hold (see the
+                # PENDING_CREDIT_HOLD_S block): the authoritative packet is
+                # still in flight — zero yaw/roll, level pitch, governed
+                # altitude support.  NO generic sweep: F75 swept +0.15
+                # away from the retained left-side successor and blinded
+                # the new leg within 0.4 s.
+                hold = support + margin
+                self._collective = hold
+                return NavigationOutput(
+                    target_roll_rad=self._slew_roll(0.0, dt),
+                    target_pitch_rad=self._slew_pitch(
+                        cfg.spawn_pitch_rad + cfg.brake_pitch_rad, dt
+                    ),
+                    yaw_rate_rad_s=0.0,
+                    thrust=self._governed_collective(hold, support),
+                    state=self.state,
+                    gate_index=self.gate_index,
+                    current_track_id=self._current_track_id(),
+                    successor_track_id=self._successor_track_id(),
+                )
+            # F49: absolute-heading sweep from the search-entry heading,
+            # first toward the last reliable bearing — the F40 anchor-
+            # centered sweep re-centered the scan on the course heading
+            # instead of where the target was last seen.
+            sweep_yaw = self._search_yaw_heading(dt, yaw_rad)
             # F75: altitude support is LATCHED in no-track SEARCH.  The F50
             # memory-descent servo turned F74's gate-1 miss into a blind
             # 4.8 s sink to the alt-est floor (-2.0) while fh grew 1.3 ->

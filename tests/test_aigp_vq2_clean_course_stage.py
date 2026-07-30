@@ -57,6 +57,7 @@ from scripts.aigp_vq2_clean_course_stage import (
     LAUNCH_BOOST_DURATION_S,
     LAUNCH_BOOST_THRUST,
     NEVER_MEASURED_S,
+    PENDING_CREDIT_HOLD_S,
     ROTATION_COMP_FOCAL_NORM,
     CleanCourseConfig,
     CleanCourseController,
@@ -2209,6 +2210,62 @@ def test_crossing_wait_is_bounded_and_authoritative_credit_is_accepted():
     output = _command(controller2, 100.13 + 11.0)
     assert controller2.state is CleanCourseState.SEARCH
     assert output.thrust > 0.0
+
+
+def test_pending_credit_hold_never_sweeps_before_delayed_credit():
+    # F76 (20260730T074122Z-visual-course-3a505ef5): after the one-zero
+    # send the pending-credit SEARCH ran the generic yaw sweep — +0.15
+    # (right) while the retained gate-1 successor sat LEFT (ex -0.43);
+    # every detection died 0.4 s later and the leg pinned blind at the
+    # yaw cap into the gate-1 structure (collision id 1002).  While
+    # authoritative credit is in flight the heading is HELD: a visible
+    # left-side successor can never produce positive yaw before delayed
+    # credit; the authoritative increment re-acquires the retained
+    # (by-construction stale) successor immediately and steers normally.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.observe(
+        _update(
+            [_track("A", 0.0, 0.0, scale=0.50), _track("B", -0.43, 0.05)],
+            frame_id=4,
+        ),
+        now_s=100.08,
+    )
+    controller._track_first_seen_s["B"] = 100.08 - 1.0  # persistent (F42)
+    controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.observe(_update([], frame_id=5), now_s=100.12)
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    out = _command(controller, 100.14)  # the single wire-zero send (F72)
+    assert out.thrust == 0.0
+    # Pending-credit window (~0.33 s << PENDING_CREDIT_HOLD_S): heading
+    # held level, zero yaw/roll, governed altitude support — no sweep.
+    for tick in range(10):
+        out = _command(controller, 100.18 + 0.033 * tick)
+        assert controller.state is CleanCourseState.SEARCH
+        assert out.yaw_rate_rad_s == 0.0
+        assert out.target_roll_rad == 0.0
+        assert out.thrust > 0.0
+    # Delayed credit inside the window: the retained left-side successor
+    # is stale by construction (the crossing swallowed measurements) but
+    # is adopted immediately — never a blind sweep on the new leg.
+    promoted = controller.note_race(gate_index=1, race_boot_ms=2400, now_s=100.55)
+    assert promoted
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.current.track_id == "B"
+    # A fresh post-credit frame of the adopted gate steers LEFT at once.
+    controller.observe(
+        _update([_track("B", -0.43, 0.05)], frame_id=6), now_s=100.57
+    )
+    out = _command(controller, 100.60)
+    assert out.yaw_rate_rad_s < 0.0  # steers LEFT toward the successor
+    # Bounded: with no credit the window expires and the sweep resumes.
+    expiring = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    expiring.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    expiring.observe(_update([], frame_id=5), now_s=100.12)
+    _command(expiring, 100.14)
+    out = _command(expiring, 100.18)
+    assert out.yaw_rate_rad_s == 0.0
+    out = _command(expiring, 100.18 + PENDING_CREDIT_HOLD_S + 1.0)
+    assert out.yaw_rate_rad_s != 0.0
 
 
 def test_authoritative_promotion_event_never_vetoed_by_vision():
