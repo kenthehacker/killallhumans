@@ -2225,14 +2225,19 @@ def test_crossing_wait_is_bounded_and_authoritative_credit_is_accepted():
     assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
     assert controller.transitions == [(0, 1)]
 
-    # The wait is bounded at 0.06 s even with no newer race packet (F68:
+    # The wait is bounded at exactly ONE wire-zero send even with no newer
+    # race packet, enforced by the send count rather than a timeout (F68:
     # the ~4 Hz cruise race stream made a 0.25 s zero window a lethal
-    # ballistic drop at low altitude; F69 grazed the bottom bar after even
-    # a 0.10-0.14 s window.  The contract bound is AT MOST 0.40 s).
+    # ballistic drop; F69 grazed the bottom bar after 0.10-0.14 s; F71
+    # tripped the roll/body-rate limits after 0.06 s).  The second command
+    # exits to SEARCH no matter when the scheduler calls it.
     controller2 = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller2.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
     controller2.observe(_update([], frame_id=5), now_s=100.12)
-    output = _command(controller2, 100.12 + 0.07)
+    output = _command(controller2, 100.13)
+    assert controller2.state is CleanCourseState.COAST_FOR_CREDIT
+    assert output.thrust == 0.0
+    output = _command(controller2, 100.13 + 11.0)
     assert controller2.state is CleanCourseState.SEARCH
     assert output.thrust > 0.0
 
@@ -3100,8 +3105,9 @@ def test_loop_coast_holds_exact_zero_then_accepts_credit():
         run_clean_course_stage(host, context, runtime=_test_runtime())
     )
     # 2026-07-30: the coast wait is EXACT WIRE ZERO — the PD is bypassed,
-    # no support thrust, no leveling rates.  Credit is still accepted
-    # during the wait.
+    # no support thrust, no leveling rates.  F72: exactly ONE zero send,
+    # bounded by the send count, not a timeout.  Credit is still accepted
+    # after the state exits.
     saw_powered = False
     zero_sends = []
     for command, _index in host.sent:
@@ -3109,7 +3115,7 @@ def test_loop_coast_holds_exact_zero_then_accepts_credit():
             saw_powered = True
         elif saw_powered and command.thrust == 0.0:
             zero_sends.append(command)
-    assert zero_sends  # the exact-zero coast wait happened
+    assert len(zero_sends) == 1  # the single exact-zero credit-wait send
     for command in zero_sends:
         assert (
             command.roll_rate,
@@ -3156,7 +3162,7 @@ def test_loop_coast_bypasses_the_pd_at_exact_zero():
             saw_powered = True
         elif saw_powered and command.thrust == 0.0:
             zero_sends.append(command)
-    assert zero_sends  # the bounded coast wait emitted exact-zero sends
+    assert len(zero_sends) == 1  # the single exact-zero credit-wait send
     for command in zero_sends:
         assert (
             command.roll_rate,
@@ -3164,6 +3170,50 @@ def test_loop_coast_bypasses_the_pd_at_exact_zero():
             command.yaw_rate,
             command.thrust,
         ) == (0.0, 0.0, 0.0, 0.0)
+    assert summary["final_gate_index"] == 1
+    assert summary["success"] is True
+
+
+@pytest.mark.parametrize("credit_tick", [5, 9, 14])
+def test_loop_coast_emits_exactly_one_zero_send(credit_tick):
+    # F72: the credible-crossing credit wait is exactly ONE wire-zero send,
+    # bounded by the state/send count rather than any timeout — no matter
+    # when the scheduler delivers the authoritative credit, the wire sees a
+    # single 0/0/0/0 command.  Credit is still accepted after the state
+    # exits (it is accepted in EVERY state).
+    host = _Host(_update([_track("A", 0.0, 0.0, scale=0.50)]))
+
+    def script(host):
+        if host.ticks == 3:
+            host.update = _update([], frame_id=99)  # close crossing loses target
+        if host.ticks == credit_tick:
+            # Authoritative credit after the wait.
+            host.race.active_gate_index = 1
+            host.race.sim_boot_time_ms = 1250
+        if host.ticks == credit_tick + 5:
+            host.race.race_finished = True
+
+    host.script = script
+    context = SimpleNamespace(
+        initial_gate_x=322, initial_gate_y=174, initial_gate_area=6400
+    )
+    summary = asyncio.run(
+        run_clean_course_stage(host, context, runtime=_test_runtime())
+    )
+    saw_powered = False
+    zero_sends = []
+    for command, _index in host.sent:
+        if command.thrust > 0.05:
+            saw_powered = True
+        elif saw_powered and command.thrust == 0.0:
+            zero_sends.append(command)
+    assert len(zero_sends) == 1
+    assert (
+        zero_sends[0].roll_rate,
+        zero_sends[0].pitch_rate,
+        zero_sends[0].yaw_rate,
+        zero_sends[0].thrust,
+    ) == (0.0, 0.0, 0.0, 0.0)
     assert summary["final_gate_index"] == 1
     assert summary["success"] is True
 

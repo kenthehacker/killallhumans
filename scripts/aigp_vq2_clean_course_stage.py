@@ -15,12 +15,14 @@ Authority model:
   and never declares a pass.
 - ``track_id`` is a local visual-continuity hypothesis only, never a gate
   number.
-- The July-18 bounded credible-crossing wait survives as the single
+- The July-18 credible-crossing wait survives as the single
   ``COAST_FOR_CREDIT`` state: after a credible close crossing loses the
-  target on a FRESH camera frame, latch zero-rate/zero-thrust and wait at
-  most 0.06 s for a strictly newer race packet (the contract bound is AT
-  MOST 0.40 s; the ~4 Hz cruise race stream turned longer windows into
-  unrecoverable ballistic drops at the plane — F68/F69).  A
+  target on a FRESH camera frame, latch zero-rate/zero-thrust for exactly
+  ONE wire-zero send, bounded by the send count rather than a timeout (the
+  contract bound is AT MOST 0.40 s of exact zero; every timed window —
+  0.25/0.10/0.06 s — still paid a multi-tick ballistic drop at the plane:
+  F68/F69/F71).  Credit is accepted in ANY state, so the wait continues as
+  a normal ``SEARCH`` after the single zero.  A
   superseded/frozen frame (same camera-frame identity republished during a
   camera stall) must never arm the coast; it goes to ``PREDICT`` with
   covariance inflation instead (flight 20260729T085719Z-visual-course-
@@ -361,12 +363,15 @@ CROSSING_MEAS_MAX_AGE_S = 0.50
 # F69 (20260730T055004Z-visual-course-352d481c): even a 0.10-0.14 s window
 # cost vz -1.7 at the plane and the 0.34-clamped recovery (~2 m/s^2 net
 # over fast-regime hover) could not re-climb 0.06-0.1 m in the 0.3 s before
-# the bottom-bar graze.  The July-18 contract bounds the wait AT MOST
-# 0.40 s; two ticks at the 30 Hz control cadence (~0.06 s, vz cost ~-0.7)
-# is the practical window that leaves a recoverable aircraft.  Credit does
+# the bottom-bar graze.  F71 (20260730T061726Z-visual-course-fa8cb298): the
+# 0.06 s window still ended in a post-coast recovery excursion that tripped
+# the roll (-40.8 deg) and body-rate (46.5 rad/s) limits (collision id
+# 1002, impulse 8.32).  F72: the credit wait is exactly ONE wire-zero SEND,
+# bounded by the send count rather than any timeout value — the smallest
+# window the July-18 contract (AT MOST 0.40 s of exact zero) admits, and
+# the only one that never pays a multi-tick ballistic drop.  Credit does
 # not depend on the window: a true pass is accepted in ANY state (F67
 # credited gate 0 in SEARCH 0.5 s after its coast exited).
-CROSSING_CREDIT_WAIT_S = 0.06  # July-18 contract bound is AT MOST 0.40 s
 # F53 (20260729T233602Z-visual-course-072c8a7b): past near_brake_log_scale
 # the misalignment brake self-locks — the brake attitude pushes the gate
 # image down, the raw ey reads as misalignment, advance goes to 0, and the
@@ -974,7 +979,6 @@ class CleanCourseConfig:
     crossing_min_log_scale: float = CROSSING_MIN_LOG_SCALE
     crossing_max_abs_ex_norm: float = CROSSING_MAX_ABS_EX_NORM
     crossing_max_abs_ey_norm: float = CROSSING_MAX_ABS_EY_NORM
-    crossing_credit_wait_s: float = CROSSING_CREDIT_WAIT_S
     commit_sustain_s: float = COMMIT_SUSTAIN_S
     commit_meas_max_age_s: float = COMMIT_MEAS_MAX_AGE_S
     commit_timeout_s: float = COMMIT_TIMEOUT_S
@@ -1099,7 +1103,7 @@ class CleanCourseController:
         self._prev_target_pitch = (
             self.config.spawn_pitch_rad + self.config.brake_pitch_rad
         )
-        self._coast_entry_s: Optional[float] = None
+        self._coast_zero_sent = False
         self._coast_race_boot_ms: Optional[int] = None
         self._last_race_boot_ms: Optional[int] = None
         self._search_direction = 1.0
@@ -1301,12 +1305,12 @@ class CleanCourseController:
         match = self._find(tracks, self._current_track_id())
 
         # COMMIT (F53): the near-plane commit is an inertial crossing —
-        # keep the hypothesis and successor fresh for the credit/timeout
-        # exit (the vertical servo reads the live filter).  On a CREDIBLE
-        # CLOSE LOSS (fresh frame, close hypothesis, no match) the armed
-        # crossing stops all active blind driving and latches the exact-zero
-        # authoritative credit wait (July-18 contract, restored 2026-07-30);
-        # only note_race (credit) or the command() timeout may otherwise
+        # keep the hypothesis and successor fresh for the credit exit (the
+        # vertical servo reads the live filter).  On a CREDIBLE CLOSE LOSS
+        # (fresh frame, close hypothesis, no match) the armed crossing stops
+        # all active blind driving and latches the exact-zero authoritative
+        # credit wait (July-18 contract, restored 2026-07-30); only
+        # note_race (credit) or the single-send command() exit may otherwise
         # leave the state.
         if self.state is CleanCourseState.COMMIT:
             if match is not None:
@@ -1318,7 +1322,7 @@ class CleanCourseController:
                 and self.current.outer_log_scale >= cfg.commit_min_log_scale
             ):
                 self.state = CleanCourseState.COAST_FOR_CREDIT
-                self._coast_entry_s = float(now_s)
+                self._coast_zero_sent = False
                 self._coast_race_boot_ms = self._last_race_boot_ms
             self._refresh_successor(tracks, now_s)
             return
@@ -1377,7 +1381,7 @@ class CleanCourseController:
                 # (fh was high from BRAKING drag, not speed), sending the
                 # drone blind into the frame in PREDICT instead.
                 self.state = CleanCourseState.COAST_FOR_CREDIT
-                self._coast_entry_s = float(now_s)
+                self._coast_zero_sent = False
                 self._coast_race_boot_ms = self._last_race_boot_ms
             else:
                 if not fresh and self.state is CleanCourseState.TRACK:
@@ -1560,20 +1564,25 @@ class CleanCourseController:
             )
 
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
-            assert self._coast_entry_s is not None
-            if now_s - self._coast_entry_s > cfg.crossing_credit_wait_s:
+            if self._coast_zero_sent:
+                # F72: exactly ONE wire-zero send is the whole credit wait,
+                # bounded by the send count rather than another timeout
+                # value — F68/F69/F71 showed every timed window pays a
+                # multi-tick ballistic drop.  Credit remains acceptable in
+                # EVERY state, so after the single zero the wait continues
+                # as a normal SEARCH.
                 self._exit_coast()
                 self._enter_search(now_s)
             else:
-                # July-18 contract item 9, RESTORED (2026-07-30): the
-                # bounded credible-crossing credit wait is EXACT WIRE ZERO
-                # on all four channels for at most crossing_credit_wait_s
-                # (0.40 s) while awaiting a newer authoritative race packet.
-                # The F25/F26 support-thrust coast through the attitude PD
-                # is out of contract: an actively driven blind wait is still
-                # blind driving.  The send path bypasses the attitude PD for
-                # this state so the wire is exactly 0/0/0/0; the wait stays
-                # bounded and credit remains the only passage authority.
+                self._coast_zero_sent = True
+                # July-18 contract item 9: the credible-crossing credit wait
+                # is EXACT WIRE ZERO on all four channels while awaiting a
+                # newer authoritative race packet.  The F25/F26
+                # support-thrust coast through the attitude PD is out of
+                # contract: an actively driven blind wait is still blind
+                # driving.  The send path bypasses the attitude PD for this
+                # state so the wire is exactly 0/0/0/0; credit remains the
+                # only passage authority.
                 return NavigationOutput(
                     target_roll_rad=0.0,
                     target_pitch_rad=0.0,
@@ -2855,7 +2864,7 @@ class CleanCourseController:
         self._search_base_yaw_rad = None
 
     def _exit_coast(self) -> None:
-        self._coast_entry_s = None
+        self._coast_zero_sent = False
         self._coast_race_boot_ms = None
 
     def _slew_roll(
