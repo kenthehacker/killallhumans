@@ -2258,8 +2258,20 @@ class CleanCourseController:
             # latched, and its max() (applied after the vz-governor
             # subtraction) pinned support+0.05 for the whole leg — a +1.9
             # m/s, +1.4 m balloon that overrode governor and arrest alike.
+            # F86 (20260730T123020Z-visual-course-34c8dd71): ...but gate 0's
+            # NEAR-PLANE band needs the arrest too.  F85 arrived at gate-0
+            # censorship climbing +0.45 (the aperture fit died to clipping,
+            # so COMMIT could not arm and the F83 entry cap never ran);
+            # the credible-loss exact-zero coast converted the climb into a
+            # ballistic apex inside the frame and the drone fell into gate
+            # 0's LOWER panel (id 1001, no credit) — F82 died the same way
+            # at +0.64 (top bar).  Every credited gate-0 crossing entered
+            # with dead vertical energy.  The F78b failure was the FAR
+            # climb-out, so gate 0 joins the arrest only inside the COMMIT
+            # proximity regime; the climb-out envelope is untouched.
+            near_plane = current.log_scale >= cfg.commit_min_log_scale
             if (
-                self.gate_index >= 1
+                (self.gate_index >= 1 or near_plane)
                 and bounded_error < 0.0
                 and not self._fh_untrusted
                 and self._vz_est_m_s > 0.0

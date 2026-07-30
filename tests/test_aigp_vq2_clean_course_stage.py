@@ -2907,6 +2907,47 @@ def test_vertical_arrival_arrest_shaves_climb_before_center():
     assert out0.thrust == pytest.approx(settled.thrust, abs=1e-3)
 
 
+def test_gate0_near_plane_arrest_shaves_censorship_entry_climb():
+    # F85 (20260730T123020Z-visual-course-34c8dd71): gate 0 arrived at
+    # censorship climbing +0.45 m/s; the aperture fit had died to clipping,
+    # so COMMIT could not arm (the F83 entry cap never ran), and the
+    # credible-loss exact-zero coast converted the climb into a ballistic
+    # apex inside the frame — the drone fell into gate 0's LOWER panel
+    # (id 1001, no credit).  F82 died the same way at +0.64 (top bar).
+    # The F78 arrival arrest now covers gate 0 inside the COMMIT proximity
+    # regime; the far climb-out keeps the proved F78b envelope (above).
+    def _gate0_thrust(vz_m_s, log_scale):
+        controller = _tracked_controller(_track("A", 0.0, -0.13, scale=0.50))
+        controller._alt_est_m = 2.0  # honest altitude (floor quiet)
+        current = controller.current
+        current.y_axis.p = -0.13  # high aperture aim at the plane
+        current.raw_y = -0.13
+        current.y_axis.v = 0.0
+        current.scale_axis.p = log_scale
+        current.scale_axis.v = 0.10  # settled closure
+        now = 100.10
+        out = None
+        for _ in range(15):  # converge the slews/governors
+            now += 0.033
+            controller._vz_est_m_s = vz_m_s
+            current.last_measurement_s = now
+            current.last_x_measurement_s = now
+            current.last_y_measurement_s = now
+            out = _command(controller, now, pitch=SPAWN_PITCH)
+        assert controller.state is CleanCourseState.TRACK
+        return out
+
+    # Near plane (inside COMMIT proximity): a +0.45 climb into censorship
+    # is arrested toward the |ey|-scaled allowance.
+    climbing = _gate0_thrust(0.45, -0.70)
+    settled = _gate0_thrust(0.0, -0.70)
+    assert climbing.thrust < settled.thrust - 0.03
+    # Far range (the F78b climb-out) keeps the plain PD output.
+    far_climbing = _gate0_thrust(0.45, -1.60)
+    far_settled = _gate0_thrust(0.0, -1.60)
+    assert far_climbing.thrust == pytest.approx(far_settled.thrust, abs=1e-3)
+
+
 def test_alt_floor_latch_yields_to_qualified_vision():
     # F79 (20260730T092415Z-visual-course-1455ab3b): the proved gate-0
     # crossing exits LOW (alt ~-1.0), so the <0.7 m pre-gate-1 altitude
