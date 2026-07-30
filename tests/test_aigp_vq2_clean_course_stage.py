@@ -2800,6 +2800,48 @@ def test_vertical_arrival_arrest_shaves_climb_before_center():
     assert out0.thrust == pytest.approx(settled.thrust, abs=1e-3)
 
 
+def test_alt_floor_latch_yields_to_qualified_vision():
+    # F79 (20260730T092415Z-visual-course-1455ab3b): the proved gate-0
+    # crossing exits LOW (alt ~-1.0), so the <0.7 m pre-gate-1 altitude
+    # floor arms in the blind pending window (F51: correct there) — but
+    # the LATCHED episode's max() then pinned support+0.05 over the vz
+    # governor and the F78 arrest for the whole QUALIFIED gate-1 leg:
+    # vz +1.8 m/s, alt +2.3 m above a gate the live ey servo held at
+    # center (ey +0.02..+0.2), losing it out the frame bottom.  The
+    # floor is terrain insurance for BLIND flight; qualified vision owns
+    # the collective.  (F78 was the same balloon one candidate earlier.)
+    controller = _tracked_controller(_track("A", 0.0, 0.05, scale=0.20))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = -1.0  # proved low gate-0 exit
+    controller._alt_floor_active = True  # latched in the blind window
+    current = controller.current
+    current.y_axis.p = 0.05  # gate at center: the F78b geometry
+    current.raw_y = 0.05
+    current.y_axis.v = 0.0
+    current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10
+    now = 100.10
+    out = None
+    for _ in range(15):
+        now += 0.033
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    assert controller._alt_floor_active  # episode still latched...
+    # ...but qualified vision owns the collective — no support+0.05 pin.
+    assert out.thrust < SPAWN_SUPPORT + 0.02
+    # Blind again (stale/censored y): the terrain floor pin returns.
+    for _ in range(15):
+        now += 0.033
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        # last_y_measurement_s deliberately NOT refreshed -> unqualified
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert out.thrust > SPAWN_SUPPORT + 0.04
+
+
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
     # F54 (20260729T235858Z-visual-course-c92d42ce): censorship of the aim
     # track began ~0.2 s after outer_log_scale crossed -0.9, so the F53

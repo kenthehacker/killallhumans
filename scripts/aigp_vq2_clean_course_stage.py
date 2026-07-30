@@ -613,7 +613,14 @@ COURSE_HEADING_ANCHOR_CAP_RAD = 1.5
 # only after alt_est has held above the release altitude for
 # ALT_FLOOR_REARM_S, and alt_est is clamped below at ALT_EST_MIN_M so a
 # biased integrator cannot push the floor deeper than its 0.7-1.2 m guard
-# band ever needs.
+# band ever needs.  F79 (20260730T092415Z-visual-course-1455ab3b): the
+# floor is TERRAIN insurance for blind flight — while vertical is
+# vision-qualified its latched max() must not override the PD/governor/
+# arrest.  F78/F78b both armed it in the blind pending window (alt -1.0
+# after the proved LOW gate-0 crossing) and its support+0.05 pin then
+# ballooned the whole qualified gate-1 leg (+1.8-1.9 m/s, +1.4-2.3 m)
+# above a gate the live ey servo held at center.  The F51 arming guard
+# already trusts a live gate over the integrator; the latch now does too.
 ALT_FLOOR_TRIGGER_M = 0.7
 ALT_FLOOR_RELEASE_M = 1.2
 ALT_FLOOR_CLIMB_MARGIN = 0.05  # support + margin -> governed recovery climb
@@ -2289,8 +2296,19 @@ class CleanCourseController:
         # pursuit cannot (see the VZ_CLIMB_CAP_M_S constant block) and stays
         # alive through TRACK, PREDICT, and SEARCH alike.  The brake-ceiling
         # band inside classifies gate-high on the F50 compensated error.
+        # F79: the latched pre-gate-1 altitude floor yields to QUALIFIED
+        # vision (alt_floor=not vertical_qualified) — F51 already refuses
+        # to ARM over a live gate ("a fresh accepted track is better
+        # altitude evidence than the sagged integrator"), but the latched
+        # episode's max() pinned support+0.05 OVER the governor and the
+        # F78 arrest for two whole gate-1 legs: F78 (+1.9 m/s, +1.4 m)
+        # and F78b (+1.8 m/s, +2.3 m) both ballooned above a gate the
+        # qualified ey servo held at center, losing it out the bottom.
+        # The floor keeps every BLIND path (SEARCH, unqualified, PREDICT)
+        # and the F21 freshness gate already disqualifies frozen ghosts.
         collective = self._governed_collective(
-            collective, support, gate_y=ey_vertical
+            collective, support, gate_y=ey_vertical,
+            alt_floor=not vertical_qualified,
         )
         thrust = _clamp(collective, cfg.min_thrust, cfg.max_thrust)
 
