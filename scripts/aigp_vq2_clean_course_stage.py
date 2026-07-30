@@ -631,35 +631,29 @@ COURSE_PRE_CROSS_BRAKE_PITCH_RAD = -0.30
 # attitude (rpy_p ~-0.45, ~0.14 rad nose-up from spawn) pitches the camera
 # up, so near the plane the gate slides DOWN the frame — measured ey
 # reached +0.93 and bottom-censored out of view while the brake held for
-# 1.5 s.  Measurement compensation (F50) cannot extend the physical FOV:
-# while a FRESH measurement shows the gate at/past the relax bound the
-# pitch target relaxes toward level, and it resumes the brake target once
-# the gate recovers to the resume bound.  Vision custody of the gate
-# outranks deceleration at the plane.
-BRAKE_RELAX_EY_NORM = 0.55  # measured ey that relaxes the brake to level
-BRAKE_RELAX_RESUME_EY_NORM = 0.45  # measured ey that resumes the brake
+# 1.5 s.  Measurement compensation (F50) cannot extend the physical FOV.
+# F94 replaces the binary relax/resume latch with a continuous
+# custody-preserving floor (see the clamp at the pitch law): the pitch
+# target never goes nose-up past the attitude that places the compensated
+# ey exactly ON the bound below, so the approach always holds the maximum
+# custody-compatible brake.  Vision custody bounds deceleration; it no
+# longer abandons it in one step.
+BRAKE_RELAX_EY_NORM = 0.55  # far-range compensated ey custody bound
 # F65 near-plane extension (20260730T021149Z-visual-course-08f41050): AT
 # the plane the F51 guard never fired — F64's gate sat at ey +0.33..+0.43
 # (below the 0.55 fresh bound), censorship then froze measurement
 # freshness, and the -0.46 brake attitude pitched the gate out of the FOV
 # for the remaining ~7 s (blind wander into the floor/structure).  Inside
-# the commit proximity regime the relax runs on the derotated HYPOTHESIS
-# (the F52 best-evidence rationale), with a lower bound, and relaxes the
-# pitch target to LEVEL rather than the brake attitude.
-NEAR_BRAKE_RELAX_EY_NORM = 0.30  # hypothesis ey that relaxes to level
-NEAR_BRAKE_RELAX_RESUME_EY_NORM = 0.20  # hypothesis ey that resumes brake
+# the commit proximity regime the floor runs on the derotated HYPOTHESIS
+# (the F52 best-evidence rationale), with a lower bound.
+NEAR_BRAKE_RELAX_EY_NORM = 0.30  # commit-regime custody bound
 # F71 (20260730T060005Z-visual-course-f05911e4): on the gate-1 leg the 0.30
 # engage bound sat a hair above the achieved hypothesis ey (0.22-0.30 for
 # the whole final second), so the relax never fired; the -0.41..-0.43 brake
 # attitude walked the gate down the FOV into engulfing at the plane and a
 # one-tick newborn corner splinter was adopted as the aim (collision id
-# 1001, impulse 5.86).  On course legs (gate_index >= 1) the relax engages
-# earlier and resumes only once the gate sits ABOVE center: leveling the
-# camera swings the image ~0.2 norm up, so any positive resume band smaller
-# than that swing would chatter brake/level every slew cycle.  Gate 0 keeps
-# the F65 bounds credited in F70.
-NEAR_BRAKE_RELAX_COURSE_EY_NORM = 0.18  # course-leg engage (hypothesis ey)
-NEAR_BRAKE_RELAX_COURSE_RESUME_EY_NORM = -0.10  # resume only above center
+# 1001, impulse 5.86).  Course legs (gate_index >= 1) get a tighter bound.
+NEAR_BRAKE_RELAX_COURSE_EY_NORM = 0.18  # course-leg custody bound
 # Course-heading anchor (F31): after losing the gate-1 track the drone
 # search-swept and edge-chased its heading +2.63 rad off the course
 # bearing, then flew sideways/backwards at ~0.65g drag into structure it
@@ -1114,13 +1108,8 @@ class CleanCourseConfig:
     course_pre_cross_brake_pitch_rad: float = COURSE_PRE_CROSS_BRAKE_PITCH_RAD
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     brake_relax_ey_norm: float = BRAKE_RELAX_EY_NORM
-    brake_relax_resume_ey_norm: float = BRAKE_RELAX_RESUME_EY_NORM
     near_brake_relax_ey_norm: float = NEAR_BRAKE_RELAX_EY_NORM
-    near_brake_relax_resume_ey_norm: float = NEAR_BRAKE_RELAX_RESUME_EY_NORM
     near_brake_relax_course_ey_norm: float = NEAR_BRAKE_RELAX_COURSE_EY_NORM
-    near_brake_relax_course_resume_ey_norm: float = (
-        NEAR_BRAKE_RELAX_COURSE_RESUME_EY_NORM
-    )
     brake_ceiling_band: float = BRAKE_CEILING_BAND
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_est_min_m: float = ALT_EST_MIN_M
@@ -1223,8 +1212,6 @@ class CleanCourseController:
         # F49: SEARCH sweep base heading — the yaw measured at search entry,
         # not the leg anchor (see _search_yaw_heading).
         self._search_base_yaw_rad: Optional[float] = None
-        # F51: brake self-blinding relax latch (see BRAKE_RELAX_EY_NORM).
-        self._brake_vision_relax = False
         # F53: near-plane COMMIT sustain timer and entry stamp (see the
         # COMMIT_* constant block).
         self._near_plane_since_s: Optional[float] = None
@@ -2449,27 +2436,6 @@ class CleanCourseController:
             brake_demand = 1.0
             pre_cross_brake = True
             self._pre_cross_brake_active = True
-        # F73b: while the hold is ARRESTING live closure, the brake
-        # attitude outranks F71 vision custody.  Leveling the camera (the
-        # F71 relax) keeps the gate in view but never reduces energy —
-        # F72 leveled at the plane and closed span 0.55 -> 0.78 straight
-        # into censorship, so in the decisive window advance=0/brake=1 was
-        # an emitted-command no-op (the relax overrode both to level).
-        # Brake blind on the derotated hypothesis instead; the hold ends
-        # via the budget or PREDICT, and custody returns the moment closure
-        # is at/below the governor target (stopped: re-center level).
-        # F75: the arrest outranks custody ONLY in the pre-censorship band
-        # [-1.2, -0.9) where the whole gate is still visible.  F73b held
-        # the brake at the plane and pitched the gate OUT of view (the
-        # self-blinding F51/F65 were built against); past the -0.9
-        # censorship onset the F51/F65 relax keeps vision custody — the
-        # energy must already be dead by then, which is exactly what the
-        # widened -1.2 hold above buys.
-        arresting_closure = (
-            near_plane_hold
-            and current.outer_log_scale < cfg.near_brake_log_scale
-            and current.expansion_rate > cfg.closure_target_rate_s
-        )
         # Closure-rate governor (F31) + misalignment brake (F35): continuous
         # blend toward the TRUE brake attitude as either the vision expansion
         # rate rises past the target or the gate sits off-axis — speed is
@@ -2503,55 +2469,45 @@ class CleanCourseController:
         target_pitch = law_pitch + brake_demand * (
             (cfg.spawn_pitch_rad + brake_pitch_offset) - law_pitch
         )
-        # F51 near-plane brake self-blinding guard (see the
-        # BRAKE_RELAX_EY_NORM block): the brake attitude pitches the camera
-        # up and the gate slides DOWN the physical FOV — compensation
-        # cannot extend it.  While the brake is active, a FRESH measurement
-        # at/past the relax bound drops the pitch target to level; the
-        # normal brake target resumes below the resume bound.  Hysteresis
-        # holds the last state between the bounds and on stale
-        # measurements; vision custody outranks deceleration at the plane.
-        # F65 (see the NEAR_BRAKE_RELAX_EY_NORM block): inside the commit
-        # proximity regime the relax runs on the derotated hypothesis (no
-        # freshness gate), with a lower bound, and relaxes to LEVEL — F64
-        # held the -0.46 brake with the gate at ey +0.43 and stayed blind
-        # for the rest of the flight.
+        # F94 custody-preserving brake floor — REPLACES the F51/F65/F71
+        # binary relax latch, its hysteresis, and the F73b/F75
+        # blind-arrest override with one continuous clamp.  The brake
+        # attitude pitches the camera up and the gate slides DOWN the
+        # frame; the latch relaxed the pitch target to FULL LEVEL the
+        # moment raw/hypothesis ey crossed the bound.  F93
+        # (20260730T143851Z-visual-course-7e67b464) shows that surrender
+        # is the killer: the held brake had HALVED the closure rate
+        # (0.45 -> 0.27 log/s) when the attitude artifact walked raw ey to
+        # +0.24 >= 0.18, the latch leveled the camera with closure still
+        # ~1.0/s, and the drone re-advanced into the gate-1 plane — the
+        # entry budget correctly refused COMMIT (expansion, |vz|) and it
+        # hit the structure (id 1001).  The compensated ey separates the
+        # attitude artifact from true geometry: raw ey at a candidate
+        # attitude is ey_vertical + (spawn - pitch) * comp_gain, so the
+        # floor attitude that places the gate exactly ON the relax bound
+        # is spawn - (bound - ey_vertical) / comp_gain.  The pitch target
+        # may never go nose-up past it — the drone always holds the
+        # MAXIMUM custody-compatible brake — and the floor never rises
+        # above level: a genuinely low gate is re-centered by the vertical
+        # channel, never by advancing.  ey_vertical is attitude-invariant
+        # by construction, so the floor is stable without any hysteresis.
         commit_regime = current.log_scale >= cfg.commit_min_log_scale
-        if arresting_closure:
-            # F73b: live closure is being arrested — the brake attitude
-            # outranks vision custody (leveling never reduces energy).
-            self._brake_vision_relax = False
-        elif not pre_cross_brake and not commit_regime:
-            self._brake_vision_relax = False
-        elif (
-            now_s - current.last_measurement_s <= CROSSING_MEAS_MAX_AGE_S
-            or commit_regime
-        ):
-            course_leg = self.gate_index >= 1
-            relax_bound = (
-                cfg.near_brake_relax_course_ey_norm
-                if commit_regime and course_leg
-                else cfg.near_brake_relax_ey_norm
-                if commit_regime
-                else cfg.brake_relax_ey_norm
-            )
-            resume_bound = (
-                cfg.near_brake_relax_course_resume_ey_norm
-                if commit_regime and course_leg
-                else cfg.near_brake_relax_resume_ey_norm
-                if commit_regime
-                else cfg.brake_relax_resume_ey_norm
-            )
-            if ey >= relax_bound:
-                self._brake_vision_relax = True
-            elif ey <= resume_bound:
-                self._brake_vision_relax = False
-        if self._brake_vision_relax:
-            target_pitch = max(
-                target_pitch,
-                cfg.spawn_pitch_rad
-                + (0.0 if commit_regime else cfg.brake_pitch_rad),
-            )
+        relax_bound = (
+            cfg.near_brake_relax_course_ey_norm
+            if commit_regime and self.gate_index >= 1
+            else cfg.near_brake_relax_ey_norm
+            if commit_regime
+            else cfg.brake_relax_ey_norm
+        )
+        custody_floor = cfg.spawn_pitch_rad - (
+            (relax_bound - ey_vertical) / cfg.vertical_pitch_comp_norm_per_rad
+        )
+        custody_floor = min(
+            custody_floor,
+            cfg.spawn_pitch_rad
+            + (0.0 if commit_regime else cfg.brake_pitch_rad),
+        )
+        target_pitch = max(target_pitch, custody_floor)
 
         return NavigationOutput(
             target_roll_rad=self._slew_roll(

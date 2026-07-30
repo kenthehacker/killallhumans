@@ -1133,7 +1133,7 @@ def test_closure_governor_full_brake_at_high_expansion_rate():
         # Fresh x measurements keep arriving (the F40 x-freshness gate
         # otherwise zeroes steering after 0.5 s without one).
         controller.current.last_x_measurement_s = now
-        out = _command(controller, now)
+        out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
     assert out.target_pitch_rad == pytest.approx(
@@ -1173,7 +1173,7 @@ def test_course_leg_brake_doubles_authority():
         # Fresh x measurements keep arriving (the F40 x-freshness gate
         # otherwise zeroes steering after 0.5 s without one).
         controller.current.last_x_measurement_s = now
-        out = _command(controller, now)
+        out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
     # The raw F80 target exceeds the clamp; the emitted target sits AT the
@@ -1283,11 +1283,11 @@ def test_closure_governor_brakes_in_predict():
     for frame in range(9):  # ~0.3 s without a measurement -> PREDICT
         now += 0.033
         controller.observe(_update([], frame_id=40 + frame), now_s=now)
-        out = _command(controller, now)
+        out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.PREDICT
     for _ in range(4):  # converge the fast brake slew inside the 0.5 s bound
         now += 0.033
-        out = _command(controller, now)
+        out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.PREDICT
     assert controller._pre_cross_brake_active
     assert out.target_pitch_rad == pytest.approx(
@@ -1312,7 +1312,7 @@ def test_pitch_offsets_follow_the_configured_spawn_attitude():
     for _ in range(15):  # fast slew attains the brake attitude
         now += 0.033
         controller.current.last_x_measurement_s = now
-        out = _command(controller, now)
+        out = _command(controller, now, pitch=config.spawn_pitch_rad)
     assert controller._pre_cross_brake_active
     # -0.20 spawn + (-0.15) pre-cross offset = -0.35 effective brake.
     assert out.target_pitch_rad == pytest.approx(-0.35, abs=1e-9)
@@ -1532,137 +1532,125 @@ def test_pre_cross_brake_does_not_suppress_crossing_detection():
     assert output.thrust == 0.0
 
 
-def test_pre_cross_brake_relaxes_near_bottom_censor_with_hysteresis():
-    # F51: the pre-cross brake attitude pitches the camera up and walks the
-    # gate DOWN the physical FOV — the brake self-blinds at the near plane.
-    # A fresh measurement at/past the 0.55 relax bound drops the pitch
-    # target to level (vision custody outranks deceleration); the brake
-    # resumes only below the 0.45 resume bound, and hysteresis holds the
-    # last state between the bounds.
+def test_pre_cross_brake_custody_floor_scales_with_compensated_ey():
+    # F94: the F51 binary relax/hysteresis latch is replaced by a
+    # continuous custody floor — the pitch target never goes nose-up past
+    # the attitude that places the compensated ey ON the 0.55 far-range
+    # bound.  Measured at the level spawn attitude, compensated ey equals
+    # raw ey, so the floor is spawn - (0.55 - ey) / 1.6: partial brake as
+    # the gate nears the bound, level only when it is genuinely past it,
+    # full brake when centered.  No hysteresis — the compensated ey is
+    # attitude-invariant, so the floor cannot chatter.
     controller = _tracked_controller(_track("A", 0.0, 0.60, scale=0.10))
-    controller.current.scale_axis.v = 0.7  # rapid expansion too: full brake
+    controller.current.scale_axis.v = 0.7  # rapid expansion: full brake demand
     now = 100.10
-    out = None
-    for _ in range(15):
-        now += 0.033
-        controller.current.last_measurement_s = now
-        controller.current.last_x_measurement_s = now
-        out = _command(controller, now)
+
+    def drive(ticks=15):
+        nonlocal now
+        out = None
+        for _ in range(ticks):
+            now += 0.033
+            controller.current.last_measurement_s = now
+            controller.current.last_x_measurement_s = now
+            controller.current.last_y_measurement_s = now
+            out = _command(controller, now, pitch=SPAWN_PITCH)
+        return out
+
+    out = drive()
     assert controller._pre_cross_brake_active  # ey=0.60: fully misaligned
-    assert controller._brake_vision_relax
+    # Past the 0.55 bound the gate is genuinely low: custody caps at level.
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
-    # Between the bounds (0.45 < ey < 0.55) the relaxed state holds.
+    # Approaching the bound the floor admits a partial brake.
     controller.current.y_axis.p = 0.50
-    for _ in range(5):
-        now += 0.033
-        controller.current.last_measurement_s = now
-        controller.current.last_x_measurement_s = now
-        out = _command(controller, now)
-    assert controller._brake_vision_relax
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
-    # Below the resume bound the brake target (spawn - 0.15) resumes.
+    assert drive().target_pitch_rad == pytest.approx(
+        SPAWN_PITCH - (0.55 - 0.50) / 1.6, abs=1e-9
+    )
     controller.current.y_axis.p = 0.40
-    for _ in range(15):
-        now += 0.033
-        controller.current.last_measurement_s = now
-        controller.current.last_x_measurement_s = now
-        out = _command(controller, now)
-    assert not controller._brake_vision_relax
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
-    # From the braking state, re-entering the band does NOT relax — the
-    # brake holds through the hysteresis gap in both directions.
-    controller.current.y_axis.p = 0.50
-    for _ in range(15):
-        now += 0.033
-        controller.current.last_measurement_s = now
-        controller.current.last_x_measurement_s = now
-        out = _command(controller, now)
-    assert not controller._brake_vision_relax
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
+    assert drive().target_pitch_rad == pytest.approx(
+        SPAWN_PITCH - (0.55 - 0.40) / 1.6, abs=1e-9
+    )
+    # Centered: the floor sits below the gate-0 brake attitude — full brake.
+    controller.current.y_axis.p = 0.0
+    assert drive().target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
 
 
-def test_near_plane_brake_relaxes_on_the_stale_hypothesis():
+def test_near_plane_custody_floor_runs_on_the_stale_hypothesis():
     # F65 (20260730T021149Z-visual-course-08f41050): AT the plane the F51
     # guard never fired — the gate sat at ey +0.43 (below the 0.55 fresh
     # bound) and censorship froze measurement freshness, so the -0.46
     # pre-cross brake attitude pitched the gate out of the FOV; the drone
     # wandered blind for ~7 s into the floor/structure.  Inside the commit
-    # proximity regime the relax runs on the STALE derotated hypothesis at
-    # the lower 0.30 bound and relaxes the pitch target to LEVEL.
+    # proximity regime the F94 custody floor runs on the STALE derotated
+    # hypothesis (no freshness gate): past the 0.30 bound it surrenders to
+    # level, below it the brake is preserved proportionally.
     controller = _tracked_controller(_track("A", 0.30, 0.43, scale=0.50))
     controller.current.scale_axis.v = 0.7  # rapid expansion: full brake demand
     now = 100.10
     out = None
     for _ in range(20):
         now += 0.033
-        # Measurements stay STALE (frozen at construction) — the far-range
-        # freshness gate would never let the relax latch.
-        out = _command(controller, now)
+        # Measurements stay STALE (frozen at construction) — the commit
+        # regime still reads the hypothesis.
+        out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller._pre_cross_brake_active
-    assert controller._brake_vision_relax
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
-    # Below the 0.20 near-plane resume bound the brake target resumes.
+    # Below the bound the floor keeps a partial brake — no binary resume.
     controller.current.y_axis.p = 0.10
     for _ in range(20):
         now += 0.033
-        out = _command(controller, now)
-    assert not controller._brake_vision_relax
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert out.target_pitch_rad == pytest.approx(
+        SPAWN_PITCH - (0.30 - 0.10) / 1.6, abs=1e-9
+    )
 
 
-def test_course_leg_near_plane_relax_engages_earlier_and_sticks():
+def test_course_leg_custody_floor_uses_the_tighter_bound():
     # F71 (20260730T060005Z-visual-course-f05911e4): on the gate-1 leg the
-    # F65 0.30 engage bound sat just above the achieved hypothesis ey
-    # (0.22-0.30 through the final second), so the relax never fired and the
-    # brake attitude walked the gate into engulfing at the plane.  Course
-    # legs (gate_index >= 1) engage at 0.18 and resume only below -0.10:
-    # leveling the camera swings the image ~0.2 norm up, so a positive
-    # resume band would chatter brake/level every slew cycle.  F73b: the
-    # relax acts only once closure is arrested (expansion at/below the
-    # governor target); while live closure is being arrested the brake
-    # attitude outranks custody.
+    # 0.30 bound sat a hair above the achieved hypothesis ey (0.22-0.30
+    # through the final second), so the brake attitude walked the gate into
+    # engulfing at the plane.  Course legs (gate_index >= 1) use the tighter
+    # 0.18 bound, and the F94 floor is continuous: more brake as the gate
+    # recovers above the bound, level only when genuinely past it.
     controller = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
     controller.gate_index = 1
-    # Stopped and re-centering (expansion 0): custody relax, not arrest.
-    # The brake demand comes from the ex 0.30 misalignment.
+    # Stopped (expansion 0): the brake demand comes from the ex 0.30
+    # misalignment.
     controller.current.scale_axis.v = 0.0
     now = 100.10
-    out = None
-    for _ in range(20):
-        now += 0.033
-        out = _command(controller, now)
-    # ey 0.22 is below the gate-0 0.30 bound but engages the course relax.
+
+    def drive(ticks=20):
+        nonlocal now
+        out = None
+        for _ in range(ticks):
+            now += 0.033
+            out = _command(controller, now, pitch=SPAWN_PITCH)
+        return out
+
+    # ey 0.22 is past the course 0.18 bound: custody caps at level.
+    out = drive()
     assert controller._pre_cross_brake_active
-    assert controller._brake_vision_relax
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
-    # Sticky through center: leveling swings the image up ~0.2 norm, so ey
-    # settling near zero must NOT resume the brake.
+    # ey 0.05: partial brake at the floor — no stickiness at level.
     controller.current.y_axis.p = 0.05
-    for _ in range(20):
-        now += 0.033
-        out = _command(controller, now)
-    assert controller._brake_vision_relax
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
-    # The brake resumes only once the gate sits comfortably above center.
-    controller.current.y_axis.p = -0.15
-    for _ in range(20):
-        now += 0.033
-        out = _command(controller, now)
-    assert not controller._brake_vision_relax
-    # F80: the resumed course-leg brake uses the doubled -0.30 offset,
-    # emitted at the F84 floor (-33 deg, clear of the -35 deg watchdog).
-    assert out.target_pitch_rad == pytest.approx(
-        controller.config.pitch_target_min_rad, abs=1e-9
+    assert drive().target_pitch_rad == pytest.approx(
+        SPAWN_PITCH - (0.18 - 0.05) / 1.6, abs=1e-9
     )
-    # Gate 0 keeps the F65 bounds: ey 0.22 does NOT relax there.
+    # ey -0.15: the floor admits most of the course brake.
+    controller.current.y_axis.p = -0.15
+    assert drive().target_pitch_rad == pytest.approx(
+        SPAWN_PITCH - (0.18 + 0.15) / 1.6, abs=1e-9
+    )
+    # Gate 0 keeps the wider 0.30 bound: the same ey 0.22 leaves MORE
+    # brake authority, not less.
     gate0 = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
     gate0.current.scale_axis.v = 0.7
     now0 = 100.10
     for _ in range(20):
         now0 += 0.033
-        out0 = _command(gate0, now0)
-    assert not gate0._brake_vision_relax
-    assert out0.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
+        out0 = _command(gate0, now0, pitch=SPAWN_PITCH)
+    assert out0.target_pitch_rad == pytest.approx(
+        SPAWN_PITCH - (0.30 - 0.22) / 1.6, abs=1e-9
+    )
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():
@@ -2395,18 +2383,16 @@ def test_near_plane_track_holds_closure_while_commit_budget_false():
     assert out0.target_pitch_rad > SPAWN_PITCH - 0.15 + 1e-9
 
 
-def test_early_arrest_brakes_before_censorship_without_self_blinding():
-    # F75 on the F72/F74 approach geometry: closure energy is arrested in
-    # the pre-censorship band [-1.2, -0.9) where the whole gate is still
-    # visible, and the near-plane zone keeps vision custody.  F73b's hold
-    # only engaged at -0.9 — by then the F74 approach (fh 2.5 -> 3.6 while
-    # braking) could no longer be stopped, and its arrest suppression
-    # pitched the gate out of view at the plane.
-    # Phase A (F74 t~4-5 s state): outer log scale -1.00, span expanding
-    # at 0.85/s, ey +0.31 (the relax WOULD level), budget false.  On
-    # fb41bc2 the emitted pitch here is LEVEL (no hold until -0.9, relax
-    # levels) — the drone carried ~3 m/s into the censorship zone.  The
-    # widened hold must emit the TRUE brake this early.
+def test_near_plane_hold_brakes_without_self_blinding():
+    # F73/F75 history: closure energy must be arrested in the pre-censorship
+    # window, but F73b's blind full brake pitched the gate out of view and
+    # F93's binary relax surrendered the brake to level while still hot.
+    # F94: the near-plane hold still cuts advance and demands the full
+    # brake with the budget false (COMMIT never arms), while the custody
+    # floor caps the emitted attitude so the gate can never be pitched out
+    # of the FOV.  With the gate genuinely 0.31 below center the floor is
+    # LEVEL (the vertical channel owns the re-centering); once the gate
+    # recovers to center with closure still hot, the floor admits brake.
     early = _commit_controller()
     current = early.current
     current.x_axis.p = -0.12
@@ -2418,39 +2404,61 @@ def test_early_arrest_brakes_before_censorship_without_self_blinding():
     current.outer_log_scale = -1.00
     current.aperture_half_x = 0.20
     current.aperture_half_y = 0.20
-    out, _ = _drive_commit_window(early, 100.10)
+    out, now = _drive_commit_window(early, 100.10)
     assert early.state is CleanCourseState.TRACK  # COMMIT never arms
     assert early._pre_cross_brake_active
-    assert not early._brake_vision_relax  # arrest outranks custody here
-    # F80: the course-leg arrest uses the doubled -0.30 brake offset —
-    # emitted at the F84 floor (-33 deg), clear of the -35 deg watchdog.
-    assert (
-        early.config.spawn_pitch_rad
-        + early.config.course_pre_cross_brake_pitch_rad
-    ) < early.config.pitch_target_min_rad
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    # Gate recovered to center, still hot (0.85/s): the custody floor now
+    # admits a real brake — spawn - (0.18 - 0)/1.6 — instead of F73b's
+    # self-blinding full brake or F71's level surrender.
+    early.current.y_axis.p = 0.0
+    early.current.raw_y = 0.0
+    out, now = _drive_commit_window(early, now)
+    assert early.state is CleanCourseState.TRACK
+    assert early._pre_cross_brake_active
     assert out.target_pitch_rad == pytest.approx(
-        early.config.pitch_target_min_rad, abs=1e-9
+        SPAWN_PITCH - 0.18 / 1.6, abs=1e-9
     )
-    # Phase B (same leg at the -0.9 censorship onset, still hot): the
-    # arrest no longer suppresses the F51/F65 relax — near-plane vision
-    # custody outranks the brake, so the emitted pitch is LEVEL on the
-    # fresh ey +0.31 instead of the self-blinding brake attitude F73b
-    # emitted at the plane.
-    plane = _commit_controller()
-    current = plane.current
-    current.x_axis.p = -0.12
-    current.y_axis.p = 0.31
-    current.raw_x = -0.12
-    current.raw_y = 0.31
-    current.scale_axis.p = -0.60
-    current.scale_axis.v = 0.85
-    current.outer_log_scale = -0.80
+
+
+def test_hot_closure_brake_survives_the_attitude_artifact():
+    # F93 (20260730T143851Z-visual-course-7e67b464): the held course brake
+    # (-0.577 attitude, 0.267 rad nose-up) had HALVED the closure rate when
+    # the attitude artifact walked RAW ey to +0.24; the F71 relax read
+    # raw ey >= 0.18 and surrendered the brake to FULL LEVEL with closure
+    # still ~1.0/s — the drone re-advanced into the gate-1 plane, the entry
+    # budget correctly refused COMMIT (expansion, |vz|), and it hit the
+    # structure (id 1001).  The compensated ey (~-0.19: the gate is actually
+    # ABOVE center) must keep the custody floor at a hard brake.  On the
+    # parent the emitted pitch here is LEVEL.
+    controller = _commit_controller()
+    current = controller.current
+    current.x_axis.p = -0.10
+    current.y_axis.p = 0.24
+    current.raw_x = -0.10
+    current.raw_y = 0.24
+    current.scale_axis.p = -0.50  # commit regime reads the inner scale
+    current.scale_axis.v = 1.0  # ~1.0 log/s closure: budget false
     current.aperture_half_x = 0.20
     current.aperture_half_y = 0.20
-    out, _ = _drive_commit_window(plane, 100.10)
-    assert plane.state is CleanCourseState.TRACK
-    assert plane._brake_vision_relax  # custody preserved at the plane
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    brake_attitude = SPAWN_PITCH - 0.267  # the held F93 brake attitude
+    now = 100.10
+    out = None
+    for _ in range(15):
+        now += 0.033
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=brake_attitude)
+    assert controller.state is CleanCourseState.TRACK  # COMMIT never arms
+    assert controller._pre_cross_brake_active
+    # Compensated ey = 0.24 - 0.267*1.6 ~= -0.19, so the floor sits at
+    # spawn - (0.18 + 0.19)/1.6 ~= spawn - 0.23: a hard custody-compatible
+    # brake, never the level surrender that re-advanced F93 into the plane.
+    assert out.target_pitch_rad <= SPAWN_PITCH - 0.15
+    assert out.target_pitch_rad == pytest.approx(
+        SPAWN_PITCH - (0.18 - (0.24 - 0.267 * 1.6)) / 1.6, abs=1e-9
+    )
 
 
 def test_no_track_search_latches_altitude_support():
