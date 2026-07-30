@@ -648,15 +648,11 @@ HIGH_GATE_CLIMB_MARGIN = 0.12  # unqualified hold margin while the gate is high
 # error is ey_true = ey_measured - (spawn_pitch_rad - rpy_p) * this gain;
 # it is zero at the spawn attitude.
 VERTICAL_PITCH_COMP_NORM_PER_RAD = 1.6  # image-norm vertical shift per rad
-# F50 SEARCH vertical memory: F49's SEARCH held the support floor at
-# ceiling height for 8 s while the gate sat ~1.5 m below — a search that
-# cannot descend never re-acquires a gate that sank out of the FOV.  With
-# a reliable bearing memory, SEARCH servos the collective on the
-# remembered attitude-compensated ey (the global vertical sign and the
-# qualified-PD error gain), bounded to this band around support; without
-# memory it holds support as before.  The output still passes through
-# _governed_collective, so the fh-untrusted floor and vz protections
-# override the memory descent.
+# SEARCH vertical band: bounds the COMMIT/TRACK ey collective servo.  The
+# F50 SEARCH memory-descent that shared this band is REMOVED (F75): it
+# turned F74's gate-1 miss into a blind sink to the alt-est floor — a
+# no-track SEARCH now latches altitude support and lets the sweep do the
+# re-acquisition.
 SEARCH_VERTICAL_MEMORY_BAND = 0.05  # collective band around support
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 # Real scan, not a wiggle (post-credit pursuit redesign): 0.12 rad/s with a
@@ -1856,25 +1852,14 @@ class CleanCourseController:
             margin = (
                 cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
             )
-            # F50 vertical memory (see the SEARCH_VERTICAL_MEMORY_BAND
-            # block): servo the collective on the REMEMBERED bearing's
-            # attitude-compensated ey so a search can descend toward a gate
-            # that sank below the FOV — F49 held the support floor at
-            # ceiling height for 8 s over a gate ~1.5 m low.  Bounded to a
-            # small band around support; no memory -> bare support hold.
-            correction = 0.0
-            if self._bearing_memory_valid:
-                remembered_ey = self._compensated_ey(
-                    self.last_reliable_bearing[1], pitch_rad
-                )
-                correction = _clamp(
-                    cfg.vertical_feedback_sign
-                    * cfg.vertical_error_gain
-                    * remembered_ey,
-                    -cfg.search_vertical_memory_band,
-                    cfg.search_vertical_memory_band,
-                )
-            search_hold = support + correction + margin
+            # F75: altitude support is LATCHED in no-track SEARCH.  The F50
+            # memory-descent servo turned F74's gate-1 miss into a blind
+            # 4.8 s sink to the alt-est floor (-2.0) while fh grew 1.3 ->
+            # 4.3 — a searching drone that descends on a frozen bearing
+            # converts a recoverable miss into a floor/structure crash.
+            # SEARCH holds altitude at support; re-acquisition is the
+            # sweep's job.  (The TRACK/COMMIT ey servo is untouched.)
+            search_hold = support + margin
             self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
             # F49: SEARCH always holds the LEVEL (spawn-attitude) pitch.
@@ -2182,10 +2167,18 @@ class CleanCourseController:
         # brake — hold OUTSIDE the blackout and re-center.  The same budget
         # passing arms COMMIT on the same tick; nothing else about the
         # crossing changes.
+        # F75: widen the hold from the censorship-onset zone (-0.9) to the
+        # commit-regime entry (-1.2).  F74 held the true brake -0.46 from
+        # -0.9 onward and closure still ROSE (fh 2.5 -> 3.6): by -0.9 the
+        # approach energy is already beyond what the brake attitude can
+        # arrest before the plane.  The only fresh, uncensored window on
+        # the F54 timeline starts at -1.2, so arrest there — stop while
+        # still seeing, re-center yaw/vertical at hover, and let the entry
+        # budget arm COMMIT from a standstill instead of arriving hot.
         near_plane_hold = (
             self.state is CleanCourseState.TRACK
             and self.gate_index >= 1
-            and current.outer_log_scale >= cfg.near_brake_log_scale
+            and current.outer_log_scale >= cfg.commit_min_log_scale
             and not self._commit_entry_budget_ok(now_s, pitch_rad, cfg)
         )
         if near_plane_hold:
@@ -2202,8 +2195,17 @@ class CleanCourseController:
         # Brake blind on the derotated hypothesis instead; the hold ends
         # via the budget or PREDICT, and custody returns the moment closure
         # is at/below the governor target (stopped: re-center level).
-        arresting_closure = near_plane_hold and (
-            current.expansion_rate > cfg.closure_target_rate_s
+        # F75: the arrest outranks custody ONLY in the pre-censorship band
+        # [-1.2, -0.9) where the whole gate is still visible.  F73b held
+        # the brake at the plane and pitched the gate OUT of view (the
+        # self-blinding F51/F65 were built against); past the -0.9
+        # censorship onset the F51/F65 relax keeps vision custody — the
+        # energy must already be dead by then, which is exactly what the
+        # widened -1.2 hold above buys.
+        arresting_closure = (
+            near_plane_hold
+            and current.outer_log_scale < cfg.near_brake_log_scale
+            and current.expansion_rate > cfg.closure_target_rate_s
         )
         # Closure-rate governor (F31) + misalignment brake (F35): continuous
         # blend toward the TRUE brake attitude as either the vision expansion

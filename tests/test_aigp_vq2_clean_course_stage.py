@@ -1603,46 +1603,10 @@ def test_search_level_pitch_held_from_the_first_tick():
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
 
 
-def test_search_descends_toward_remembered_low_bearing():
-    # F50 (flight 20260729T222920Z-visual-course-3a8ed087): F49's SEARCH
-    # held the support floor at ceiling height for 8 s while the gate sat
-    # ~1.5 m below — a search that cannot descend never re-acquires a gate
-    # that sank below the FOV.  With a reliable bearing memory, SEARCH
-    # servos the collective on the remembered attitude-compensated ey,
-    # bounded to a small band around support.
-    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
-    controller._enter_search(100.10)
-    controller._set_reliable_bearing(0.0, 0.50)  # gate below center
-    out = _command(controller, 100.143, pitch=SPAWN_PITCH)
-    # Proportional descent: -0.080 * 0.50 = -0.04 around the level base.
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.080 * 0.50, abs=1e-9)
-    assert out.thrust < SPAWN_SUPPORT
-    # A remembered HIGH bearing climbs by the same term.
-    controller._set_reliable_bearing(0.0, -0.50)
-    out = _command(controller, 100.20, pitch=SPAWN_PITCH)
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.080 * 0.50, abs=1e-9)
-    # The correction is bounded to the band, and the min-thrust envelope
-    # still floors the result.
-    controller._set_reliable_bearing(0.0, 0.95)
-    out = _command(controller, 100.26, pitch=SPAWN_PITCH)
-    assert out.thrust == pytest.approx(0.21, abs=1e-9)
-
-
-def test_search_memory_descent_yields_to_fh_untrusted_floor():
-    # The memory servo still passes through _governed_collective: while
-    # vz/alt are known lies the support + margin floor overrides the
-    # descent correction (the F21 blind-sink protections win).
-    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
-    controller._enter_search(100.10)
-    controller._set_reliable_bearing(0.0, 0.50)
-    controller._fh_untrusted = True
-    out = _command(controller, 100.143, pitch=SPAWN_PITCH, fh=6.0)
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-9)
-
-
 def test_search_without_bearing_memory_holds_support():
-    # No bearing evidence yet: the vertical memory servo stays out and the
-    # search holds the plain support collective (pre-F50 behavior).
+    # F75: no-track SEARCH latches altitude support (the F50 memory
+    # descent is removed); with no bearing evidence this is the same
+    # plain support hold.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller._enter_search(100.10)
     controller._bearing_memory_valid = False
@@ -2504,33 +2468,68 @@ def test_near_plane_track_holds_closure_while_commit_budget_false():
     assert out0.target_pitch_rad > SPAWN_PITCH - 0.15 + 1e-9
 
 
-def test_arresting_closure_overrides_vision_relax_with_true_brake():
-    # F73b decisive-window regression on the F72 t=5.0-5.5 s geometry
-    # (20260730T063739Z-visual-course-34c53413): gate-1 TRACK at the plane,
-    # ex -0.12, ey +0.31 (the F71 relax WOULD level the camera), span ~0.55
-    # expanding at 0.85/s, budget false.  On 37f26ce the emitted pitch here
-    # is LEVEL (the relax overrode the brake blend) — the drone closed span
-    # 0.55 -> 0.78 straight into censorship.  Arresting live closure must
-    # emit the TRUE brake attitude: leveling keeps custody but never
-    # reduces energy.  Once closure is arrested the custody relax returns
-    # (covered by test_course_leg_near_plane_relax_engages_earlier_and_
-    # sticks, expansion 0).
-    controller = _commit_controller()
-    current = controller.current
+def test_early_arrest_brakes_before_censorship_without_self_blinding():
+    # F75 on the F72/F74 approach geometry: closure energy is arrested in
+    # the pre-censorship band [-1.2, -0.9) where the whole gate is still
+    # visible, and the near-plane zone keeps vision custody.  F73b's hold
+    # only engaged at -0.9 — by then the F74 approach (fh 2.5 -> 3.6 while
+    # braking) could no longer be stopped, and its arrest suppression
+    # pitched the gate out of view at the plane.
+    # Phase A (F74 t~4-5 s state): outer log scale -1.00, span expanding
+    # at 0.85/s, ey +0.31 (the relax WOULD level), budget false.  On
+    # fb41bc2 the emitted pitch here is LEVEL (no hold until -0.9, relax
+    # levels) — the drone carried ~3 m/s into the censorship zone.  The
+    # widened hold must emit the TRUE brake this early.
+    early = _commit_controller()
+    current = early.current
     current.x_axis.p = -0.12
     current.y_axis.p = 0.31
     current.raw_x = -0.12
     current.raw_y = 0.31
-    current.scale_axis.p = -0.60  # span ~0.55
-    current.scale_axis.v = 0.85  # F72's measured expansion
-    current.outer_log_scale = -0.60
+    current.scale_axis.p = -1.00
+    current.scale_axis.v = 0.85
+    current.outer_log_scale = -1.00
     current.aperture_half_x = 0.20
     current.aperture_half_y = 0.20
-    out, _ = _drive_commit_window(controller, 100.10)
-    assert controller.state is CleanCourseState.TRACK  # COMMIT never arms
-    assert controller._pre_cross_brake_active
-    assert not controller._brake_vision_relax  # arrest outranks custody
+    out, _ = _drive_commit_window(early, 100.10)
+    assert early.state is CleanCourseState.TRACK  # COMMIT never arms
+    assert early._pre_cross_brake_active
+    assert not early._brake_vision_relax  # arrest outranks custody here
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
+    # Phase B (same leg at the -0.9 censorship onset, still hot): the
+    # arrest no longer suppresses the F51/F65 relax — near-plane vision
+    # custody outranks the brake, so the emitted pitch is LEVEL on the
+    # fresh ey +0.31 instead of the self-blinding brake attitude F73b
+    # emitted at the plane.
+    plane = _commit_controller()
+    current = plane.current
+    current.x_axis.p = -0.12
+    current.y_axis.p = 0.31
+    current.raw_x = -0.12
+    current.raw_y = 0.31
+    current.scale_axis.p = -0.60
+    current.scale_axis.v = 0.85
+    current.outer_log_scale = -0.80
+    current.aperture_half_x = 0.20
+    current.aperture_half_y = 0.20
+    out, _ = _drive_commit_window(plane, 100.10)
+    assert plane.state is CleanCourseState.TRACK
+    assert plane._brake_vision_relax  # custody preserved at the plane
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+
+
+def test_no_track_search_latches_altitude_support():
+    # F75: a no-track SEARCH holds altitude support — the F50 memory
+    # descent turned F74's gate-1 miss into a blind 4.8 s sink to the
+    # alt-est floor before the structure strike.  With a reliable bearing
+    # memory BELOW the camera (remembered ey +0.50, the descent case the
+    # F50 servo was built for), the emitted collective stays at support.
+    controller = _tracked_controller(_track("A", 0.10, 0.45))
+    controller._enter_search(100.10)
+    controller._set_reliable_bearing(0.10, 0.50)
+    out = _command(controller, 100.143, pitch=SPAWN_PITCH)
+    assert out.state is CleanCourseState.SEARCH
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
 
 
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
