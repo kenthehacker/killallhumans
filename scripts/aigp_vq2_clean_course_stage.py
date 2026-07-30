@@ -1757,9 +1757,27 @@ class CleanCourseController:
         ):
             self._enter_search(now_s)
 
+        # F95: the tilt compensation is relative to the LEVEL (spawn)
+        # attitude, not absolute rpy.  The -0.31 spawn attitude is an rpy
+        # frame offset — the body is level there (F38: stationary, span
+        # flat), so true tilt is pitch_rad - spawn_pitch_rad.  The
+        # absolute-rpy formula inflated support at the brake attitude
+        # (0.2906 at -0.577 vs the true ~0.269 at 0.267 rad from level),
+        # an open-loop +0.9 m/s^2 climb bias — the chronic gate-1 balloon
+        # (F90/F91/F93/F94 all ballooned vz +0.4..+0.5 at the brake
+        # attitude) that the vertical arrest kept chasing downstream.  At
+        # level both formulas agree (0.2594), so every level-tuned path
+        # (the F14/F21 margins, the F83 floor, gate 0's envelope) is
+        # unchanged; F83 already proved the same inflation wrong in the
+        # fh-untrusted floor and bounded it there.
+        level_hover = cfg.support_collective / math.cos(cfg.spawn_pitch_rad)
         support = _clamp(
-            cfg.support_collective
-            / max(0.85, math.cos(roll_rad) * math.cos(pitch_rad)),
+            level_hover
+            / max(
+                0.85,
+                math.cos(roll_rad)
+                * math.cos(pitch_rad - cfg.spawn_pitch_rad),
+            ),
             cfg.min_thrust,
             cfg.max_thrust,
         )
