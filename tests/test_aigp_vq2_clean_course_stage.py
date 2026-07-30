@@ -2913,6 +2913,50 @@ def test_vertical_arrival_arrest_shaves_climb_before_center():
     assert out0.thrust == pytest.approx(settled.thrust, abs=1e-3)
 
 
+def test_two_sided_arrest_bleeds_centered_gate_climb():
+    # F90 (20260730T134602Z-visual-course-6e302725): the gate-1 leg
+    # inherited vz +0.18 and a 0.024 support trim from the credited
+    # gate-0 wait, then climbed vz +0.3..+0.4 for 1.3 s with the gate
+    # vertically CENTERED (ey ~+0.03) — the one-sided arrest required a
+    # climb COMMAND (ey < 0), the 0.5 m/s governor only caps rate, and
+    # the ey PD is ~zero at center, so nothing bled the climb.  The F14
+    # latch then pinned it 1.5 s more, the gate fell out the frame
+    # bottom, and the recovery dove into the ground (id 1002).  With the
+    # gate at/below center ANY positive vz is energy away from the aim:
+    # the |ey|-scaled allowance binds in both directions.
+    def _gate_low_thrust(vz_m_s):
+        controller = _tracked_controller(_track("A", 0.0, 0.03, scale=0.20))
+        _promote_to_gate_one(controller)
+        controller._alt_est_m = 2.0  # honest altitude (floor quiet)
+        current = controller.current
+        current.x_axis.p = 0.0
+        current.raw_x = 0.0
+        current.y_axis.p = 0.03  # gate AT/slightly BELOW center: no climb intent
+        current.raw_y = 0.03
+        current.y_axis.v = 0.0
+        current.scale_axis.p = -1.6
+        current.scale_axis.v = 0.10  # settled closure
+        now = 100.10
+        out = None
+        for _ in range(15):  # converge the slews/governors
+            now += 0.033
+            controller._vz_est_m_s = vz_m_s
+            current.last_measurement_s = now
+            current.last_x_measurement_s = now
+            current.last_y_measurement_s = now
+            out = _command(controller, now, pitch=SPAWN_PITCH)
+        assert controller.state is CleanCourseState.TRACK
+        return out
+
+    climbing = _gate_low_thrust(0.30)
+    settled = _gate_low_thrust(0.0)
+    # A +0.30 m/s climb at ey +0.03 is arrested hard (allowance 0.03):
+    # subtraction 0.15 * (0.30 - 0.03) = 0.040.  On the one-sided parent
+    # the arrest never engages and the two outputs are identical (the
+    # vz governor is quiet at 0.30 < 0.5 and the trim leak starts at 0).
+    assert climbing.thrust < settled.thrust - 0.02
+
+
 def test_gate0_near_plane_arrest_shaves_censorship_entry_climb():
     # F85 (20260730T123020Z-visual-course-34c8dd71): gate 0 arrived at
     # censorship climbing +0.45 m/s; the aperture fit had died to clipping,

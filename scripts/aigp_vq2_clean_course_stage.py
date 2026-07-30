@@ -197,15 +197,19 @@ VZ_DESCENT_GOVERNOR_GAIN = 0.21  # collective per m/s below the floor
 # censorship and the crossing went high.  The governor binds only at the
 # cap; what is missing is a STOPPING law: as the compensated error
 # approaches center the desired vertical velocity must approach zero.
-# While a climb is commanded (bounded_error < 0) and the IMU vz is
-# positive, allowed climb is proportional to the REMAINING error
-# (vz_allow = ARREST_VZ_PER_NORM * |ey|); any excess subtracts collective
-# continuously.  Descents (vz <= 0) and descend commands (ey >= 0) are
-# untouched — no blanket reduction, no sink; the descent floor below
-# still bounds any sag, and the F14 fh-untrusted latch (frozen vz) keeps
-# its no-vz-adjustment contract.  F78b: gate-1+ legs only — on gate 0 it
+# While the IMU vz is positive, allowed climb is proportional to the
+# REMAINING error (vz_allow = ARREST_VZ_PER_NORM * |ey|); any excess
+# subtracts collective continuously.  Descents (vz <= 0) are untouched —
+# no blanket reduction, no sink; the descent floor below still bounds
+# any sag, and the F14 fh-untrusted latch (frozen vz) keeps its
+# no-vz-adjustment contract.  F78b: gate-1+ legs only — on gate 0 it
 # arrested the proved climb-out and armed the pre-gate-1 altitude floor
-# (20260730T085104Z-visual-course-34b59dea).
+# (20260730T085104Z-visual-course-34b59dea).  F91: two-sided — F90
+# climbed vz +0.3..+0.4 with the gate CENTERED (ey ~0, no climb command,
+# so the one-sided arrest never engaged), ballooned ~0.5 m over the gate
+# under the F14 latch, lost it out the frame bottom, and dove into the
+# ground (20260730T134602Z-visual-course-6e302725, id 1002).  With the
+# gate at/below center any positive vz is energy away from the aim.
 VERTICAL_ARREST_VZ_PER_NORM = 1.0  # m/s allowed climb per norm of |ey|
 VERTICAL_ARREST_COLLECTIVE_GAIN = 0.15  # subtraction per m/s of excess
 
@@ -2331,7 +2335,7 @@ class CleanCourseController:
             # block): a commanded climb near center may not carry speed
             # INTO center — allowed climb scales with the remaining error,
             # excess vz subtracts collective continuously.  Inactive on
-            # descents/descend commands and under the F14 latch.
+            # descents and under the F14 latch.
             # F78b (20260730T085104Z-visual-course-34b59dea): GATE-1+
             # ONLY.  Applied globally it arrested the PROVED gate-0
             # climb-out (thrust 0.21 at t=0.43), the drone crossed low
@@ -2350,14 +2354,26 @@ class CleanCourseController:
             # with dead vertical energy.  The F78b failure was the FAR
             # climb-out, so gate 0 joins the arrest only inside the COMMIT
             # proximity regime; the climb-out envelope is untouched.
+            # F91 (20260730T134602Z-visual-course-6e302725): the arrest is
+            # TWO-SIDED.  F90's gate-1 leg inherited vz +0.18 and a 0.024
+            # support trim from the (credited) gate-0 credit wait, then
+            # climbed vz +0.3..+0.4 for 1.3 s with the gate vertically
+            # CENTERED (ey ~0) — the one-sided arrest required a climb
+            # COMMAND (ey < 0), the 0.5 m/s governor only caps rate, and
+            # the ey PD is ~zero at center, so nothing bled the climb.
+            # The F14 latch then pinned the climb 1.5 s more and the gate
+            # fell out the frame bottom; the recovery dove into the ground
+            # (id 1002).  With the gate at/below center ANY positive vz is
+            # energy away from the aim, so the |ey|-scaled allowance binds
+            # in both directions; a genuine high gate (ey < 0) keeps the
+            # exact same allowance it had.
             near_plane = current.log_scale >= cfg.commit_min_log_scale
             if (
                 (self.gate_index >= 1 or near_plane)
-                and bounded_error < 0.0
                 and not self._fh_untrusted
                 and self._vz_est_m_s > 0.0
             ):
-                vz_allow = cfg.vertical_arrest_vz_per_norm * (-bounded_error)
+                vz_allow = cfg.vertical_arrest_vz_per_norm * abs(bounded_error)
                 excess = self._vz_est_m_s - vz_allow
                 if excess > 0.0:
                     collective -= cfg.vertical_arrest_collective_gain * excess
