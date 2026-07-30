@@ -2662,6 +2662,90 @@ def test_course_leg_sink_response_stays_off_max_clamp():
     assert out.thrust > SPAWN_SUPPORT  # the sink IS answered, just coherently
 
 
+def test_course_leg_trim_fast_leaks_when_fighting_the_tracker():
+    # F97 (20260730T160909Z-visual-course-a4bfb6d3): the gate-1 leg's
+    # mid-leg overshoot (alt +0.19 with ey ~0) was propped by the
+    # vz-center trim, wound to its 0.06 cap during the blind
+    # post-crossing window and leaking back at only 0.02/s — it fought
+    # the tracker (which wanted vz ~0 while vz_est read +0.24) for the
+    # whole leg.  A wound positive trim in that geometry is suspect by
+    # construction: bleed it at 0.10/s, not 0.02/s.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.20))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 2.0
+    controller._vz_center_trim = 0.06  # the blind post-crossing windup
+    current = controller.current
+    current.y_axis.p = 0.0
+    current.raw_y = 0.0
+    current.y_axis.v = 0.0
+    current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10
+    now = 100.10
+    out = None
+    for _ in range(15):  # ~0.5 s of the F96 mid-leg geometry
+        now += 0.033
+        controller._vz_est_m_s = 0.24
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    assert out.vertical_qualified
+    # 0.10/s over ~0.5 s bleeds 0.06 -> ~0.01 (the old 0.02/s leak
+    # leaves ~0.05 — the parent's value, which fails this assertion).
+    assert controller._vz_center_trim < 0.02
+
+
+def test_course_leg_vz_des_respects_commit_budget_near_plane():
+    # F97: F96's tracker saturated vz_des at -0.5 pulling a low gate
+    # (ey +0.3) to center and held vz -0.46 into the plane, so COMMIT's
+    # |vz| <= 0.25 entry budget vetoed the crossing.  The setpoint cap
+    # ramps 0.5 -> 0.20 across the approach (ramp start log_scale -2.0,
+    # commit_min_log_scale -1.2): near the plane the same geometry
+    # commands a budget-compatible descent.
+    controller = _tracked_controller(_track("A", 0.0, 0.30, scale=0.20))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 2.0
+    current = controller.current
+    current.y_axis.p = 0.30  # F96's low-sitting gate at the plane
+    current.raw_y = 0.30
+    current.y_axis.v = 0.0
+    current.scale_axis.p = -0.9  # log_scale >= -1.2: inside the commit regime
+    current.scale_axis.v = 0.10
+    now = 100.10
+    out = None
+    for _ in range(15):
+        now += 0.033
+        controller._vz_est_m_s = 0.10
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    # vz_des is capped at -0.20 (not -0.30): support + 0.12*(-0.20-0.10).
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.036, abs=1e-3)
+    # Far away the full -0.30 setpoint applies: support + 0.12*(-0.30-0.10).
+    far = _tracked_controller(_track("A", 0.0, 0.30, scale=0.20))
+    _promote_to_gate_one(far)
+    far._alt_est_m = 2.0
+    far_current = far.current
+    far_current.y_axis.p = 0.30
+    far_current.raw_y = 0.30
+    far_current.y_axis.v = 0.0
+    far_current.scale_axis.p = -2.5  # beyond the ramp start: full 0.5 cap
+    far_current.scale_axis.v = 0.10
+    far_now = 100.10
+    far_out = None
+    for _ in range(15):
+        far_now += 0.033
+        far._vz_est_m_s = 0.10
+        far_current.last_measurement_s = far_now
+        far_current.last_x_measurement_s = far_now
+        far_current.last_y_measurement_s = far_now
+        far_out = _command(far, far_now, pitch=SPAWN_PITCH)
+    assert far_out.thrust == pytest.approx(SPAWN_SUPPORT - 0.048, abs=1e-3)
+
+
 def test_two_sided_arrest_bleeds_centered_gate_climb():
     # F90 (20260730T134602Z-visual-course-6e302725): the gate-1 leg
     # inherited vz +0.18 and a 0.024 support trim from the credited

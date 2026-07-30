@@ -241,6 +241,23 @@ VERTICAL_ARREST_COLLECTIVE_GAIN = 0.15  # subtraction per m/s of excess
 COURSE_VZ_DES_PER_NORM = 1.0  # m/s desired climb per norm of compensated ey
 COURSE_VZ_DES_MAX_M_S = 0.5  # matches the VZ_CLIMB_CAP_COURSE_M_S envelope
 COURSE_VZ_TRACK_GAIN = 0.12  # collective per m/s of vz tracking error
+# F97 (20260730T160909Z-visual-course-a4bfb6d3): F96 flew smoothly but the
+# tracker's vz_des saturated at -0.5 pulling a low-sitting gate to center,
+# holding vz -0.46 into the plane — COMMIT's |vz| <= 0.25 entry budget
+# vetoed the crossing exactly as F95's oscillation residue had.  The
+# setpoint clamp and the entry budget were in direct spec conflict.  Near
+# the commit regime the setpoint is capped at 0.20 (inside the budget with
+# margin), ramping continuously from the far value so the vertical
+# correction happens earlier in the approach, not at the plane.
+COURSE_VZ_DES_COMMIT_M_S = 0.20  # vz_des cap at/inside commit_min_log_scale
+COURSE_VZ_DES_RAMP_START_LOG_SCALE = -2.0  # far end of the cap ramp
+# F97: the same flight's mid-leg overshoot (alt +0.19 with ey ~0) was
+# propped by the vz-center trim, wound to its cap during the blind
+# post-crossing window (F90 blind anti-sink, working as designed) and
+# leaking back at only 0.02/s — it fought the tracker for the whole leg.
+# A wound positive trim while the tracker wants LESS climb than the
+# measured vz is suspect by construction: bleed it fast.
+COURSE_VZ_TRIM_FAST_LEAK_S = 0.10  # collective/s when trim fights the tracker
 
 # Launch boost is pure feedforward (it ignores ey).  Flight
 # 20260729T094736Z-visual-course-9d430a40: the 0.32 x 0.75 s boost alone
@@ -1070,6 +1087,9 @@ class CleanCourseConfig:
     course_vz_des_per_norm: float = COURSE_VZ_DES_PER_NORM
     course_vz_des_max_m_s: float = COURSE_VZ_DES_MAX_M_S
     course_vz_track_gain: float = COURSE_VZ_TRACK_GAIN
+    course_vz_des_commit_m_s: float = COURSE_VZ_DES_COMMIT_M_S
+    course_vz_des_ramp_start_log_scale: float = COURSE_VZ_DES_RAMP_START_LOG_SCALE
+    course_vz_trim_fast_leak_s: float = COURSE_VZ_TRIM_FAST_LEAK_S
     min_thrust: float = MIN_COURSE_THRUST
     max_thrust: float = MAX_COURSE_THRUST
     launch_boost_thrust: float = LAUNCH_BOOST_THRUST
@@ -2261,11 +2281,39 @@ class CleanCourseController:
                 # Gate 0 keeps the proved PD envelope below; the F14
                 # fh-untrusted path cannot track a frozen vz_est and
                 # keeps the camera PD.
+                # F97: reconcile the setpoint with the COMMIT |vz| <= 0.25
+                # entry budget (see the COURSE_VZ_DES_COMMIT_M_S block):
+                # the cap ramps 0.5 -> 0.20 across the approach so the
+                # tracker cannot carry a budget-vetoing vertical rate
+                # into the plane.
+                ramp = _clamp01(
+                    (current.log_scale - cfg.course_vz_des_ramp_start_log_scale)
+                    / (
+                        cfg.commit_min_log_scale
+                        - cfg.course_vz_des_ramp_start_log_scale
+                    )
+                )
+                vz_des_max = cfg.course_vz_des_max_m_s - (
+                    cfg.course_vz_des_max_m_s - cfg.course_vz_des_commit_m_s
+                ) * ramp
                 vz_des = _clamp(
                     -cfg.course_vz_des_per_norm * bounded_error,
-                    -cfg.course_vz_des_max_m_s,
-                    cfg.course_vz_des_max_m_s,
+                    -vz_des_max,
+                    vz_des_max,
                 )
+                # F97: a wound positive trim while the tracker wants LESS
+                # climb than the measured vz is suspect by construction
+                # (it fought the tracker for F96's whole leg); bleed it
+                # fast, then emit with the bled value.
+                if (
+                    self._vz_center_trim > 0.0
+                    and self._vz_est_m_s > vz_des + 0.05
+                ):
+                    self._vz_center_trim = max(
+                        0.0,
+                        self._vz_center_trim
+                        - cfg.course_vz_trim_fast_leak_s * dt,
+                    )
                 collective = (
                     support
                     + self._vz_center_trim
