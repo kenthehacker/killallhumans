@@ -158,21 +158,25 @@ GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
 # Symmetric descent floor (flight 20260729T111003Z-visual-course-d52adcd4):
 # a 6.1 s frozen-camera stall blinded the loop while a_up ~= -1.9 m/s^2 sank
 # it into a ground graze.  The hover regime shifts ~0.275 -> ~0.30 support
-# in fast/descending flight, so from the measured plant (a_up =
-# 66.7*thrust - 18.44) the gain adds +0.06 collective at vz = -1.5 m/s
-# (~+4 m/s^2 of arrest authority) and tapers to zero at the floor boundary.
-VZ_DESCENT_FLOOR_M_S = -0.5  # sink-rate bound, mirroring the climb cap
-VZ_DESCENT_GOVERNOR_GAIN = 0.06  # collective per m/s below the floor
+# in fast/descending flight.  F63 (20260730T015429Z-visual-course-5e550551)
+# proved the original floor too weak AND too late: a deliberate ey-servo
+# descent at t=5.0 built an established -0.5..-1.5 m/s sink that the
+# 0.06/m/s gain could not arrest (thrust peaked 0.33 while the fast-regime
+# hover is ~=0.32) — the drone passed UNDER gate 1 and spun blind into the
+# floor.  Engage at -0.35 m/s (before momentum builds) with 0.10/m/s so the
+# command reaches the 0.34 envelope top by vz ~= -1.0.
+VZ_DESCENT_FLOOR_M_S = -0.35  # sink-rate bound, mirroring the climb cap
+VZ_DESCENT_GOVERNOR_GAIN = 0.10  # collective per m/s below the floor
 # Descent-regime hover feedforward (flight 20260729T112603Z-visual-course-
 # d5e89c2b): a ~-0.5 m/s^2 sink persisted ~4 s while the leaky vz estimate
 # (tau 2.5 s) wound up and the proportional floor alone reached only ~0.31
-# by ground contact; the effective fast-regime hover is ~=0.32.  A fixed
-# +0.025 (mid of the diagnosed +0.02..0.03) applies whenever vz is below
-# the floor, so full arrest authority arrives with the FIRST confirmed
-# sub-floor estimate instead of seconds later.  A shorter downward leak
-# tau was rejected: steady-state vz_est = a_up*tau would sit above the
-# -0.5 floor and the proportional floor would never engage at all.
-VZ_DESCENT_HOVER_FEEDFORWARD = 0.025  # step feedforward while below the floor
+# by ground contact; the effective fast-regime hover is ~=0.32.  F63
+# repeated the same shape (thrust 0.30-0.33, sink unarrested for ~5 s), so
+# the step is +0.04 whenever vz is below the floor: full arrest authority
+# arrives with the FIRST confirmed sub-floor estimate instead of seconds
+# later.  A shorter downward leak tau was rejected: steady-state vz_est =
+# a_up*tau would sit above the floor and the floor would never engage.
+VZ_DESCENT_HOVER_FEEDFORWARD = 0.04  # step feedforward while below the floor
 
 # Launch boost is pure feedforward (it ignores ey).  Flight
 # 20260729T094736Z-visual-course-9d430a40: the 0.32 x 0.75 s boost alone

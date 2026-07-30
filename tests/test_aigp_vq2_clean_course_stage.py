@@ -499,22 +499,28 @@ def test_vz_governor_applies_in_predict_and_search():
 def test_vz_governor_floors_collective_below_descent_floor():
     # Flight 20260729T111003Z-visual-course-d52adcd4: a 6.1 s frozen-camera
     # stall blinded the loop while a_up ~= -1.9 m/s^2 sank it into a ground
-    # graze; the climb-only governor did nothing.  The symmetric floor adds
-    # K_VZ_DESCENT per m/s below the -0.5 m/s sink bound, plus the fixed
-    # +0.025 descent-regime hover feedforward (flight d5e89c2b) whenever the
-    # estimate is below the floor.
+    # graze; the climb-only governor did nothing.  F63 (5e550551) proved the
+    # original -0.5/0.06/+0.025 floor too weak: an established -1.0..-1.5
+    # sink ran ~5 s unarrested at thrust 0.30-0.33 (fast-regime hover ~=0.32)
+    # and the drone passed under gate 1 into the floor.  The F64 floor
+    # engages at -0.35 m/s with 0.10/m/s plus a +0.04 step feedforward.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     helper = controller._governed_collective
     max_thrust = controller.config.max_thrust
-    controller._vz_est_m_s = -0.5  # at the floor boundary: no effect
+    controller._vz_est_m_s = -0.35  # at the floor boundary: no effect
     assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT, abs=1e-9)
-    controller._vz_est_m_s = -1.0  # 0.5 m/s below -> +0.03 + 0.025 feedforward
-    # support + 0.055: inside the raised 0.34 envelope (F9/F10 headroom
+    controller._vz_est_m_s = -0.7  # 0.35 m/s below -> +0.035 + 0.04 feedforward
+    # support + 0.075: inside the raised 0.34 envelope (F9/F10 headroom
     # restoration; the old 0.32 clamp clipped exactly this case).
-    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.055, abs=1e-9)
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(SUPPORT + 0.075, abs=1e-9)
+    # F64: by vz -1.0 the arrest saturates at max_thrust (raw support +
+    # 0.065 + 0.04 = 0.352) — the F63 sink ran unarrested at 0.30-0.33
+    # while the fast-regime hover is ~=0.32.
+    controller._vz_est_m_s = -1.0
+    assert helper(SUPPORT, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
     # Deep sinks saturate at max_thrust (flight 039186c8: the unclamped
     # floor boost exceeded the runner's 0.35 envelope abort in SEARCH).
-    controller._vz_est_m_s = -1.7  # 1.2 m/s below -> +0.072 + 0.025 raw
+    controller._vz_est_m_s = -1.7  # 1.35 m/s below -> +0.135 + 0.04 raw
     assert helper(SUPPORT, SUPPORT) == pytest.approx(max_thrust, abs=1e-9)
     # The floor only raises collective, but the governed output is still
     # clamped: a higher command saturates at max_thrust as well.
@@ -523,34 +529,36 @@ def test_vz_governor_floors_collective_below_descent_floor():
 
 
 def test_vz_descent_floor_raises_command_thrust():
-    # Command level: vz = -0.7 m/s lifts the emitted collective to
-    # support + 0.012 (proportional) + 0.025 (feedforward) = 0.312, below
-    # the raised 0.34 clamp so it stays observable; a deeper sink (vz -1.0,
-    # raw 0.33) now fits inside the envelope instead of clipping at 0.32.
+    # Command level (F64 law): vz = -0.7 m/s lifts the emitted collective to
+    # support + 0.035 (proportional) + 0.04 (feedforward) = 0.322; a deeper
+    # sink (vz -1.0, raw 0.352) clips at the 0.34 envelope top... the raw
+    # 0.352 still fits the assertion below the clamp here (support 0.247 +
+    # 0.105 = 0.352 -> clamped to 0.34 = max_thrust).
     controller = _tracked_controller(_track("A", 0.0, 0.0))  # e = 0, vy ~ 0
     controller._vz_est_m_s = -0.7
     assert _command(controller, 100.10).thrust == pytest.approx(
-        SUPPORT + 0.037, abs=1e-9
+        SUPPORT + 0.075, abs=1e-9
     )
     controller._vz_est_m_s = -1.0
     assert _command(controller, 100.14).thrust == pytest.approx(
-        SUPPORT + 0.055, abs=1e-9
+        controller.config.max_thrust, abs=1e-9
     )
 
 
 def test_vz_descent_floor_applies_in_predict_and_search():
     # The floor is IMU-based for the same reason as the climb cap: vision
-    # loss (the d52adcd4 stall case) must not disable it.
+    # loss (the d52adcd4 stall case) must not disable it.  F64 law: vz -0.7
+    # -> support + 0.035 proportional + 0.04 feedforward.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller.observe(_update([], frame_id=2), now_s=100.12)  # superseded
     assert controller.state is CleanCourseState.PREDICT
     controller._vz_est_m_s = -0.7
     assert _command(controller, 100.16).thrust == pytest.approx(
-        SUPPORT + 0.037, abs=1e-9
+        SUPPORT + 0.075, abs=1e-9
     )
     controller._enter_search(100.20)
     assert _command(controller, 100.22).thrust == pytest.approx(
-        SUPPORT + 0.037, abs=1e-9
+        SUPPORT + 0.075, abs=1e-9
     )
 
 
@@ -900,8 +908,11 @@ def test_altitude_floor_triggers_and_releases_with_hysteresis():
         frame += 1
     assert controller._alt_floor_active
     assert out.yaw_rate_rad_s == 0.0
-    # Sinking at -1.0 m/s: support + 0.06 * 0.5 + 0.025 feedforward.
-    assert out.thrust == pytest.approx(SUPPORT + 0.055, abs=1e-9)
+    # F64: sinking at -1.0 m/s saturates the strengthened descent floor at
+    # the 0.34 envelope top (raw support + 0.065 + 0.04 = 0.352).
+    assert out.thrust == pytest.approx(
+        controller.config.max_thrust, abs=1e-9
+    )
     # Hysteresis: climbing between 0.7 and 1.2 m keeps the floor active.
     controller._vz_est_m_s = 1.0
     while controller._alt_est_m < 1.0:
