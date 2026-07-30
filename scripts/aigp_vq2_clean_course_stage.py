@@ -18,12 +18,13 @@ Authority model:
 - The July-18 bounded credible-crossing wait survives as the single
   ``COAST_FOR_CREDIT`` state: after a credible close crossing loses the
   target on a FRESH camera frame, latch zero-rate/zero-thrust and wait at
-  most 0.10 s for a strictly newer race packet (the contract bound is AT
-  MOST 0.40 s; the ~4 Hz cruise race stream made a 0.25 s window a lethal
-  ballistic drop in F68).  A superseded/frozen frame (same camera-frame
-  identity republished during a camera stall) must never arm the coast; it
-  goes to ``PREDICT`` with covariance inflation instead (flight
-  20260729T085719Z-visual-course-4455fd61).
+  most 0.06 s for a strictly newer race packet (the contract bound is AT
+  MOST 0.40 s; the ~4 Hz cruise race stream turned longer windows into
+  unrecoverable ballistic drops at the plane — F68/F69).  A
+  superseded/frozen frame (same camera-frame identity republished during a
+  camera stall) must never arm the coast; it goes to ``PREDICT`` with
+  covariance inflation instead (flight 20260729T085719Z-visual-course-
+  4455fd61).
 
 Control-law constant sources:
 
@@ -357,12 +358,15 @@ CROSSING_MEAS_MAX_AGE_S = 0.50
 # zero for a full 0.25 s — at 1 m altitude with forward speed the ballistic
 # + fast-regime lift-loss collapse measured -12.6 m/s^2 (vz +0.33 -> -2.83,
 # alt -0.35 -> -0.81) and the recovery could not arrest before terrain.
-# The July-18 contract bounds the wait AT MOST 0.40 s; the zero window is
-# now capped at 0.10 s (vz cost ~-1.2, recoverable), whichever comes first
-# of timeout or a newer packet.  Credit does not depend on the window: a
-# true pass is accepted in ANY state (F67 credited gate 0 in SEARCH 0.5 s
-# after its coast exited).
-CROSSING_CREDIT_WAIT_S = 0.10  # July-18 contract bound is AT MOST 0.40 s
+# F69 (20260730T055004Z-visual-course-352d481c): even a 0.10-0.14 s window
+# cost vz -1.7 at the plane and the 0.34-clamped recovery (~2 m/s^2 net
+# over fast-regime hover) could not re-climb 0.06-0.1 m in the 0.3 s before
+# the bottom-bar graze.  The July-18 contract bounds the wait AT MOST
+# 0.40 s; two ticks at the 30 Hz control cadence (~0.06 s, vz cost ~-0.7)
+# is the practical window that leaves a recoverable aircraft.  Credit does
+# not depend on the window: a true pass is accepted in ANY state (F67
+# credited gate 0 in SEARCH 0.5 s after its coast exited).
+CROSSING_CREDIT_WAIT_S = 0.06  # July-18 contract bound is AT MOST 0.40 s
 # F53 (20260729T233602Z-visual-course-072c8a7b): past near_brake_log_scale
 # the misalignment brake self-locks — the brake attitude pushes the gate
 # image down, the raw ey reads as misalignment, advance goes to 0, and the
