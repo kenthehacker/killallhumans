@@ -1381,6 +1381,41 @@ def test_descent_floor_cannot_fire_from_frozen_vz_est():
     assert out.thrust == pytest.approx(SUPPORT + 0.05, abs=1e-9)
 
 
+def test_fh_untrusted_floor_not_inflated_by_brake_attitude():
+    # F83 (20260730T113315Z-visual-course-57671d35): at the -0.55 pre-cross
+    # brake attitude the tilt-compensated support rose 0.2594 -> 0.2906, so
+    # the F21 fh-untrusted floor (support + 0.05) pinned MAX thrust for the
+    # whole 1.3 s latch while the same latch disabled the vz climb governor
+    # — an open-loop +2.4 m/s^2 balloon carried the drone OVER gate 1 (no
+    # credit; ground collision after the fall).  The floor's support term
+    # is bounded at the spawn-level tilt compensation.
+    controller = _tracked_controller(_track("A", 0.0, 0.50))
+    now = 100.10
+    # Promote to gate 1 (F83's leg; the gate-0 brake band is out of scope).
+    controller.observe(
+        _update([_track("A", 0.0, 0.50), _track("S1", 0.0, 0.50)], frame_id=3),
+        now_s=now,
+    )
+    controller._track_first_seen_s["A"] = now - 1.0
+    controller._track_first_seen_s["S1"] = now - 1.0
+    assert controller.note_race(gate_index=1, race_boot_ms=1001, now_s=now)
+    assert controller.state is CleanCourseState.TRACK
+    controller._alt_est_m = 2.0  # honest altitude (pre-gate-1 floor quiet)
+    # Latch fh-untrusted (0.3 s sustain over the 5.0 trigger) at the F83
+    # brake attitude.  The gate sits LOW (compensated ey ~+0.12 at this
+    # pitch), so the qualified PD asks for ~0.28 — BELOW the floor — which
+    # isolates the floor as the decisive term.
+    out = None
+    for _ in range(12):
+        now += 0.033
+        controller.current.last_y_measurement_s = now
+        controller.current.last_measurement_s = now
+        out = _command(controller, now, pitch=-0.55, fh=6.0)
+    assert controller._fh_untrusted
+    assert out.vertical_qualified
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-3)
+
+
 def test_closure_governor_full_brake_at_high_expansion_rate():
     # F31: the vision log-scale expansion rate is the only honest closure
     # signal (fh is a signless drag magnitude).  At/above the full-brake

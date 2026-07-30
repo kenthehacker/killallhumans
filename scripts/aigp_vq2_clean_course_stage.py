@@ -2995,7 +2995,23 @@ class CleanCourseController:
             # above the floor.  This closes the blind-sink family in one
             # place (F19 SEARCH hold, F20 coast gate, F21 qualified-PD sag)
             # instead of per-path patches.
-            floor = support + self.config.fh_untrusted_vertical_margin
+            # F83 (20260730T113315Z-visual-course-57671d35): the floor's
+            # support term is tilt-INFLATED by attitude — at the -0.55
+            # pre-cross brake attitude support rose 0.2594 -> 0.2906 and
+            # the +0.05 floor pinned MAX thrust (0.34) for the whole 1.3 s
+            # latch while the same latch disabled the vz climb governor:
+            # an open-loop +2.4 m/s^2 balloon carried the drone OVER gate
+            # 1 (no credit; ground collision after the fall).  The F14/F21
+            # deficit was measured at ~level attitude, so the floor's
+            # support term is bounded at the spawn-level tilt compensation;
+            # qualified PD may still command above the floor.
+            level_support = self.config.support_collective / max(
+                0.85, math.cos(self.config.spawn_pitch_rad)
+            )
+            floor = (
+                min(support, level_support)
+                + self.config.fh_untrusted_vertical_margin
+            )
             governed = _clamp(
                 max(collective, floor),
                 self.config.min_thrust,
