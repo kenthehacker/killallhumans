@@ -3084,6 +3084,22 @@ def test_vz_center_trim_nulls_centered_sink():
         current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller._vz_center_trim == pytest.approx(0.0, abs=1e-9)
+    # F88 (20260730T131916Z-visual-course-9bde29e4): the gate-1 leg sank
+    # at vz -0.55 with ey +0.03 (far-left gate under misalignment
+    # braking) into the ground (id 1002) — the original 0.02 ey bound
+    # gated the trim out of exactly that geometry.  A slightly-low gate
+    # still learns: the P law's descent demand there is negligible.
+    current.y_axis.p = 0.03
+    current.raw_y = 0.03
+    for _ in range(30):  # ~1 s of the F88 gate-1 sink geometry
+        now += 0.033
+        controller._vz_est_m_s = -0.55
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller._vz_center_trim > 0.03
+    assert out.thrust > SPAWN_SUPPORT + 0.03
 
 
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():

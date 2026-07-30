@@ -481,7 +481,8 @@ EX_TRIM_ACTIVE_EX_NORM = 0.25  # integrate only inside the near regime
 # 0.080/norm: the measured -0.03 droop yields +0.002 collective), so a
 # slightly-underestimated support settles ON the -0.35 m/s descent-floor
 # boundary as a STABLE equilibrium — continuous by F65 design, so the
-# floor adds exactly zero there.  F87 (20260730T125108Z-visual-course-
+# floor adds exactly zero there — or, under a larger brake-attitude
+# deficit, droops BELOW it.  F87 (20260730T125108Z-visual-course-
 # 95059527) rode vz ~-0.35 with ey ~0 through the whole gate-0 final
 # approach, arrived ~0.3-0.4 m low, and the credible-loss zero coast
 # dropped it onto the lower lip (id 1001, no credit); F86 sank the
@@ -489,12 +490,20 @@ EX_TRIM_ACTIVE_EX_NORM = 0.25  # integrate only inside the near regime
 # approach + descent keeps the gate centered).  While TRACK holds the
 # gate at/above center with a qualified vertical channel, integrate a
 # bounded upward trim against the residual sink until vz ~0; hold it on
-# demanded descents (ey > 0, where the P law owns the descent) and leak
-# it on real climbs.  One-sided by design: the F78 arrest already owns
-# climb overshoot.
+# demanded descents (ey > active bound, where the P law owns the
+# descent) and leak it on real climbs.  One-sided by design: the F78
+# arrest already owns climb overshoot.  F88 (20260730T131916Z-visual-
+# course-9bde29e4): gate 0 CREDITED with dead vertical energy (vz +0.08,
+# alt +0.11 at the coast) after the trim arrested the mid-approach sink
+# — then the gate-1 leg sank at vz -0.55 with ey +0.03 (a far-left gate
+# under misalignment braking) and hit the ground (id 1002) with the
+# trim gated out by the original 0.02 ey bound.  The P law's descent
+# demand at |ey| 0.10 is 0.008 collective — negligible — so the active
+# band widens to 0.10: a genuine low gate (ey > 0.10) still holds the
+# trim, anything nearer center learns.
 VZ_CENTER_TRIM_GAIN = 0.08  # collective per (m/s of sink) per second
 VZ_CENTER_TRIM_MAX = 0.06  # anti-windup bound (~2x the measured deficit)
-VZ_CENTER_TRIM_ACTIVE_EY_NORM = 0.02  # integrate only at/above center
+VZ_CENTER_TRIM_ACTIVE_EY_NORM = 0.10  # integrate only near center
 VZ_CENTER_TRIM_SINK_M_S = -0.10  # deadband above estimator noise
 VZ_CENTER_TRIM_LEAK_S = 0.02  # collective/s release on real climbs
 
@@ -2276,13 +2285,14 @@ class CleanCourseController:
             # the COMMIT entry budget instead of tuned out per-gate.
             # VZ_CENTER_TRIM (see the constant block): the PD is too weak
             # around center to hold altitude, so an underestimated support
-            # settles ON the descent-floor boundary and the approach sinks
-            # with ey ~0.  Learn the support correction while TRACK holds
-            # the gate at/above center with a qualified, IMU-trusted
-            # vertical channel; hold on demanded descents (ey > active
-            # bound), leak on real climbs, and never wind into a saturated
-            # collective.  The trim is added AFTER the PD so every governor
-            # and floor below sees the corrected demand.
+            # settles ON the descent-floor boundary (or droops below it)
+            # and the approach sinks with ey ~0.  Learn the support
+            # correction while TRACK holds the gate near center with a
+            # qualified, IMU-trusted vertical channel; hold on demanded
+            # descents (ey > active bound), leak on real climbs, and never
+            # wind into a saturated collective.  The trim is added AFTER
+            # the PD so every governor and floor below sees the corrected
+            # demand.
             if (
                 self.state is CleanCourseState.TRACK
                 and not self._fh_untrusted
