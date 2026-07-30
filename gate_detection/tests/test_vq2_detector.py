@@ -693,7 +693,17 @@ def test_tracking_prior_does_not_change_an_ordinary_unambiguous_fit() -> None:
     )
 
 
-def test_connected_current_successor_union_never_claims_passage_geometry() -> None:
+def test_connected_current_successor_union_fits_dominant_opening() -> None:
+    """Merged current+successor supports now fit the dominant opening.
+
+    Deliberate behaviour change from the enclosed-region disambiguation
+    (F80 panel gates): the proposal names the larger enclosed opening —
+    here the near gate's — and the fit is clean enough to claim passage.
+    Previously this fixture survived only because the hybrid two-opening
+    residuals kept confidence below the passage floor.  Comparable paired
+    openings remain rejected; see
+    ``test_multiple_similar_aperture_gaps_are_rejected_as_ambiguous``.
+    """
     mask = np.zeros((160, 300), dtype=np.uint8)
     cv2.rectangle(mask, (20, 20), (200, 140), 255, 10)
     cv2.rectangle(mask, (198, 32), (282, 112), 255, 8)
@@ -705,6 +715,84 @@ def test_connected_current_successor_union_never_claims_passage_geometry() -> No
         detection_confidence=0.9,
     )
 
+    assert fit.succeeded
+    assert fit.fitted_corners_px is not None
+    center_x = sum(point[0] for point in fit.fitted_corners_px) / 4.0
+    center_y = sum(point[1] for point in fit.fitted_corners_px) / 4.0
+    # The dominant (near gate) opening spans x 25-195, y 25-135.
+    assert center_x == pytest.approx(110.0, abs=10.0)
+    assert center_y == pytest.approx(80.0, abs=10.0)
+    assert passage_geometry_from_vq2_aperture_fit(fit) is not None
+
+
+def test_panel_gate_below_opening_slit_fits_true_opening() -> None:
+    """F80 gate-1 topology: ring, solid sponsor panel, comparable slit.
+
+    Columns crossing the panel see two comparable dark gaps (opening and
+    below-panel slit), which the legacy competing-gap test must reject as
+    ambiguous.  The single dominant enclosed region — the opening, bounded
+    above by the top bar — resolves the ambiguity and the fit locks the
+    true opening with passage-usable confidence.
+    """
+    mask = np.zeros((260, 220), dtype=np.uint8)
+    cv2.rectangle(mask, (20, 20), (180, 40), 255, -1)
+    cv2.rectangle(mask, (20, 40), (40, 120), 255, -1)
+    cv2.rectangle(mask, (160, 40), (180, 120), 255, -1)
+    cv2.rectangle(mask, (20, 120), (180, 160), 255, -1)
+    cv2.rectangle(mask, (20, 160), (60, 220), 255, -1)
+    cv2.rectangle(mask, (150, 160), (180, 220), 255, -1)
+    cv2.rectangle(mask, (20, 220), (180, 240), 255, -1)
+
+    fit = fit_vq2_aperture_mask(
+        mask,
+        (18, 18, 164, 224),
+        detection_confidence=0.9,
+    )
+
+    assert fit.succeeded
+    assert np.asarray(fit.fitted_corners_px) == pytest.approx(
+        np.asarray(
+            (
+                (40.5, 40.5),
+                (159.5, 40.5),
+                (159.5, 119.5),
+                (40.5, 119.5),
+            )
+        ),
+        abs=2.5,
+    )
+    assert passage_geometry_from_vq2_aperture_fit(fit) is not None
+
+
+def test_enclosed_pylon_window_without_top_bar_is_not_an_aperture() -> None:
+    """F80 f1640441 topology: the true opening leaks through the below-panel
+    slit, so the only enclosed dark region is the pylon's sponsor window.
+    The window is enclosed and dominant, but it is not bounded above by the
+    component's top bar, so the region proposal must refuse it and the fit
+    must fall through to the legacy ambiguity rejection rather than claim a
+    usable aperture on solid structure.
+    """
+    mask = np.zeros((280, 240), dtype=np.uint8)
+    cv2.rectangle(mask, (60, 20), (200, 40), 255, -1)
+    cv2.rectangle(mask, (60, 40), (90, 120), 255, -1)
+    cv2.rectangle(mask, (170, 40), (200, 120), 255, -1)
+    cv2.rectangle(mask, (60, 120), (140, 150), 255, -1)
+    cv2.rectangle(mask, (60, 150), (100, 240), 255, -1)
+    cv2.rectangle(mask, (170, 150), (200, 240), 255, -1)
+    cv2.rectangle(mask, (60, 240), (200, 258), 255, -1)
+    cv2.rectangle(mask, (20, 100), (50, 240), 255, -1)
+    cv2.rectangle(mask, (20, 120), (60, 150), 255, -1)
+    cv2.rectangle(mask, (28, 160), (44, 200), 0, -1)
+
+    fit = fit_vq2_aperture_mask(
+        mask,
+        (18, 18, 184, 242),
+        detection_confidence=0.9,
+    )
+
+    assert not fit.succeeded
+    assert fit.rejection_reason == "ambiguous_multiple_aperture_gaps"
+    assert fit.fitted_corners_px is None
     assert passage_geometry_from_vq2_aperture_fit(fit) is None
 
 

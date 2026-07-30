@@ -9,6 +9,15 @@ is censored and inferred with an explicitly named square-in-pixel-space prior.
 This is not calibrated pose, distance, or physical square evidence.  Ambiguous
 multiple openings and geometry with fewer than three supported sides are
 rejected rather than assigned precise fitted values.
+
+Panel-style gates (F80: a solid sponsor panel fills the blob below the true
+opening) give some scanlines two comparable dark gaps, which the competing-gap
+test must not silently pick between.  When exactly one dominant *enclosed*
+dark region exists inside the support and it is bounded above by the
+component's top bar, that region names the opening and each scanline selects
+the unique gap overlapping it.  Comparable paired regions, regions touching
+the crop border, and regions without top-bar support (e.g. a pylon sponsor
+window) fall through to the unchanged legacy behaviour.
 """
 
 from __future__ import annotations
@@ -51,6 +60,24 @@ _TEMPORAL_COVARIANCE_MODEL_ID = (
     "vq2-temporally-associated-aperture-diagonal-v1"
 )
 
+# Enclosed-region disambiguation (panel-style gates).  A candidate opening
+# must be bounded above by the component's top bar: walking upward from the
+# region through (speckle-closed) support pixels must reach the component's
+# top edge band in at least this fraction of the region's columns.  F80
+# evidence: true openings score 0.43-1.00, the pylon sponsor window 0.00.
+_APERTURE_REGION_TOP_BAR_CLOSE_KERNEL = 5
+_APERTURE_REGION_TOP_BAR_MIN_FRACTION = 0.25
+# Confidence calibration: the residual score normalises rms by two percent of
+# the smaller support dimension, which drops below one pixel for gates under
+# fifty pixels and over-punishes the ragged mask edges of resolved panel-gate
+# openings (a verified-correct 3.9 px rms on a 90 px gate scored 0.12 and
+# never reached the 0.20 steering floor).  A 4.5 px floor keeps correct
+# small-gate fits steerable while a wrong hybrid fit (6.4 px rms on a 62 px
+# support, F80 f1640361) still scores <= 0.17 confidence.  Gates above
+# 225 px are unchanged.  This scales confidence only; covariance and
+# measurement_std keep using the raw pixel rms.
+_RESIDUAL_SCORE_MIN_SCALE_PX = 4.5
+
 
 @dataclass(frozen=True, slots=True)
 class VQ2ApertureConfig:
@@ -61,6 +88,7 @@ class VQ2ApertureConfig:
     min_component_pixels: int = 24
     min_gap_px: int = 4
     min_line_samples: int = 4
+    min_aperture_region_pixels: int = 16
     secondary_component_ratio: float = 0.45
     competing_gap_ratio: float = 0.65
     square_prior_relative_sigma: float = 0.12
@@ -72,6 +100,7 @@ class VQ2ApertureConfig:
             "min_component_pixels",
             "min_gap_px",
             "min_line_samples",
+            "min_aperture_region_pixels",
         ):
             value = getattr(self, name)
             if type(value) is not int:
@@ -86,6 +115,8 @@ class VQ2ApertureConfig:
             raise ValueError("min_gap_px must be at least two pixels")
         if self.min_line_samples < 2:
             raise ValueError("min_line_samples must be at least two")
+        if self.min_aperture_region_pixels < 1:
+            raise ValueError("min_aperture_region_pixels must be positive")
         for name in (
             "secondary_component_ratio",
             "competing_gap_ratio",
@@ -403,6 +434,79 @@ def _largest_unambiguous_gap(
     return (gaps[0].before, gaps[0].after), False
 
 
+def _enclosed_aperture_region(
+    component_crop: np.ndarray,
+    *,
+    minimum_area: int,
+    competing_ratio: float,
+    top_bar_margin: int,
+) -> Optional[np.ndarray]:
+    """Name the opening as the dominant enclosed dark region, if unambiguous.
+
+    Returns a crop-shaped boolean mask of the selected region, or ``None``
+    when no enclosed region exists, when two comparable regions compete, or
+    when the dominant region lacks top-bar support (pylon-style sponsor
+    windows are enclosed dark regions too, but sit under a deep panel rather
+    than directly below the top bar).  ``None`` means the caller keeps the
+    unchanged legacy scanline behaviour.
+    """
+
+    dark = (component_crop == 0).astype(np.uint8)
+    region_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        dark, connectivity=4
+    )
+    crop_height, crop_width = dark.shape
+    enclosed: list[tuple[int, int]] = []
+    for index in range(1, region_count):
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if area < minimum_area:
+            continue
+        left = int(stats[index, cv2.CC_STAT_LEFT])
+        top = int(stats[index, cv2.CC_STAT_TOP])
+        width = int(stats[index, cv2.CC_STAT_WIDTH])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        if (
+            left == 0
+            or top == 0
+            or left + width >= crop_width
+            or top + height >= crop_height
+        ):
+            continue
+        enclosed.append((area, index))
+    if not enclosed:
+        return None
+    enclosed.sort(reverse=True)
+    if (
+        len(enclosed) > 1
+        and enclosed[1][0] >= competing_ratio * enclosed[0][0]
+    ):
+        return None
+    region = labels == enclosed[0][1]
+    # Close support speckle (JPEG/morphology pinholes in the top bar) before
+    # the upward walk; the walk, not the fit, uses this copy.
+    walk = cv2.morphologyEx(
+        component_crop,
+        cv2.MORPH_CLOSE,
+        np.ones(
+            (_APERTURE_REGION_TOP_BAR_CLOSE_KERNEL,) * 2, dtype=np.uint8
+        ),
+    )
+    columns = np.flatnonzero(region.any(axis=0))
+    if columns.size == 0:
+        return None
+    supported = 0
+    for column in columns:
+        top_row = int(np.flatnonzero(region[:, column])[0])
+        row = top_row - 1
+        while row >= 0 and walk[row, column]:
+            row -= 1
+        if row <= top_bar_margin:
+            supported += 1
+    if supported < _APERTURE_REGION_TOP_BAR_MIN_FRACTION * columns.size:
+        return None
+    return region
+
+
 def _scanline_pairs(
     component: np.ndarray,
     bbox: tuple[int, int, int, int],
@@ -410,6 +514,7 @@ def _scanline_pairs(
     horizontal_scan: bool,
     minimum_gap: int,
     competing_ratio: float,
+    aperture_region: Optional[np.ndarray] = None,
 ) -> tuple[
     dict[ApertureSide, list[Point]],
     tuple[_AmbiguousGapScanline, ...],
@@ -428,24 +533,47 @@ def _scanline_pairs(
         )
         nonzero = np.flatnonzero(values)
         runs = _runs(nonzero)
-        gap, is_ambiguous = _largest_unambiguous_gap(
-            runs,
-            minimum=minimum_gap,
-            competing_ratio=competing_ratio,
-        )
-        if is_ambiguous:
-            ambiguous.append(
-                _AmbiguousGapScanline(
-                    offset=offset,
-                    candidates=_gap_candidates(
-                        runs,
-                        minimum=minimum_gap,
-                    ),
+        if aperture_region is not None:
+            # Region-guided selection: keep the unique gap overlapping the
+            # named opening.  Scanlines missing the region, hitting it more
+            # than once, or holding only foreign gaps (pylon windows, panel
+            # slits) are skipped rather than counted ambiguous.
+            candidates = _gap_candidates(runs, minimum=minimum_gap)
+            overlapping = []
+            for candidate in candidates:
+                segment = (
+                    aperture_region[
+                        y + offset, x + candidate.before + 1 : x + candidate.after
+                    ]
+                    if horizontal_scan
+                    else aperture_region[
+                        y + candidate.before + 1 : y + candidate.after, x + offset
+                    ]
                 )
+                if segment.any():
+                    overlapping.append(candidate)
+            if len(overlapping) != 1:
+                continue
+            gap = (overlapping[0].before, overlapping[0].after)
+        else:
+            gap, is_ambiguous = _largest_unambiguous_gap(
+                runs,
+                minimum=minimum_gap,
+                competing_ratio=competing_ratio,
             )
-            continue
-        if gap is None:
-            continue
+            if is_ambiguous:
+                ambiguous.append(
+                    _AmbiguousGapScanline(
+                        offset=offset,
+                        candidates=_gap_candidates(
+                            runs,
+                            minimum=minimum_gap,
+                        ),
+                    )
+                )
+                continue
+            if gap is None:
+                continue
         before, after = gap
         if horizontal_scan:
             row = float(y + offset) + 0.5
@@ -987,12 +1115,25 @@ def fit_vq2_aperture_mask(
     component = np.zeros(mask.shape, dtype=np.uint8)
     component[y : y + height, x : x + width] = labels == largest_label
     minimum_gap = max(config.min_gap_px, math.ceil(0.08 * min(width, height)))
+    region_crop = _enclosed_aperture_region(
+        component[y : y + height, x : x + width],
+        minimum_area=max(
+            config.min_aperture_region_pixels, minimum_gap * minimum_gap
+        ),
+        competing_ratio=config.competing_gap_ratio,
+        top_bar_margin=alignment_margin,
+    )
+    aperture_region = None
+    if region_crop is not None:
+        aperture_region = np.zeros(mask.shape, dtype=np.uint8)
+        aperture_region[y : y + height, x : x + width] = region_crop
     horizontal, ambiguous_rows = _scanline_pairs(
         component,
         bbox,
         horizontal_scan=True,
         minimum_gap=minimum_gap,
         competing_ratio=config.competing_gap_ratio,
+        aperture_region=aperture_region,
     )
     vertical, ambiguous_columns = _scanline_pairs(
         component,
@@ -1000,6 +1141,7 @@ def fit_vq2_aperture_mask(
         horizontal_scan=False,
         minimum_gap=minimum_gap,
         competing_ratio=config.competing_gap_ratio,
+        aperture_region=aperture_region,
     )
     row_ambiguity = len(ambiguous_rows) >= config.min_line_samples
     column_ambiguity = (
@@ -1212,7 +1354,8 @@ def fit_vq2_aperture_mask(
     )
     coverage = min(1.0, inlier_count / max(expected_edge_support, 1.0))
     residual_score = math.exp(
-        -residual_rms / max(1.0, 0.02 * min(width, height))
+        -residual_rms
+        / max(_RESIDUAL_SCORE_MIN_SCALE_PX, 0.02 * min(width, height))
     )
     censor_factor = 0.65 if inferred_side is not None else 1.0
     fit_confidence = max(
