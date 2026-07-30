@@ -251,9 +251,11 @@ def test_identical_global_vertical_sign_at_every_gate():
         now += 0.05
     # Image-down positive error with the same geometry at every gate yields
     # the same signed correction relative to support (ONE GLOBAL SIGN).
+    # F96: gate-1+ legs track a desired vz (one coherent IMU-vz term), so
+    # the MAGNITUDE differs from the gate-0 PD by design — the global
+    # contract that remains is the sign, plus gate-1+ self-consistency.
     for thrust in thrusts:
         assert thrust < SUPPORT
-    assert thrusts[0] == pytest.approx(thrusts[1], abs=1e-9)
     assert thrusts[1] == pytest.approx(thrusts[2], abs=1e-9)
 
 
@@ -2514,57 +2516,6 @@ def test_no_track_search_latches_altitude_support():
     assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
 
 
-def test_course_closure_excess_brakes_collective_below_support():
-    # F77 (20260730T080147Z-visual-course-87a36ce9): the F76 gate-1 leg
-    # adopted the left successor cleanly and STILL blew through the
-    # plane — fh 3-4 the whole leg, a +2.1 m balloon, and the gate
-    # walked out the bottom-left corner at the plane.  Attitude-only
-    # braking never decelerates (F74/F75/F76 all held fh 2.5-5 through
-    # the -0.46 brake attitude), and the (gate-0-evidenced) brake
-    # ceiling band floored the collective near support: nothing removed
-    # the energy.  Closure excess above the governor target subtracts
-    # collective BELOW support on gate-1+ legs; gate 0 keeps its proved
-    # envelope (and the brake band) untouched.
-    controller = _tracked_controller(_track("A", 0.0, 0.05, scale=0.20))
-    _promote_to_gate_one(controller)
-    controller._alt_est_m = 2.0  # honest altitude (floor quiet)
-    current = controller.current
-    current.x_axis.p = 0.0
-    current.raw_x = 0.0
-    current.scale_axis.p = -1.6  # span ~0.20, outside the near-plane zone
-    current.scale_axis.v = 0.58  # F76-measured hot closure (target 0.35)
-    now = 100.10
-    out = None
-    for _ in range(15):  # converge the slews/governors
-        now += 0.033
-        current.last_measurement_s = now
-        current.last_x_measurement_s = now
-        current.last_y_measurement_s = now
-        out = _command(controller, now, pitch=SPAWN_PITCH)
-    assert controller.state is CleanCourseState.TRACK
-    assert out.thrust < SPAWN_SUPPORT - 0.03  # real deceleration authority
-    # Settled closure restores the normal support-level vertical law.
-    current.scale_axis.v = 0.10
-    for _ in range(15):
-        now += 0.033
-        current.last_measurement_s = now
-        current.last_x_measurement_s = now
-        current.last_y_measurement_s = now
-        out = _command(controller, now, pitch=SPAWN_PITCH)
-    assert out.thrust > SPAWN_SUPPORT - 0.03
-    # Gate 0 is untouched: the same hot closure keeps its envelope.
-    gate0 = _tracked_controller(_track("A", 0.0, 0.05, scale=0.20))
-    gate0.current.scale_axis.v = 0.58
-    now0 = 100.10
-    for _ in range(15):
-        now0 += 0.033
-        gate0.current.last_measurement_s = now0
-        gate0.current.last_x_measurement_s = now0
-        gate0.current.last_y_measurement_s = now0
-        out0 = _command(gate0, now0, pitch=SPAWN_PITCH)
-    assert out0.thrust > SPAWN_SUPPORT - 0.03
-
-
 def _converged_gate_one_vertical(vz_m_s):
     """Gate-1 TRACK controller, gate just above center, settled closure."""
 
@@ -2598,23 +2549,21 @@ def test_vertical_arrival_arrest_shaves_climb_before_center():
     # above center), the PD's small P-term kept the climb alive, and the
     # 0.5 m/s course governor only caps the RATE, so the gate sank
     # ey -0.10 -> +0.16/+0.27 before censorship and the crossing went
-    # high.  The arrest drives desired vz toward zero as the compensated
-    # error approaches center: allowed climb scales with |ey|.
+    # high.  F96: the gate-1+ vz-tracking law drives desired vz toward
+    # zero as the compensated error approaches center (vz_des scales
+    # with ey) — the arrest semantics as a setpoint, one coherent gain.
     climbing = _converged_gate_one_vertical(0.60)
     settled = _converged_gate_one_vertical(0.0)
-    # A +0.6 m/s climb at |ey| 0.10 is arrested HARD (allowance 0.1 m/s):
-    # the subtraction dwarfs the F68 governor's 0.10*(0.6-0.5) = 0.01 —
-    # on the parent law the two outputs differ by only that governor
-    # term, so this margin proves the arrest changed the emitted command.
+    # A +0.6 m/s climb at ey -0.10 is arrested HARD: vz_des is +0.10, so
+    # the tracker subtracts 0.12*(0.6-0.1) = 0.06 below the settled case.
     assert climbing.thrust < settled.thrust - 0.05
     # Descending (or a descend command) is untouched: no blanket
     # reduction, no manufactured sink.
     sinking = _converged_gate_one_vertical(-0.30)
     # No blanket reduction, no manufactured sink: the output is never
     # BELOW the settled case.  With the gate at/above center a sink is
-    # never the intent, so the F88 vertical centering trim may add its
-    # bounded support correction here — designed learning, capped by
-    # VZ_CENTER_TRIM_MAX, and never a subtraction.
+    # never the intent, so the tracker (and the F88 vertical centering
+    # trim) may add its bounded correction here — never a subtraction.
     assert sinking.thrust >= settled.thrust - 1e-3
     assert sinking.thrust <= settled.thrust + 0.06 + 1e-3
     # F78b (20260730T085104Z-visual-course-34b59dea): gate 0 keeps its
@@ -2638,7 +2587,79 @@ def test_vertical_arrival_arrest_shaves_climb_before_center():
         current.last_x_measurement_s = now
         current.last_y_measurement_s = now
         out0 = _command(gate0, now, pitch=SPAWN_PITCH)
-    assert out0.thrust == pytest.approx(settled.thrust, abs=1e-3)
+    # Gate 0 is the unchanged camera PD: support + 0.080*|ey|.
+    assert out0.thrust == pytest.approx(SPAWN_SUPPORT + 0.080 * 0.10, abs=1e-3)
+
+
+def test_course_leg_vertical_drops_image_rate_double_count():
+    # F96 (20260730T153947Z-visual-course-a2741311): the gate-1 leg
+    # oscillated clamp-to-clamp (thrust 0.21 <-> 0.34, vz +/-0.4..0.5)
+    # because vz feedback was stacked incoherently — the camera y-rate
+    # D term (a lagged image copy of vz) PLUS the arrest PLUS the trim
+    # PLUS the governor, each tuned as if alone.  The replacement is
+    # ONE vz-tracking term; with vz_est at zero and the gate centered,
+    # image motion alone must not move the collective.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.20))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 2.0  # honest altitude (floor quiet)
+    current = controller.current
+    current.y_axis.p = 0.0
+    current.raw_y = 0.0
+    current.y_axis.v = 0.30  # gate sliding down the frame (image rate)
+    current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10
+    now = 100.10
+    out = None
+    for _ in range(15):
+        now += 0.033
+        controller._vz_est_m_s = 0.0
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    assert out.vertical_qualified
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-3)
+
+
+def test_course_leg_closure_excess_leaves_collective_alone():
+    # F96: the F77 closure-excess collective cut is deleted.  Under the
+    # vz-tracking law a sub-support cut is immediately restored by the
+    # tracker (a masked no-op) and was a fourth incoherent vz term in
+    # the F95 limit cycle.  Forward braking stays with the closure
+    # governor's PITCH law; a hot closure with the gate centered and
+    # vz zero leaves the collective at support.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.20))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 2.0
+    current = controller.current
+    current.y_axis.p = 0.0
+    current.raw_y = 0.0
+    current.y_axis.v = 0.0
+    current.scale_axis.p = -1.6  # span ~0.20, outside the near-plane zone
+    current.scale_axis.v = 0.58  # hot closure (target 0.35)
+    now = 100.10
+    out = None
+    for _ in range(15):
+        now += 0.033
+        controller._vz_est_m_s = 0.0
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-3)
+
+
+def test_course_leg_sink_response_stays_off_max_clamp():
+    # F96: a centered-gate sink is answered by the SINGLE tracker term
+    # plus the bounded trim — the old stack (arrest + trim wound to its
+    # cap + PD) summed past the max clamp, the other half of F95's
+    # clamp-to-clamp bang.  The F95 trace's own sink excursion (vz
+    # -0.40 with the gate near center) must NOT reach 0.34.
+    out = _converged_gate_one_vertical(-0.40)
+    assert out.thrust < 0.34
+    assert out.thrust > SPAWN_SUPPORT  # the sink IS answered, just coherently
 
 
 def test_two_sided_arrest_bleeds_centered_gate_climb():
@@ -2835,6 +2856,9 @@ def test_vz_center_trim_nulls_centered_sink():
     # braking) into the ground (id 1002) — the original 0.02 ey bound
     # gated the trim out of exactly that geometry.  A slightly-low gate
     # still learns: the P law's descent demand there is negligible.
+    # F96: the vz tracker already covers the sink (its correction sits
+    # INSIDE _collective), so the anti-windup saturation check caps the
+    # trim early — winding further would double-count the same deficit.
     current.y_axis.p = 0.03
     current.raw_y = 0.03
     for _ in range(30):  # ~1 s of the F88 gate-1 sink geometry
@@ -2844,7 +2868,7 @@ def test_vz_center_trim_nulls_centered_sink():
         current.last_x_measurement_s = now
         current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
-    assert controller._vz_center_trim > 0.03
+    assert controller._vz_center_trim > 0.01
     assert out.thrust > SPAWN_SUPPORT + 0.03
     # F89 (20260730T132758Z-visual-course-ef525c4c): the gate-1 leg's sink
     # (vz -0.47 sustained) developed while the vertical channel was
