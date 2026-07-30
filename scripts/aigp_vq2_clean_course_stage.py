@@ -500,10 +500,21 @@ EX_TRIM_ACTIVE_EX_NORM = 0.25  # integrate only inside the near regime
 # trim gated out by the original 0.02 ey bound.  The P law's descent
 # demand at |ey| 0.10 is 0.008 collective — negligible — so the active
 # band widens to 0.10: a genuine low gate (ey > 0.10) still holds the
-# trim, anything nearer center learns.
+# trim, anything nearer center learns.  F89 (20260730T132758Z-visual-
+# course-ef525c4c): gate 0 credited again, but the gate-1 leg's sink
+# (vz -0.47 sustained) developed while the vertical channel was
+# UNQUALIFIED (stale y-axis) — the trim lived inside the qualified
+# branch and could not engage — and the following blind SEARCH held
+# bare support+margin for 5+ s of vz -0.45..-0.48 into the ground
+# (id 1002).  F90: the integrator is a shared helper; the blind paths
+# (SEARCH, pending-credit hold, unqualified TRACK/PREDICT) add the
+# trim to their support holds and wind it with NO ey gate — a blind
+# path holds altitude by definition, so any IMU-trusted sink is
+# unwanted.  COAST (exact-zero contract) and COMMIT (its own bounded
+# crossing servo) never wind or consume it.
 VZ_CENTER_TRIM_GAIN = 0.08  # collective per (m/s of sink) per second
 VZ_CENTER_TRIM_MAX = 0.06  # anti-windup bound (~2x the measured deficit)
-VZ_CENTER_TRIM_ACTIVE_EY_NORM = 0.10  # integrate only near center
+VZ_CENTER_TRIM_ACTIVE_EY_NORM = 0.10  # integrate only near center (TRACK)
 VZ_CENTER_TRIM_SINK_M_S = -0.10  # deadband above estimator noise
 VZ_CENTER_TRIM_LEAK_S = 0.02  # collective/s release on real climbs
 
@@ -2056,7 +2067,11 @@ class CleanCourseController:
                 # gain and cap as the TRACK law, no roll, no advance, no
                 # promotion — authoritative ownership is unchanged);
                 # absent or ambiguous evidence keeps the neutral hold.
-                hold = support + margin
+                # F90: blind paths hold altitude by definition, so any
+                # IMU-trusted sink is unwanted — wind the support trim
+                # with no ey gate (see _wind_vz_center_trim).
+                self._wind_vz_center_trim(dt)
+                hold = support + margin + self._vz_center_trim
                 self._collective = hold
                 recenter_yaw = 0.0
                 successor = self.successor
@@ -2099,7 +2114,11 @@ class CleanCourseController:
             # converts a recoverable miss into a floor/structure crash.
             # SEARCH holds altitude at support; re-acquisition is the
             # sweep's job.  (The TRACK/COMMIT ey servo is untouched.)
-            search_hold = support + margin
+            # F90: the support trim winds here too — a blind SEARCH at
+            # bare support sank F89's gate-1 leg vz -0.47 for 5+ s into
+            # the ground while the sweep ran.
+            self._wind_vz_center_trim(dt)
+            search_hold = support + margin + self._vz_center_trim
             self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
             # F49: SEARCH always holds the LEVEL (spawn-attitude) pitch.
@@ -2292,34 +2311,13 @@ class CleanCourseController:
             # descents (ey > active bound), leak on real climbs, and never
             # wind into a saturated collective.  The trim is added AFTER
             # the PD so every governor and floor below sees the corrected
-            # demand.
+            # demand.  F90: the same integrator also covers the blind
+            # paths via _wind_vz_center_trim call sites below.
             if (
                 self.state is CleanCourseState.TRACK
-                and not self._fh_untrusted
-                and dt > 0.0
                 and ey_vertical <= cfg.vz_center_trim_active_ey_norm
             ):
-                saturated = (
-                    self._collective is not None
-                    and self._collective >= cfg.max_thrust - 0.005
-                )
-                if (
-                    self._vz_est_m_s < cfg.vz_center_trim_sink_m_s
-                    and not saturated
-                ):
-                    self._vz_center_trim = _clamp(
-                        self._vz_center_trim
-                        + cfg.vz_center_trim_gain
-                        * (-self._vz_est_m_s)
-                        * dt,
-                        0.0,
-                        cfg.vz_center_trim_max,
-                    )
-                elif self._vz_est_m_s > -cfg.vz_center_trim_sink_m_s:
-                    self._vz_center_trim = max(
-                        0.0,
-                        self._vz_center_trim - cfg.vz_center_trim_leak_s * dt,
-                    )
+                self._wind_vz_center_trim(dt)
             collective = (
                 support
                 + self._vz_center_trim
@@ -2380,7 +2378,11 @@ class CleanCourseController:
             # and the historical nose-down dives must not read it as HIGH.
             if ey_vertical < cfg.high_gate_y_norm:
                 margin = max(margin, cfg.high_gate_climb_margin)
-            hold = support + margin
+            # F90: the unqualified hold is blind — wind the support trim
+            # against any IMU-trusted sink (no ey gate; a stale y-axis was
+            # what made the path blind in the first place).
+            self._wind_vz_center_trim(dt)
+            hold = support + margin + self._vz_center_trim
             if self._collective is None:
                 self._collective = hold
             # Flight bc8c6003: a phantom vy (+0.38 norm/s, seeded as the gate
@@ -3069,6 +3071,37 @@ class CleanCourseController:
             1.0 - successor.position_std / cfg.search_covariance_std_norm
         )
         return cfg.successor_blend_max * closure * trust
+
+    def _wind_vz_center_trim(self, dt: float) -> None:
+        """One-sided support-trim integrator (see the VZ_CENTER_TRIM block).
+
+        The caller decides WHEN to run it: qualified TRACK gates on the ey
+        active bound (a demanded descent is not a sink to fight); blind
+        paths (SEARCH, unqualified TRACK/PREDICT) hold altitude by
+        definition, so any sink is unwanted and there is no ey gate (F90).
+        A sink winds the trim up (bounded, anti-windup at saturation); a
+        real climb leaks it back down.  Never runs while fh-untrusted — a
+        biased-regime vz is not evidence — and COAST/COMMIT never call it,
+        so the exact-zero wait and the crossing law keep their semantics.
+        """
+        if self._fh_untrusted or dt <= 0.0:
+            return
+        cfg = self.config
+        saturated = (
+            self._collective is not None
+            and self._collective >= cfg.max_thrust - 0.005
+        )
+        if self._vz_est_m_s < cfg.vz_center_trim_sink_m_s and not saturated:
+            self._vz_center_trim = _clamp(
+                self._vz_center_trim
+                + cfg.vz_center_trim_gain * (-self._vz_est_m_s) * dt,
+                0.0,
+                cfg.vz_center_trim_max,
+            )
+        elif self._vz_est_m_s > -cfg.vz_center_trim_sink_m_s:
+            self._vz_center_trim = max(
+                0.0, self._vz_center_trim - cfg.vz_center_trim_leak_s * dt
+            )
 
     def _governed_collective(
         self,

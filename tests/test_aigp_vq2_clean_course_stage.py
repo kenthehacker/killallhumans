@@ -3100,6 +3100,26 @@ def test_vz_center_trim_nulls_centered_sink():
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller._vz_center_trim > 0.03
     assert out.thrust > SPAWN_SUPPORT + 0.03
+    # F89 (20260730T132758Z-visual-course-ef525c4c): the gate-1 leg's sink
+    # (vz -0.47 sustained) developed while the vertical channel was
+    # UNQUALIFIED, and the blind SEARCH that followed held bare
+    # support+margin for 5+ s of vz -0.45..-0.48 into the ground (id
+    # 1002) — the integrator lived inside the qualified branch and the
+    # SEARCH hold never consumed the trim.  F90: blind paths wind and
+    # spend the trim with no ey gate (a blind path holds altitude by
+    # definition, so any IMU-trusted sink is unwanted).  The differential
+    # is in the EMITTED thrust: the descent floor's proportional reaction
+    # at vz -0.47 is only +0.025 over support; the wound trim must lift
+    # the blind hold well above that.
+    trim_before = controller._vz_center_trim
+    controller._enter_search(now)
+    for _ in range(30):  # ~1 s of the F89 blind-search sink
+        now += 0.033
+        controller._vz_est_m_s = -0.47
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert out.state is CleanCourseState.SEARCH
+    assert controller._vz_center_trim > trim_before + 0.005
+    assert out.thrust > SPAWN_SUPPORT + 0.05
 
 
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
