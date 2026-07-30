@@ -7455,10 +7455,31 @@ def attitude_rate_command(
         float(target_pitch_rad),
         estimate.yaw,
     )
+    # F58 deadlock fix: damp only TILTING motion, not the raw gyro.  While
+    # the drone yaws at a tilted attitude (the whole near-plane regime:
+    # brake pitch ~-0.46 + steering yaw), the gravity-axis rotation projects
+    # onto the body roll/pitch gyro axes (br_x ~ -br_z*tan(pitch), verified
+    # on flight 20260730T005506Z-d26e199d).  The kd term read that projection
+    # as roll rate and cancelled ~70% of the P command; the remainder sat
+    # below the sim's small-rate response threshold, so roll NEVER engaged
+    # and the near-plane orbital limit cycle was unbreakable.  Remove the
+    # gravity-axis component (NED-down expressed in body) from the damping
+    # vector; the P error is untouched.
+    q = estimate.orientation
+    down_x = 2.0 * (q.x * q.z - q.w * q.y)
+    down_y = 2.0 * (q.y * q.z + q.w * q.x)
+    down_z = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+    omega = estimate.body_rates
+    spin = omega[0] * down_x + omega[1] * down_y + omega[2] * down_z
+    tilt_omega = (
+        omega[0] - spin * down_x,
+        omega[1] - spin * down_y,
+        omega[2] - spin * down_z,
+    )
     roll_rate, pitch_rate, _yaw_rate = _attitude_error_body_rates(
         estimate.orientation,
         desired,
-        omega=estimate.body_rates,
+        omega=tilt_omega,
         kp=(VISUAL_ROLL_ATTITUDE_KP, pitch_kp, 0.0),
         kd=(0.4, 0.2, 0.0),
         max_rate=(MAX_COMMAND_RATE_RAD_S,) * 3,

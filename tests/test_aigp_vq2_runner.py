@@ -424,6 +424,38 @@ def _estimate(roll=0.0, pitch=-0.31, yaw=0.0):
     )
 
 
+def test_attitude_rate_command_damps_tilt_not_yaw_projection():
+    """F58 deadlock regression (flight 20260730T005506Z-d26e199d).
+
+    At brake pitch (-0.46) with a steering yaw rate, the gravity-axis
+    rotation projects onto the body roll gyro axis (br_x ~ -br_z*tan(pitch)).
+    Raw-gyro kd read that projection as roll rate and cancelled ~70% of the
+    roll P command; the net sat below the sim's small-rate response
+    threshold and roll never engaged.  The damping must only see TILTING
+    motion: a pure gravity-axis spin must not attenuate the P command.
+    """
+    import dataclasses
+
+    # Pure gravity-axis (NED-down) rotation at -0.26 rad/s, expressed in the
+    # body frame of the -0.46 brake attitude: matches the F58 stall gyro.
+    est = dataclasses.replace(
+        _estimate(roll=-0.013, pitch=-0.46, yaw=-1.05),
+        body_rates=(-0.115, 0.0, -0.233),
+    )
+    command = attitude_rate_command(
+        est,
+        target_roll_rad=-0.10,
+        target_pitch_rad=-0.46,
+        thrust=0.28,
+    )
+    # Full P authority survives: 2.0 * (-0.10 - -0.013) ~ -0.174.  The
+    # pre-fix raw-gyro kd cut this to ~-0.13.
+    assert command.roll_rate < -0.15
+    # No phantom pitch command from the same projection.
+    assert abs(command.pitch_rate) < 0.05
+
+
+
 def _vision_snapshot(
     *,
     frame_id=100,
