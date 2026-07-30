@@ -2351,9 +2351,18 @@ class CleanCourseController:
         # qualified ey servo held at center, losing it out the bottom.
         # The floor keeps every BLIND path (SEARCH, unqualified, PREDICT)
         # and the F21 freshness gate already disqualifies frozen ghosts.
+        # F86 (20260730T124019Z-visual-course-1f7f89d7): the yield is
+        # vz-aware.  The qualified ey servo is degenerate while SINKING
+        # toward a gate — approach + descent keeps the gate centered
+        # (ey ~0) as the altitude bleeds out: F86 tracked gate 1 centered
+        # for 3 s while sinking alt -0.4 -> -2.0 (vz ~-0.36, the descent
+        # floor's -0.35 bound quiet), lost it, and SEARCHed into the
+        # ground.  F79's balloon was a CLIMBING overshoot (vz +1.8), so
+        # vision yields the floor only while NOT sinking; at vz < 0 the
+        # latched floor's max() re-engages over the ey servo.
         collective = self._governed_collective(
             collective, support, gate_y=ey_vertical,
-            alt_floor=not vertical_qualified,
+            alt_floor=(not vertical_qualified) or self._vz_est_m_s < 0.0,
         )
         thrust = _clamp(collective, cfg.min_thrust, cfg.max_thrust)
 
@@ -3127,8 +3136,18 @@ class CleanCourseController:
         # prevents descent.  COMMIT opts out (alt_floor=False): a forced
         # climb at the plane flies the drone over the gate.
         if alt_floor and self._alt_floor_active:
+            # F84/F86: the anti-sink deficit this floor insures against was
+            # measured at ~level attitude — at the -0.58 brake attitude the
+            # tilt-inflated support would pin the floor at MAX thrust, so
+            # the support term is bounded at the spawn-level tilt
+            # compensation (same bound as the F21 fh-untrusted floor).
+            level_support = self.config.support_collective / max(
+                0.85, math.cos(self.config.spawn_pitch_rad)
+            )
             governed = max(
-                governed, support + self.config.alt_floor_climb_margin
+                governed,
+                min(support, level_support)
+                + self.config.alt_floor_climb_margin,
             )
         return governed
 

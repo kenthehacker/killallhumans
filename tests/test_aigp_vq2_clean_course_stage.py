@@ -2990,6 +2990,41 @@ def test_alt_floor_latch_yields_to_qualified_vision():
     assert out.thrust > SPAWN_SUPPORT + 0.04
 
 
+def test_alt_floor_reengages_over_qualified_vision_while_sinking():
+    # F86 (20260730T124019Z-visual-course-1f7f89d7): the qualified ey
+    # servo is degenerate while SINKING toward a gate — approach +
+    # descent keeps the gate centered (ey ~0) as the altitude bleeds
+    # out: F86 tracked gate 1 centered for 3 s while sinking alt
+    # -0.4 -> -2.0 at vz ~-0.36 (the descent floor's -0.35 bound quiet),
+    # lost the gate, and SEARCHed into the ground (id 1002).  The
+    # latched altitude floor's max() re-engages over qualified vision
+    # at vz < 0; F79's yield above still covers the vz >= 0 balloon.
+    controller = _tracked_controller(_track("A", 0.0, 0.05, scale=0.20))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = -1.0  # proved low gate-0 exit
+    controller._alt_floor_active = True  # latched in the blind window
+    current = controller.current
+    current.y_axis.p = 0.05  # gate at center: the degenerate geometry
+    current.raw_y = 0.05
+    current.y_axis.v = 0.0
+    current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10
+    now = 100.10
+    out = None
+    for _ in range(15):
+        now += 0.033
+        controller._vz_est_m_s = -0.36  # F86's qualified-vision sink
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    assert out.vertical_qualified
+    # The ey PD asks for ~support (0.255); the re-engaged floor pins the
+    # bounded anti-sink hold instead.
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-3)
+
+
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
     # F54 (20260729T235858Z-visual-course-c92d42ce): censorship of the aim
     # track began ~0.2 s after outer_log_scale crossed -0.9, so the F53
