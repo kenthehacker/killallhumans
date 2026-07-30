@@ -314,6 +314,17 @@ EXPANSION_BRAKE_FREE_S = 1.5  # expansion rate below which no braking applies
 EXPANSION_BRAKE_SPAN_S = 3.0  # span from free advance to full expansion brake
 NEAR_FREE_LOG_SCALE = -1.5  # far enough that near-plane risk does not brake
 NEAR_BRAKE_LOG_SCALE = -0.9  # close enough that closure is fully braked
+# F57 (20260730T003044Z-visual-course-74abd688 + f56/ frames): the F56
+# corridor correctly blocked mis-aimed commits, but the pursuit NEVER
+# satisfied it — ex stalled at -0.15..-0.18 for the whole approach (a
+# P-pursuit limit cycle: yaw gain 0.9 commands only -0.14 rad/s against
+# close-range parallax while the yaw cap is 0.5 and the airframe measurably
+# responds to >=0.42).  Inside the COMMIT proximity regime both lateral
+# error gains are boosted so ex actually converges into the corridor before
+# censorship; the caps are unchanged (at ex -0.16 the boosted yaw command
+# is -0.36, inside the cap and the measured response).  Far range keeps
+# the proved 0.9/0.5 gains.
+NEAR_PLANE_STEER_GAIN_MULT = 2.5  # near-regime lateral gain multiplier
 
 CROSSING_MIN_LOG_SCALE = -0.80  # retired stage crossing_arm_min_log_scale
 # F45 (20260729T210351Z-visual-course-b1f5e89f): the crossing coast is
@@ -660,7 +671,14 @@ CLIPPED_INFLATE_VAR_NORM = 0.004  # clipping uncertainty inflation
 INITIAL_POS_VAR_NORM = 0.01  # fresh measured hypothesis position variance
 INITIAL_RATE_VAR = 0.25
 SYNTHETIC_POS_VAR_NORM = 0.16  # StartContext-only fallback hypothesis
-ROTATION_COMP_FOCAL_NORM = 1.0  # normalized focal length for de-rotation
+# F57 (20260730T003044Z-visual-course-74abd688): the de-rotation focal was
+# inconsistent with the SAME camera's measured geometry already in this
+# file (VERTICAL_PITCH_COMP_NORM_PER_RAD = 1.6) — at 1.0 every predicted
+# bearing under-rotated by 37.5%, which is why the frozen hypothesis
+# lagged the true gate bearing in F52 (frozen ex -0.156 vs true -0.48) and
+# why stale-bearing steering under-corrects.  The measured 1.6 now drives
+# every derotation consumer (PREDICT, coast, F52-A hold, COMMIT steering).
+ROTATION_COMP_FOCAL_NORM = 1.6  # normalized focal length for de-rotation
 ROTATION_COMP_UNCERTAINTY = 0.25  # fraction of comp drift added as variance
 # Timestamp sentinel for "this axis has never had an accepted measurement"
 # (censored creation detection); any horizon check against it fails.
@@ -880,6 +898,7 @@ class CleanCourseConfig:
     commit_min_log_scale: float = COMMIT_MIN_LOG_SCALE
     commit_corridor_half_span_frac: float = COMMIT_CORRIDOR_HALF_SPAN_FRAC
     commit_corridor_min_ex_norm: float = COMMIT_CORRIDOR_MIN_EX_NORM
+    near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
     x_steer_max_age_s: float = X_STEER_MAX_AGE_S
@@ -1634,9 +1653,16 @@ class CleanCourseController:
                     <= cfg.commit_meas_max_age_s
                 )
                 if commit_fresh_x:
+                    # F57: the near-plane boost applies here too — at
+                    # commit range the far-range gains limit-cycle against
+                    # parallax (see NEAR_PLANE_STEER_GAIN_MULT).
+                    commit_steer_gain = 1.0
+                    if self.current.log_scale >= cfg.commit_min_log_scale:
+                        commit_steer_gain = cfg.near_plane_steer_gain_mult
                     commit_yaw = _clamp(
                         cfg.yaw_error_sign
                         * cfg.yaw_error_gain
+                        * commit_steer_gain
                         * self.current.x,
                         -cfg.max_yaw_rate_rad_s,
                         cfg.max_yaw_rate_rad_s,
@@ -1645,6 +1671,7 @@ class CleanCourseController:
                     commit_roll = _clamp(
                         cfg.roll_error_sign
                         * cfg.roll_error_gain
+                        * commit_steer_gain
                         * self.current.x,
                         -cfg.max_target_roll_rad,
                         cfg.max_target_roll_rad,
@@ -1936,14 +1963,21 @@ class CleanCourseController:
         # (codex, flights 4480d0a6/ab6252b2): the clip penalty halves yaw
         # exactly when the target is escaping at the frame edge.
         steer_cap = 1.0
+        # F57 near-plane steering boost (see the NEAR_PLANE_STEER_GAIN_MULT
+        # block): inside the COMMIT proximity regime the proved far-range
+        # gains limit-cycle against close-range parallax (ex stalled at
+        # -0.15..-0.18 for F56's whole approach).  Caps unchanged.
+        steer_gain = 1.0
+        if current.log_scale >= cfg.commit_min_log_scale:
+            steer_gain = cfg.near_plane_steer_gain_mult
         yaw_rate = _clamp(
-            cfg.yaw_error_sign * cfg.yaw_error_gain * ex,
+            cfg.yaw_error_sign * cfg.yaw_error_gain * steer_gain * ex,
             -cfg.max_yaw_rate_rad_s * steer_cap,
             cfg.max_yaw_rate_rad_s * steer_cap,
         )
         yaw_rate = self._anchor_clamped_yaw(yaw_rate, yaw_rad)
         target_roll = _clamp(
-            cfg.roll_error_sign * cfg.roll_error_gain * ex,
+            cfg.roll_error_sign * cfg.roll_error_gain * steer_gain * ex,
             -cfg.max_target_roll_rad * steer_cap,
             cfg.max_target_roll_rad * steer_cap,
         )

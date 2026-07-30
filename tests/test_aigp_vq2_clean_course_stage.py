@@ -22,9 +22,9 @@ expansion brake (near window or sub-2.5 s expansion TTC, near-field gated
 at -1.8, fast slew, lateral pursuit and vz governor alive, crossing
 detection unsuppressed), a pre-gate-1 altitude floor
 (vz_est-integrated alt_est clamped at >= -2.0 m, 0.7 -> 1.2 m hysteresis)
-overriding everything but the coast support-hold latch with a level
-attitude, zero yaw, and a governed climb collective, bounded to a 2.5 s
-latch with a 1.0 s above-release re-arm (F13), an fh inflow-regime gate
+as a pure collective floor inside the vz governor (F55: the early-return
+attitude/lateral override was deleted after three plane-region preemption
+deaths), bounded to a 2.5 s latch with a 1.0 s above-release re-arm (F13), an fh inflow-regime gate
 (sustained fh > 3.0 for 0.3 s freezes vz/alt integration, blocks floor
 arming, suppresses the vz governor, holds support + 0.05 unqualified;
 hysteresis release below 2.0), an edge-parked advance-stall cap forcing
@@ -57,6 +57,7 @@ from scripts.aigp_vq2_clean_course_stage import (
     LAUNCH_BOOST_DURATION_S,
     LAUNCH_BOOST_THRUST,
     NEVER_MEASURED_S,
+    ROTATION_COMP_FOCAL_NORM,
     CleanCourseConfig,
     CleanCourseController,
     CleanCourseRuntime,
@@ -2163,15 +2164,58 @@ def test_near_plane_stale_x_keeps_derotated_steering():
     near.current.last_x_measurement_s = 100.10 - 1.0  # past X_STEER_MAX_AGE_S
     out = _command(near, 100.10)
     assert out.state is CleanCourseState.TRACK
-    # yaw gain 0.90 on the held ex=-0.17 bearing keeps centering.
-    assert out.yaw_rate_rad_s == pytest.approx(-0.153, abs=1e-9)
-    assert out.target_roll_rad < 0.0  # slewing toward the 0.50*ex bank
+    # The held ex=-0.17 bearing keeps centering — at this near-plane scale
+    # with the F57 boost (0.90 * 2.5 * -0.17).
+    assert out.yaw_rate_rad_s == pytest.approx(-0.3825, abs=1e-9)
+    assert out.target_roll_rad < 0.0  # slewing toward the boosted bank
     # FAR target, identical staleness: the F40 zeroing still applies.
     far = _tracked_controller(_track("A", -0.17, 0.0, scale=0.10))
     far.current.last_x_measurement_s = 100.10 - 1.0
     out = _command(far, 100.10)
     assert out.yaw_rate_rad_s == 0.0
     assert out.target_roll_rad == 0.0
+
+
+def test_derotation_focal_matches_measured_camera_geometry():
+    # F57 (20260730T003044Z-visual-course-74abd688): the de-rotation focal
+    # equals the same camera's measured 1.6 norm/rad already in the file
+    # (VERTICAL_PITCH_COMP_NORM_PER_RAD) — at 1.0 every predicted bearing
+    # under-rotated by 37.5% (F52 frozen ex -0.156 vs true -0.48).
+    assert ROTATION_COMP_FOCAL_NORM == pytest.approx(1.6)
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    hypothesis = controller.current
+    start_x, start_y = hypothesis.x, hypothesis.y
+    controller._predict(hypothesis, 0.033, (0.0, -0.20, 0.40))
+    # drift_x = -yaw_rate * focal * dt; drift_y = pitch_rate * focal * dt.
+    assert hypothesis.x - start_x == pytest.approx(-0.40 * 1.6 * 0.033)
+    assert hypothesis.y - start_y == pytest.approx(-0.20 * 1.6 * 0.033)
+
+
+def test_near_plane_steering_boost_scales_both_lateral_gains():
+    # F57: inside the COMMIT proximity regime the TRACK law multiplies both
+    # lateral error gains by 2.5 to break the parallax limit cycle (F56's
+    # ex stalled at -0.15..-0.18 for the whole approach); the caps are
+    # unchanged and far range keeps the proved 0.9/0.5 gains.
+    near = _tracked_controller(_track("A", -0.16, 0.0, scale=0.50))
+    out = _command(near, 100.10)
+    # 0.90 * 2.5 * -0.16 = -0.36 (inside the 0.5 cap and the measured
+    # airframe response of >=0.42 rad/s).
+    assert out.yaw_rate_rad_s == pytest.approx(-0.36, abs=1e-9)
+    far = _tracked_controller(_track("A", -0.16, 0.0, scale=0.10))
+    out = _command(far, 100.10)
+    assert out.yaw_rate_rad_s == pytest.approx(-0.144, abs=1e-9)  # 0.90*-0.16
+
+
+def test_commit_fresh_steering_carries_the_near_plane_boost():
+    boosted = _commit_controller()
+    boosted.current.scale_axis.p = math.log(0.35)  # log_scale -1.05 >= -1.2
+    out, _ = _drive_commit_window(boosted, 100.10)
+    assert boosted.state is CleanCourseState.COMMIT
+    assert out.yaw_rate_rad_s == pytest.approx(0.225, abs=1e-9)  # 0.9*2.5*0.10
+    plain = _commit_controller()  # scale_axis log ~-3.0: far-range gains
+    out, _ = _drive_commit_window(plain, 100.10)
+    assert plain.state is CleanCourseState.COMMIT
+    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)  # 0.9*0.10
 
 
 def _commit_controller(now_s=100.10):
