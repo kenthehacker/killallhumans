@@ -368,7 +368,13 @@ CROSSING_CREDIT_WAIT_S = 0.40  # July-18 safety contract item 9
 COMMIT_MIN_LOG_SCALE = -1.2  # entry proximity bound (span ~0.3)
 COMMIT_SUSTAIN_S = 0.10  # near-plane regime must persist this long to arm
 COMMIT_MEAS_MAX_AGE_S = 0.30  # fresh uncensored both-axis window at entry
-COMMIT_TIMEOUT_S = 2.0  # no credit this long -> arrest and search
+# F58 (20260730T004618Z-visual-course-cae7b894): the pre-cross brake bled
+# the approach to ~0 speed at entry and the coast-sized 0.05 rad advance
+# only rebuilds ~1 m/s in the window — the commit never reached the plane
+# while tangential velocity carried it past the gate's face.  0.15 rad
+# (~1.5 m/s^2) covers the 3-4 m brake-stall drive inside a 3.0 s window.
+COMMIT_ADVANCE_PITCH_RAD = 0.15  # real advance drive from standstill
+COMMIT_TIMEOUT_S = 3.0  # no credit this long -> arrest and search
 # F56 (20260730T001902Z-visual-course-efb189d4 + f55/ debug frames): F55's
 # COMMIT ran cleanly but crossed BESIDE gate 1's left post — the nose was
 # ~0.22 norm off gate center while the gate's visible half-width was only
@@ -896,6 +902,7 @@ class CleanCourseConfig:
     commit_meas_max_age_s: float = COMMIT_MEAS_MAX_AGE_S
     commit_timeout_s: float = COMMIT_TIMEOUT_S
     commit_min_log_scale: float = COMMIT_MIN_LOG_SCALE
+    commit_advance_pitch_rad: float = COMMIT_ADVANCE_PITCH_RAD
     commit_corridor_half_span_frac: float = COMMIT_CORRIDOR_HALF_SPAN_FRAC
     commit_corridor_min_ex_norm: float = COMMIT_CORRIDOR_MIN_EX_NORM
     near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
@@ -1686,6 +1693,16 @@ class CleanCourseController:
                     -cfg.search_vertical_memory_band,
                     cfg.search_vertical_memory_band,
                 )
+                if (
+                    now_s - self.current.last_y_measurement_s
+                    > cfg.commit_meas_max_age_s
+                ):
+                    # F58: y is stale/censored — never CLIMB on a frozen
+                    # bearing (F57's frozen servo pinned support+0.05 for
+                    # the whole commit and drifted up over the opening).
+                    # The descend side stays live; the vz governor bounds
+                    # the sink.
+                    commit_correction = min(commit_correction, 0.0)
                 commit_hold = support + commit_correction
                 self._collective = commit_hold
                 return NavigationOutput(
@@ -1693,9 +1710,12 @@ class CleanCourseController:
                     # F55: the advance attitude must actually be reached —
                     # the generic 0.30 rad/s slew only moved rpy_p from
                     # -0.42 to -0.32 across F54's whole 2 s commit.  Use
-                    # the braking-regime fast slew.
+                    # the braking-regime fast slew.  F58: the drive is
+                    # COMMIT_ADVANCE_PITCH_RAD (the coast's 0.05 offset was
+                    # sized for a 0.4 s wait, not a 3-4 m brake-stall
+                    # drive); the coast law's own offset is untouched.
                     target_pitch_rad=self._slew_pitch(
-                        cfg.spawn_pitch_rad + cfg.coast_advance_pitch_rad,
+                        cfg.spawn_pitch_rad + cfg.commit_advance_pitch_rad,
                         dt,
                         slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
                     ),

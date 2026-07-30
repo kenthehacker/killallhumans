@@ -1259,8 +1259,8 @@ def test_alt_floor_does_not_bump_commit_thrust():
 def test_commit_timeout_fires_while_alt_floor_latched():
     # The F54 regression: the floor's early return preempted COMMIT for
     # 3.84 s, blocking the commit timeout until the floor released.  With
-    # the override deleted the timeout fires on schedule even though the
-    # latch outlasts the whole 2.0 s commit window (2.5 s max latch).
+    # the override deleted the timeout fires on schedule at 3.0 s even
+    # with the floor latched through the first 2.5 s of the commit.
     controller = _commit_controller()
     controller._alt_est_m = 0.5
     _blind_current(controller, 100.10)
@@ -1268,7 +1268,7 @@ def test_commit_timeout_fires_while_alt_floor_latched():
     assert controller._alt_floor_active
     out, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
-    for _ in range(75):  # ~2.5 s > the 2.0 s commit window
+    for _ in range(100):  # ~3.3 s > the 3.0 s commit window
         now += 0.033
         if controller.current is not None:  # dropped at the timeout
             controller.current.last_measurement_s = now
@@ -2385,8 +2385,8 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     # entry offset is finished, not frozen (F55 crossed beside the post).
     assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
     assert out.target_roll_rad == pytest.approx(0.05, abs=1e-9)
-    # The coast advance nudge, not the brake attitude, carries the plane.
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.05, abs=1e-9)
+    # F58: the real 0.15 rad advance drive, not the coast's 0.05 nudge.
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.15, abs=1e-9)
     # Bounded vertical servo on the compensated ey (0.05 -> -0.004).
     assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.004, abs=1e-9)
     # The servo tracks inside the band (0.50 -> -0.04)...
@@ -2416,7 +2416,7 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     controller.current.last_y_measurement_s = now
     out = _command(controller, now, pitch=SPAWN_PITCH)
     assert out.yaw_rate_rad_s == pytest.approx(0.50, abs=1e-9)
-    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.05, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.15, abs=1e-9)
     # Once x goes STALE/censored the commit holds heading (the frozen
     # bearing has no parallax term — F52): yaw zero, bank slewing to level.
     controller.current.x_axis.p = 0.10
@@ -2430,14 +2430,40 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     assert out.target_roll_rad == pytest.approx(0.0, abs=1e-9)
 
 
+def test_commit_stale_y_never_climbs_on_a_frozen_bearing():
+    # F58 (20260730T004618Z-visual-course-cae7b894): the band servo's y
+    # input froze at censorship and output the CLIMB side (thrust pinned
+    # support+0.05) for the whole commit — the drone drifted up over the
+    # opening.  Stale/censored y clamps the servo correction to <= 0:
+    # bare support instead of a frozen climb; the descend side stays live
+    # (and the vz governor bounds the sink).  Fresh y keeps the
+    # bidirectional band (covered by the law test above).
+    controller = _commit_controller()
+    out, now = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.COMMIT
+    controller.current.y_axis.p = -0.50  # frozen climb-side servo (+0.04)
+    for _ in range(15):  # the y stamp ages past the 0.30 s window
+        now += 0.033
+        controller.current.last_measurement_s = now
+        controller.current.last_x_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.COMMIT
+    # Correction clamped to 0 — bare support, never support + band.
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
+    # The descend side survives the clamp (0.50 -> -0.04).
+    controller.current.y_axis.p = 0.50
+    out = _command(controller, now + 0.033, pitch=SPAWN_PITCH)
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.04, abs=1e-9)
+
+
 def test_commit_timeout_drops_hypothesis_and_searches():
-    # ~2.0 s without authoritative credit: arrest and SEARCH, with the
+    # ~3.0 s without authoritative credit: arrest and SEARCH, with the
     # hypothesis DROPPED — the innovation gate permanently rejects the true
     # gate while the frozen hypothesis lives (association lock-out).
     controller = _commit_controller()
     out, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
-    for _ in range(75):  # ~2.5 s > the 2.0 s commit window
+    for _ in range(100):  # ~3.3 s > the 3.0 s commit window
         now += 0.033
         if controller.current is not None:  # dropped at the timeout
             controller.current.last_measurement_s = now
