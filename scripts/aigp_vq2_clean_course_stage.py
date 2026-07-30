@@ -2170,6 +2170,29 @@ class CleanCourseController:
             / (cfg.near_brake_log_scale - cfg.near_free_log_scale)
         )
         advance = align * confidence * uncertainty * expansion * near_plane
+        # F73 (20260730T063739Z-visual-course-34c53413): TRACK kept closing
+        # while the COMMIT entry budget was false — the gate-1 aim walked
+        # ey +0.31 -> +0.49 into bottom censorship at the plane, the track
+        # died, a bottom-right splinter was adopted, and the drone wandered
+        # 9 s blind into structure (collision id 1002).  At the plane the
+        # angular error rate (~offset/distance) outruns any re-centering
+        # servo, so the crossing energy must be controlled BEFORE
+        # censorship: on a gate-1+ TRACK in the near-plane regime with a
+        # false entry budget, cut the advance law and demand the full
+        # brake — hold OUTSIDE the blackout and re-center (the F71 course
+        # relax keeps the camera level for custody).  The same budget
+        # passing arms COMMIT on the same tick; nothing else about the
+        # crossing changes.
+        if (
+            self.state is CleanCourseState.TRACK
+            and self.gate_index >= 1
+            and current.outer_log_scale >= cfg.near_brake_log_scale
+            and not self._commit_entry_budget_ok(now_s, pitch_rad, cfg)
+        ):
+            advance = 0.0
+            brake_demand = 1.0
+            pre_cross_brake = True
+            self._pre_cross_brake_active = True
         # Closure-rate governor (F31) + misalignment brake (F35): continuous
         # blend toward the TRUE brake attitude as either the vision expansion
         # rate rises past the target or the gate sits off-axis — speed is

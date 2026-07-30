@@ -2455,6 +2455,50 @@ def test_commit_entry_requires_inner_aperture_budget():
     assert blind.state is CleanCourseState.TRACK
 
 
+def test_near_plane_track_holds_closure_while_commit_budget_false():
+    # F73 (20260730T063739Z-visual-course-34c53413): the gate-1 leg kept
+    # CLOSING with the entry budget false (ey +0.31 -> +0.49 into bottom
+    # censorship); the aim died at the plane, a bottom-right splinter was
+    # adopted, and the drone wandered 9 s blind into structure (collision
+    # id 1002).  At the plane the angular error rate outruns re-centering,
+    # so crossing energy is controlled BEFORE censorship: a gate-1+ TRACK
+    # in the near-plane regime with a false budget cuts advance and demands
+    # the full brake.  The same budget passing still arms COMMIT.
+    # Misaligned beyond the 60% aperture margin: budget false, and the
+    # F71 course relax levels the camera (ey 0.35 >= 0.18).
+    holding = _commit_controller()
+    current = holding.current
+    current.x_axis.p = 0.30
+    current.y_axis.p = 0.35
+    current.raw_x = 0.30
+    current.raw_y = 0.35
+    current.scale_axis.p = -0.50  # relax's commit regime reads the inner scale
+    out, _ = _drive_commit_window(holding, 100.10)
+    assert holding.state is CleanCourseState.TRACK  # COMMIT never arms
+    assert holding._pre_cross_brake_active
+    assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    # Centered but with a stale x-axis the budget is still false: the hold
+    # demands the FULL brake attitude instead of the advance law's
+    # nose-down pitch (relax quiet at ey 0.05 < 0.18).
+    stalled = _commit_controller()
+    now = 100.10
+    for _ in range(12):
+        now += 0.033
+        stalled.current.last_measurement_s = now
+        stalled.current.last_y_measurement_s = now
+        # x stamp frozen at construction: 0.4 s stale inside the window.
+        out = _command(stalled, now, pitch=SPAWN_PITCH)
+    assert stalled.state is CleanCourseState.TRACK
+    assert stalled._pre_cross_brake_active
+    assert out.target_pitch_rad <= SPAWN_PITCH + 1e-9
+    # Gate 0 is untouched: the same geometry keeps its proved advance law.
+    gate0 = _tracked_controller(_track("A", 0.10, 0.05, scale=0.50))
+    gate0.current.outer_log_scale = -0.50
+    gate0.current.last_x_measurement_s = 100.0 - 0.40
+    out0 = _command(gate0, 100.10)
+    assert out0.target_pitch_rad > SPAWN_PITCH - 0.15 + 1e-9
+
+
 def test_commit_entry_beats_censorship_onset_at_minus_1p2():
     # F54 (20260729T235858Z-visual-course-c92d42ce): censorship of the aim
     # track began ~0.2 s after outer_log_scale crossed -0.9, so the F53
