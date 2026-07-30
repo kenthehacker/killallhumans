@@ -660,6 +660,10 @@ def test_vz_phantom_sink_cannot_move_coast_exact_zero():
     # governed control law at all.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    # F102: the gate-0 hot-coast trigger is deleted — COAST arms only from
+    # an armed COMMIT, so route the entry through the COMMIT latch.
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = 100.12
     controller.observe(_update([], frame_id=3), now_s=100.12)  # fresh close loss
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     controller._vz_est_m_s = -1.0
@@ -1508,12 +1512,16 @@ def test_crossing_loss_latches_coast_even_while_fh_untrusted():
     # gate-0 plane, the fh guard blocked the coast latch, and the drone
     # flew blind into the frame in PREDICT.  A credible close crossing loss
     # coasts regardless.  2026-07-30: the coast is exact wire zero for the
-    # bounded credit wait — no support-thrust PD hold.
+    # bounded credit wait — no support-thrust PD hold.  F102: the gate-0
+    # hot-coast trigger is deleted; the coast arms only from an armed
+    # COMMIT, so this test enters through the COMMIT latch.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
     controller._fh_untrusted = True
     now = 100.10
     now += 0.033
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = now
     controller.observe(_update([], frame_id=20), now_s=now)  # fresh close loss
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     output = _command(controller, now + 0.02)
@@ -1583,6 +1591,10 @@ def test_pre_cross_brake_does_not_suppress_crossing_detection():
     # size keeps growing through crossing_min_log_scale while the brake is
     # active, and the fresh close loss still latches the exact-zero COAST
     # wait (the brake's deceleration must not suppress crossing detection).
+    # F102: the near-plane hold is gate-agnostic, so the brake engages at
+    # gate 0 too (no aperture on the default track fails the entry budget);
+    # the coast itself arms only from an armed COMMIT — enter via the
+    # COMMIT latch.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.30))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
     now = 100.10
@@ -1598,6 +1610,8 @@ def test_pre_cross_brake_does_not_suppress_crossing_detection():
     assert brake_seen  # the brake engaged during the final approach
     assert controller.current.outer_log_scale >= -0.80  # crossing armed
     now += 0.033
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = now
     controller.observe(_update([], frame_id=20), now_s=now)  # fresh close loss
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     output = _command(controller, now + 0.02)
@@ -1828,8 +1842,12 @@ def test_fresh_close_loss_still_coasts_at_exact_zero():
     # close-range loss on a FRESH frame (new frame id) still arms the coast
     # latch.  2026-07-30 contract correction: the wait is exact wire zero —
     # no roll/pitch/yaw rate, no thrust — for at most the credit window.
+    # F102: the gate-0 hot-coast trigger is deleted — the latch arms only
+    # from an armed COMMIT, so this test enters through the COMMIT latch.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = 100.12
     controller.observe(_update([], frame_id=3), now_s=100.12)  # fresh id
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     output = _command(controller, 100.14)
@@ -1979,21 +1997,16 @@ def test_off_center_close_loss_goes_to_predict_not_coast():
     assert controller.state is CleanCourseState.PREDICT
 
 
-def test_centered_close_loss_still_arms_coast():
-    # The aligned case keeps the July-18 bounded credible-crossing wait: a
-    # near-center fresh close loss arms COAST_FOR_CREDIT (the wait itself
-    # is covered by the bounded/coast tests below).
-    controller = _tracked_controller(_track("A", 0.10, -0.15, scale=0.50))
-    controller.observe(_update([], frame_id=5), now_s=100.12)
-    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
-
-
 def test_crossing_loss_latches_coast_and_waits_for_newer_race_packet():
     config = _config()
     controller = _tracked_controller(
         _track("A", 0.0, 0.0, scale=0.50), config=config  # close crossing
     )
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    # F102: the gate-0 hot-coast trigger is deleted — COAST arms only from
+    # an armed COMMIT; enter through the COMMIT latch.
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = 100.12
     controller.observe(_update([], frame_id=5), now_s=100.12)
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     output = _command(controller, 100.14)
@@ -2012,8 +2025,12 @@ def test_crossing_loss_latches_coast_and_waits_for_newer_race_packet():
 
 
 def test_crossing_wait_is_bounded_and_authoritative_credit_is_accepted():
+    # F102: the gate-0 hot-coast trigger is deleted — COAST arms only from
+    # an armed COMMIT; enter through the COMMIT latch.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = 100.12
     controller.observe(_update([], frame_id=5), now_s=100.12)
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     # Authoritative increment during the wait is accepted immediately.
@@ -2030,6 +2047,8 @@ def test_crossing_wait_is_bounded_and_authoritative_credit_is_accepted():
     # exits to SEARCH no matter when the scheduler calls it.
     controller2 = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller2.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller2.state = CleanCourseState.COMMIT
+    controller2._commit_entry_s = 100.12
     controller2.observe(_update([], frame_id=5), now_s=100.12)
     output = _command(controller2, 100.13)
     assert controller2.state is CleanCourseState.COAST_FOR_CREDIT
@@ -2059,6 +2078,10 @@ def test_pending_credit_hold_never_sweeps_before_delayed_credit():
     )
     controller._track_first_seen_s["B"] = 100.08 - 1.0  # persistent (F42)
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    # F102: the gate-0 hot-coast trigger is deleted — COAST arms only from
+    # an armed COMMIT; enter through the COMMIT latch.
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = 100.12
     controller.observe(_update([], frame_id=5), now_s=100.12)
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     out = _command(controller, 100.14)  # the single wire-zero send (F72)
@@ -2091,6 +2114,8 @@ def test_pending_credit_hold_never_sweeps_before_delayed_credit():
     # Bounded: with no credit the window expires and the sweep resumes.
     expiring = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     expiring.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    expiring.state = CleanCourseState.COMMIT
+    expiring._commit_entry_s = 100.12
     expiring.observe(_update([], frame_id=5), now_s=100.12)
     _command(expiring, 100.14)
     out = _command(expiring, 100.18)
@@ -2119,6 +2144,10 @@ def test_pending_credit_recenters_toward_credible_successor():
     )
     controller._track_first_seen_s["B"] = 100.08 - 1.0  # persistent (F42)
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    # F102: the gate-0 hot-coast trigger is deleted — COAST arms only from
+    # an armed COMMIT; enter through the COMMIT latch.
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = 100.12
     controller.observe(_update([], frame_id=5), now_s=100.12)
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     out = _command(controller, 100.14)  # the single wire-zero send (F72)
@@ -2142,9 +2171,12 @@ def test_pending_credit_recenters_toward_credible_successor():
 
 def test_pending_credit_holds_neutral_without_successor():
     # F78: absent successor evidence the pending-credit window retains the
-    # F76 neutral heading hold (zero yaw/roll, governed support).
+    # F76 neutral heading hold (zero yaw/roll, governed support).  F102:
+    # COAST arms only from an armed COMMIT; enter through the COMMIT latch.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = 100.12
     controller.observe(_update([], frame_id=5), now_s=100.12)
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
     out = _command(controller, 100.14)  # the single wire-zero send (F72)
@@ -2162,9 +2194,12 @@ def test_pending_credit_match_reappearance_never_resumes_track():
     # not a SEARCH-command posture — the pre-credit gate's own track id
     # reappearing in a fresh frame must NOT flip SEARCH back to TRACK
     # through the same-track match path and start advancing before the
-    # authoritative credit that owns the leg.
+    # authoritative credit that owns the leg.  F102: COAST arms only from
+    # an armed COMMIT; enter through the COMMIT latch.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = 100.12
     controller.observe(_update([], frame_id=5), now_s=100.12)
     out = _command(controller, 100.14)  # the single wire-zero send (F72)
     assert out.thrust == 0.0
@@ -2339,6 +2374,68 @@ def _drive_commit_window(controller, now, ticks=12):
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     return out, now
+
+
+def test_close_loss_without_armed_commit_never_coasts():
+    # F102: the gate-0 scale-triggered hot coast is deleted — ONE crossing
+    # policy.  A centered close loss in TRACK (no armed COMMIT) is an
+    # ordinary loss: PREDICT carries the pursuit, never the ballistic
+    # credit wait.  (Parent behavior: this exact scenario latched
+    # COAST_FOR_CREDIT.)
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.observe(_update([], frame_id=5), now_s=100.12)
+    assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
+    now = 100.12
+    for frame in range(6, 16):
+        now += 0.033
+        controller.observe(_update([], frame_id=frame), now_s=now)
+        assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
+        if controller.state is CleanCourseState.PREDICT:
+            break
+    assert controller.state is CleanCourseState.PREDICT
+
+
+def _commit_controller_gate_zero(now_s=100.10):
+    """F102 gate-0 variant of _commit_controller: same near-plane,
+    budget-satisfying TRACK setup but still on the GATE-0 leg (no
+    promotion) — the unified crossing policy must arm COMMIT at gate 0
+    exactly as it does at gate 1+."""
+
+    controller = _tracked_controller(
+        _track("A", 0.0, 0.0), config=_config(ex_trim_gain=0.0)
+    )
+    controller._alt_est_m = 2.0  # honest altitude (floor quiet)
+    current = controller.current
+    current.x_axis.p = 0.10
+    current.y_axis.p = 0.05
+    current.raw_x = 0.10
+    current.raw_y = 0.05
+    current.aperture_half_x = 0.25
+    current.aperture_half_y = 0.25
+    current.outer_log_scale = -0.50
+    current.outer_half_span_x = 0.25
+    return controller
+
+
+def test_commit_entry_arms_on_gate_zero():
+    # F102: COMMIT is gate-agnostic — there is ONE energy-budgeted crossing
+    # policy, gate 0 included.  The same sustained, aligned, freshly
+    # measured near-plane regime that commits on a gate-1+ leg commits on
+    # gate 0.  (Parent behavior: COMMIT required gate_index >= 1, so gate 0
+    # could only cross via the deleted hot coast.)
+    controller = _commit_controller_gate_zero()
+    out, now = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.COMMIT
+
+    # Same gate-0 setup with unarrested vertical energy (|vz| > 0.25 fails
+    # the entry budget): COMMIT never arms, and the now gate-agnostic
+    # near-plane hold keeps the full brake engaged outside censorship.
+    climbing = _commit_controller_gate_zero()
+    climbing._vz_est_m_s = 0.64
+    _drive_commit_window(climbing, 100.10)
+    assert climbing.state is CleanCourseState.TRACK
+    assert climbing._pre_cross_brake_active
 
 
 def test_commit_entry_fires_sustained_aligned_near_plane():
@@ -3833,8 +3930,27 @@ def test_loop_skipped_send_promotes_and_finishes():
 
 def test_loop_coast_holds_exact_zero_then_accepts_credit():
     host = _Host(_update([_track("A", 0.0, 0.0, scale=0.50)]))
+    # F102: the gate-0 hot-coast trigger is deleted — COAST arms only from
+    # an armed COMMIT.  Inject the controller (same config the stage would
+    # build) so the script can enter COMMIT just before the tick-3 close
+    # loss and let the surviving COMMIT latch arm the coast.
+    rt = _test_runtime()
+    controller = CleanCourseController(
+        CleanCourseConfig(
+            min_thrust=rt.min_thrust,
+            max_thrust=rt.max_thrust,
+            max_yaw_rate_rad_s=rt.max_yaw_rate_rad_s,
+            control_period_s=rt.control_period_s,
+            spawn_pitch_rad=rt.spawn_pitch_rad,
+        )
+    )
 
     def script(host):
+        if host.ticks == 2:
+            import time
+
+            controller.state = CleanCourseState.COMMIT
+            controller._commit_entry_s = time.monotonic()
         if host.ticks == 3:
             host.update = _update([], frame_id=99)  # close crossing loses target
         if host.ticks == 6:
@@ -3849,7 +3965,9 @@ def test_loop_coast_holds_exact_zero_then_accepts_credit():
         initial_gate_x=322, initial_gate_y=174, initial_gate_area=6400
     )
     summary = asyncio.run(
-        run_clean_course_stage(host, context, runtime=_test_runtime())
+        run_clean_course_stage(
+            host, context, runtime=_test_runtime(), controller=controller
+        )
     )
     # 2026-07-30: the coast wait is EXACT WIRE ZERO — the PD is bypassed,
     # no support thrust, no leveling rates.  F72: exactly ONE zero send,
@@ -3878,14 +3996,32 @@ def test_loop_coast_bypasses_the_pd_at_exact_zero():
     # PD leaked nonzero rates at zero thrust; F26 moved the wait through
     # the PD at support thrust.  2026-07-30 contract correction: the wait
     # is exact wire zero again and the PD is BYPASSED — a tilted attitude
-    # estimate cannot leak leveling rates or thrust onto the wire.
+    # estimate cannot leak leveling rates or thrust onto the wire.  F102:
+    # the gate-0 hot-coast trigger is deleted — COAST arms only from an
+    # armed COMMIT, so inject the controller and enter COMMIT just before
+    # the tick-3 close loss (same config the stage would build).
     host = _Host(_update([_track("A", 0.0, 0.0, scale=0.50)]))
     host.estimate = SimpleNamespace(
         orientation=SimpleNamespace(to_euler=lambda: (0.10, -0.08, 0.0)),
         body_rates=(0.0, 0.0, 0.0),
     )
+    rt = _test_runtime()
+    controller = CleanCourseController(
+        CleanCourseConfig(
+            min_thrust=rt.min_thrust,
+            max_thrust=rt.max_thrust,
+            max_yaw_rate_rad_s=rt.max_yaw_rate_rad_s,
+            control_period_s=rt.control_period_s,
+            spawn_pitch_rad=rt.spawn_pitch_rad,
+        )
+    )
 
     def script(host):
+        if host.ticks == 2:
+            import time
+
+            controller.state = CleanCourseState.COMMIT
+            controller._commit_entry_s = time.monotonic()
         if host.ticks == 3:
             host.update = _update([], frame_id=99)  # close crossing loses target
         if host.ticks == 6:
@@ -3900,7 +4036,9 @@ def test_loop_coast_bypasses_the_pd_at_exact_zero():
         initial_gate_x=322, initial_gate_y=174, initial_gate_area=6400
     )
     summary = asyncio.run(
-        run_clean_course_stage(host, context, runtime=_test_runtime())
+        run_clean_course_stage(
+            host, context, runtime=_test_runtime(), controller=controller
+        )
     )
     saw_powered = False
     zero_sends = []
@@ -3927,10 +4065,28 @@ def test_loop_coast_emits_exactly_one_zero_send(credit_tick):
     # bounded by the state/send count rather than any timeout — no matter
     # when the scheduler delivers the authoritative credit, the wire sees a
     # single 0/0/0/0 command.  Credit is still accepted after the state
-    # exits (it is accepted in EVERY state).
+    # exits (it is accepted in EVERY state).  F102: the gate-0 hot-coast
+    # trigger is deleted — COAST arms only from an armed COMMIT, so inject
+    # the controller (same config the stage would build) and enter COMMIT
+    # just before the tick-3 close loss.
     host = _Host(_update([_track("A", 0.0, 0.0, scale=0.50)]))
+    rt = _test_runtime()
+    controller = CleanCourseController(
+        CleanCourseConfig(
+            min_thrust=rt.min_thrust,
+            max_thrust=rt.max_thrust,
+            max_yaw_rate_rad_s=rt.max_yaw_rate_rad_s,
+            control_period_s=rt.control_period_s,
+            spawn_pitch_rad=rt.spawn_pitch_rad,
+        )
+    )
 
     def script(host):
+        if host.ticks == 2:
+            import time
+
+            controller.state = CleanCourseState.COMMIT
+            controller._commit_entry_s = time.monotonic()
         if host.ticks == 3:
             host.update = _update([], frame_id=99)  # close crossing loses target
         if host.ticks == credit_tick:
@@ -3945,7 +4101,9 @@ def test_loop_coast_emits_exactly_one_zero_send(credit_tick):
         initial_gate_x=322, initial_gate_y=174, initial_gate_area=6400
     )
     summary = asyncio.run(
-        run_clean_course_stage(host, context, runtime=_test_runtime())
+        run_clean_course_stage(
+            host, context, runtime=_test_runtime(), controller=controller
+        )
     )
     saw_powered = False
     zero_sends = []

@@ -399,22 +399,9 @@ NEAR_BRAKE_LOG_SCALE = -0.9  # close enough that closure is fully braked
 NEAR_PLANE_STEER_GAIN_MULT = 2.5  # near-regime lateral gain multiplier
 
 CROSSING_MIN_LOG_SCALE = -0.80  # retired stage crossing_arm_min_log_scale
-# F45 (20260729T210351Z-visual-course-b1f5e89f): the crossing coast is
-# ballistic (yaw 0, support collective), so arming it on an OFF-CENTER
-# close loss preserves the offset — the last measured bearing (-0.39,-0.28)
-# slid -0.69 -> -0.93 censored and out of frame, no authoritative credit
-# came, and the leg fell into blind-search churn (impulse 4.91).  Race
-# credit is authoritative and arrives via race packet whenever the drone
-# truly passes the plane — the stage does not need the coast to OBTAIN
-# credit, so the coast may only own the 0.4 s wait of an ALIGNED crossing:
-# the last freshly MEASURED bearing must sit inside these bounds.
-CROSSING_MAX_ABS_EX_NORM = 0.20  # |ex| bound to arm the crossing coast
-CROSSING_MAX_ABS_EY_NORM = 0.25  # |ey| bound to arm the crossing coast
-# The alignment check reads the last MEASURED bearing, never a long-
-# predicted one; the horizon matches the engulfing anchor freshness (the
-# engulfed plane is blind, so a genuine centered crossing's last accepted
-# measurement can be this old at the loss).
-CROSSING_MEAS_MAX_AGE_S = 0.50
+# F102: the gate-0 scale-triggered "crossing coast" (CROSSING_MAX_ABS_*,
+# CROSSING_MEAS_MAX_AGE_S) is deleted — every gate now crosses via the
+# energy-budgeted COMMIT, so those bounds have no reader left.
 # F68 (20260730T053935Z-visual-course-1e82777a): the cruise-phase race
 # stream publishes at ~4 Hz, so "wait for a newer packet" held the exact
 # zero for a full 0.25 s — at 1 m altitude with forward speed the ballistic
@@ -1132,8 +1119,6 @@ class CleanCourseConfig:
     near_free_log_scale: float = NEAR_FREE_LOG_SCALE
     near_brake_log_scale: float = NEAR_BRAKE_LOG_SCALE
     crossing_min_log_scale: float = CROSSING_MIN_LOG_SCALE
-    crossing_max_abs_ex_norm: float = CROSSING_MAX_ABS_EX_NORM
-    crossing_max_abs_ey_norm: float = CROSSING_MAX_ABS_EY_NORM
     commit_sustain_s: float = COMMIT_SUSTAIN_S
     commit_meas_max_age_s: float = COMMIT_MEAS_MAX_AGE_S
     commit_timeout_s: float = COMMIT_TIMEOUT_S
@@ -1522,74 +1507,40 @@ class CleanCourseController:
                 self._ex_trim = 0.0
         else:
             gap = now_s - self.current.last_measurement_s
+            # F102: the gate-0 credible-close-loss coast is DELETED — every
+            # gate now crosses through the aperture/energy-budgeted COMMIT
+            # (ONE final-approach/crossing policy, the standing contract).
+            # The hot scale-triggered coast crossed gate 0 at ~1.0 log/s
+            # (~2.4 m/s) every flight, and the next leg inherited that
+            # energy: F100 ran away to ~1.2 log/s at the gate-1 plane
+            # (structure strike); F101 lost the gate at the bottom edge
+            # under the brake and VRS-sank into the ground (id 1002).  A
+            # gate-0 close loss without an armed COMMIT is NOT a credible
+            # crossing and falls through to PREDICT/re-center, exactly
+            # like gate-1+ legs.
+            if not fresh and self.state is CleanCourseState.TRACK:
+                # Frozen-frame stall: the republication carries no new
+                # information, so predict (covariance inflates in
+                # _predict) and let command() decay the collective toward
+                # support instead of coasting or holding a stale fix.
+                self.state = CleanCourseState.PREDICT
+            if gap > cfg.predict_frame_gap_s:
+                self.state = CleanCourseState.PREDICT
+            anchored = (
+                self._last_engulfing_anchor_s is not None
+                and now_s - self._last_engulfing_anchor_s
+                <= ENGULFING_ANCHOR_MAX_AGE_S
+            )
             if (
-                self.state is CleanCourseState.TRACK
-                and fresh
-                # Gate-0 legs only (2026-07-30 unification): gate-1+
-                # crossings take ONE path — the aperture-budget COMMIT; a
-                # gate-1+ close loss without an armed commit is NOT a
-                # credible crossing and falls through to PREDICT/re-center.
-                # Gate-0 never commits (its climb-bias path credits every
-                # flight through this coast) and stays untouched.
-                and self.gate_index == 0
-                and self.current.outer_log_scale >= cfg.crossing_min_log_scale
-                # F45 (20260729T210351Z-visual-course-b1f5e89f): the coast is
-                # ballistic, so an OFF-CENTER close loss must not arm it —
-                # the (-0.39,-0.28) last bearing slid out of frame
-                # uncredited.  Credit is authoritative (it arrives by race
-                # packet on a true pass); the coast only owns the wait of an
-                # ALIGNED crossing.  The bearing must come from a fresh
-                # MEASUREMENT, not a long prediction; an off-center or
-                # stale-bearing loss falls through to PREDICT so the
-                # derotated hypothesis carries the pursuit and TRACK can
-                # resume on re-acquisition.
-                and now_s - self.current.last_x_measurement_s
-                <= CROSSING_MEAS_MAX_AGE_S
-                and now_s - self.current.last_y_measurement_s
-                <= CROSSING_MEAS_MAX_AGE_S
-                and abs(self.current.x) <= cfg.crossing_max_abs_ex_norm
-                and abs(self.current.y) <= cfg.crossing_max_abs_ey_norm
-            ):
-                # Credible close crossing lost the target on a FRESH frame:
-                # latch the single bounded credit wait from the July-18
-                # contract.  Flight 20260729T085719Z-visual-course-4455fd61:
-                # a ~0.27 s camera stall republished one frozen frame id and
-                # the stale close-range loss latched zero thrust at the
-                # gate-0 top bar, so a superseded frame must never arm this.
-                # The F22 fh-untrusted guard (flight 6bebd725: zero thrust
-                # latched at speed) was retired in F33: the coast has held
-                # the SUPPORT collective at level attitude since F25, so
-                # there is no zero-thrust drop to guard against — and the
-                # guard blocked the F32 coast at the engulfed gate-0 plane
-                # (fh was high from BRAKING drag, not speed), sending the
-                # drone blind into the frame in PREDICT instead.
-                self.state = CleanCourseState.COAST_FOR_CREDIT
-                self._coast_zero_sent = False
-                self._coast_race_boot_ms = self._last_race_boot_ms
-            else:
-                if not fresh and self.state is CleanCourseState.TRACK:
-                    # Frozen-frame stall: the republication carries no new
-                    # information, so predict (covariance inflates in
-                    # _predict) and let command() decay the collective toward
-                    # support instead of coasting or holding a stale fix.
-                    self.state = CleanCourseState.PREDICT
-                if gap > cfg.predict_frame_gap_s:
-                    self.state = CleanCourseState.PREDICT
-                anchored = (
-                    self._last_engulfing_anchor_s is not None
-                    and now_s - self._last_engulfing_anchor_s
-                    <= ENGULFING_ANCHOR_MAX_AGE_S
+                not anchored
+                and self.state is CleanCourseState.PREDICT
+                and (
+                    gap > cfg.predict_max_gap_s
+                    or self.current.position_std
+                    > cfg.search_covariance_std_norm
                 )
-                if (
-                    not anchored
-                    and self.state is CleanCourseState.PREDICT
-                    and (
-                        gap > cfg.predict_max_gap_s
-                        or self.current.position_std
-                        > cfg.search_covariance_std_norm
-                    )
-                ):
-                    self._enter_search(now_s)
+            ):
+                self._enter_search(now_s)
 
         # F42 anti-deadlock: an adopted debris splinter whose x-axis can
         # NEVER be measured held TRACK for 0.8 s with the F41 x-steer gate
@@ -1856,8 +1807,12 @@ class CleanCourseController:
         # F53 near-plane COMMIT (see the COMMIT_* constant block): the
         # misalignment brake self-locks short of the plane, so a sustained,
         # aligned, freshly measured close regime commits to an inertial
-        # crossing.  TRACK only; gate-1+ legs only (gate-0's climb-bias path
-        # is working and stays untouched).  F54: proximity arms at
+        # crossing.  F102: gate-agnostic.  Gate 0's old scale-triggered hot
+        # coast (credible-close-loss -> COAST at ~2.4 m/s, no energy budget)
+        # inherited runaway closure into every subsequent leg — F99/F100/
+        # F101 all died on energy the gate-0 crossing created.  There is ONE
+        # crossing policy: every gate crosses via this energy-budgeted
+        # COMMIT, gate 0 included.  F54: proximity arms at
         # commit_min_log_scale (-1.2), NOT near_brake_log_scale — censorship
         # onset coincides with the -0.9 crossing, killing the fresh-
         # uncensored window before the old threshold ever sustained.
@@ -1880,7 +1835,6 @@ class CleanCourseController:
         # censorship blackout until the crossing is provably aligned.
         if (
             near_plane_close
-            and self.gate_index >= 1
             and now_s - self._near_plane_since_s >= cfg.commit_sustain_s
             and self._commit_entry_budget_ok(now_s, pitch_rad, cfg)
         ):
@@ -2550,11 +2504,11 @@ class CleanCourseController:
         # 9 s blind into structure (collision id 1002).  At the plane the
         # angular error rate (~offset/distance) outruns any re-centering
         # servo, so the crossing energy must be controlled BEFORE
-        # censorship: on a gate-1+ TRACK in the near-plane regime with a
-        # false entry budget, cut the advance law and demand the full
-        # brake — hold OUTSIDE the blackout and re-center.  The same budget
-        # passing arms COMMIT on the same tick; nothing else about the
-        # crossing changes.
+        # censorship: on ANY near-plane TRACK with a false entry budget (F102:
+        # gate-agnostic — gate 0 holds outside the blackout too), cut the
+        # advance law and demand the full brake — hold OUTSIDE the blackout
+        # and re-center.  The same budget passing arms COMMIT on the same
+        # tick; nothing else about the crossing changes.
         # F75: widen the hold from the censorship-onset zone (-0.9) to the
         # commit-regime entry (-1.2).  F74 held the true brake -0.46 from
         # -0.9 onward and closure still ROSE (fh 2.5 -> 3.6): by -0.9 the
@@ -2565,7 +2519,6 @@ class CleanCourseController:
         # budget arm COMMIT from a standstill instead of arriving hot.
         near_plane_hold = (
             self.state is CleanCourseState.TRACK
-            and self.gate_index >= 1
             and current.outer_log_scale >= cfg.commit_min_log_scale
             and not self._commit_entry_budget_ok(now_s, pitch_rad, cfg)
         )
@@ -2717,7 +2670,20 @@ class CleanCourseController:
             return False
         if current.aperture_half_x is None or current.aperture_half_y is None:
             return False
-        if current.expansion_rate > cfg.commit_entry_max_expansion_rate_s:
+        # F102 (Codex checkpoint): veto on the FASTER of the lagging Kalman
+        # rate and the fresh raw outer-bbox rate — the same signal the F99
+        # closure governor brakes on.  The filtered rate alone lags ~1 s on
+        # a fresh/adopted track and would arm a still-hot crossing.
+        raw_closure = (
+            current.outer_expansion_rate
+            if now_s - current.last_measurement_s
+            <= cfg.outer_expansion_max_age_s
+            else 0.0
+        )
+        if (
+            max(current.expansion_rate, raw_closure)
+            > cfg.commit_entry_max_expansion_rate_s
+        ):
             return False
         # F82: the blackout-displacement budget includes IMU vz, not just
         # vision vy — a +0.64 m/s climb carried a "passing" entry into the
@@ -3774,6 +3740,7 @@ async def run_clean_course_stage(
     *,
     runtime: CleanCourseRuntime,
     config: Optional[CleanCourseConfig] = None,
+    controller: Optional["CleanCourseController"] = None,
 ) -> Dict[str, Any]:
     """Run the clean course loop against the duck-typed runner host.
 
@@ -3792,7 +3759,8 @@ async def run_clean_course_stage(
             control_period_s=rt.control_period_s,
             spawn_pitch_rad=rt.spawn_pitch_rad,
         )
-    controller = CleanCourseController(config)
+    if controller is None:
+        controller = CleanCourseController(config)
 
     host._sample()
     race = host.adapter.race_status
