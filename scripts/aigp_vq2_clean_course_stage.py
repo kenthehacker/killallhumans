@@ -344,9 +344,20 @@ CROSSING_CREDIT_WAIT_S = 0.40  # July-18 safety contract item 9
 # crossing horizon (the bearing moves ~0.33 norm in 0.7 s at the plane, so
 # a 0.5 s-old bearing is ~0.2 norm wrong), and crossing-coast alignment on
 # the F50 compensated ey — gate-1+ legs only for now.
-COMMIT_SUSTAIN_S = 0.30  # near-plane regime must persist this long to arm
+# F54 (20260729T235858Z-visual-course-c92d42ce): the F53 calibration never
+# entered — censorship of the aim track began essentially SIMULTANEOUS with
+# outer_log_scale crossing the -0.9 proximity threshold, so the 0.30 s
+# sustain outlived the ~0.2 s fresh-uncensored window and the hover trap
+# repeated into gate 1's structure.  The clean commit point in that trace
+# sat at log_scale ~-1.2 (uncensored, fresh, aligned, ~0.7 s before
+# censorship onset, ~1.2-1.5 s before the plane): entry proximity now arms
+# at -1.2 with a 0.10 s sustain, and the timeout grows to cover the longer
+# inertial leg.  NEAR_BRAKE_LOG_SCALE stays for the brake law and the F52-A
+# steering hold.
+COMMIT_MIN_LOG_SCALE = -1.2  # entry proximity bound (span ~0.3)
+COMMIT_SUSTAIN_S = 0.10  # near-plane regime must persist this long to arm
 COMMIT_MEAS_MAX_AGE_S = 0.30  # fresh uncensored both-axis window at entry
-COMMIT_TIMEOUT_S = 1.5  # no credit this long -> arrest and search
+COMMIT_TIMEOUT_S = 2.0  # no credit this long -> arrest and search
 # F38 (18c0b35c): with the true (nose-up) brake the drone arrives at the
 # engulfed plane SLOW; a level coast ran out of residual closure and the
 # bounded wait expired into SEARCH without credit.  A small nose-down
@@ -848,6 +859,7 @@ class CleanCourseConfig:
     commit_sustain_s: float = COMMIT_SUSTAIN_S
     commit_meas_max_age_s: float = COMMIT_MEAS_MAX_AGE_S
     commit_timeout_s: float = COMMIT_TIMEOUT_S
+    commit_min_log_scale: float = COMMIT_MIN_LOG_SCALE
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
     x_steer_max_age_s: float = X_STEER_MAX_AGE_S
@@ -1563,11 +1575,14 @@ class CleanCourseController:
         # aligned, freshly measured close regime commits to an inertial
         # crossing.  TRACK only; gate-1+ legs only (gate-0's climb-bias path
         # is working and stays untouched).  The alt-floor override above
-        # still wins in every state except SEARCH.
+        # still wins in every state except SEARCH.  F54: proximity arms at
+        # commit_min_log_scale (-1.2), NOT near_brake_log_scale — censorship
+        # onset coincides with the -0.9 crossing, killing the fresh-
+        # uncensored window before the old threshold ever sustained.
         near_plane_close = (
             self.state is CleanCourseState.TRACK
             and self.current is not None
-            and self.current.outer_log_scale >= cfg.near_brake_log_scale
+            and self.current.outer_log_scale >= cfg.commit_min_log_scale
         )
         if near_plane_close:
             if self._near_plane_since_s is None:

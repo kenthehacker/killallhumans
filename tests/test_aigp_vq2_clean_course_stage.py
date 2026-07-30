@@ -2173,13 +2173,43 @@ def _drive_commit_window(controller, now, ticks=12):
 def test_commit_entry_fires_sustained_aligned_near_plane():
     # F53 (20260729T233602Z-visual-course-072c8a7b): the misalignment brake
     # self-locked the F52 drone into a hover 1-2 m short of gate 1's plane.
-    # A sustained (~0.3 s), aligned, freshly measured near-plane regime on
-    # a gate-1+ leg commits to an inertial crossing instead.
+    # A sustained (~0.1 s, F54), aligned, freshly measured near-plane
+    # regime on a gate-1+ leg commits to an inertial crossing instead.
     controller = _commit_controller()
     out, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
     assert out.state is CleanCourseState.COMMIT
     assert out.yaw_rate_rad_s == 0.0
+
+
+def test_commit_entry_beats_censorship_onset_at_minus_1p2():
+    # F54 (20260729T235858Z-visual-course-c92d42ce): censorship of the aim
+    # track began ~0.2 s after outer_log_scale crossed -0.9, so the F53
+    # (-0.9 proximity, 0.30 s sustain) calibration never entered and the
+    # hover trap repeated into gate 1's structure.  At the F54 calibration
+    # (-1.2 proximity, 0.10 s sustain) the commit latches well inside the
+    # fresh window: measurements that go censored 0.6 s after the -1.2
+    # crossing (the trace had ~0.7 s) still commit.
+    controller = _commit_controller()
+    controller.current.outer_log_scale = -1.15  # just past the -1.2 bound
+    now = 100.10
+    entered_elapsed = None
+    for tick in range(30):  # ~1.0 s
+        now += 0.033
+        if tick < 18:  # fresh uncensored measurements for the first 0.6 s
+            controller.current.last_measurement_s = now
+            controller.current.last_x_measurement_s = now
+            controller.current.last_y_measurement_s = now
+        # else: censored — the stamps freeze (see _update_hypothesis)
+        _command(controller, now, pitch=SPAWN_PITCH)
+        if entered_elapsed is None and controller.state is CleanCourseState.COMMIT:
+            entered_elapsed = now - 100.10
+    assert controller.state is CleanCourseState.COMMIT
+    assert entered_elapsed is not None
+    # Latched within ~0.2 s of the -1.2 crossing — under the old 0.30 s
+    # sustain (and -0.9 threshold) the 0.6 s censorship onset would have
+    # killed the fresh-uncensored window before entry.
+    assert entered_elapsed < 0.6 - 0.3
 
 
 def test_commit_entry_requires_fresh_uncensored_both_axes():
@@ -2215,10 +2245,10 @@ def test_commit_entry_requires_alignment_proximity_and_gate_one():
     off_axis.current.x_axis.p = 0.30
     _drive_commit_window(off_axis, 100.10)
     assert off_axis.state is CleanCourseState.TRACK
-    # Far range (outer log scale below the -0.9 near bound): the sustain
-    # timer never starts.
+    # Far range (outer log scale below the F54 -1.2 entry bound): the
+    # sustain timer never starts.
     far = _commit_controller()
-    far.current.outer_log_scale = -1.20
+    far.current.outer_log_scale = -1.30
     _drive_commit_window(far, 100.10)
     assert far.state is CleanCourseState.TRACK
     # Gate 0 is deliberately excluded — its climb-bias path is working.
@@ -2274,13 +2304,13 @@ def test_commit_law_holds_heading_advances_and_bounds_vertical():
 
 
 def test_commit_timeout_drops_hypothesis_and_searches():
-    # ~1.5 s without authoritative credit: arrest and SEARCH, with the
+    # ~2.0 s without authoritative credit: arrest and SEARCH, with the
     # hypothesis DROPPED — the innovation gate permanently rejects the true
     # gate while the frozen hypothesis lives (association lock-out).
     controller = _commit_controller()
     out, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
-    for _ in range(50):  # ~1.65 s > the 1.5 s commit window
+    for _ in range(75):  # ~2.5 s > the 2.0 s commit window
         now += 0.033
         if controller.current is not None:  # dropped at the timeout
             controller.current.last_measurement_s = now
