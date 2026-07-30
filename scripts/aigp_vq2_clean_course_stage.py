@@ -188,35 +188,15 @@ GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
 # the command saturates at the 0.34 envelope top by vz ~= -0.8.
 VZ_DESCENT_FLOOR_M_S = -0.35  # sink-rate bound, mirroring the climb cap
 VZ_DESCENT_GOVERNOR_GAIN = 0.21  # collective per m/s below the floor
-# F96: this arrest now applies to GATE 0 near the plane ONLY — the
-# gate-1+ qualified path it was built for is the unified vz-tracking
-# law (see COURSE_VZ_* below), which carries the same "desired vz -> 0
-# as ey -> center" semantics as its setpoint.  The F78/F91/F93 history
-# below is kept for provenance.
-# F78 vertical arrival arrest (20260730T082159Z-visual-course-7e18243d):
-# the gate-1 approach climbed at vz +0.65 THROUGH the opening — the
-# compensated error sat at ey ~-0.10 (gate just above center), the PD's
-# small P-term kept commanding climb, and the 0.5 m/s course governor
-# only caps the RATE, so the gate sank ey -0.10 -> +0.16/+0.27 before
-# censorship and the crossing went high.  The governor binds only at the
-# cap; what is missing is a STOPPING law: as the compensated error
-# approaches center the desired vertical velocity must approach zero.
-# While the IMU vz is positive, allowed climb is proportional to the
-# REMAINING error (vz_allow = ARREST_VZ_PER_NORM * |ey|); any excess
-# subtracts collective continuously.  Descents (vz <= 0) are untouched —
-# no blanket reduction, no sink; the descent floor below still bounds
-# any sag, and the F14 fh-untrusted latch (frozen vz) keeps its
-# no-vz-adjustment contract.  F78b: gate-1+ legs only — on gate 0 it
-# arrested the proved climb-out and armed the pre-gate-1 altitude floor
-# (20260730T085104Z-visual-course-34b59dea; the latch itself is deleted in
-# F92 after four ballooned gate-1 legs).  F91: two-sided — F90
-# climbed vz +0.3..+0.4 with the gate CENTERED (ey ~0, no climb command,
-# so the one-sided arrest never engaged), ballooned ~0.5 m over the gate
-# under the F14 latch, lost it out the frame bottom, and dove into the
-# ground (20260730T134602Z-visual-course-6e302725, id 1002).  With the
-# gate at/below center any positive vz is energy away from the aim.
-VERTICAL_ARREST_VZ_PER_NORM = 1.0  # m/s allowed climb per norm of |ey|
-VERTICAL_ARREST_COLLECTIVE_GAIN = 0.15  # subtraction per m/s of excess
+# F100: the F78/F91/F93 vertical arrival arrest is DELETED.  Its last
+# scope (gate 0 near the plane, F96) was a second vz term stacked on
+# the same path the unified vz-tracking law now owns — the F95
+# limit-cycle sin.  The tracker's vz_des IS the arrest's per-norm
+# allowance as a setpoint, with one coherent gain and no deadband, on
+# every fh-trusted qualified TRACK path (gate-agnostic).  Provenance:
+# F78 (20260730T082159Z-...-7e18243d) climb-through-the-opening, F91
+# (20260730T134602Z-...-6e302725) centered-gate balloon, F99
+# (20260730T170522Z-...-50b0c982) gate-0 sink into the lower structure.
 
 # F96 unified course-leg vertical law (flight
 # 20260730T153947Z-visual-course-a2741311).  F95 removed the support
@@ -231,13 +211,24 @@ VERTICAL_ARREST_COLLECTIVE_GAIN = 0.15  # subtraction per m/s of excess
 # (thrust 0.21 <-> 0.34, vz +/-0.4..0.5), |vz| never met COMMIT's
 # <= 0.25 entry budget at the plane, the gate engulfed the frame with
 # no crossing path, and the blind search flew into the ground (id
-# 1002).  The replacement is ONE vz-tracking law on gate-1+ qualified
+# 1002).  The replacement is ONE vz-tracking law on qualified
 # fh-trusted TRACK: the desired climb rate is proportional to the
 # compensated error (the arrest's per-norm allowance as a SETPOINT, no
 # deadband — it goes to zero as ey approaches center), and a single
-# coherent gain tracks it.  Gate 0 keeps its proved PD envelope; the
-# F14 fh-untrusted path keeps the camera PD (a frozen vz_est cannot be
-# tracked); blind paths keep their support floors and the governor.
+# coherent gain tracks it.  The F14 fh-untrusted path keeps the camera
+# PD (a frozen vz_est cannot be tracked); blind paths keep their
+# support floors and the governor.
+# F100 (20260730T170522Z-visual-course-50b0c982): the law is now GLOBAL
+# — gate 0's "proved PD envelope" special case is deleted.  That PD had
+# no signal mid-approach (ey ~0 by perspective geometry), so collective
+# sat at support+trim while the fh fast-regime thrust deficit sank the
+# drone at vz -0.31..-0.37; the only counter was the vz-center trim
+# integrator winding at ~0.015/s.  Every gate-0 approach F95-F99 flew
+# at/below pad altitude; F99 arrived at the plane sinking, the
+# post-coast ballistic dip carried it to -0.42 m, and it struck the
+# gate-0 lower structure (id 1001) before credit.  Gate-0-specific
+# behavior stays feedforward-only (launch boost), per the standing
+# one-global-vertical-law contract.
 COURSE_VZ_DES_PER_NORM = 1.0  # m/s desired climb per norm of compensated ey
 COURSE_VZ_DES_MAX_M_S = 0.5  # matches the VZ_CLIMB_CAP_COURSE_M_S envelope
 COURSE_VZ_TRACK_GAIN = 0.12  # collective per m/s of vz tracking error
@@ -1099,8 +1090,6 @@ class CleanCourseConfig:
     vertical_rate_gain: float = VERTICAL_RATE_GAIN
     vertical_max_abs_error_norm: float = VERTICAL_MAX_ABS_ERROR_NORM
     vertical_max_abs_rate_norm_s: float = VERTICAL_MAX_ABS_RATE_NORM_S
-    vertical_arrest_vz_per_norm: float = VERTICAL_ARREST_VZ_PER_NORM
-    vertical_arrest_collective_gain: float = VERTICAL_ARREST_COLLECTIVE_GAIN
     course_vz_des_per_norm: float = COURSE_VZ_DES_PER_NORM
     course_vz_des_max_m_s: float = COURSE_VZ_DES_MAX_M_S
     course_vz_track_gain: float = COURSE_VZ_TRACK_GAIN
@@ -2268,8 +2257,7 @@ class CleanCourseController:
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
         self._pre_cross_brake_active = pre_cross_brake
-        arrest_error: Optional[float] = None  # qualified branch sets this
-        vz_tracked = False  # qualified gate-1+ branch sets this (F96)
+        vz_tracked = False  # qualified fh-trusted branch sets this (F96)
         if vertical_qualified:
             bounded_error = _clamp(
                 ey_vertical - vertical_setpoint_offset,
@@ -2307,18 +2295,16 @@ class CleanCourseController:
                 and ey_vertical <= cfg.vz_center_trim_active_ey_norm
             ):
                 self._wind_vz_center_trim(dt)
-            if self.gate_index >= 1 and not self._fh_untrusted:
-                # F96 unified course-leg vertical law (see the
-                # COURSE_VZ_* constant block): ONE vz-tracking term
-                # replaces the stacked camera D + arrest + closure
-                # collective cut + course governor that limit-cycled
-                # clamp-to-clamp in F95.  The desired climb rate is
-                # proportional to the compensated error — it goes to
-                # zero as ey approaches center, so vertical energy is
-                # arrested BEFORE the center crossing by construction.
-                # Gate 0 keeps the proved PD envelope below; the F14
-                # fh-untrusted path cannot track a frozen vz_est and
-                # keeps the camera PD.
+            if not self._fh_untrusted:
+                # F96/F100 unified course-leg vertical law (see the
+                # COURSE_VZ_* constant block): ONE vz-tracking term on
+                # EVERY fh-trusted qualified TRACK path, gate-agnostic.
+                # The desired climb rate is proportional to the
+                # compensated error — it goes to zero as ey approaches
+                # center, so vertical energy is arrested BEFORE the
+                # center crossing by construction.  The F14 fh-untrusted
+                # path cannot track a frozen vz_est and keeps the camera
+                # PD (below).
                 # F97: reconcile the setpoint with the COMMIT |vz| <= 0.25
                 # entry budget (see the COURSE_VZ_DES_COMMIT_M_S block):
                 # the cap ramps 0.5 -> 0.20 across the approach so the
@@ -2377,10 +2363,6 @@ class CleanCourseController:
                         + cfg.vertical_rate_gain * bounded_rate
                     )
                 )
-            # The F78/F91/F93 vertical energy arrest needs this branch's
-            # bounded error, hoisted here; F96 scopes it to gate 0 (the
-            # gate-1+ qualified path is the unified vz-tracking law).
-            arrest_error = bounded_error
             self._collective = collective
         else:
             # F14: while fh-untrusted the camera is the only honest vertical
@@ -2439,32 +2421,11 @@ class CleanCourseController:
         # braking stays with the closure-governor pitch law above, and
         # vertical energy is the vz tracker's job.
 
-        # F78/F91/F93 vertical energy arrest (see the VERTICAL_ARREST_*
-        # block), F96-scoped to GATE 0 near the plane (F86: every
-        # credited gate-0 crossing entered with dead vertical energy).
-        # The gate-1+ qualified path that F91/F93 added the two-sided
-        # law for is now the unified vz-tracking law, which arrests
-        # energy continuously as the vz setpoint approaches zero near
-        # center — no deadband, one coherent gain.
-        near_plane = current.log_scale >= cfg.commit_min_log_scale
-        if (
-            arrest_error is not None
-            and self.gate_index == 0
-            and near_plane
-            and not self._fh_untrusted
-        ):
-            if self._vz_est_m_s > 0.0:
-                vz_allow = cfg.vertical_arrest_vz_per_norm * abs(arrest_error)
-                excess = self._vz_est_m_s - vz_allow
-                if excess > 0.0:
-                    collective -= cfg.vertical_arrest_collective_gain * excess
-            else:
-                vz_allow = cfg.vertical_arrest_vz_per_norm * max(
-                    0.0, arrest_error
-                )
-                excess = -self._vz_est_m_s - vz_allow
-                if excess > 0.0:
-                    collective += cfg.vertical_arrest_collective_gain * excess
+        # F100: the gate-0 near-plane vertical energy arrest is DELETED —
+        # the unified vz-tracking law now owns every fh-trusted qualified
+        # TRACK path, and a second vz term here was the F95 limit-cycle
+        # sin.  F86's "dead vertical energy at the plane" property is the
+        # tracker's vz_des -> 0 setpoint near center.
 
         # Gate-0 takeoff boost is feedforward only; it never changes the
         # closed-loop vertical sign.
@@ -3186,21 +3147,22 @@ class CleanCourseController:
             # gate-1+ legs get the 0.5/0.10 course envelope, SUBTRACTIVE
             # from the PD demand so the arrest is continuous (no cap
             # chatter against the demand).
-            # F96: when the unified vz-tracking law computed the collective
-            # (gate-1+ qualified fh-trusted TRACK) the climb cap is skipped —
-            # it would be a second incoherent vz term on top of the tracker
-            # (the F95 limit cycle).  The descent floor stays: it is a
-            # one-sided hard lower bound, not feedback.
-            if self.gate_index == 0:
-                excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
-                if excess > 0.0:
-                    collective = min(
-                        collective, support - VZ_GOVERNOR_GAIN * excess
-                    )
-            elif not vz_tracked:
-                course_excess = self._vz_est_m_s - VZ_CLIMB_CAP_COURSE_M_S
-                if course_excess > 0.0:
-                    collective -= VZ_GOVERNOR_COURSE_GAIN * course_excess
+            # F96/F100: when the unified vz-tracking law computed the
+            # collective (ANY qualified fh-trusted TRACK) the climb cap is
+            # skipped — it would be a second incoherent vz term on top of
+            # the tracker (the F95 limit cycle).  The descent floor stays:
+            # it is a one-sided hard lower bound, not feedback.
+            if not vz_tracked:
+                if self.gate_index == 0:
+                    excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
+                    if excess > 0.0:
+                        collective = min(
+                            collective, support - VZ_GOVERNOR_GAIN * excess
+                        )
+                else:
+                    course_excess = self._vz_est_m_s - VZ_CLIMB_CAP_COURSE_M_S
+                    if course_excess > 0.0:
+                        collective -= VZ_GOVERNOR_COURSE_GAIN * course_excess
             descent_excess = VZ_DESCENT_FLOOR_M_S - self._vz_est_m_s
             if descent_excess > 0.0:
                 collective = max(

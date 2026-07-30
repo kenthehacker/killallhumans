@@ -261,17 +261,20 @@ def test_identical_global_vertical_sign_at_every_gate():
 
 def test_vertical_sign_is_the_gate0_minus_form_by_default():
     # pitch=SPAWN_PITCH: the F49 neutral (level-flight) attitude, so the
-    # F50 attitude compensation is exactly zero in these PD-law checks;
+    # F50 attitude compensation is exactly zero in these law checks;
     # the exact base is the tilt-compensated SPAWN_SUPPORT.
+    # F100: gate 0 shares the unified vz-tracking law — at vz_est 0 the
+    # magnitude is 0.12*vz_des (one coherent IMU-vz term), the sign is
+    # the global minus form (gate low -> less collective).
     controller = _tracked_controller(_track("A", 0.0, 0.20))
     output = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert output.thrust == pytest.approx(
-        SPAWN_SUPPORT - 0.080 * 0.20, abs=1e-9
+        SPAWN_SUPPORT - 0.12 * 0.20, abs=1e-9
     )
     controller = _tracked_controller(_track("A", 0.0, -0.20))
     output = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert output.thrust == pytest.approx(
-        SPAWN_SUPPORT + 0.080 * 0.20, abs=1e-9
+        SPAWN_SUPPORT + 0.12 * 0.20, abs=1e-9
     )
 
 
@@ -302,10 +305,11 @@ def test_vertical_error_is_pitch_attitude_compensated():
         SPAWN_SUPPORT / math.cos(0.15), abs=1e-9
     )
     # ...while the same reading at the spawn attitude really is low.
+    # (F100: vz_des = -0.24 tracked at 0.12/m/s, vz_est 0.)
     level = _tracked_controller(_track("A", 0.0, 0.24))
     out = _command(level, 100.10, pitch=SPAWN_PITCH)
     assert out.thrust == pytest.approx(
-        SPAWN_SUPPORT - 0.080 * 0.24, abs=1e-9
+        SPAWN_SUPPORT - 0.12 * 0.24, abs=1e-9
     )
 
 
@@ -392,9 +396,9 @@ def test_gate0_climb_vertical_offset_is_bounded_feedforward():
     config = _config(gate0_climb_vertical_offset_norm=0.25)
     controller = _tracked_controller(_track("A", 0.0, -0.10), config=config)
     output = _command(controller, 100.10, pitch=SPAWN_PITCH)
-    # e = -0.10 - 0.25 = -0.35 -> full climb correction above support.
+    # e = -0.10 - 0.25 = -0.35 -> vz_des +0.35, tracked at 0.12 (F100).
     assert output.thrust == pytest.approx(
-        SPAWN_SUPPORT + 0.080 * 0.35, abs=1e-9
+        SPAWN_SUPPORT + 0.12 * 0.35, abs=1e-9
     )
     assert 0.21 <= output.thrust <= 0.34
 
@@ -433,7 +437,7 @@ def test_gate0_climb_offset_scales_with_closure():
         _track("A", 0.0, -0.10, scale=0.1667), config=config
     )
     assert _command(far, 100.10, pitch=SPAWN_PITCH).thrust == pytest.approx(
-        SPAWN_SUPPORT + 0.080 * (0.10 + 0.25), abs=1e-9
+        SPAWN_SUPPORT + 0.12 * (0.10 + 0.25), abs=1e-9
     )
 
     mid = _tracked_controller(
@@ -441,7 +445,7 @@ def test_gate0_climb_offset_scales_with_closure():
     )
     mid_offset = 0.25 * (-1.295 - (-0.80)) / (-1.79 - (-0.80))
     assert _command(mid, 100.10, pitch=SPAWN_PITCH).thrust == pytest.approx(
-        SPAWN_SUPPORT + 0.080 * (0.10 + mid_offset), abs=1e-9
+        SPAWN_SUPPORT + 0.12 * (0.10 + mid_offset), abs=1e-9
     )
 
     crossing = _tracked_controller(
@@ -471,42 +475,43 @@ def test_gate0_climb_offset_never_lifts_aim_above_center():
         _track("A", 0.0, 0.10, scale=0.1667), config=config
     )
     output = _command(below, 100.10, pitch=SPAWN_PITCH)
-    # Offset contributes nothing: only the plain e = +0.10 descent feedback.
+    # Offset contributes nothing: vz_des = -0.10, tracked at 0.12 (F100).
     assert output.thrust == pytest.approx(
-        SPAWN_SUPPORT - 0.080 * 0.10, abs=1e-9
+        SPAWN_SUPPORT - 0.12 * 0.10, abs=1e-9
     )
     assert output.thrust < SPAWN_SUPPORT
 
 
-def test_vertical_rate_term_keeps_full_authority():
-    # The flight-2 D-direction limiter was removed after flight
-    # 20260729T094736Z-...-4dbe4b8c: it pinned collective at exactly support
-    # through the decisive window (vz 2.7 m/s, t=1.31-1.72) because ey
-    # hovered near zero.  Opposing P/D now yields full D authority; honest
-    # climb-rate limiting is the IMU vz governor's job (tests below).
+def test_gate0_image_rate_is_not_a_vertical_term():
+    # F100: gate 0 shares the unified vz-tracking law (the F96
+    # double-count deletion, now global) — the camera y-rate is a lagged
+    # image copy of vz and must NOT move the collective on the fh-trusted
+    # path; IMU vz_est is the only vertical rate feedback.  The old
+    # full-authority image-D test lived on the deleted gate-0 PD.
     config = _config(gate0_climb_vertical_offset_norm=0.25)
     controller = _tracked_controller(_track("A", 0.0, -0.10), config=config)
-    controller.current.y_axis.v = 1.0  # strong rate opposing the P correction
-    output = _command(controller, 100.10)
+    controller.current.y_axis.v = 1.0  # strong image rate, ignored
+    output = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert output.vertical_qualified
-    # e = -0.35 (P demands climb) but vy = +1.0: D fully reverses the
-    # correction and the collective sags to the 0.21 floor.  Under the
-    # removed limiter this was pinned at exactly SUPPORT.
-    assert output.thrust == pytest.approx(0.21, abs=1e-9)
-    assert output.thrust < SUPPORT - 0.03
+    # vz_des = +0.35 from the error alone, tracked at 0.12 with vz_est 0.
+    assert output.thrust == pytest.approx(SPAWN_SUPPORT + 0.12 * 0.35, abs=1e-9)
 
 
 def test_vz_governor_caps_collective_above_climb_cap():
     # Four gate-0 top-bar flights: bearing pursuit built unbounded vz
     # (2.8-3.35 m/s peaks vs a ~0.9 m/s requirement).  The IMU governor
     # removes K_VZ per m/s over the 1.0 m/s cap from the collective.
-    controller = _tracked_controller(_track("A", 0.0, 0.0))  # e = 0, vy ~ 0
+    # F100: tested at the governor seam — on the qualified fh-trusted
+    # TRACK path the unified tracker owns vz feedback and the cap is
+    # skipped there (no second incoherent vz term).
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    helper = controller._governed_collective
     controller._vz_est_m_s = 0.5  # below the cap: no effect
-    assert _command(controller, 100.10, pitch=SPAWN_PITCH).thrust == pytest.approx(
+    assert helper(SPAWN_SUPPORT, SPAWN_SUPPORT) == pytest.approx(
         SPAWN_SUPPORT, abs=1e-9
     )
     controller._vz_est_m_s = 2.0  # 1.0 m/s over cap -> -0.03 collective
-    assert _command(controller, 100.14, pitch=SPAWN_PITCH).thrust == pytest.approx(
+    assert helper(SPAWN_SUPPORT, SPAWN_SUPPORT) == pytest.approx(
         SPAWN_SUPPORT - 0.03, abs=1e-9
     )
 
@@ -594,18 +599,38 @@ def test_vz_governor_floors_collective_below_descent_floor():
 
 
 def test_vz_descent_floor_raises_command_thrust():
-    # Command level (F67 law): vz = -0.7 m/s lifts the emitted collective to
-    # support + 0.0735 (proportional 0.21/m/s, no step); a deeper sink
-    # (vz -1.0, raw 0.3835) clips at the 0.34 envelope top.
+    # Command level: the F100 unified tracker (+0.12 per m/s of sink)
+    # stacks above the F67 descent floor (a one-sided hard bound,
+    # +0.21/m/s below -0.35) — at vz -0.7 the pair saturates the 0.34
+    # envelope top; deeper sinks stay saturated.  The pure floor law is
+    # covered at the governor seam (test above).
     controller = _tracked_controller(_track("A", 0.0, 0.0))  # e = 0, vy ~ 0
     controller._vz_est_m_s = -0.7
     assert _command(controller, 100.10, pitch=SPAWN_PITCH).thrust == pytest.approx(
-        SPAWN_SUPPORT + 0.0735, abs=1e-9
+        controller.config.max_thrust, abs=1e-9
     )
     controller._vz_est_m_s = -1.0
     assert _command(controller, 100.14, pitch=SPAWN_PITCH).thrust == pytest.approx(
         controller.config.max_thrust, abs=1e-9
     )
+
+
+def test_gate0_track_fights_regime_sink_immediately():
+    # F100 (20260730T170522Z-visual-course-50b0c982): the deleted gate-0
+    # camera PD had no signal mid-approach (ey ~0 by perspective
+    # geometry), so collective sat at support+trim while the fh
+    # fast-regime thrust deficit sank the drone at vz -0.31..-0.37 — the
+    # vz-center trim integrator (~0.015/s) was the only counter, and
+    # every F95-F99 gate-0 approach flew at/below pad altitude.  F99
+    # arrived at the plane sinking; the post-coast ballistic dip reached
+    # alt_est -0.42 and struck the gate-0 lower structure (id 1001)
+    # before credit.  The unified vz-tracking law answers the sink on
+    # the FIRST tick: 0.12*(0 - (-0.35)) = +0.042 above support, no
+    # integrator wind-up.  The parent's PD emits ~bare support here.
+    controller = _tracked_controller(_track("A", 0.0, 0.00))
+    controller._vz_est_m_s = -0.35
+    out = _command(controller, 100.10, pitch=SPAWN_PITCH)
+    assert out.thrust > SPAWN_SUPPORT + 0.03
 
 
 def test_vz_descent_floor_applies_in_predict_and_search():
@@ -2571,29 +2596,34 @@ def test_vertical_arrival_arrest_shaves_climb_before_center():
     # trim) may add its bounded correction here — never a subtraction.
     assert sinking.thrust >= settled.thrust - 1e-3
     assert sinking.thrust <= settled.thrust + 0.06 + 1e-3
-    # F78b (20260730T085104Z-visual-course-34b59dea): gate 0 keeps its
-    # PROVED climb-out — the same state at gate 0 must emit the plain PD
-    # output (the global F78 arrest dropped it to 0.21 at t=0.43, sank
-    # the leg to alt -0.57, and latched the pre-gate-1 altitude floor
-    # whose max() pinned support+0.05 over governor and arrest alike).
-    gate0 = _tracked_controller(_track("A", 0.0, -0.10, scale=0.20))
-    gate0._alt_est_m = 2.0
-    current = gate0.current
-    current.y_axis.p = -0.10
-    current.raw_y = -0.10
-    current.y_axis.v = 0.0
-    current.scale_axis.p = -1.6
-    current.scale_axis.v = 0.10
-    now = 100.10
-    for _ in range(15):
-        now += 0.033
-        gate0._vz_est_m_s = 0.60
-        current.last_measurement_s = now
-        current.last_x_measurement_s = now
-        current.last_y_measurement_s = now
-        out0 = _command(gate0, now, pitch=SPAWN_PITCH)
-    # Gate 0 is the unchanged camera PD: support + 0.080*|ey|.
-    assert out0.thrust == pytest.approx(SPAWN_SUPPORT + 0.080 * 0.10, abs=1e-3)
+    # F100: gate 0 shares the unified vz-tracking law — the old "proved
+    # PD envelope" special case is deleted (the F99 gate-0 sink into the
+    # lower structure, id 1001, ran on it).  The same +0.6 m/s climb at
+    # ey -0.10 is arrested by the tracker on gate 0 too.
+    def _gate0_thrust(vz_m_s):
+        gate0 = _tracked_controller(_track("A", 0.0, -0.10, scale=0.20))
+        gate0._alt_est_m = 2.0
+        current = gate0.current
+        current.y_axis.p = -0.10
+        current.raw_y = -0.10
+        current.y_axis.v = 0.0
+        current.scale_axis.p = -1.6
+        current.scale_axis.v = 0.10
+        now = 100.10
+        out = None
+        for _ in range(15):
+            now += 0.033
+            gate0._vz_est_m_s = vz_m_s
+            current.last_measurement_s = now
+            current.last_x_measurement_s = now
+            current.last_y_measurement_s = now
+            out = _command(gate0, now, pitch=SPAWN_PITCH)
+        return out
+
+    gate0_climbing = _gate0_thrust(0.60)
+    gate0_settled = _gate0_thrust(0.0)
+    # vz_des +0.10: the tracker pulls 0.12*(0.60-0.10) = 0.06 below settled.
+    assert gate0_climbing.thrust < gate0_settled.thrust - 0.05
 
 
 def test_course_leg_vertical_drops_image_rate_double_count():
@@ -2932,15 +2962,16 @@ def test_descent_arrest_bounds_sink_near_center():
     assert very_low.thrust < SPAWN_SUPPORT + 0.02
 
 
-def test_gate0_near_plane_arrest_shaves_censorship_entry_climb():
+def test_gate0_near_plane_tracker_shaves_censorship_entry_climb():
     # F85 (20260730T123020Z-visual-course-34c8dd71): gate 0 arrived at
     # censorship climbing +0.45 m/s; the aperture fit had died to clipping,
     # so COMMIT could not arm (the F83 entry cap never ran), and the
     # credible-loss exact-zero coast converted the climb into a ballistic
     # apex inside the frame — the drone fell into gate 0's LOWER panel
     # (id 1001, no credit).  F82 died the same way at +0.64 (top bar).
-    # The F78 arrival arrest now covers gate 0 inside the COMMIT proximity
-    # regime; the far climb-out keeps the proved F78b envelope (above).
+    # F100: the unified vz-tracking law owns gate 0 too (the F78 arrest
+    # and the F78b far-range PD exemption are deleted) — entry climbs are
+    # shaved by the tracker's vz_des -> 0 setpoint, near AND far.
     def _gate0_thrust(vz_m_s, log_scale):
         controller = _tracked_controller(_track("A", 0.0, -0.13, scale=0.50))
         controller._alt_est_m = 2.0  # honest altitude (floor quiet)
@@ -2963,14 +2994,15 @@ def test_gate0_near_plane_arrest_shaves_censorship_entry_climb():
         return out
 
     # Near plane (inside COMMIT proximity): a +0.45 climb into censorship
-    # is arrested toward the |ey|-scaled allowance.
+    # is arrested toward the vz_des setpoint.
     climbing = _gate0_thrust(0.45, -0.70)
     settled = _gate0_thrust(0.0, -0.70)
     assert climbing.thrust < settled.thrust - 0.03
-    # Far range (the F78b climb-out) keeps the plain PD output.
+    # Far range: the F78b climb-out exemption is gone — vz feedback is one
+    # coherent tracker now, so the same climb is arrested there too.
     far_climbing = _gate0_thrust(0.45, -1.60)
     far_settled = _gate0_thrust(0.0, -1.60)
-    assert far_climbing.thrust == pytest.approx(far_settled.thrust, abs=1e-3)
+    assert far_climbing.thrust < far_settled.thrust - 0.03
 
 
 def test_vz_center_trim_nulls_centered_sink():
