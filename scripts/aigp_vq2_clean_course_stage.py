@@ -2068,6 +2068,14 @@ class CleanCourseController:
             # the ground while the sweep ran.
             self._wind_vz_center_trim(dt)
             search_hold = support + margin + self._vz_center_trim
+            # F98: while fh is TRUSTED the SEARCH hold also tracks vz -> 0
+            # (see the TRACK/PREDICT blind-hold block).  F95/F96/F97 all
+            # ended in a blind SEARCH porpoising vz +/-0.4 on the passive
+            # support hold into the ground (id 1002).
+            if not self._fh_untrusted:
+                search_hold += cfg.course_vz_track_gain * (
+                    0.0 - self._vz_est_m_s
+                )
             self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
             # F49: SEARCH always holds the LEVEL (spawn-attitude) pitch.
@@ -2286,8 +2294,17 @@ class CleanCourseController:
                 # the cap ramps 0.5 -> 0.20 across the approach so the
                 # tracker cannot carry a budget-vetoing vertical rate
                 # into the plane.
+                # F98: the ramp reads outer_log_scale — the raw per-frame
+                # outer-bbox proximity that COMMIT's own entry check uses.
+                # F97 keyed on the FILTERED hypothesis log_scale, which
+                # read -1.67 while the gate already engulfed the frame
+                # (outer span 0.87x0.75): the 0.20 cap never engaged and
+                # vz_des was still ~-0.43 at the plane (F97 flight).
                 ramp = _clamp01(
-                    (current.log_scale - cfg.course_vz_des_ramp_start_log_scale)
+                    (
+                        current.outer_log_scale
+                        - cfg.course_vz_des_ramp_start_log_scale
+                    )
                     / (
                         cfg.commit_min_log_scale
                         - cfg.course_vz_des_ramp_start_log_scale
@@ -2356,6 +2373,20 @@ class CleanCourseController:
             # what made the path blind in the first place).
             self._wind_vz_center_trim(dt)
             hold = support + margin + self._vz_center_trim
+            # F98 (20260730T162145Z-visual-course-e7628b9c): while fh is
+            # TRUSTED the blind hold gets the same vz-tracking law with a
+            # zero setpoint.  F97's leg-start plateau ran on THIS path —
+            # the new track's y-axis stayed unqualified ~1.2 s while the
+            # hold sat at support + wound trim (~0.29) and HELD vz +0.36,
+            # ballooning the drone ~0.5 m above the gate line; the gate
+            # then sat low in frame, the custody floor levelled the brake
+            # pitch, and the leg arrived at the plane with ~1.67 log/s
+            # closure (COMMIT's first veto) and a late dive.  A passive
+            # hold cannot arrest that; track vz -> 0.  fh-untrusted keeps
+            # the support+margin floor: a frozen vz_est cannot be tracked
+            # (F14/F21).
+            if not self._fh_untrusted:
+                hold += cfg.course_vz_track_gain * (0.0 - self._vz_est_m_s)
             if self._collective is None:
                 self._collective = hold
             # Flight bc8c6003: a phantom vy (+0.38 norm/s, seeded as the gate

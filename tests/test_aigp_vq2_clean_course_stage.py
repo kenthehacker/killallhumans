@@ -543,16 +543,19 @@ def test_vz_governor_course_leg_damps_climb_continuously():
 
 def test_vz_governor_applies_in_predict_and_search():
     # The governor is IMU-based precisely so vision loss cannot disable it.
+    # F98: the fh-trusted blind holds also track vz -> 0 — at vz +2.0 the
+    # tracker alone (0.12*(0-2.0) = -0.24) already saturates the lower
+    # clamp, with the governor's climb cap stacked on top.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller.observe(_update([], frame_id=2), now_s=100.12)  # superseded
     assert controller.state is CleanCourseState.PREDICT
     controller._vz_est_m_s = 2.0
     assert _command(controller, 100.16, pitch=SPAWN_PITCH).thrust == pytest.approx(
-        SPAWN_SUPPORT - 0.03, abs=1e-9
+        controller.config.min_thrust, abs=1e-9
     )
     controller._enter_search(100.20)
     assert _command(controller, 100.22, pitch=SPAWN_PITCH).thrust == pytest.approx(
-        SPAWN_SUPPORT - 0.03, abs=1e-9
+        controller.config.min_thrust, abs=1e-9
     )
 
 
@@ -607,18 +610,20 @@ def test_vz_descent_floor_raises_command_thrust():
 
 def test_vz_descent_floor_applies_in_predict_and_search():
     # The floor is IMU-based for the same reason as the climb cap: vision
-    # loss (the d52adcd4 stall case) must not disable it.  F67 law: vz -0.7
-    # -> support + 0.0735 proportional.
+    # loss (the d52adcd4 stall case) must not disable it.  F98: the
+    # fh-trusted blind holds track vz -> 0 — at vz -0.7 the tracker
+    # (0.12*0.7 = +0.084) stacks above the floor's +0.0735 and the
+    # command saturates at the envelope top.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller.observe(_update([], frame_id=2), now_s=100.12)  # superseded
     assert controller.state is CleanCourseState.PREDICT
     controller._vz_est_m_s = -0.7
     assert _command(controller, 100.16, pitch=SPAWN_PITCH).thrust == pytest.approx(
-        SPAWN_SUPPORT + 0.0735, abs=1e-9
+        controller.config.max_thrust, abs=1e-9
     )
     controller._enter_search(100.20)
     assert _command(controller, 100.22, pitch=SPAWN_PITCH).thrust == pytest.approx(
-        SPAWN_SUPPORT + 0.0735, abs=1e-9
+        controller.config.max_thrust, abs=1e-9
     )
 
 
@@ -2703,6 +2708,10 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
     # ramps 0.5 -> 0.20 across the approach (ramp start log_scale -2.0,
     # commit_min_log_scale -1.2): near the plane the same geometry
     # commands a budget-compatible descent.
+    # F98: the ramp reads outer_log_scale (COMMIT's own proximity
+    # signal) — F97 keyed on the filtered hypothesis scale, which lagged
+    # (-1.67) while the gate already engulfed the frame.  This test
+    # deliberately leaves the filtered scale behind.
     controller = _tracked_controller(_track("A", 0.0, 0.30, scale=0.20))
     _promote_to_gate_one(controller)
     controller._alt_est_m = 2.0
@@ -2710,8 +2719,9 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
     current.y_axis.p = 0.30  # F96's low-sitting gate at the plane
     current.raw_y = 0.30
     current.y_axis.v = 0.0
-    current.scale_axis.p = -0.9  # log_scale >= -1.2: inside the commit regime
+    current.scale_axis.p = -1.67  # filtered hypothesis LAGS...
     current.scale_axis.v = 0.10
+    current.outer_log_scale = -0.9  # ...while raw proximity is at the plane
     now = 100.10
     out = None
     for _ in range(15):
@@ -2732,8 +2742,9 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
     far_current.y_axis.p = 0.30
     far_current.raw_y = 0.30
     far_current.y_axis.v = 0.0
-    far_current.scale_axis.p = -2.5  # beyond the ramp start: full 0.5 cap
+    far_current.scale_axis.p = -2.5
     far_current.scale_axis.v = 0.10
+    far_current.outer_log_scale = -2.5  # beyond the ramp start: full 0.5 cap
     far_now = 100.10
     far_out = None
     for _ in range(15):
@@ -2744,6 +2755,40 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
         far_current.last_y_measurement_s = far_now
         far_out = _command(far, far_now, pitch=SPAWN_PITCH)
     assert far_out.thrust == pytest.approx(SPAWN_SUPPORT - 0.048, abs=1e-3)
+
+
+def test_blind_hold_tracks_zero_vz_when_fh_trusted():
+    # F98 (20260730T162145Z-visual-course-e7628b9c): the gate-1 leg-start
+    # plateau ran on the UNQUALIFIED hold — the new track's y-axis stayed
+    # unqualified ~1.2 s while support + wound trim (~0.29) HELD vz
+    # +0.36, ballooning the drone ~0.5 m above the gate line (the gate
+    # then sat low in frame, the custody floor levelled the brake, and
+    # the leg arrived at ~1.67 log/s closure).  While fh is TRUSTED the
+    # blind hold tracks vz -> 0 with the same gain as the qualified law;
+    # fh-untrusted keeps the support+margin floor (frozen vz_est).
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.20))
+    _promote_to_gate_one(controller)
+    controller._alt_est_m = 2.0
+    controller._vz_center_trim = 0.03  # the post-crossing blind windup
+    current = controller.current
+    current.y_axis.p = 0.0
+    current.raw_y = 0.0
+    current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10
+    now = 100.10
+    out = None
+    for _ in range(30):  # ~1 s of the F97 leg-start plateau geometry
+        now += 0.033
+        controller._vz_est_m_s = 0.36  # the held climb
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        # y stays STALE: vertical unqualified, the F98 blind-hold path
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.TRACK
+    assert not out.vertical_qualified
+    # support + trim + 0.12*(0-0.36) ~= 0.23: the climb is actively
+    # opposed (the parent's passive hold emits ~0.29 and fails this).
+    assert out.thrust < SPAWN_SUPPORT - 0.02
 
 
 def test_two_sided_arrest_bleeds_centered_gate_climb():
@@ -2961,18 +3006,21 @@ def test_vz_center_trim_nulls_centered_sink():
     # 1002) — the integrator lived inside the qualified branch and the
     # SEARCH hold never consumed the trim.  F90: blind paths wind and
     # spend the trim with no ey gate (a blind path holds altitude by
-    # definition, so any IMU-trusted sink is unwanted).  The differential
-    # is in the EMITTED thrust: the descent floor's proportional reaction
-    # at vz -0.47 is only +0.025 over support; the wound trim must lift
-    # the blind hold well above that.
-    trim_before = controller._vz_center_trim
+    # definition, so any IMU-trusted sink is unwanted).  F98: the blind
+    # SEARCH hold also tracks vz -> 0, which covers the sink directly —
+    # the anti-windup saturation check then caps the trim early (winding
+    # further would double-count the deficit the tracker is correcting).
+    # The differential is in the EMITTED thrust: the descent floor's
+    # proportional reaction at vz -0.47 is only +0.025 over support; the
+    # tracker (+0.056) plus the bounded trim must lift the blind hold
+    # well above that.
     controller._enter_search(now)
     for _ in range(30):  # ~1 s of the F89 blind-search sink
         now += 0.033
         controller._vz_est_m_s = -0.47
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert out.state is CleanCourseState.SEARCH
-    assert controller._vz_center_trim > trim_before + 0.005
+    assert controller._vz_center_trim > 0.005  # bounded wind, not the cap
     assert out.thrust > SPAWN_SUPPORT + 0.05
 
 
@@ -3006,13 +3054,13 @@ def test_no_alt_floor_latch_overrides_blind_search():
         if tick == 0:
             first = out.thrust
     assert out.state is CleanCourseState.SEARCH
-    # First tick: the descent floor's proportional reaction only
-    # (0.21*(0.40-0.35) = 0.0105 over support) — the deleted latch
-    # pinned exactly support+0.05 here for the whole leg.
-    assert first < SPAWN_SUPPORT + 0.045
-    # After ~1 s the wound trim lifts the blind hold: the anti-sink
-    # still works without the latch.
-    assert controller._vz_center_trim > 0.02
+    # First tick: the F98 vz -> 0 tracker's proportional reaction
+    # (0.12*0.40 = +0.048 over support) — NOT the deleted latch's
+    # support+0.05 pin (a fixed pin, held for the whole leg).
+    assert first == pytest.approx(SPAWN_SUPPORT + 0.048, abs=5e-3)
+    # After ~1 s the wound trim lifts the blind hold further: the
+    # anti-sink still works without the latch.
+    assert controller._vz_center_trim > 0.005
     assert out.thrust > SPAWN_SUPPORT + 0.03
 
 
