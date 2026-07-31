@@ -249,6 +249,17 @@ COURSE_VZ_DES_RAMP_START_LOG_SCALE = -2.0  # far end of the cap ramp
 # A wound positive trim while the tracker wants LESS climb than the
 # measured vz is suspect by construction: bleed it fast.
 COURSE_VZ_TRIM_FAST_LEAK_S = 0.10  # collective/s when trim fights the tracker
+# F103 (20260730T182343Z-visual-course-334c208e): a commanded -0.5 m/s sink
+# at ~1 m altitude enters VRS and the collective CANNOT arrest it — F102
+# parked short of gate 1 with the gate genuinely low (raw ey +0.88 at a
+# level attitude), the tracker commanded the full -0.5 descent, thrust
+# saturated at the 0.34 envelope top against the vortex ring, and the
+# drone struck the ground (id 1002) — F101's endgame exactly.  Prevention,
+# not arrest: descent authority tapers with alt_est (relative to spawn
+# altitude) to a VRS-safe -0.15 m/s at/below spawn; the climb side is
+# untouched and full descent authority returns 0.50 m above spawn.
+COURSE_VZ_DES_GROUND_M_S = 0.15  # VRS-safe descent cap at/below spawn alt
+COURSE_VZ_DES_GROUND_ALT_M = 0.50  # full descent authority this far above spawn
 
 # Launch boost is pure feedforward (it ignores ey).  Flight
 # 20260729T094736Z-visual-course-9d430a40: the 0.32 x 0.75 s boost alone
@@ -1094,6 +1105,8 @@ class CleanCourseConfig:
     course_vz_des_commit_m_s: float = COURSE_VZ_DES_COMMIT_M_S
     course_vz_des_ramp_start_log_scale: float = COURSE_VZ_DES_RAMP_START_LOG_SCALE
     course_vz_trim_fast_leak_s: float = COURSE_VZ_TRIM_FAST_LEAK_S
+    course_vz_des_ground_m_s: float = COURSE_VZ_DES_GROUND_M_S
+    course_vz_des_ground_alt_m: float = COURSE_VZ_DES_GROUND_ALT_M
     min_thrust: float = MIN_COURSE_THRUST
     max_thrust: float = MAX_COURSE_THRUST
     launch_boost_thrust: float = LAUNCH_BOOST_THRUST
@@ -2317,9 +2330,18 @@ class CleanCourseController:
                 vz_des_max = cfg.course_vz_des_max_m_s - (
                     cfg.course_vz_des_max_m_s - cfg.course_vz_des_commit_m_s
                 ) * ramp
+                # F103 (see the COURSE_VZ_DES_GROUND_* block): a fast
+                # commanded sink at ~1 m altitude enters VRS and the
+                # collective cannot arrest it (F101/F102 both died at
+                # thrust saturation, id 1002).  Descent authority tapers
+                # to the VRS-safe cap as alt_est approaches spawn level;
+                # the climb side is untouched.
+                vz_des_sink_max = cfg.course_vz_des_ground_m_s + (
+                    vz_des_max - cfg.course_vz_des_ground_m_s
+                ) * _clamp01(self._alt_est_m / cfg.course_vz_des_ground_alt_m)
                 vz_des = _clamp(
                     -cfg.course_vz_des_per_norm * bounded_error,
-                    -vz_des_max,
+                    -vz_des_sink_max,
                     vz_des_max,
                 )
                 # F97: a wound positive trim while the tracker wants LESS

@@ -219,6 +219,10 @@ def test_identical_global_vertical_sign_at_every_gate():
     controller = _tracked_controller(_track("A", 0.0, 0.20), config=config)
     now = 100.10
     for gate in (0, 1, 2):
+        # F103: the descent setpoint tapers near/below spawn altitude —
+        # hold an honest altitude at EVERY gate so this sign-contract test
+        # stays on the full-authority vertical law it means to exercise.
+        controller._alt_est_m = 2.0  # honest altitude (floor quiet)
         if gate > 0:
             successor_id = f"S{gate}"
             controller.observe(
@@ -267,11 +271,13 @@ def test_vertical_sign_is_the_gate0_minus_form_by_default():
     # magnitude is 0.12*vz_des (one coherent IMU-vz term), the sign is
     # the global minus form (gate low -> less collective).
     controller = _tracked_controller(_track("A", 0.0, 0.20))
+    controller._alt_est_m = 2.0  # honest altitude: full descent authority (F103)
     output = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert output.thrust == pytest.approx(
         SPAWN_SUPPORT - 0.12 * 0.20, abs=1e-9
     )
     controller = _tracked_controller(_track("A", 0.0, -0.20))
+    controller._alt_est_m = 2.0  # honest altitude: full descent authority (F103)
     output = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert output.thrust == pytest.approx(
         SPAWN_SUPPORT + 0.12 * 0.20, abs=1e-9
@@ -305,8 +311,10 @@ def test_vertical_error_is_pitch_attitude_compensated():
         SPAWN_SUPPORT / math.cos(0.15), abs=1e-9
     )
     # ...while the same reading at the spawn attitude really is low.
-    # (F100: vz_des = -0.24 tracked at 0.12/m/s, vz_est 0.)
+    # (F100: vz_des = -0.24 tracked at 0.12/m/s, vz_est 0; honest altitude
+    # keeps the F103 near-ground descent taper out of this law check.)
     level = _tracked_controller(_track("A", 0.0, 0.24))
+    level._alt_est_m = 2.0
     out = _command(level, 100.10, pitch=SPAWN_PITCH)
     assert out.thrust == pytest.approx(
         SPAWN_SUPPORT - 0.12 * 0.24, abs=1e-9
@@ -347,6 +355,7 @@ def test_launch_boost_constants_are_the_cut_values():
 def test_vertical_loss_decays_toward_support_not_saturation_retention():
     # Start with a saturated sub-support collective (target below center).
     controller = _tracked_controller(_track("A", 0.0, 0.30))
+    controller._alt_est_m = 2.0  # honest altitude: full descent authority (F103)
     saturated = _command(controller, 100.10, pitch=SPAWN_PITCH).thrust
     assert saturated < SUPPORT - 0.01
     # The vertical axis becomes unobservable (top clipping censors y); the
@@ -2832,6 +2841,39 @@ def test_course_leg_trim_fast_leaks_when_fighting_the_tracker():
     # 0.10/s over ~0.5 s bleeds 0.06 -> ~0.01 (the old 0.02/s leak
     # leaves ~0.05 — the parent's value, which fails this assertion).
     assert controller._vz_center_trim < 0.02
+
+
+def test_course_leg_vz_des_sink_is_capped_near_the_ground():
+    # F103 (20260730T182343Z-visual-course-334c208e): parked short of
+    # gate 1 with the gate genuinely low (raw ey +0.88 at a level
+    # attitude), the tracker commanded the full -0.5 m/s descent at ~1 m
+    # altitude, entered VRS, and the saturated collective could not
+    # arrest it (id 1002) — F101's endgame exactly.  Below spawn
+    # altitude the descent setpoint tapers to the VRS-safe -0.15 m/s;
+    # full authority returns 0.50 m above spawn (the F97 far block at
+    # alt_est 2.0 above is unchanged).  The climb side is untouched.
+    low = _tracked_controller(_track("A", 0.0, 0.30, scale=0.20))
+    _promote_to_gate_one(low)
+    low._alt_est_m = -0.10  # F102's death geometry: at/below spawn level
+    current = low.current
+    current.y_axis.p = 0.30
+    current.raw_y = 0.30
+    current.y_axis.v = 0.0
+    current.scale_axis.p = -2.5
+    current.scale_axis.v = 0.10
+    current.outer_log_scale = -2.5  # far: the F97 commit ramp is not the cap
+    now = 100.10
+    out = None
+    for _ in range(15):
+        now += 0.033
+        low._vz_est_m_s = 0.0
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(low, now, pitch=SPAWN_PITCH)
+    assert low.state is CleanCourseState.TRACK
+    # vz_des is capped at -0.15 (not -0.30): support + 0.12*(-0.15-0).
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.018, abs=1e-3)
 
 
 def test_course_leg_vz_des_respects_commit_budget_near_plane():
