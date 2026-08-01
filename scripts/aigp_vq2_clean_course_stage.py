@@ -430,33 +430,28 @@ UNMEASURED_X_FORCE_SEARCH_S = 0.75
 # same way — terrain at the gate-1 threshold in the high-drag regime with
 # frozen estimates): vision expansion rate is the ONLY honest closure
 # signal (fh is a signless drag magnitude that conflates speed with
-# braking).  Speed is now capped CONTINUOUSLY at every range: as the
-# filtered log-scale rate rises past the target, the pitch target blends
-# from the advance law toward the gentle brake attitude, reaching it at the
-# full-brake rate.  This replaces the fh closure governor (wrong signal),
+# braking).  Speed is now capped CONTINUOUSLY at every range: as the fresh
+# horizontal bbox log-span rate rises past the target, the pitch target
+# blends from the advance law toward the gentle brake attitude, reaching it
+# at the full-brake rate.  This replaces the fh closure governor (wrong signal),
 # the near-field log_scale/TTC triggers (late), and the post-credit brake
 # (no job left once crossings are slow — and its hard nose-up episodes
 # were themselves VRS generators).
-CLOSURE_TARGET_RATE_S = 0.35  # log-scale rate the governor holds (TTC ~3 s)
 # F108 (20260801T054550Z-visual-course-8b530eed): F106's 0.36/s threshold
 # put Gate 0 on the fast brake response far from the plane.  F107 then
 # accumulated a vertical sink before the near-plane hold (vz -0.11 m/s,
 # altitude -0.09 m at span 0.55), pitched to the custody limit, and struck
 # the structure without credit.  Restore F104's live-proven 0.60/s response
-# ceiling: the range-ramped governor still blends brake continuously, while
+# ceiling: the governor still blends brake continuously, while
 # the explicit near-plane budget-false hold still demands full braking.
 CLOSURE_FULL_BRAKE_RATE_S = 0.60
-# F101 (20260730T173407Z-visual-course-7a862549): a range-flat 0.35
-# target permits 3+ m/s at leg start (0.35 log/s at 8-10 m), more than
-# custody-compatible attitude braking (~0.4-0.7 m/s^2, capped by the F94
-# floor near the plane) can dissipate inside the leg — F100's gate-1 leg
-# held pb=1 mid-leg and still ran away to ~1.2 log/s at the plane
-# (COMMIT veto, blind structure strike).  The target ramps from a low
-# far value (an implicit constant-speed cap while the full gate is
-# visible and custody is free) up to the unchanged 0.35 entry budget at
-# the commit regime.
-CLOSURE_FAR_TARGET_RATE_S = 0.15  # far-range closure target (~1.2 m/s at 8 m)
-CLOSURE_FAR_LOG_SCALE = -2.0  # ramp start; 0.35 target at commit_min_log_scale
+# F156 retests F154's one 0.15/s energy target only after replacing the
+# detector-shape-contaminated closure signal below.  F154's fatal launch
+# pulse was a height-only bbox snap (0.161 -> 0.231 norm) at constant 0.125
+# width, not physical approach.  With one uncensored horizontal-span rate,
+# the target continuously removes inherited energy without that false full
+# brake; there is still one brake reference and no range policy switch.
+CLOSURE_TARGET_RATE_S = 0.15  # continuous energy target (TTC ~6.7 s)
 # F96: the F77 closure-excess collective brake (COURSE_CLOSURE_BRAKE_COLLECTIVE)
 # is deleted with its call site — under the unified vz-tracking law a
 # sub-support cut is immediately restored by the tracker (a masked no-op)
@@ -469,19 +464,13 @@ CLOSURE_FAR_LOG_SCALE = -2.0  # ramp start; 0.35 target at commit_min_log_scale
 # (far-field real closure at our speeds never exceeds the target anyway:
 # 4 m/s at 10 m is 0.4/s with scale already >= ~0.08).
 CLOSURE_MIN_LOG_SCALE = -2.6
-# F99 (20260730T164633Z-visual-course-cb4e1b9e): the closure governor's
-# signal is the Kalman scale_axis.v, which lags ~1 s on a fresh/adopted
-# track — F98 braked only incidentally (misalignment), the governor never
-# saw the true closure, and the leg arrived at expansion +1.7..+3.5 log/s
-# through every centered fresh frame (COMMIT's 0.35 entry limit vetoed
-# first; gate 0's hot 2.5-3.5 m/s crossings are the same lag).  The raw
-# outer-bbox log-scale rate (EMA over uncensored frames) is fast enough;
-# the governor takes the FASTER of the two, so braking never goes below
-# today's.  Physics: holding the 0.35 log/s cap over a 15 m leg from
-# 3 m/s needs ~0.3 m/s^2 — inside the measured 0.4-0.7 brake authority,
-# so the signal, not the airframe, was the bottleneck.
-OUTER_EXPANSION_TAU_S = 0.20  # EMA time constant for the raw closure rate
-OUTER_EXPANSION_MAX_AGE_S = 0.15  # freshness bound on the raw signal
+# F156 keeps F99's fast response but removes the contradictory lagging
+# geometric-rate owner.  The sole closure signal is an EMA of uncensored
+# horizontal bbox log-span growth: it responds within a few frames while
+# rejecting F154's height-only fragment snap.  It naturally expires through
+# censorship/dropout instead of reusing a stale image measurement.
+OUTER_EXPANSION_TAU_S = 0.20  # horizontal log-span EMA time constant
+OUTER_EXPANSION_MAX_AGE_S = 0.15  # freshness bound on that image signal
 # Fragment advance gate (F43, 20260729T202844Z-visual-course-ee8fd1e5): the
 # gate-1 leg advanced at full +0.08 on a LONE span-(0.04,0.10) fragment
 # (log_scale ~-3.7), built fh 3-4 mps2, and parallax outran yaw authority
@@ -798,7 +787,7 @@ class _Hypothesis:
         "scale_axis",
         "confidence",
         "outer_log_scale",
-        "outer_log_scale_s",
+        "outer_expansion_s",
         "outer_expansion_rate",
         "outer_half_span_x",
         "clipped",
@@ -830,7 +819,7 @@ class _Hypothesis:
         self.scale_axis = _AxisFilter(log_scale, 0.0, pos_var, INITIAL_RATE_VAR)
         self.confidence = _clamp01(confidence)
         self.outer_log_scale = float(log_scale)
-        self.outer_log_scale_s = float(now_s)
+        self.outer_expansion_s = float(now_s)
         self.outer_expansion_rate = 0.0
         # F56: outer bbox x half-width in norm — the COMMIT corridor bound
         # is measured in gate units.  Square-box proxy from the area scale
@@ -875,10 +864,6 @@ class _Hypothesis:
     @property
     def log_scale(self) -> float:
         return self.scale_axis.p
-
-    @property
-    def expansion_rate(self) -> float:
-        return self.scale_axis.v
 
     @property
     def position_std(self) -> float:
@@ -956,8 +941,6 @@ class CleanCourseConfig:
     x_steer_max_age_s: float = X_STEER_MAX_AGE_S
     closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
     closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
-    closure_far_target_rate_s: float = CLOSURE_FAR_TARGET_RATE_S
-    closure_far_log_scale: float = CLOSURE_FAR_LOG_SCALE
     closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
     outer_expansion_tau_s: float = OUTER_EXPANSION_TAU_S
     outer_expansion_max_age_s: float = OUTER_EXPANSION_MAX_AGE_S
@@ -1939,74 +1922,18 @@ class CleanCourseController:
             and current.y_axis.std <= cfg.search_covariance_std_norm
         )
         floor_gate_y = ey_vertical if vertical_qualified else None
-        # Vision closure-rate governor (F31, see the CLOSURE_* constant
-        # block): the filtered log-scale rate is the only honest closure
-        # signal — fh is a signless drag magnitude that conflates speed with
-        # braking.  Speed is capped CONTINUOUSLY at every range: the pitch
-        # target below blends from the advance law toward the gentle brake
-        # attitude as the expansion rate rises past the target.  Applies in
-        # TRACK and PREDICT alike (the SEARCH path returned above).
-        # F33 trust gate: expansion from tiny far tracks is sub-pixel noise,
-        # so the governor only runs above CLOSURE_MIN_LOG_SCALE.
-        # F99: the Kalman rate lags ~1 s on a fresh/adopted track (see the
-        # OUTER_EXPANSION_* block) — the governor only braked incidentally
-        # and every leg arrived hot.  Take the FASTER of the filtered rate
-        # and the raw outer-bbox rate (fresh only): braking never goes
-        # below what the filtered signal alone would command.
-        raw_closure = (
-            current.outer_expansion_rate
-            if now_s - current.last_measurement_s
-            <= cfg.outer_expansion_max_age_s
-            else 0.0
-        )
-        closure_rate = 0.0
-        if current.outer_log_scale >= cfg.closure_min_log_scale:
-            # F114 (20260801T063210Z-visual-course-9260728c): only the
-            # failed Gate-0 run produced a full-brake pulse at t=0.047...
-            # 0.110 s while its raw outer box was exactly stationary
-            # (outer EMA 0.0).  The fresh hypothesis's lagging scale rate
-            # invoked the high-authority brake loop during launch, moved
-            # pitch -0.31 -> -0.33, and the approach stayed above the
-            # aperture into the top structure.  During the bounded Gate-0
-            # launch boost, use the fast raw outer-box signal alone; real
-            # raw closure and the independent misalignment brake remain
-            # fully authoritative.  After the boost, resume the normal
-            # faster-of-two governor.
-            launch_scale_warmup = (
-                self.gate_index == 0
-                and self._course_start_s is not None
-                and now_s - self._course_start_s
-                < cfg.launch_boost_duration_s
-            )
-            closure_rate = (
-                raw_closure
-                if launch_scale_warmup
-                else max(current.expansion_rate, raw_closure)
-            )
-        # F101 approach-energy profile (20260730T173407Z-...-7a862549):
-        # F100's gate-1 leg braked mid-leg (pb=1, pitch to -0.57) yet the
-        # closure held 0.43 log/s and then RAN AWAY to ~1.2 log/s at the
-        # plane once the F94 custody floor capped the brake attitude —
-        # attitude braking authority (~0.4-0.7 m/s^2, custody-limited to
-        # less near the plane) cannot kill 2.5-3.5 m/s inside the leg
-        # remainder, so the COMMIT expansion budget vetoed and the blind
-        # drone hit the gate-1 structure.  A constant 0.35 log/s target
-        # only bounds speed NEAR the plane; far out it permits 3+ m/s.
-        # The target now RAMPS with range: a low far target
-        # (constant-speed cap in log terms) bleeding energy while the
-        # full gate is visible and custody is free, rising to the
-        # unchanged 0.35 entry budget at the commit regime.  Same law on
-        # every leg — gate-0 entry energy is what the next leg inherits.
-        target_frac = _clamp01(
-            (current.outer_log_scale - cfg.closure_far_log_scale)
-            / (cfg.commit_min_log_scale - cfg.closure_far_log_scale)
-        )
-        closure_target = cfg.closure_far_target_rate_s + (
-            cfg.closure_target_rate_s - cfg.closure_far_target_rate_s
-        ) * target_frac
+        # Vision closure-rate governor (F156, see the CLOSURE_* block): one
+        # shape-robust signal owns governor, advance, and entry-budget
+        # decisions.  It is the EMA of fresh uncensored horizontal bbox
+        # growth, so a fragment gaining only vertical support cannot be
+        # interpreted as physical approach.  The target blends continuously
+        # toward the gentle brake at every trusted range; tiny far tracks and
+        # stale PREDICT evidence have no closure authority.  The lagging
+        # geometric Kalman rate and launch-only selector are deleted.
+        closure_rate = self._closure_rate(current, now_s)
         closure_brake = _clamp01(
-            (closure_rate - closure_target)
-            / (cfg.closure_full_brake_rate_s - closure_target)
+            (closure_rate - cfg.closure_target_rate_s)
+            / (cfg.closure_full_brake_rate_s - cfg.closure_target_rate_s)
         )
         # Misalignment brake (F35, d25f23fe): a fully misaligned gate only
         # suppressed ADVANCE, leaving the pitch law at brake_pitch (near
@@ -2115,7 +2042,7 @@ class CleanCourseController:
         )
         expansion = _clamp01(
             1.0
-            - max(0.0, current.expansion_rate - cfg.expansion_brake_free_s)
+            - max(0.0, closure_rate - cfg.expansion_brake_free_s)
             / cfg.expansion_brake_span_s
         )
         near_plane = _clamp01(
@@ -2264,6 +2191,16 @@ class CleanCourseController:
         self.last_reliable_bearing = (float(x), float(y))
         self._bearing_memory_valid = True
 
+    def _closure_rate(self, current: _Hypothesis, now_s: float) -> float:
+        """Return the one fresh, shape-robust physical-approach signal."""
+
+        cfg = self.config
+        if current.outer_log_scale < cfg.closure_min_log_scale:
+            return 0.0
+        if now_s - current.outer_expansion_s > cfg.outer_expansion_max_age_s:
+            return 0.0
+        return current.outer_expansion_rate
+
     def _commit_entry_budget_ok(
         self, now_s: float, pitch_rad: float, cfg: "CleanCourseConfig"
     ) -> bool:
@@ -2290,19 +2227,11 @@ class CleanCourseController:
             return False
         if current.aperture_half_x is None or current.aperture_half_y is None:
             return False
-        # F102 (Codex checkpoint): veto on the FASTER of the lagging Kalman
-        # rate and the fresh raw outer-bbox rate — the same signal the F99
-        # closure governor brakes on.  The filtered rate alone lags ~1 s on
-        # a fresh/adopted track and would arm a still-hot crossing.
-        raw_closure = (
-            current.outer_expansion_rate
-            if now_s - current.last_measurement_s
-            <= cfg.outer_expansion_max_age_s
-            else 0.0
-        )
-        if (
-            max(current.expansion_rate, raw_closure)
-            > cfg.commit_entry_max_expansion_rate_s
+        # F156: entry reads the same uncensored horizontal-span rate as the
+        # pitch law.  A second geometric/filter closure owner cannot veto or
+        # admit a crossing on contradictory detector-shape evidence.
+        if self._closure_rate(current, now_s) > (
+            cfg.commit_entry_max_expansion_rate_s
         ):
             return False
         # F82: the blackout-displacement budget includes IMU vz, not just
@@ -2493,30 +2422,34 @@ class CleanCourseController:
             hypothesis.y_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
         hypothesis.last_measurement_s = float(now_s)
         new_outer_log_scale = math.log(max(1e-6, float(track.apparent_scale)))
-        # F99: fast raw closure signal (see the OUTER_EXPANSION_* block) —
-        # EMA of the per-frame outer log-scale rate, so the closure
-        # governor does not wait ~1 s for the Kalman scale_axis.v to
-        # tighten on a fresh/adopted track.
-        dt_outer = float(now_s) - hypothesis.outer_log_scale_s
-        if dt_outer > 1e-6:
-            raw_rate = (
-                new_outer_log_scale - hypothesis.outer_log_scale
-            ) / dt_outer
-            alpha = dt_outer / (self.config.outer_expansion_tau_s + dt_outer)
-            hypothesis.outer_expansion_rate += alpha * (
-                raw_rate - hypothesis.outer_expansion_rate
-            )
         hypothesis.outer_log_scale = new_outer_log_scale
-        hypothesis.outer_log_scale_s = float(now_s)
         if not x_censored:
-            # F56: the corridor bound needs the gate's true half-width; a
-            # censored-x bbox underreports it, so only uncensored frames
-            # refresh the span.
+            # F156: horizontal bbox growth is the sole closure measurement.
+            # F154's fatal launch pulse changed only height; using apparent
+            # area made that association/shape correction look like 5.8/s
+            # physical approach.  The x span is co-timed with accepted x and
+            # is held (and naturally ages stale) while horizontally censored.
             bbox = getattr(track, "bbox_norm", None)
             if bbox is not None and len(bbox) >= 4:
-                hypothesis.outer_half_span_x = 0.5 * (
-                    float(bbox[2]) - float(bbox[0])
+                new_span_x = max(
+                    1e-6, float(bbox[2]) - float(bbox[0])
                 )
+                previous_span_x = max(
+                    1e-6, 2.0 * hypothesis.outer_half_span_x
+                )
+                dt_outer = float(now_s) - hypothesis.outer_expansion_s
+                if dt_outer > 1e-6:
+                    raw_rate = (
+                        math.log(new_span_x) - math.log(previous_span_x)
+                    ) / dt_outer
+                    alpha = dt_outer / (
+                        self.config.outer_expansion_tau_s + dt_outer
+                    )
+                    hypothesis.outer_expansion_rate += alpha * (
+                        raw_rate - hypothesis.outer_expansion_rate
+                    )
+                hypothesis.outer_half_span_x = 0.5 * new_span_x
+                hypothesis.outer_expansion_s = float(now_s)
         # 2026-07-30 entry budget: the CURRENT frame's usable inner aperture
         # (passage_usable) is recorded as half-extents; a missing/unusable
         # fit clears them, so a close-range aperture loss is itself visible
@@ -2815,25 +2748,18 @@ class CleanCourseController:
             self._turn_successor_authority if successor is not None else 0.0
         )
         if successor is not None:
-            # F155 restores F148's continuous carry without its retired trim
-            # or off/full steering gain.  F150 assigned every unsupported
-            # fraction to an implicit zero-bearing measurement, so a still-left
-            # successor and a small current passage correction pulled the
-            # filtered reference left -> right -> left before Gate-0 credit.
-            # Unsupported evidence now leaves the sole, already IMU-derotated
-            # reference unchanged; only explicit current and successor claims
-            # move it.  No second command owner or raw bearing is retained.
+            # F146: F145 computed an evidence-backed current claim, then the
+            # final blend discarded it and implicitly restored current error
+            # to (1 - successor authority).  That recreated the rightward
+            # counterturn whenever the old left bearing grew uncertain.  Use
+            # the two claims actually supported by evidence; unclaimed weight
+            # is neutral, and the existing derotated reference filter supplies
+            # continuity.  Weak evidence now decays toward zero rather than
+            # granting the opposing current error invented authority.
             current_weight = min(current_claim, 1.0 - authority)
-            carried_weight = max(0.0, 1.0 - current_weight - authority)
-            carried_reference = (
-                self._turn_reference_x
-                if self._turn_reference_x is not None
-                else float(current_error)
-            )
             desired = (
                 current_weight * float(current_error)
                 + authority * successor.x
-                + carried_weight * carried_reference
             )
 
         if self._turn_reference_x is None:
