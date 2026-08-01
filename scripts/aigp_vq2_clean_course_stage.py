@@ -2236,11 +2236,30 @@ class CleanCourseController:
             <= cfg.outer_expansion_max_age_s
             else 0.0
         )
-        closure_rate = (
-            max(current.expansion_rate, raw_closure)
-            if current.outer_log_scale >= cfg.closure_min_log_scale
-            else 0.0
-        )
+        closure_rate = 0.0
+        if current.outer_log_scale >= cfg.closure_min_log_scale:
+            # F114 (20260801T063210Z-visual-course-9260728c): only the
+            # failed Gate-0 run produced a full-brake pulse at t=0.047...
+            # 0.110 s while its raw outer box was exactly stationary
+            # (outer EMA 0.0).  The fresh hypothesis's lagging scale rate
+            # invoked the high-authority brake loop during launch, moved
+            # pitch -0.31 -> -0.33, and the approach stayed above the
+            # aperture into the top structure.  During the bounded Gate-0
+            # launch boost, use the fast raw outer-box signal alone; real
+            # raw closure and the independent misalignment brake remain
+            # fully authoritative.  After the boost, resume the normal
+            # faster-of-two governor.
+            launch_scale_warmup = (
+                self.gate_index == 0
+                and self._course_start_s is not None
+                and now_s - self._course_start_s
+                < cfg.launch_boost_duration_s
+            )
+            closure_rate = (
+                raw_closure
+                if launch_scale_warmup
+                else max(current.expansion_rate, raw_closure)
+            )
         # F101 approach-energy profile (20260730T173407Z-...-7a862549):
         # F100's gate-1 leg braked mid-leg (pb=1, pitch to -0.57) yet the
         # closure held 0.43 log/s and then RAN AWAY to ~1.2 log/s at the
@@ -2475,7 +2494,13 @@ class CleanCourseController:
         # blind anti-sink is owned by the vz-center trim and the continuous
         # vz descent floor.
         collective = self._governed_collective(
-            collective, support, gate_y=ey_vertical, vz_tracked=vz_tracked
+            collective,
+            support,
+            # F113's margin taper is camera-authoritative only while the
+            # y-axis is qualified.  A stale/predicted y immediately regains
+            # the full untrusted-IMU floor instead of controlling thrust.
+            gate_y=ey_vertical if vertical_qualified else None,
+            vz_tracked=vz_tracked,
         )
         thrust = _clamp(collective, cfg.min_thrust, cfg.max_thrust)
 

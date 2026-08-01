@@ -1217,6 +1217,26 @@ def test_fh_untrusted_course_floor_tapers_before_gate_reaches_center():
     assert SPAWN_SUPPORT <= out.thrust < SPAWN_SUPPORT + 0.05
 
 
+def test_fh_untrusted_course_taper_requires_fresh_vertical_geometry():
+    # F113's low-margin path is justified only by a qualified camera y.
+    # Once that axis is stale, a retained low-gate hypothesis must not keep
+    # collective near bare support while both IMU vertical channels are
+    # untrusted.  The full floor returns immediately rather than waiting on
+    # the unqualified hold's decay time constant.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller)
+    now = 100.50
+    controller._fh_untrusted = True
+    controller._collective = SPAWN_SUPPORT
+    controller.current.y_axis.p = 0.50
+    controller.current.raw_y = 0.50
+    controller.current.last_measurement_s = now
+    controller.current.last_y_measurement_s = now - 1.0
+    out = _command(controller, now, pitch=SPAWN_PITCH, fh=6.0)
+    assert not out.vertical_qualified
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-9)
+
+
 def test_closure_governor_full_brake_at_high_expansion_rate():
     # F31: the vision log-scale expansion rate is the only honest closure
     # signal (fh is a signless drag magnitude).  At/above the full-brake
@@ -1307,6 +1327,41 @@ def test_closure_governor_distrusts_tiny_track_expansion():
     assert not controller._pre_cross_brake_active
     # Advance law still closes: above the level (spawn) brake base.
     assert out.target_pitch_rad > SPAWN_PITCH
+
+
+def test_gate_zero_launch_uses_raw_closure_while_scale_filter_warms():
+    # F114 (20260801T063210Z-visual-course-9260728c): the only failed run
+    # among F110-F113 pulsed the full brake during t=0.047...0.110 even
+    # though the raw Gate-0 box was stationary.  During the bounded launch
+    # boost, a newborn filtered-scale spike cannot own the brake; honest raw
+    # expansion and misalignment remain active, and the normal max signal
+    # resumes immediately afterward.
+    controller = _tracked_controller(
+        _track("A", 0.0, 0.0, scale=math.exp(-1.79)),
+        config=_config(launch_boost_duration_s=0.40),
+    )
+    controller.current.scale_axis.v = 2.0  # newborn filtered-rate spike
+    controller.current.outer_expansion_rate = 0.0  # stationary raw box
+    controller.current.last_measurement_s = 100.10
+    out = _command(controller, 100.10, pitch=SPAWN_PITCH)
+    assert not controller._pre_cross_brake_active
+    assert out.target_pitch_rad > SPAWN_PITCH
+
+    # A real fast outer-box approach still brakes inside the launch window.
+    raw = _tracked_controller(
+        _track("A", 0.0, 0.0, scale=math.exp(-1.79)),
+        config=_config(launch_boost_duration_s=0.40),
+    )
+    raw.current.scale_axis.v = 0.0
+    raw.current.outer_expansion_rate = 0.80
+    raw.current.last_measurement_s = 100.10
+    _command(raw, 100.10, pitch=SPAWN_PITCH)
+    assert raw._pre_cross_brake_active
+
+    # The filtered rate regains authority at the boost boundary.
+    controller.current.last_measurement_s = 100.41
+    _command(controller, 100.41, pitch=SPAWN_PITCH)
+    assert controller._pre_cross_brake_active
 
 
 def test_closure_governor_is_a_continuous_blend():
