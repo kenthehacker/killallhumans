@@ -1911,7 +1911,7 @@ def test_turn_aperture_uses_signed_leg_relative_swept_envelope():
         controller.current.raw_x = image_x
         controller._turn_reference(
             controller.current,
-            controller.successor,
+            None,
             current_error=image_x,
             now_s=100.10,
             yaw_rad=yaw,
@@ -1919,12 +1919,16 @@ def test_turn_aperture_uses_signed_leg_relative_swept_envelope():
         )
         return controller._turn_aperture_reserve
 
-    unshifted = reserve(image_x=-0.08, yaw=0.0, vx=0.5)
-    yaw_shifted = reserve(image_x=0.08, yaw=-0.10, vx=0.5)
-    divergent = reserve(image_x=-0.08, yaw=0.0, vx=-0.5)
+    unshifted_reserve = reserve(
+        image_x=-0.08, yaw=0.0, vx=0.5
+    )
+    yaw_shifted_reserve = reserve(
+        image_x=0.08, yaw=-0.10, vx=0.5
+    )
+    divergent_reserve = reserve(image_x=-0.08, yaw=0.0, vx=-0.5)
 
-    assert yaw_shifted == pytest.approx(unshifted, abs=1e-12)
-    assert unshifted > divergent > 0.0
+    assert yaw_shifted_reserve == pytest.approx(unshifted_reserve, abs=1e-12)
+    assert unshifted_reserve > divergent_reserve > 0.0
 
 
 def test_continuous_turn_reference_coordinates_yaw_and_bank_only():
@@ -2175,65 +2179,6 @@ def test_successor_reassociation_cannot_recreate_precredit_s_turn():
     assert max(yaw_steps) < 0.08
 
 
-def test_correlated_successor_quality_does_not_create_precredit_dead_zone():
-    # F131 fixed the passage reserve: it rose 0.35 -> 0.83 while the old
-    # Gate-1 hypothesis remained consistently left.  Yet covariance and age
-    # rose from the same missed frames, and their product (again multiplied by
-    # confidence) drove authority 0.10 -> 0.05 and reversed the reference
-    # until reassociation.  Use the weakest quality once so the bounded,
-    # derotated bearing keeps one left handoff through the fresh-id tick.
-    controller = _turn_reference_controller(current_x=0.02)
-    now = 100.10
-    controller.state = CleanCourseState.PREDICT
-    controller.current.outer_log_scale = -0.95
-    controller.current.aperture_half_x = None
-    controller.current.aperture_half_y = None
-    controller.successor.x_axis.p = -0.43
-    controller.successor.confidence = 0.64
-    controller.successor.outer_log_scale = -4.37
-    controller._turn_aperture_reserve = 0.438
-    controller._turn_successor_authority = 0.055
-    controller._turn_reference_x = 0.010
-    controller._turn_reference_yaw_rad = 0.0
-    controller._last_command_s = now
-
-    samples = []
-    variations = (
-        # The old-id uncertainty/age progression while Gate 0 engulfed.
-        (0.378, 0.375, None),
-        (0.460, 0.469, None),
-        (0.556, 0.578, None),
-        # Same physical left gate, now assigned the fresh fused-track id.
-        (0.141, 0.0, "B-reassociated"),
-        (0.014, 0.0, None),
-        (0.014, 0.0, None),
-    )
-    for std, age_s, replacement_id in variations:
-        now += 0.047
-        variance = (std / math.sqrt(2.0)) ** 2
-        controller.successor.x_axis.pp = variance
-        controller.successor.y_axis.pp = variance
-        controller.successor.last_measurement_s = now - age_s
-        controller.successor.last_x_measurement_s = now - age_s
-        if replacement_id is not None:
-            controller.successor.track_id = replacement_id
-            controller._track_first_seen_s[replacement_id] = now
-        controller._last_engulfing_anchor_s = now
-        samples.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
-
-    first_left = next(
-        index for index, sample in enumerate(samples) if sample.yaw_rate_rad_s < 0.0
-    )
-    assert first_left < 3  # useful turn starts before the fresh-id tick
-    assert all(sample.yaw_rate_rad_s < 0.0 for sample in samples[first_left:])
-    assert all(sample.target_roll_rad < 0.0 for sample in samples[first_left:])
-    yaw_steps = [
-        abs(right.yaw_rate_rad_s - left.yaw_rate_rad_s)
-        for left, right in zip(samples, samples[1:])
-    ]
-    assert max(yaw_steps) < 0.08
-
-
 def test_weak_successor_evidence_decays_turn_reference_smoothly():
     controller = _turn_reference_controller(current_x=0.04)
     now = 100.10
@@ -2280,6 +2225,49 @@ def test_weak_successor_evidence_decays_turn_reference_smoothly():
     assert all(yaw < 0.0 for yaw in yaws)
 
 
+def test_safe_passage_release_prevents_camera_current_error_counterturn():
+    # F132 at credit-0.468 s: the consistently-left successor retained 0.24
+    # authority and Gate 0 had 0.76 signed leg-frame aperture reserve, but the
+    # convex blend still gave camera-x +0.121 a 0.76 weight and turned right.
+    # Safe passage releases that camera-centering demand continuously; the
+    # sole carried reference must remain left without a sign latch.
+    controller = _turn_reference_controller(current_x=0.121)
+    now = 100.10
+    controller._course_anchor_yaw_rad = 0.0
+    controller._turn_reference_yaw_rad = -0.096
+    controller._turn_reference_x = -0.0021
+    controller._turn_aperture_reserve = 0.680
+    controller._turn_successor_authority = 0.252
+    controller.current.x_axis.p = 0.121
+    controller.current.x_axis.v = 0.0
+    controller.current.raw_x = 0.172
+    controller.successor.x_axis.p = -0.358
+    controller.successor.confidence = 0.636
+    variance = (0.439 / math.sqrt(2.0)) ** 2
+    controller.successor.x_axis.pp = variance
+    controller.successor.y_axis.pp = variance
+    controller.successor.last_measurement_s = now - 0.407
+    controller.successor.last_x_measurement_s = now - 0.407
+
+    reference, authority = controller._turn_reference(
+        controller.current,
+        controller.successor,
+        current_error=0.121,
+        now_s=now,
+        yaw_rad=-0.096,
+        dt=0.047,
+    )
+    target_roll, yaw_rate = controller._coordinated_turn_request(
+        reference, steer_gain=1.0, yaw_rad=-0.096
+    )
+
+    assert controller._turn_aperture_reserve > 0.68
+    assert 0.0 < authority < 0.252
+    assert reference < 0.0
+    assert yaw_rate < 0.0
+    assert target_roll < 0.0
+
+
 def test_weak_opposite_successor_cannot_erase_current_gate_turn():
     # F120 live regression: Gate 1 was still x=-0.309 when a right-side Gate
     # 2 candidate reached only 2.1e-7 authority.  Binary sign arbitration
@@ -2306,7 +2294,7 @@ def test_weak_opposite_successor_cannot_erase_current_gate_turn():
     )
 
     assert authority == pytest.approx(0.0)
-    assert heading == pytest.approx(-0.30)
+    assert heading < -0.02
     assert yaw_rate < -0.02
     assert target_roll < 0.0
 

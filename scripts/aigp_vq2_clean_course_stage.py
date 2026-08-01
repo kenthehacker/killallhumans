@@ -2831,19 +2831,18 @@ class CleanCourseController:
                 / max(1e-6, cfg.successor_min_log_scale_gap)
             )
             # Successor selection already owns persistence, so track age is
-            # deliberately absent here.  F132 pairs F131's signed passage
-            # reserve with one continuous evidence quality.  Confidence,
-            # covariance, and freshness are correlated consequences of the
-            # same missed observation; multiplying them made the credible
-            # left successor lose authority three times while passage reserve
-            # was rising, reversing the shared reference until reassociation.
-            # The weakest evidence remains authoritative without restoring a
-            # binary qualification gate or a second command-bearing state.
-            evidence_quality = min(confidence, uncertainty, freshness)
+            # deliberately absent here.  F125/F126 showed that feeding this
+            # product directly into the reference still let covariance loss
+            # followed by a fresh tracker id create a 0.126 rad/s yaw jump.
+            # Carry the evidence product continuously; weak evidence changes
+            # authority instead of resetting it, while the one reference below
+            # remains the only state that can command yaw and bank.
             desired_authority = (
                 closure
                 * self._turn_aperture_reserve
-                * evidence_quality
+                * confidence
+                * uncertainty
+                * freshness
                 * range_order
             )
         self._turn_successor_authority += alpha * (
@@ -2856,13 +2855,15 @@ class CleanCourseController:
             self._turn_successor_authority if successor is not None else 0.0
         )
         if successor is not None:
-            # A true convex blend has no low-authority dead zone: weak
-            # successor evidence leaves current-passage alignment in charge,
-            # while credible evidence transfers that same coordinated yaw
-            # and bank reference toward the successor.  The filtered
-            # aperture reserve is already one factor in the carried authority.
+            # F133: passage reserve continuously releases current-gate
+            # centering independently of successor strength.  F124's convex
+            # weighting kept current camera-x at nearly full authority even
+            # when the leg-relative swept envelope said passage was safe; the
+            # resulting camera-yaw artifact countermanded a known-left gate.
+            # Both bearing terms remain in camera coordinates, while the
+            # signed leg-frame reserve is only the scalar passage authority.
             desired = (
-                (1.0 - authority) * float(current_error)
+                (1.0 - self._turn_aperture_reserve) * float(current_error)
                 + authority * successor.x
             )
 
