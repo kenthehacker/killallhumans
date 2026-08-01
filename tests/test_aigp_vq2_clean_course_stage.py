@@ -1168,14 +1168,15 @@ def test_descent_floor_cannot_fire_from_frozen_vz_est():
     assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-9)
 
 
-def test_fh_untrusted_floor_not_inflated_by_brake_attitude():
+def test_fh_untrusted_course_floor_tapers_when_gate_is_low():
     # F83 (20260730T113315Z-visual-course-57671d35): at the -0.55 pre-cross
     # brake attitude the tilt-compensated support rose 0.2594 -> 0.2906, so
     # the F21 fh-untrusted floor (support + 0.05) pinned MAX thrust for the
     # whole 1.3 s latch while the same latch disabled the vz climb governor
     # — an open-loop +2.4 m/s^2 balloon carried the drone OVER gate 1 (no
     # credit; ground collision after the fall).  The floor's support term
-    # is bounded at the spawn-level tilt compensation.
+    # remains bounded at spawn-level tilt compensation.  F112 also tapers
+    # only the extra deficit margin when fresh course-gate geometry is low.
     controller = _tracked_controller(_track("A", 0.0, 0.50))
     now = 100.10
     # Promote to gate 1 (F83's leg; the gate-0 brake band is out of scope).
@@ -1190,8 +1191,8 @@ def test_fh_untrusted_floor_not_inflated_by_brake_attitude():
     controller._alt_est_m = 2.0  # honest altitude (pre-gate-1 floor quiet)
     # Latch fh-untrusted (0.3 s sustain over the 5.0 trigger) at the F83
     # brake attitude.  The gate sits LOW (compensated ey ~+0.12 at this
-    # pitch), so the qualified PD asks for ~0.28 — BELOW the floor — which
-    # isolates the floor as the decisive term.
+    # pitch), so the qualified PD asks below the old pinned floor.  The extra
+    # margin now tapers continuously toward bare level support.
     out = None
     for _ in range(12):
         now += 0.033
@@ -1200,7 +1201,18 @@ def test_fh_untrusted_floor_not_inflated_by_brake_attitude():
         out = _command(controller, now, pitch=-0.55, fh=6.0)
     assert controller._fh_untrusted
     assert out.vertical_qualified
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-3)
+    compensated_ey = controller._compensated_ey(0.50, -0.55)
+    margin_fraction = 1.0 - min(
+        1.0,
+        max(0.0, compensated_ey)
+        / controller.config.near_brake_relax_course_ey_norm,
+    )
+    assert out.thrust == pytest.approx(
+        SPAWN_SUPPORT
+        + controller.config.fh_untrusted_vertical_margin * margin_fraction,
+        abs=1e-3,
+    )
+    assert SPAWN_SUPPORT <= out.thrust < SPAWN_SUPPORT + 0.05
 
 
 def test_closure_governor_full_brake_at_high_expansion_rate():

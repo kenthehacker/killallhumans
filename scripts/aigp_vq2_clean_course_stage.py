@@ -3174,9 +3174,10 @@ class CleanCourseController:
             # so the qualified-PD path sagged collective 0.318 -> 0.254 over
             # 1.5 s at fh 6.5-7.5 — below real hover in the fast regime — and
             # the drone sank ~2 m into terrain.  While vz/alt are known lies,
-            # NOTHING may command below support + margin (the F14-measured
-            # biased-regime deficit); honest qualified PD may still command
-            # above the floor.  This closes the blind-sink family in one
+            # NOTHING may command below the governed support floor (the
+            # F14-measured deficit margin is tapered only by fresh low-gate
+            # geometry on course legs); honest qualified PD may still command
+            # above it.  This closes the blind-sink family in one
             # place (F19 SEARCH hold, F20 coast gate, F21 qualified-PD sag)
             # instead of per-path patches.
             # F83 (20260730T113315Z-visual-course-57671d35): the floor's
@@ -3192,10 +3193,27 @@ class CleanCourseController:
             level_support = self.config.support_collective / max(
                 0.85, math.cos(self.config.spawn_pitch_rad)
             )
-            floor = (
-                min(support, level_support)
-                + self.config.fh_untrusted_vertical_margin
-            )
+            floor_margin = self.config.fh_untrusted_vertical_margin
+            # F112 (20260801T060914Z-visual-course-39579943): the full
+            # support+0.05 regime floor remained pinned after the correctly
+            # tracked Gate 1 moved BELOW the vehicle (compensated ey +0.44).
+            # Closure was finally inside budget (~0.22/s), but the floor
+            # overruled fresh camera descent demand and the vertical entry
+            # budget could never pass.  On course legs only, taper that extra
+            # deficit margin as fresh compensated geometry moves from center
+            # to the existing low-gate custody bound.  Bare level support is
+            # still a hard floor: untrusted IMU state can never command the
+            # historical sub-support blind sink.
+            if (
+                self.gate_index >= 1
+                and gate_y is not None
+                and self.config.near_brake_relax_course_ey_norm > 1e-9
+            ):
+                floor_margin *= 1.0 - _clamp01(
+                    max(0.0, gate_y)
+                    / self.config.near_brake_relax_course_ey_norm
+                )
+            floor = min(support, level_support) + floor_margin
             governed = _clamp(
                 max(collective, floor),
                 self.config.min_thrust,
