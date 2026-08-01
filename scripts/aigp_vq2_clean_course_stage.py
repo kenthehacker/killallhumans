@@ -2572,11 +2572,15 @@ class CleanCourseController:
             )
         # F80 (see the COURSE_PRE_CROSS_BRAKE_PITCH_RAD block): course legs
         # inherit the previous crossing's energy, so the TRUE brake doubles
-        # to -0.30 from spawn at gate_index >= 1; gate 0 keeps the proved
-        # -0.15.  Same single blend, same relax/custody machinery.
+        # to -0.30 from spawn at gate_index >= 1.  F104 applies that same
+        # bounded brake to Gate 0 only when the near-plane COMMIT budget is
+        # false: F102/F103 crossed from PREDICT with raw expansion still
+        # above the entry budget, so the weaker Gate-0 hold did not arrest
+        # the handoff energy.  Far Gate-0 alignment keeps the proved -0.15
+        # brake.  Same single blend and relax/custody machinery throughout.
         brake_pitch_offset = (
             cfg.course_pre_cross_brake_pitch_rad
-            if self.gate_index >= 1
+            if self.gate_index >= 1 or near_plane_hold
             else cfg.pre_cross_brake_pitch_rad
         )
         target_pitch = law_pitch + brake_demand * (

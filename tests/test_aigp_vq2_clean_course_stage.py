@@ -2447,6 +2447,50 @@ def test_commit_entry_arms_on_gate_zero():
     assert climbing._pre_cross_brake_active
 
 
+def test_gate_zero_budget_false_hold_uses_full_course_brake():
+    # F104: F102/F103 received authoritative Gate-0 credit from PREDICT,
+    # never COMMIT.  Raw expansion remained above the 0.35/s entry budget
+    # through censorship while the Gate-0 hold used only the -0.15 offset.
+    # Preserve the far approach, but once Gate 0 is near-plane with a false
+    # entry budget, use the already-bounded course brake.  The existing
+    # custody floor remains the final authority and keeps the gate visible.
+    controller = _commit_controller_gate_zero()
+    current = controller.current
+    current.x_axis.p = 0.0
+    current.raw_x = 0.0
+    current.y_axis.p = 0.15
+    current.raw_y = 0.15
+    current.scale_axis.p = -1.0
+    current.scale_axis.v = 0.0
+    current.outer_log_scale = -1.0
+    current.outer_expansion_rate = 1.5
+    weak_brake_attitude = (
+        controller.config.spawn_pitch_rad
+        + controller.config.pre_cross_brake_pitch_rad
+    )
+    now = 100.10
+    out = None
+    for _ in range(15):
+        now += 0.033
+        current.last_measurement_s = now
+        current.last_x_measurement_s = now
+        current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=weak_brake_attitude)
+
+    assert controller.state is CleanCourseState.TRACK
+    assert controller._pre_cross_brake_active
+    assert out.target_pitch_rad < weak_brake_attitude - 0.05
+    compensated_ey = 0.15 - 0.15 * controller.config.vertical_pitch_comp_norm_per_rad
+    custody_floor = controller.config.spawn_pitch_rad - (
+        (
+            controller.config.near_brake_relax_ey_norm
+            - compensated_ey
+        )
+        / controller.config.vertical_pitch_comp_norm_per_rad
+    )
+    assert out.target_pitch_rad == pytest.approx(custody_floor, abs=1e-9)
+
+
 def test_commit_entry_fires_sustained_aligned_near_plane():
     # F53 (20260729T233602Z-visual-course-072c8a7b): the misalignment brake
     # self-locked the F52 drone into a hover 1-2 m short of gate 1's plane.
