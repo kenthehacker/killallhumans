@@ -544,12 +544,14 @@ BRAKE_RELAX_EY_NORM = 0.55  # far-range compensated ey custody bound
 # for the remaining ~7 s (blind wander into the floor/structure).  Inside
 # the commit proximity regime the floor runs on the derotated HYPOTHESIS
 # (the F52 best-evidence rationale), with a lower bound.
-# F71 (20260730T060005Z-visual-course-f05911e4): a 0.30 near bound sat above
-# the achieved ey (0.22-0.30), so the brake walked the gate down the FOV into
-# engulfing.  F152 removes the remaining gate-specific/filtered-scale switch:
-# every leg approaches this proved passage-custody bound continuously on the
-# existing outer-range ramp, so race promotion cannot change pitch authority.
-NEAR_BRAKE_RELAX_EY_NORM = 0.18  # passage-range custody bound on every leg
+NEAR_BRAKE_RELAX_EY_NORM = 0.30  # commit-regime custody bound
+# F71 (20260730T060005Z-visual-course-f05911e4): on the gate-1 leg the 0.30
+# engage bound sat a hair above the achieved hypothesis ey (0.22-0.30 for
+# the whole final second), so the relax never fired; the -0.41..-0.43 brake
+# attitude walked the gate down the FOV into engulfing at the plane and a
+# one-tick newborn corner splinter was adopted as the aim (collision id
+# 1001, impulse 5.86).  Course legs (gate_index >= 1) get a tighter bound.
+NEAR_BRAKE_RELAX_COURSE_EY_NORM = 0.18  # course-leg custody bound
 # Course-heading anchor (F31): after losing the gate-1 track the drone
 # search-swept and edge-chased its heading +2.63 rad off the course
 # bearing, then flew sideways/backwards at ~0.65g drag into structure it
@@ -965,6 +967,7 @@ class CleanCourseConfig:
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     brake_relax_ey_norm: float = BRAKE_RELAX_EY_NORM
     near_brake_relax_ey_norm: float = NEAR_BRAKE_RELAX_EY_NORM
+    near_brake_relax_course_ey_norm: float = NEAR_BRAKE_RELAX_COURSE_EY_NORM
     brake_ceiling_band: float = BRAKE_CEILING_BAND
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_est_min_m: float = ALT_EST_MIN_M
@@ -2199,19 +2202,21 @@ class CleanCourseController:
         # above level: a genuinely low gate is re-centered by the vertical
         # channel, never by advancing.  ey_vertical is attitude-invariant
         # by construction, so the floor is stable without any hysteresis.
-        # F152: the bound itself now transfers continuously on raw outer
-        # range.  The old filtered-scale/gate-index selector contradicted
-        # F125 by changing camera custody at promotion and engaging too late.
-        passage = self._course_range_ramp(current)
-        relax_bound = cfg.brake_relax_ey_norm + passage * (
-            cfg.near_brake_relax_ey_norm - cfg.brake_relax_ey_norm
+        commit_regime = current.log_scale >= cfg.commit_min_log_scale
+        relax_bound = (
+            cfg.near_brake_relax_course_ey_norm
+            if commit_regime and self.gate_index >= 1
+            else cfg.near_brake_relax_ey_norm
+            if commit_regime
+            else cfg.brake_relax_ey_norm
         )
         custody_floor = cfg.spawn_pitch_rad - (
             (relax_bound - ey_vertical) / cfg.vertical_pitch_comp_norm_per_rad
         )
         custody_floor = min(
             custody_floor,
-            cfg.spawn_pitch_rad + cfg.brake_pitch_rad,
+            cfg.spawn_pitch_rad
+            + (0.0 if commit_regime else cfg.brake_pitch_rad),
         )
         target_pitch = max(target_pitch, custody_floor)
 
@@ -2889,11 +2894,21 @@ class CleanCourseController:
         vz_des_sink_max = cfg.course_vz_des_ground_m_s + (
             vz_des_max - cfg.course_vz_des_ground_m_s
         ) * _clamp01(self._alt_est_m / cfg.course_vz_des_ground_alt_m)
-        return _clamp(
+        bounded_vz_des = _clamp(
             -cfg.course_vz_des_per_norm * bounded_error,
             -vz_des_sink_max,
             vz_des_max,
         )
+        # F153 discriminates physical position-loop overshoot from the
+        # already-disproven camera-custody explanation.  F150's compensated
+        # position request remained climb-positive while Gate 1 approached,
+        # carrying vz/altitude through zero before the aperture ran down the
+        # image.  F144/F146 proved that fading physical IMU damping is unsafe.
+        # Keep that damping at full authority and continuously withdraw only
+        # the position-driven desired rate over the existing range ramp.  At
+        # passage the one owner therefore arrests real vertical velocity
+        # instead of chasing an angular error amplified by closure.
+        return bounded_vz_des * (1.0 - ramp)
 
     def _course_range_ramp(self, current: _Hypothesis) -> float:
         """Continuous far-to-crossing authority transfer already used by vz."""

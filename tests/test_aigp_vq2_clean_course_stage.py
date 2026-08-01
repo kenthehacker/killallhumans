@@ -431,16 +431,21 @@ def test_gate0_climb_offset_scales_with_closure():
     far = _tracked_controller(
         _track("A", 0.0, -0.10, scale=0.1667), config=config
     )
+    far_arrival_authority = 1.0 - far._course_range_ramp(far.current)
     assert _command(far, 100.10, pitch=SPAWN_PITCH).thrust == pytest.approx(
-        SPAWN_SUPPORT + 0.12 * (0.10 + 0.25), abs=1e-9
+        SPAWN_SUPPORT + 0.12 * (0.10 + 0.25) * far_arrival_authority,
+        abs=1e-9,
     )
 
     mid = _tracked_controller(
         _track("A", 0.0, -0.10, scale=math.exp(-1.295)), config=config
     )
     mid_offset = 0.25 * (-1.295 - (-0.80)) / (-1.79 - (-0.80))
+    mid_arrival_authority = 1.0 - mid._course_range_ramp(mid.current)
     assert _command(mid, 100.10, pitch=SPAWN_PITCH).thrust == pytest.approx(
-        SPAWN_SUPPORT + 0.12 * (0.10 + mid_offset), abs=1e-9
+        SPAWN_SUPPORT
+        + 0.12 * (0.10 + mid_offset) * mid_arrival_authority,
+        abs=1e-9,
     )
 
     crossing = _tracked_controller(
@@ -470,9 +475,11 @@ def test_gate0_climb_offset_never_lifts_aim_above_center():
         _track("A", 0.0, 0.10, scale=0.1667), config=config
     )
     output = _command(below, 100.10, pitch=SPAWN_PITCH)
-    # Offset contributes nothing: vz_des = -0.10, tracked at 0.12 (F100).
+    # Offset contributes nothing; F153's continuous arrival authority also
+    # applies at this observed outer scale.
+    arrival_authority = 1.0 - below._course_range_ramp(below.current)
     assert output.thrust == pytest.approx(
-        SPAWN_SUPPORT - 0.12 * 0.10, abs=1e-9
+        SPAWN_SUPPORT - 0.12 * 0.10 * arrival_authority, abs=1e-9
     )
     assert output.thrust < SPAWN_SUPPORT
 
@@ -508,9 +515,9 @@ def test_vertical_rate_owner_applies_in_predict_and_search():
 
 
 def test_near_plane_compensated_gate_y_keeps_physical_sink_damping():
-    # F147: compensated geometry still sets the desired rate at the crossing,
-    # but it must not erase measured vertical energy.  F146 reached Gate-0
-    # credit sinking -0.55 m/s after the range fade removed this damping.
+    # F153's diagnostic arrival reference removes the position-driven rate at
+    # the crossing, but it must not erase measured vertical energy.  F146
+    # reached Gate-0 credit sinking -0.55 m/s after range-fading this damping.
     brake_pitch = -0.46
     controller = _tracked_controller(_track("A", 0.0, 0.10))
     controller.current.outer_log_scale = controller.config.commit_min_log_scale
@@ -520,15 +527,14 @@ def test_near_plane_compensated_gate_y_keeps_physical_sink_damping():
     compensated = controller._compensated_ey(0.10, brake_pitch)
     assert compensated < 0.0
     assert out.thrust == pytest.approx(
-        support + 0.12 * (-compensated - controller._vz_est_m_s), abs=1e-9
+        support + 0.12 * (0.0 - controller._vz_est_m_s), abs=1e-9
     )
     assert out.thrust > support
 
 
 def test_qualified_imu_rate_authority_does_not_fade_with_range():
-    # F147 keeps the one physical-rate owner continuous through the existing
-    # proximity ramp.  Range can cap the desired rate, but cannot silently
-    # remove damping of an already-established physical sink.
+    # F153 fades only position-driven motion.  Range cannot silently remove
+    # damping of an already-established physical sink.
     thrusts = []
     for outer_log_scale in (-2.0, -1.8, -1.6, -1.4, -1.2):
         controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
@@ -539,6 +545,37 @@ def test_qualified_imu_rate_authority_does_not_fade_with_range():
 
     assert thrusts == pytest.approx(
         [SPAWN_SUPPORT + 0.12 * 0.40] * len(thrusts), abs=1e-9
+    )
+
+
+def test_position_driven_vertical_rate_fades_continuously_with_range():
+    # F153's one-flight discriminator uses the existing outer-range ramp and
+    # no new mode boundary.  Far away the compensated position owns its full
+    # desired rate; at passage only the independently tested IMU damping is
+    # left.  The exact zero is an explicit falsifier, not hidden authority.
+    controller = _tracked_controller(_track("A", 0.0, 0.30, scale=0.10))
+    controller._alt_est_m = 2.0
+    current = controller.current
+    sink_rates = []
+    climb_rates = []
+    for outer_log_scale in (-2.0, -1.8, -1.6, -1.4, -1.2):
+        current.outer_log_scale = outer_log_scale
+        sink_rates.append(
+            controller._course_vz_setpoint(
+                current, vertical_error=0.30, vertical_qualified=True
+            )
+        )
+        climb_rates.append(
+            controller._course_vz_setpoint(
+                current, vertical_error=-0.30, vertical_qualified=True
+            )
+        )
+
+    assert sink_rates == pytest.approx(
+        (-0.30, -0.225, -0.15, -0.06875, 0.0)
+    )
+    assert climb_rates == pytest.approx(
+        (0.30, 0.225, 0.15, 0.06875, 0.0)
     )
 
 
@@ -1593,7 +1630,7 @@ def test_near_plane_custody_floor_runs_on_the_stale_hypothesis():
     # pre-cross brake attitude pitched the gate out of the FOV; the drone
     # wandered blind for ~7 s into the floor/structure.  Inside the commit
     # proximity regime the F94 custody floor runs on the STALE derotated
-    # hypothesis (no freshness gate): past the 0.18 bound it surrenders to
+    # hypothesis (no freshness gate): past the 0.30 bound it surrenders to
     # level, below it the brake is preserved proportionally.
     controller = _tracked_controller(_track("A", 0.30, 0.43, scale=0.50))
     controller.current.scale_axis.v = 0.7  # rapid expansion: full brake demand
@@ -1612,17 +1649,17 @@ def test_near_plane_custody_floor_runs_on_the_stale_hypothesis():
         now += 0.033
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert out.target_pitch_rad == pytest.approx(
-        SPAWN_PITCH - (0.18 - 0.10) / 1.6, abs=1e-9
+        SPAWN_PITCH - (0.30 - 0.10) / 1.6, abs=1e-9
     )
 
 
-def test_passage_custody_floor_is_gate_agnostic():
+def test_course_leg_custody_floor_relaxes_the_single_brake():
     # F71 (20260730T060005Z-visual-course-f05911e4): on the gate-1 leg the
     # 0.30 bound sat a hair above the achieved hypothesis ey (0.22-0.30
     # through the final second), so the brake attitude walked the gate into
-    # engulfing at the plane.  F152 uses the tighter 0.18 passage bound on
-    # every leg: promotion cannot switch pitch authority under identical
-    # evidence.
+    # engulfing at the plane.  Course legs (gate_index >= 1) use the tighter
+    # 0.18 bound, and the F94 floor is continuous: more brake as the gate
+    # recovers above the bound, level only when genuinely past it.
     controller = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
     controller.gate_index = 1
     # Stopped (expansion 0): the brake demand comes from the ex 0.30
@@ -1653,38 +1690,17 @@ def test_passage_custody_floor_is_gate_agnostic():
     assert drive().target_pitch_rad == pytest.approx(
         SPAWN_PITCH + controller.config.pre_cross_brake_pitch_rad, abs=1e-9
     )
-    # Gate 0 uses the identical bound: the same geometry emits the same pitch.
+    # Gate 0 keeps the wider 0.30 bound: the same ey 0.22 leaves MORE
+    # brake authority, not less.
     gate0 = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
     gate0.current.scale_axis.v = 0.7
     now0 = 100.10
     for _ in range(20):
         now0 += 0.033
         out0 = _command(gate0, now0, pitch=SPAWN_PITCH)
-    assert out0.target_pitch_rad == pytest.approx(out.target_pitch_rad, abs=1e-9)
-
-
-def test_brake_custody_uses_one_continuous_outer_range_schedule():
-    # F152: replace the far/near filtered-scale selector with the existing
-    # outer-range ramp.  A fixed physical bearing may relax brake authority
-    # smoothly, but cannot jump because a threshold flickers or race promotes.
-    pitches = []
-    for outer_log_scale in (-2.00, -1.80, -1.60, -1.40, -1.20):
-        controller = _tracked_controller(_track("A", 0.30, 0.30, scale=0.10))
-        controller.current.outer_log_scale = outer_log_scale
-        now = 100.10
-        out = None
-        for _ in range(20):
-            now += 0.033
-            controller.current.last_measurement_s = now
-            controller.current.last_x_measurement_s = now
-            controller.current.last_y_measurement_s = now
-            out = _command(controller, now, pitch=SPAWN_PITCH)
-        pitches.append(out.target_pitch_rad)
-
-    assert pitches[0] == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
-    assert pitches[-1] == pytest.approx(SPAWN_PITCH, abs=1e-9)
-    assert all(right >= left for left, right in zip(pitches, pitches[1:]))
-    assert max(abs(right - left) for left, right in zip(pitches, pitches[1:])) < 0.07
+    assert out0.target_pitch_rad == pytest.approx(
+        SPAWN_PITCH - (0.30 - 0.22) / 1.6, abs=1e-9
+    )
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():
@@ -3565,13 +3581,12 @@ def test_course_leg_vz_des_sink_is_capped_near_the_ground():
     assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.018, abs=1e-3)
 
 
-def test_course_leg_vz_des_respects_commit_budget_near_plane():
+def test_course_leg_position_reference_fades_before_commit_plane():
     # F97: F96's tracker saturated vz_des at -0.5 pulling a low gate
     # (ey +0.3) to center and held vz -0.46 into the plane, so COMMIT's
-    # |vz| <= 0.25 entry budget vetoed the crossing.  The setpoint cap
-    # ramps 0.5 -> 0.20 across the approach (ramp start log_scale -2.0,
-    # commit_min_log_scale -1.2): near the plane the same geometry
-    # commands a budget-compatible descent.
+    # |vz| <= 0.25 entry budget vetoed the crossing.  F153's bounded
+    # diagnostic goes one step further: the position-driven setpoint fades
+    # continuously to zero at commit range while physical rate damping stays.
     # F98: the ramp reads outer_log_scale (COMMIT's own proximity
     # signal) — F97 keyed on the filtered hypothesis scale, which lagged
     # (-1.67) while the gate already engulfed the frame.  This test
@@ -3596,9 +3611,9 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
         current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.TRACK
-    # At/inside commit range the setpoint is capped at -0.20, while the same
-    # full physical-rate error also damps the measured +0.10 m/s climb.
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.036, abs=1e-3)
+    # At/inside commit range only the full physical-rate error damps the
+    # measured +0.10 m/s climb; nonzero image position has no hidden owner.
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.012, abs=1e-3)
     # Far away the full -0.30 setpoint and +0.10 IMU climb both apply.
     far = _tracked_controller(_track("A", 0.0, 0.30, scale=0.20))
     _promote_to_gate_one(far)
@@ -3994,34 +4009,22 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     assert out.target_pitch_rad == pytest.approx(
         SPAWN_PITCH + 0.15, abs=1e-9
     )
-    # COMMIT uses the same bounded desired-vz law as TRACK.
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.12 * 0.05, abs=1e-9)
+    # F153's diagnostic arrival reference is continuous across TRACK/COMMIT:
+    # at this passage-range fixture position authority has faded to zero.
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
     baseline_thrust = out.thrust
-    # A larger downward error lowers the one target, but the carried
-    # collective cannot jump to it in one control tick.
+    # Image-position changes cannot resurrect a hidden near-plane owner.
     controller.current.y_axis.p = 0.50
     out = _command(controller, now + 0.033, pitch=SPAWN_PITCH)
-    descend_target = (
-        SPAWN_SUPPORT
-        - controller.config.course_vz_track_gain
-        * controller.config.course_vz_des_commit_m_s
-    )
-    assert descend_target < out.thrust < baseline_thrust
-    assert baseline_thrust - out.thrust < 0.01
+    assert out.thrust == pytest.approx(baseline_thrust, abs=1e-9)
     controller.current.y_axis.p = 1.0
     deeper = _command(controller, now + 0.066, pitch=SPAWN_PITCH)
-    assert descend_target < deeper.thrust < out.thrust
-    # Reversing the visual setpoint changes direction continuously rather
-    # than activating a separate climb margin.
+    assert deeper.thrust == pytest.approx(baseline_thrust, abs=1e-9)
+    # Reversing the visual setpoint likewise cannot activate a climb margin;
+    # the separate test below proves that physical-rate damping remains live.
     controller.current.y_axis.p = -1.0
     rebound = _command(controller, now + 0.099, pitch=SPAWN_PITCH)
-    climb_target = (
-        SPAWN_SUPPORT
-        + controller.config.course_vz_track_gain
-        * controller.config.course_vz_des_commit_m_s
-    )
-    assert deeper.thrust < rebound.thrust < climb_target
-    assert rebound.thrust - deeper.thrust < 0.01
+    assert rebound.thrust == pytest.approx(baseline_thrust, abs=1e-9)
     # The progress-removers stay bypassed: a bearing that would fully
     # engage the misalignment brake in TRACK gets no brake pitch — the
     # advance continues; steering follows the fresh bearing (yaw gain
@@ -4089,9 +4092,10 @@ def test_commit_qualified_vertical_keeps_full_physical_rate_reference():
     assert out.thrust <= controller.config.max_thrust
 
 
-def test_commit_stale_y_relaxes_continuously_to_zero_vz_reference():
-    # Frozen climb-side image evidence ages out into the same zero-vz owner.
-    # The carried collective must relax toward support without a mode step.
+def test_commit_stale_y_keeps_the_same_zero_vz_reference():
+    # At COMMIT range F153 has already faded position authority continuously
+    # to zero.  Aging or refreshing image evidence cannot produce a
+    # qualification step or resurrect another collective owner.
     controller = _commit_controller()
     out, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
@@ -4109,19 +4113,12 @@ def test_commit_stale_y_relaxes_continuously_to_zero_vz_reference():
             stale_thrusts.append(out.thrust)
     assert controller.state is CleanCourseState.COMMIT
     assert len(stale_thrusts) > 5
-    assert all(
-        after <= before + 1e-12
-        for before, after in zip(stale_thrusts, stale_thrusts[1:])
+    assert thrusts == pytest.approx([SPAWN_SUPPORT] * len(thrusts), abs=1e-9)
+    assert stale_thrusts == pytest.approx(
+        [SPAWN_SUPPORT] * len(stale_thrusts), abs=1e-9
     )
-    assert abs(stale_thrusts[-1] - SPAWN_SUPPORT) < abs(
-        stale_thrusts[0] - SPAWN_SUPPORT
-    )
-    assert max(
-        abs(after - before) for before, after in zip(thrusts, thrusts[1:])
-    ) < 0.01
 
-    # Fresh low-gate evidence reuses the same owner and eventually asks below
-    # support; there is no instantaneous band or overlay command.
+    # Fresh low-gate evidence remains position-neutral at this same range.
     controller.current.y_axis.p = 0.50
     fresh = []
     for _ in range(20):
@@ -4130,8 +4127,7 @@ def test_commit_stale_y_relaxes_continuously_to_zero_vz_reference():
         controller.current.last_x_measurement_s = now
         controller.current.last_y_measurement_s = now
         fresh.append(_command(controller, now, pitch=SPAWN_PITCH).thrust)
-    assert fresh[-1] < SPAWN_SUPPORT
-    assert all(after <= before + 1e-12 for before, after in zip(fresh, fresh[1:]))
+    assert fresh == pytest.approx([SPAWN_SUPPORT] * len(fresh), abs=1e-9)
 
 
 def test_commit_timeout_drops_hypothesis_and_searches():
