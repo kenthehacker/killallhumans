@@ -2228,6 +2228,37 @@ def test_promoted_camera_bearing_unwinds_completed_left_translation():
     assert outputs[-1].target_roll_rad >= -0.01
 
 
+def test_fresh_current_x_correction_does_not_lag_imu_derotation():
+    # F138 Gate 1 remained freshly measured near x=-0.14 while sustained
+    # left yaw repeatedly derotated the carried reference right.  The fixed
+    # 0.15 s correction then equilibrated near -0.03 in this exact sequence,
+    # hiding most of the live error.  Existing x certainty/freshness must
+    # continuously restore the measured reference without deleting the
+    # slow bounded carry used when x is stale.
+    controller = _turn_reference_controller(
+        successor_x=None, current_x=-0.14
+    )
+    controller._turn_reference_x = -0.14
+    controller._turn_reference_yaw_rad = 0.0
+    now = 100.10
+    references = []
+    for tick in range(12):
+        now += 0.04
+        controller.current.last_x_measurement_s = now
+        reference, _ = controller._turn_reference(
+            controller.current,
+            None,
+            current_error=-0.14,
+            now_s=now,
+            yaw_rad=-0.02 * (tick + 1),
+            dt=0.04,
+        )
+        references.append(reference)
+
+    assert all(reference < 0.0 for reference in references)
+    assert references[-1] < -0.11
+
+
 def test_weak_successor_evidence_decays_turn_reference_smoothly():
     controller = _turn_reference_controller(current_x=0.04)
     now = 100.10

@@ -2783,6 +2783,16 @@ class CleanCourseController:
         )
         self._turn_aperture_reserve = _clamp01(self._turn_aperture_reserve)
 
+        current_x_uncertainty = _clamp01(
+            1.0 - current.x_axis.std / cfg.search_covariance_std_norm
+        )
+        current_x_freshness = _clamp01(
+            1.0
+            - max(0.0, now_s - current.last_x_measurement_s)
+            / cfg.x_steer_max_age_s
+        )
+        current_x_quality = current_x_uncertainty * current_x_freshness
+        reference_correction_quality = current_x_quality
         desired_authority = 0.0
         desired = float(current_error)
         if successor is not None:
@@ -2817,19 +2827,13 @@ class CleanCourseController:
                 * range_order
             )
             current_confidence = _clamp01(current.confidence)
-            current_uncertainty = _clamp01(
-                1.0 - current.x_axis.std / cfg.search_covariance_std_norm
-            )
-            current_freshness = _clamp01(
-                1.0
-                - max(0.0, now_s - current.last_x_measurement_s)
-                / cfg.x_steer_max_age_s
-            )
             current_claim = (
                 (1.0 - self._turn_aperture_reserve)
                 * current_confidence
-                * current_uncertainty
-                * current_freshness
+                * current_x_quality
+            )
+            reference_correction_quality = (
+                (1.0 - self._turn_aperture_reserve) * current_x_quality
             )
             # F138: F137's normalized ratio granted full authority to any
             # nonzero successor when the current claim vanished, then reused
@@ -2865,7 +2869,26 @@ class CleanCourseController:
         if self._turn_reference_x is None:
             self._turn_reference_x = float(desired)
         else:
-            self._turn_reference_x += alpha * (
+            # F139: the hypothesis filter has already fused fresh camera-x
+            # evidence with IMU prediction.  Applying the same slow turn
+            # time constant after unconditionally derotating this reference
+            # made a fresh Gate 1 under-report its own error by 32-43% in
+            # F138, while a left successor was briefly countermanded across
+            # reassociation.  Retain the continuous reference filter, but
+            # let existing x-axis certainty/freshness shorten only its
+            # measurement-correction time constant.  When x ages out the
+            # original bounded IMU carry returns continuously; no threshold,
+            # latch, second owner, or raw bearing reuse is introduced.
+            reference_alpha = _clamp01(
+                dt
+                / max(
+                    1e-6,
+                    cfg.turn_reference_tau_s
+                    * (1.0 - reference_correction_quality)
+                    + dt,
+                )
+            )
+            self._turn_reference_x += reference_alpha * (
                 float(desired) - self._turn_reference_x
             )
         self._turn_reference_x = _clamp(self._turn_reference_x, -1.0, 1.0)
