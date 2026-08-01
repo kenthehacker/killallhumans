@@ -1978,6 +1978,46 @@ def test_search_never_promotes_retained_successor_without_race_credit():
     assert controller.successor.track_id == "B"
 
 
+def test_search_adopts_retained_successor_after_race_clears_old_ownership():
+    # F110 (20260801T055544Z-visual-course-195506c7): Gate-1 credit arrived
+    # while retained track B was marginal for direct promotion.  note_race
+    # correctly cleared the old current, but F107 still excluded B in SEARCH
+    # and the controller adopted a tiny unrelated track instead.  Once race
+    # authority advances and current ownership is None, B is the authorized
+    # current-gate candidate; adoption also clears its stale successor role.
+    controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
+    controller.observe(
+        _update(
+            [_track("A", 0.0, 0.0, scale=0.50), _track("B", -0.45, 0.10)],
+            frame_id=4,
+        ),
+        now_s=100.08,
+    )
+    assert controller.successor is not None
+    assert controller.successor.track_id == "B"
+    controller.successor.last_measurement_s = 99.0
+    controller.successor.last_x_measurement_s = 99.0
+
+    promoted = controller.note_race(
+        gate_index=1, race_boot_ms=2200, now_s=100.10
+    )
+    assert promoted
+    assert controller.state is CleanCourseState.SEARCH
+    assert controller.current is None
+    assert controller.successor is not None
+    assert controller.successor.track_id == "B"
+
+    controller.observe(
+        _update([_track("B", -0.43, 0.08)], frame_id=5), now_s=100.15
+    )
+
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.gate_index == 1
+    assert controller.current is not None
+    assert controller.current.track_id == "B"
+    assert controller.successor is None
+
+
 def test_newborn_suspicious_truss_not_adopted_in_search_reacquisition():
     # F49 (terminal F48 failure): the gate-1 re-acquisition adopted a
     # NEWBORN top-censored extreme-aspect ceiling truss (span 0.50 x 0.23)

@@ -1522,6 +1522,15 @@ class CleanCourseController:
             )
             if adopted is not None:
                 self.current = self._hypothesis_from_track(adopted, now_s)
+                # After an authoritative increment can no longer promote a
+                # marginal cached successor directly, SEARCH is allowed to
+                # qualify and adopt that now-current gate.  Remove its stale
+                # successor label so one track id cannot own both roles.
+                if (
+                    self.successor is not None
+                    and self.successor.track_id == adopted.track_id
+                ):
+                    self.successor = None
                 self.state = CleanCourseState.TRACK
                 # New target, new geometry: relearn the orbit trim.
                 self._ex_trim = 0.0
@@ -3019,10 +3028,15 @@ class CleanCourseController:
         # Gate-0 brake pushed the current gate below frame, generic SEARCH
         # adopted the already-retained Gate-1 successor and drove toward it
         # while authoritative race ownership remained Gate 0.  A retained
-        # successor is explicitly next-gate evidence; only note_race() may
-        # promote it.  SEARCH may re-adopt the same current id or another
-        # candidate, but never this known successor before credit.
-        successor_id = self._successor_track_id()
+        # successor is explicitly next-gate evidence while a current gate
+        # still owns the leg; only note_race() may promote it then.  F110:
+        # once an authoritative increment has cleared current ownership, the
+        # retained hypothesis describes the gate that is NOW authorized and
+        # SEARCH must be allowed to qualify/adopt it (F109 otherwise adopted
+        # tiny track 06 instead of retained Gate-1 track 04).
+        successor_id = (
+            self._successor_track_id() if self.current is not None else None
+        )
         # F49: newborn suspicious-geometry tracks (ceiling-truss slabs,
         # extreme aspects) are ineligible until they persist — the terminal
         # F48 re-acquisition adopted one over the persistent real gate.
