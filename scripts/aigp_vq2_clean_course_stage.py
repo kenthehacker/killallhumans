@@ -437,26 +437,24 @@ UNMEASURED_X_FORCE_SEARCH_S = 0.75
 # the near-field log_scale/TTC triggers (late), and the post-credit brake
 # (no job left once crossings are slow — and its hard nose-up episodes
 # were themselves VRS generators).
-CLOSURE_TARGET_RATE_S = 0.35  # log-scale rate the governor holds (TTC ~3 s)
 # F108 (20260801T054550Z-visual-course-8b530eed): F106's 0.36/s threshold
 # put Gate 0 on the fast brake response far from the plane.  F107 then
 # accumulated a vertical sink before the near-plane hold (vz -0.11 m/s,
 # altitude -0.09 m at span 0.55), pitched to the custody limit, and struck
 # the structure without credit.  Restore F104's live-proven 0.60/s response
-# ceiling: the range-ramped governor still blends brake continuously, while
+# ceiling: the governor still blends brake continuously, while
 # the explicit near-plane budget-false hold still demands full braking.
 CLOSURE_FULL_BRAKE_RATE_S = 0.60
-# F101 (20260730T173407Z-visual-course-7a862549): a range-flat 0.35
-# target permits 3+ m/s at leg start (0.35 log/s at 8-10 m), more than
-# custody-compatible attitude braking (~0.4-0.7 m/s^2, capped by the F94
-# floor near the plane) can dissipate inside the leg — F100's gate-1 leg
-# held pb=1 mid-leg and still ran away to ~1.2 log/s at the plane
-# (COMMIT veto, blind structure strike).  The target ramps from a low
-# far value (an implicit constant-speed cap while the full gate is
-# visible and custody is free) up to the unchanged 0.35 entry budget at
-# the commit regime.
-CLOSURE_FAR_TARGET_RATE_S = 0.15  # far-range closure target (~1.2 m/s at 8 m)
-CLOSURE_FAR_LOG_SCALE = -2.0  # ramp start; 0.35 target at commit_min_log_scale
+# F154: F150 and F153 both reached Gate 1 with more approach energy than the
+# proved -0.15 brake could arrest: expansion exceeded 0.6/s at the COMMIT
+# boundary and rose through 1.0-1.6/s before bottom censorship, while the
+# entry budget is 0.35/s.  F101's target started at 0.15/s but relaxed toward
+# 0.35/s during Gate 0, delaying energy bleed until about 1.5 s before credit;
+# the next leg inherited that energy and saturated the same brake.  Keep the
+# evidence-backed far target continuously.  This removes the range relaxation
+# without adding a mode, threshold, or deeper attitude; the 0.60/s full-brake
+# response and 0.35/s COMMIT budget remain unchanged.
+CLOSURE_TARGET_RATE_S = 0.15  # continuous energy target (TTC ~6.7 s)
 # F96: the F77 closure-excess collective brake (COURSE_CLOSURE_BRAKE_COLLECTIVE)
 # is deleted with its call site — under the unified vz-tracking law a
 # sub-support cut is immediately restored by the tracker (a masked no-op)
@@ -956,8 +954,6 @@ class CleanCourseConfig:
     x_steer_max_age_s: float = X_STEER_MAX_AGE_S
     closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
     closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
-    closure_far_target_rate_s: float = CLOSURE_FAR_TARGET_RATE_S
-    closure_far_log_scale: float = CLOSURE_FAR_LOG_SCALE
     closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
     outer_expansion_tau_s: float = OUTER_EXPANSION_TAU_S
     outer_expansion_max_age_s: float = OUTER_EXPANSION_MAX_AGE_S
@@ -1983,30 +1979,11 @@ class CleanCourseController:
                 if launch_scale_warmup
                 else max(current.expansion_rate, raw_closure)
             )
-        # F101 approach-energy profile (20260730T173407Z-...-7a862549):
-        # F100's gate-1 leg braked mid-leg (pb=1, pitch to -0.57) yet the
-        # closure held 0.43 log/s and then RAN AWAY to ~1.2 log/s at the
-        # plane once the F94 custody floor capped the brake attitude —
-        # attitude braking authority (~0.4-0.7 m/s^2, custody-limited to
-        # less near the plane) cannot kill 2.5-3.5 m/s inside the leg
-        # remainder, so the COMMIT expansion budget vetoed and the blind
-        # drone hit the gate-1 structure.  A constant 0.35 log/s target
-        # only bounds speed NEAR the plane; far out it permits 3+ m/s.
-        # The target now RAMPS with range: a low far target
-        # (constant-speed cap in log terms) bleeding energy while the
-        # full gate is visible and custody is free, rising to the
-        # unchanged 0.35 entry budget at the commit regime.  Same law on
-        # every leg — gate-0 entry energy is what the next leg inherits.
-        target_frac = _clamp01(
-            (current.outer_log_scale - cfg.closure_far_log_scale)
-            / (cfg.commit_min_log_scale - cfg.closure_far_log_scale)
-        )
-        closure_target = cfg.closure_far_target_rate_s + (
-            cfg.closure_target_rate_s - cfg.closure_far_target_rate_s
-        ) * target_frac
+        # F154: one constant energy target prevents the current gate from
+        # relaxing its brake response before the next leg inherits closure.
         closure_brake = _clamp01(
-            (closure_rate - closure_target)
-            / (cfg.closure_full_brake_rate_s - closure_target)
+            (closure_rate - cfg.closure_target_rate_s)
+            / (cfg.closure_full_brake_rate_s - cfg.closure_target_rate_s)
         )
         # Misalignment brake (F35, d25f23fe): a fully misaligned gate only
         # suppressed ADVANCE, leaving the pitch law at brake_pitch (near
@@ -2894,21 +2871,11 @@ class CleanCourseController:
         vz_des_sink_max = cfg.course_vz_des_ground_m_s + (
             vz_des_max - cfg.course_vz_des_ground_m_s
         ) * _clamp01(self._alt_est_m / cfg.course_vz_des_ground_alt_m)
-        bounded_vz_des = _clamp(
+        return _clamp(
             -cfg.course_vz_des_per_norm * bounded_error,
             -vz_des_sink_max,
             vz_des_max,
         )
-        # F153 discriminates physical position-loop overshoot from the
-        # already-disproven camera-custody explanation.  F150's compensated
-        # position request remained climb-positive while Gate 1 approached,
-        # carrying vz/altitude through zero before the aperture ran down the
-        # image.  F144/F146 proved that fading physical IMU damping is unsafe.
-        # Keep that damping at full authority and continuously withdraw only
-        # the position-driven desired rate over the existing range ramp.  At
-        # passage the one owner therefore arrests real vertical velocity
-        # instead of chasing an angular error amplified by closure.
-        return bounded_vz_des * (1.0 - ramp)
 
     def _course_range_ramp(self, current: _Hypothesis) -> float:
         """Continuous far-to-crossing authority transfer already used by vz."""
