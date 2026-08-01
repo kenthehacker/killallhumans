@@ -2880,13 +2880,17 @@ class CleanCourseController:
             self._turn_successor_authority if successor is not None else 0.0
         )
         if successor is not None:
-            # A true convex blend has no low-authority dead zone: weak
-            # successor evidence leaves current-passage alignment in charge,
-            # while credible evidence transfers that same coordinated yaw
-            # and bank reference toward the successor.  The filtered
-            # aperture reserve is already one factor in the carried authority.
+            # F146: F145 computed an evidence-backed current claim, then the
+            # final blend discarded it and implicitly restored current error
+            # to (1 - successor authority).  That recreated the rightward
+            # counterturn whenever the old left bearing grew uncertain.  Use
+            # the two claims actually supported by evidence; unclaimed weight
+            # is neutral, and the existing derotated reference filter supplies
+            # continuity.  Weak evidence now decays toward zero rather than
+            # granting the opposing current error invented authority.
+            current_weight = min(current_claim, 1.0 - authority)
             desired = (
-                (1.0 - authority) * float(current_error)
+                current_weight * float(current_error)
                 + authority * successor.x
             )
 
