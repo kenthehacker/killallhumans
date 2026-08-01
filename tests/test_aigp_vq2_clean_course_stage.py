@@ -2381,6 +2381,53 @@ def test_f143_crossing_reassociation_keeps_one_left_turn_time_series():
     assert max(abs(b - a) for a, b in zip(yaws, yaws[1:])) < 0.06
 
 
+def test_f144_engulfing_evidence_supersedes_stale_aperture_extent():
+    # F144 received fresh same-id engulfing observations from -0.55 s, but a
+    # retained non-None aperture extent won the old if/elif precedence.  Its
+    # invalid margin target stayed zero, reserve collapsed .012 -> .001, and
+    # the consistently-left successor was countermanded by current x=+0.066.
+    # Both existing passage signals must feed one continuous reserve target.
+    controller = _turn_reference_controller(successor_x=-0.45, current_x=0.10)
+    controller.current.outer_log_scale = -0.90
+    controller.current.aperture_half_x = 0.05
+    controller.current.aperture_half_y = 0.05
+    controller.current.raw_x = 0.30  # retained extent has no usable margin
+    controller._turn_aperture_reserve = 0.01
+    controller._turn_successor_authority = 0.12
+    controller._turn_reference_x = -0.02
+    controller._turn_reference_yaw_rad = 0.0
+
+    now = 100.10
+    reserves = []
+    commands = []
+    for _ in range(16):
+        now += 0.047
+        controller._last_engulfing_anchor_s = now
+        controller.current.last_x_measurement_s = now
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        reference, _ = controller._turn_reference(
+            controller.current,
+            controller.successor,
+            current_error=0.10,
+            now_s=now,
+            yaw_rad=0.0,
+            dt=0.047,
+        )
+        reserves.append(controller._turn_aperture_reserve)
+        commands.append(
+            controller._coordinated_turn_request(
+                reference, steer_gain=1.0, yaw_rad=0.0
+            )
+        )
+
+    rolls, yaws = zip(*commands)
+    assert all(right > left for left, right in zip(reserves, reserves[1:]))
+    assert reserves[-1] > 0.95
+    assert all(yaw < 0.0 for yaw in yaws)
+    assert all(roll < 0.0 for roll in rolls)
+
+
 def test_weak_opposite_successor_cannot_erase_current_gate_turn():
     # F120 live regression: Gate 1 was still x=-0.309 when a right-side Gate
     # 2 candidate reached only 2.1e-7 authority.  Binary sign arbitration

@@ -2796,15 +2796,20 @@ class CleanCourseController:
                 aperture_target = _clamp01(
                     1.0 - projected_current_error / aperture_budget
                 )
-        elif (
-            self._last_engulfing_anchor_s is not None
-            and now_s - self._last_engulfing_anchor_s
-            <= ENGULFING_ANCHOR_MAX_AGE_S
-        ):
-            # The fresh same-id engulfing observation is passage evidence, not
-            # a successor bearing.  It smoothly raises the saved aperture
-            # reserve while the successor hypothesis continues to derotate.
-            aperture_target = 1.0
+        if self._last_engulfing_anchor_s is not None:
+            # F145: both existing passage observations feed the same filtered
+            # reserve.  F144 retained a stale non-None aperture extent, so the
+            # old if/elif precedence shadowed fresh same-id engulfing evidence
+            # and collapsed reserve .012 -> .001.  Age the anchor evidence
+            # continuously and take the stronger physical passage margin;
+            # there is no new mode, latch, threshold, or command owner.
+            anchor_age_s = max(
+                0.0, now_s - self._last_engulfing_anchor_s
+            )
+            anchor_passage = _clamp01(
+                1.0 - anchor_age_s / ENGULFING_ANCHOR_MAX_AGE_S
+            )
+            aperture_target = max(aperture_target, anchor_passage)
         self._turn_aperture_reserve += alpha * (
             aperture_target - self._turn_aperture_reserve
         )
