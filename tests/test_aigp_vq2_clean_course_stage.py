@@ -2169,7 +2169,7 @@ def test_successor_reassociation_cannot_recreate_precredit_s_turn():
     assert max(yaw_steps) < 0.08
 
 
-def test_weak_successor_evidence_decays_turn_reference_smoothly():
+def test_weak_successor_evidence_releases_into_carried_reference_smoothly():
     controller = _turn_reference_controller(current_x=0.04)
     now = 100.10
     for _ in range(14):
@@ -2184,9 +2184,9 @@ def test_weak_successor_evidence_decays_turn_reference_smoothly():
     assert authority_before > 0.0
     assert out.yaw_rate_rad_s < 0.0
 
-    # All evidence factors weaken together.  Raw evidence weight can vanish,
-    # but the only command-bearing state is the derotated reference, which
-    # must decay continuously instead of reproducing F119's off-full switch.
+    # All evidence factors weaken together.  Raw evidence authority can
+    # vanish, but unsupported mass remains on the derotated reference instead
+    # of creating F146's zero-biased dead zone or F119's off-full switch.
     controller.successor.x_axis.pp = 2.0
     controller.successor.y_axis.pp = 2.0
     controller.successor.last_measurement_s = now - 2.0
@@ -2209,8 +2209,14 @@ def test_weak_successor_evidence_decays_turn_reference_smoothly():
         right < left for left, right in zip(authorities, authorities[1:])
     )
     assert all(reference < 0.0 for reference in references)
+    # Residual left evidence can still update the carried reference while its
+    # authority fades, but every update remains small and same-sign.
     assert all(
-        right > left for left, right in zip(references, references[1:])
+        right < left for left, right in zip(references, references[1:])
+    )
+    assert (
+        max(abs(right - left) for left, right in zip(references, references[1:]))
+        < 0.02
     )
     assert all(yaw < 0.0 for yaw in yaws)
 
@@ -2511,6 +2517,44 @@ def test_weak_opposite_successor_cannot_erase_current_gate_turn():
     assert heading < -0.20
     assert yaw_rate < -0.02
     assert target_roll < 0.0
+
+
+def test_f147_zero_authority_successor_cannot_dilute_current_pursuit():
+    # F147: Gate 1 was still x=-0.178 when far-right Gate 2 first appeared.
+    # Its successor authority remained exactly zero, yet merely entering the
+    # successor branch assigned uncertain current mass to neutral and decayed
+    # the carried reference -0.129 -> -0.082.  Unsupported mass must preserve
+    # the already derotated reference; fresh current evidence can then move it
+    # toward Gate 1 without a zero-biased dead zone.
+    controller = _turn_reference_controller(successor_x=0.34, current_x=-0.18)
+    controller.current.outer_log_scale = -2.0  # successor closure authority 0
+    controller.current.aperture_half_x = 0.25
+    controller.current.raw_x = -0.18
+    controller._turn_aperture_reserve = 0.0
+    controller._turn_successor_authority = 0.0
+    controller._turn_reference_x = -0.13
+    controller._turn_reference_yaw_rad = 0.0
+
+    now = 100.10
+    references = []
+    for _ in range(8):
+        now += 0.031
+        controller.current.last_x_measurement_s = now
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        reference, authority = controller._turn_reference(
+            controller.current,
+            controller.successor,
+            current_error=-0.18,
+            now_s=now,
+            yaw_rad=0.0,
+            dt=0.031,
+        )
+        references.append(reference)
+        assert authority == pytest.approx(0.0, abs=1e-12)
+
+    assert all(right < left for left, right in zip(references, references[1:]))
+    assert references[-1] < -0.15
 
 
 def test_authoritative_promotion_retains_stale_measured_successor_for_prediction():

@@ -2867,18 +2867,25 @@ class CleanCourseController:
             self._turn_successor_authority if successor is not None else 0.0
         )
         if successor is not None:
-            # F146: F145 computed an evidence-backed current claim, then the
-            # final blend discarded it and implicitly restored current error
-            # to (1 - successor authority).  That recreated the rightward
-            # counterturn whenever the old left bearing grew uncertain.  Use
-            # the two claims actually supported by evidence; unclaimed weight
-            # is neutral, and the existing derotated reference filter supplies
-            # continuity.  Weak evidence now decays toward zero rather than
-            # granting the opposing current error invented authority.
+            # F148: F147 exposed the remaining dead zone in F146's neutral
+            # mass.  Merely detecting far-right Gate 2 weakened race-owned
+            # Gate-1 pursuit while successor authority was exactly zero:
+            # reference -0.129 -> -0.082 and x stalled near -0.153.  Assign
+            # unsupported mass to the already IMU-derotated carried reference,
+            # so evidence strength controls how fast it updates rather than
+            # biasing it toward zero.  The current and successor claims, race
+            # ownership, and the single yaw/bank owner are unchanged.
             current_weight = min(current_claim, 1.0 - authority)
+            carried_weight = max(0.0, 1.0 - current_weight - authority)
+            carried_reference = (
+                self._turn_reference_x
+                if self._turn_reference_x is not None
+                else float(current_error)
+            )
             desired = (
                 current_weight * float(current_error)
                 + authority * successor.x
+                + carried_weight * carried_reference
             )
 
         if self._turn_reference_x is None:
