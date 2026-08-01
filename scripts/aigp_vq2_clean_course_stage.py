@@ -2761,8 +2761,29 @@ class CleanCourseController:
             aperture_budget = (
                 cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
             )
+            # F128: passage margin is a leg-relative physical quantity, not a
+            # camera-heading error.  F127's useful left preturn moved Gate 0
+            # right in-frame by almost exactly ``-focal * delta_yaw``; feeding
+            # that optical motion back here collapsed aperture reserve and
+            # suppressed the same successor turn that caused it.  Derotate the
+            # fresh/predicted position against the existing race-leg heading
+            # anchor only for passage eligibility.  Current-gate pursuit still
+            # consumes the camera bearing, and the conservative vx projection
+            # remains unchanged for this discriminating candidate.
+            passage_yaw_offset = 0.0
+            if yaw_rad is not None and self._course_anchor_yaw_rad is not None:
+                passage_yaw_offset = (
+                    math.atan2(
+                        math.sin(float(yaw_rad) - self._course_anchor_yaw_rad),
+                        math.cos(float(yaw_rad) - self._course_anchor_yaw_rad),
+                    )
+                    * ROTATION_COMP_FOCAL_NORM
+                )
             projected_current_error = (
-                max(abs(current.x), abs(current.raw_x))
+                max(
+                    abs(current.x + passage_yaw_offset),
+                    abs(current.raw_x + passage_yaw_offset),
+                )
                 + abs(current.vx) * cfg.successor_preview_projection_s
             )
             if aperture_budget > 1e-9:

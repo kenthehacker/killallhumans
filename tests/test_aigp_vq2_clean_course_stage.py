@@ -1925,6 +1925,52 @@ def test_continuous_turn_reference_coordinates_yaw_and_bank_only():
     assert turn.current.track_id == "A"
 
 
+def test_turn_aperture_margin_uses_leg_relative_not_camera_x():
+    # F127: a useful left preturn moved the still-safe Gate 0 right in-frame,
+    # and the aperture scheduler misread that expected optical flow as physical
+    # passage loss.  Equivalent centered and yaw-shifted geometry must retain
+    # the same reserve; the same image displacement without yaw is real error.
+    centered = _turn_reference_controller(current_x=0.0)
+    yaw_shifted = _turn_reference_controller(current_x=0.16)
+    physically_shifted = _turn_reference_controller(current_x=0.16)
+    for controller in (centered, yaw_shifted, physically_shifted):
+        controller._course_anchor_yaw_rad = 0.0
+        controller._turn_reference_x = None
+        controller._turn_reference_yaw_rad = None
+
+    centered._turn_reference(
+        centered.current,
+        centered.successor,
+        current_error=0.0,
+        now_s=100.10,
+        yaw_rad=0.0,
+        dt=0.04,
+    )
+    yaw_shifted._turn_reference(
+        yaw_shifted.current,
+        yaw_shifted.successor,
+        current_error=0.16,
+        now_s=100.10,
+        yaw_rad=-0.10,
+        dt=0.04,
+    )
+    physically_shifted._turn_reference(
+        physically_shifted.current,
+        physically_shifted.successor,
+        current_error=0.16,
+        now_s=100.10,
+        yaw_rad=0.0,
+        dt=0.04,
+    )
+
+    assert yaw_shifted._turn_aperture_reserve == pytest.approx(
+        centered._turn_aperture_reserve, abs=1e-12
+    )
+    assert physically_shifted._turn_aperture_reserve < (
+        0.1 * centered._turn_aperture_reserve
+    )
+
+
 def test_continuous_turn_reference_continues_through_safe_commit():
     # A TRACK->COMMIT transition must not undo the coordinated preturn while
     # fresh aperture reserve remains.
