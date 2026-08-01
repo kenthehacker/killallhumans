@@ -2251,6 +2251,56 @@ def test_successor_heading_preview_continues_through_safe_commit():
     )
 
 
+def test_admitted_successor_preturn_is_held_through_fresh_engulfing_anchor():
+    # F118 preturned on approach, then aperture loss disabled the preview and
+    # PREDICT yaw unwound it for ~0.6 s before credit; Gate 1 entered worse at
+    # x=-0.61.  Once the successor earned the live aperture lease, a fresh
+    # same-current engulfing anchor preserves the bounded heading/prebank
+    # through that short crossing window without claiming credit.
+    controller = _successor_preview_controller()
+    approach = _command(controller, 100.10, pitch=SPAWN_PITCH)
+    assert approach.successor_blend > 0.0  # arms the continuation lease
+
+    controller.state = CleanCourseState.PREDICT
+    controller._last_engulfing_anchor_s = 100.11
+    controller.current.aperture_half_x = None
+    controller.current.aperture_half_y = None
+    controller.successor = None  # crossing swallowed the live next track
+    crossing = _command(controller, 100.12, pitch=SPAWN_PITCH)
+
+    assert controller._successor_preview_crossing_hold
+    assert crossing.successor_blend == pytest.approx(0.35, abs=1e-12)
+    assert crossing.yaw_rate_rad_s < 0.0
+    assert controller._successor_prebank_rad < 0.0
+    assert crossing.gate_index == 0
+    assert controller.current.track_id == "A"
+    assert controller.transitions == []
+
+
+def test_crossing_preturn_withdraws_on_aperture_error_or_anchor_expiry():
+    displaced = _successor_preview_controller()
+    _command(displaced, 100.10, pitch=SPAWN_PITCH)  # admit/arm
+    displaced.state = CleanCourseState.PREDICT
+    displaced._last_engulfing_anchor_s = 100.11
+    displaced.successor = None
+    displaced.current.x_axis.p = 0.30
+    displaced.current.raw_x = 0.30
+    displaced.current.last_x_measurement_s = 100.11
+    displaced_out = _command(displaced, 100.12, pitch=SPAWN_PITCH)
+    assert displaced_out.successor_blend == 0.0
+    assert displaced._successor_prebank_rad == 0.0
+
+    expired = _successor_preview_controller()
+    _command(expired, 100.10, pitch=SPAWN_PITCH)  # admit/arm
+    expired.state = CleanCourseState.PREDICT
+    expired._last_engulfing_anchor_s = 100.12 - 1.0
+    expired.successor = None
+    expired_out = _command(expired, 100.12, pitch=SPAWN_PITCH)
+    assert expired_out.successor_blend == 0.0
+    assert not expired._successor_preview_crossing_hold
+    assert expired._successor_prebank_rad == 0.0
+
+
 def test_successor_heading_preview_yields_when_current_aperture_is_consumed():
     # Regression for ab6252b2: an opposite-side successor can never cancel a
     # displaced current-gate correction.  Preview also needs current aperture,

@@ -1365,6 +1365,16 @@ class CleanCourseController:
         self._successor_heading_blend = 0.0
         self._successor_heading_error_norm: Optional[float] = None
         self._successor_prebank_rad = 0.0
+        # Crossing continuation lease (F119): once fresh aperture geometry
+        # admits the successor, retain its bearing through a short, fresh
+        # engulfing-anchor window instead of unwinding the preturn while the
+        # authoritative race packet is in flight.  The stored aperture budget
+        # and current-track identity remain the withdrawal authority.
+        self._crossing_preview_current_track_id: Optional[str] = None
+        self._crossing_preview_bearing_x: Optional[float] = None
+        self._crossing_preview_admitted_s: Optional[float] = None
+        self._crossing_preview_aperture_budget = 0.0
+        self._successor_preview_crossing_hold = False
         # Course-heading anchor (F31): yaw at the leg start (lazily
         # captured on the first command tick with a live yaw measurement,
         # re-armed on every authoritative promotion).  Yaw commands that
@@ -1393,6 +1403,10 @@ class CleanCourseController:
         self._course_start_s = float(now_s)
         self._ex_trim = 0.0
         self._vz_center_trim = 0.0
+        self._crossing_preview_current_track_id = None
+        self._crossing_preview_bearing_x = None
+        self._crossing_preview_admitted_s = None
+        self._crossing_preview_aperture_budget = 0.0
         identity = _frame_identity(update)
         if identity is not None:
             self._last_frame_identity = identity
@@ -1665,6 +1679,10 @@ class CleanCourseController:
         self.transitions.append((previous, self.gate_index))
         # Promotion: the next gate's pursuit gets a fresh orbit trim.
         self._ex_trim = 0.0
+        self._crossing_preview_current_track_id = None
+        self._crossing_preview_bearing_x = None
+        self._crossing_preview_admitted_s = None
+        self._crossing_preview_aperture_budget = 0.0
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             self._exit_coast()
         # F76: an authoritative increment settles the pending-credit hold.
@@ -1750,6 +1768,7 @@ class CleanCourseController:
         self._successor_heading_blend = 0.0
         self._successor_heading_error_norm = None
         self._successor_prebank_rad = 0.0
+        self._successor_preview_crossing_hold = False
         if yaw_rad is not None and self._course_anchor_yaw_rad is None:
             self._course_anchor_yaw_rad = float(yaw_rad)
         if self._last_command_s is None:
@@ -1971,21 +1990,20 @@ class CleanCourseController:
                 # its source, so the entry arrives centered about the true
                 # crossing point rather than compensating it blind.
                 commit_ex = self.current.x - self._ex_trim
-                commit_blend = self._successor_blend(
+                commit_blend, commit_preview_bearing_x = self._successor_preview(
                     self.current,
-                    self.successor,
                     now_s=now_s,
                 )
                 commit_heading_ex = commit_ex
                 commit_preview_roll = 0.0
-                if commit_blend > 0.0 and self.successor is not None:
+                if commit_blend > 0.0 and commit_preview_bearing_x is not None:
                     commit_heading_ex = (
                         (1.0 - commit_blend) * commit_ex
-                        + commit_blend * self.successor.x
+                        + commit_blend * commit_preview_bearing_x
                     )
                     commit_preview_roll = self._successor_prebank(
                         commit_blend,
-                        self.successor,
+                        commit_preview_bearing_x,
                     )
                     self._successor_heading_blend = commit_blend
                     self._successor_heading_error_norm = commit_heading_ex
@@ -2265,11 +2283,14 @@ class CleanCourseController:
         # CURRENT aperture reserve; it fades to zero as current error/drift
         # consumes that reserve.  Roll keeps its current-gate correction and
         # receives only the separately capped coordinated prebank.
-        blend = self._successor_blend(current, self.successor, now_s=now_s)
+        blend, preview_bearing_x = self._successor_preview(
+            current,
+            now_s=now_s,
+        )
         preview_roll = 0.0
-        if blend > 0.0 and self.successor is not None:
-            heading_ex = (1.0 - blend) * ex + blend * self.successor.x
-            preview_roll = self._successor_prebank(blend, self.successor)
+        if blend > 0.0 and preview_bearing_x is not None:
+            heading_ex = (1.0 - blend) * ex + blend * preview_bearing_x
+            preview_roll = self._successor_prebank(blend, preview_bearing_x)
             self._successor_heading_blend = blend
             self._successor_heading_error_norm = heading_ex
             self._successor_prebank_rad = preview_roll
@@ -3324,16 +3345,77 @@ class CleanCourseController:
         )
         return cfg.successor_blend_max * closure * aperture_reserve
 
+    def _successor_preview(
+        self,
+        current: _Hypothesis,
+        *,
+        now_s: float,
+    ) -> Tuple[float, Optional[float]]:
+        """Resolve live approach preview or its bounded crossing continuation."""
+
+        blend = self._successor_blend(current, self.successor, now_s=now_s)
+        if blend > 0.0 and self.successor is not None:
+            self._crossing_preview_current_track_id = current.track_id
+            self._crossing_preview_bearing_x = self.successor.x
+            self._crossing_preview_admitted_s = float(now_s)
+            assert current.aperture_half_x is not None
+            self._crossing_preview_aperture_budget = (
+                self.config.commit_entry_aperture_margin_frac
+                * current.aperture_half_x
+            )
+            return blend, self.successor.x
+
+        cfg = self.config
+        anchor_fresh = (
+            self._last_engulfing_anchor_s is not None
+            and now_s - self._last_engulfing_anchor_s
+            <= ENGULFING_ANCHOR_MAX_AGE_S
+        )
+        admission_fresh = (
+            self._crossing_preview_admitted_s is not None
+            and now_s - self._crossing_preview_admitted_s
+            <= PREDICT_STALL_FORCE_SEARCH_S
+        )
+        if (
+            self.state
+            not in (
+                CleanCourseState.TRACK,
+                CleanCourseState.PREDICT,
+                CleanCourseState.COMMIT,
+            )
+            or not anchor_fresh
+            or not admission_fresh
+            or current.track_id != self._crossing_preview_current_track_id
+            or self._crossing_preview_bearing_x is None
+            or self._crossing_preview_aperture_budget <= 0.0
+        ):
+            return 0.0, None
+
+        # A fresh horizontal correction still outranks the preview.  With x
+        # censored/stale, the fresh same-id engulfing anchor is the bounded
+        # center evidence; it expires after 0.50 s and cannot sustain a blind
+        # turn into ordinary SEARCH.
+        if now_s - current.last_x_measurement_s <= cfg.x_steer_max_age_s:
+            projected_current_error = (
+                max(abs(current.x), abs(current.raw_x))
+                + abs(current.vx) * cfg.successor_preview_projection_s
+            )
+            if projected_current_error > self._crossing_preview_aperture_budget:
+                return 0.0, None
+
+        self._successor_preview_crossing_hold = True
+        return cfg.successor_blend_max, self._crossing_preview_bearing_x
+
     def _successor_prebank(
         self,
         blend: float,
-        successor: Optional[_Hypothesis],
+        bearing_x: Optional[float],
     ) -> float:
         """Small coordinated bank under the same aperture-reserve lease."""
 
         cfg = self.config
         if (
-            successor is None
+            bearing_x is None
             or blend <= 0.0
             or cfg.successor_blend_max <= 1e-9
             or cfg.successor_prebank_full_bearing_norm <= 1e-9
@@ -3341,7 +3423,7 @@ class CleanCourseController:
             return 0.0
         authority = _clamp01(blend / cfg.successor_blend_max)
         bearing = _clamp(
-            successor.x / cfg.successor_prebank_full_bearing_norm,
+            bearing_x / cfg.successor_prebank_full_bearing_norm,
             -1.0,
             1.0,
         )
@@ -4073,6 +4155,9 @@ def _clean_course_tick_trace(
             controller._successor_heading_error_norm
         ),
         "successor_prebank_rad": controller._successor_prebank_rad,
+        "successor_preview_crossing_hold": (
+            controller._successor_preview_crossing_hold
+        ),
         "vertical_censor_edge": (
             None if current is None else int(current.vertical_censor_edge)
         ),
