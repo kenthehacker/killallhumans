@@ -2643,7 +2643,7 @@ def _turn_reference_controller(
     return controller
 
 
-def test_continuous_turn_reference_coordinates_yaw_and_bank_only():
+def test_successor_preview_changes_yaw_but_not_current_gate_bank():
     turn = _turn_reference_controller()
     current_only = _turn_reference_controller(successor_x=None)
     with_turn = None
@@ -2661,7 +2661,12 @@ def test_continuous_turn_reference_coordinates_yaw_and_bank_only():
     assert with_turn.successor_track_id == "B"
     assert with_turn.successor_blend > 0.0
     assert with_turn.yaw_rate_rad_s < 0.0
-    assert with_turn.target_roll_rad < 0.0
+    # F164: successor preview manages camera/FOV yaw only.  Physical bank
+    # remains owned by the current gate's optical intercept until race credit.
+    assert with_turn.target_roll_rad > 0.0
+    assert with_turn.target_roll_rad == pytest.approx(
+        without_turn.target_roll_rad, abs=1e-12
+    )
     assert without_turn.yaw_rate_rad_s > 0.0
     assert without_turn.target_roll_rad > 0.0
     # The successor changes only the shared lateral reference.
@@ -2698,8 +2703,10 @@ def test_continuous_turn_reference_continues_through_safe_commit():
     assert with_preview.state is CleanCourseState.COMMIT
     assert with_preview.successor_blend > 0.0
     assert with_preview.yaw_rate_rad_s < without_preview.yaw_rate_rad_s
-    assert with_preview.target_roll_rad < without_preview.target_roll_rad
-    assert with_preview.yaw_rate_rad_s * with_preview.target_roll_rad > 0.0
+    assert with_preview.target_roll_rad == pytest.approx(
+        without_preview.target_roll_rad, abs=1e-12
+    )
+    assert with_preview.yaw_rate_rad_s * with_preview.target_roll_rad < 0.0
     assert with_preview.target_pitch_rad == pytest.approx(
         without_preview.target_pitch_rad, abs=1e-12
     )
@@ -2764,7 +2771,8 @@ def test_turn_reference_survives_track_predict_commit_credit_and_promotion():
         abs(out.target_roll_rad) <= controller.config.max_target_roll_rad + 1e-9
         for out in handoff
     )
-    assert handoff[-1].target_roll_rad < 0.0
+    assert controller._lateral_intercept_reference_x < 0.0
+    assert handoff[-1].target_roll_rad < handoff[-2].target_roll_rad
     assert controller.transitions == [(0, 1)]
 
 
@@ -2783,7 +2791,7 @@ def test_turn_reference_eligibility_variation_never_reverses_left_handoff():
         controller.successor.last_x_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
     assert out.yaw_rate_rad_s < 0.0
-    assert out.target_roll_rad < 0.0
+    assert out.target_roll_rad > 0.0
 
     samples = []
     variations = (
@@ -2819,7 +2827,7 @@ def test_turn_reference_eligibility_variation_never_reverses_left_handoff():
         samples.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
 
     assert all(sample.yaw_rate_rad_s <= 1e-9 for sample in samples)
-    assert all(sample.target_roll_rad <= 1e-9 for sample in samples)
+    assert all(sample.target_roll_rad >= -1e-9 for sample in samples)
     assert any(sample.yaw_rate_rad_s < -0.02 for sample in samples)
     yaw_steps = [
         abs(right.yaw_rate_rad_s - left.yaw_rate_rad_s)
@@ -2843,7 +2851,7 @@ def test_fresh_reassociated_successor_has_no_second_turn_age_gate():
 
     assert out.successor_blend > 0.0
     assert out.yaw_rate_rad_s < 0.0
-    assert out.target_roll_rad < 0.0
+    assert out.target_roll_rad == pytest.approx(0.0, abs=1e-12)
 
 
 def test_bottom_censored_successor_keeps_fresh_horizontal_turn_authority():
@@ -2936,15 +2944,14 @@ def test_successor_reassociation_cannot_recreate_precredit_s_turn():
         samples.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
 
     assert all(sample.yaw_rate_rad_s < 0.0 for sample in samples)
-    # Roll consumes its own optical-intercept state.  It may cross zero while
-    # the camera-heading handoff remains continuously left, but stays bounded
-    # and converges to the same physical side once fresh evidence returns.
+    # Roll consumes only the current gate's optical-intercept state.  It stays
+    # bounded and keeps current-gate custody while yaw previews the successor.
     assert all(
         abs(sample.target_roll_rad)
         <= controller.config.max_target_roll_rad + 1e-9
         for sample in samples
     )
-    assert samples[-1].target_roll_rad < 0.0
+    assert samples[-1].target_roll_rad > 0.0
     yaw_steps = [
         abs(right.yaw_rate_rad_s - left.yaw_rate_rad_s)
         for left, right in zip(samples, samples[1:])
@@ -3507,9 +3514,7 @@ def test_pending_credit_hold_never_sweeps_before_delayed_credit():
         out = _command(controller, t, yaw=0.0)
         assert controller.state is CleanCourseState.SEARCH
         assert out.yaw_rate_rad_s <= 0.0
-        assert out.target_roll_rad <= 0.0
-        if out.yaw_rate_rad_s < 0.0:
-            assert out.target_roll_rad < 0.0
+        assert out.target_roll_rad == pytest.approx(0.0, abs=1e-12)
         assert out.thrust > 0.0
     # Delayed credit inside the window: the retained left-side successor is
     # stale by construction, so it remains the current PREDICT hypothesis —
@@ -3588,7 +3593,7 @@ def test_pending_credit_recenters_toward_credible_successor():
         assert controller.state is CleanCourseState.SEARCH
         assert controller.gate_index == 0  # authoritative ownership intact
         assert -MAX_COURSE_YAW_RATE_RAD_S <= out.yaw_rate_rad_s < 0.0
-        assert out.target_roll_rad < 0.0
+        assert out.target_roll_rad == pytest.approx(0.0, abs=1e-12)
         # No forward advance before credit: the crossing brake may still be
         # slewing back toward level, but must never cross into nose-down drive.
         assert out.target_pitch_rad <= level_pitch + 1e-6
@@ -3944,8 +3949,10 @@ def test_gate_zero_budget_false_near_plane_hold_keeps_gentle_brake():
     # brake, but Gate 0 keeps the F102/F103/F109/F110-proven -0.15 attitude.
     controller = _commit_controller_gate_zero()
     current = controller.current
-    current.x_axis.p = 0.0
-    current.raw_x = 0.0
+    # Keep the trajectory outside the 60% corridor core.  A centered hot
+    # approach at this range is now an explicit point-of-no-return commit.
+    current.x_axis.p = 0.16
+    current.raw_x = 0.16
     current.y_axis.p = 0.15
     current.raw_y = 0.15
     current.scale_axis.p = -1.0
@@ -4022,7 +4029,8 @@ def test_f162_observations_have_no_live_aperture_commit_overlap():
     # This is deliberately separate from the synthetic public-boundary
     # reachability proof in test_aigp_vq2_runner.py.  F162's real Gate-1
     # observations lost their usable aperture at t=4.656; proximity did not
-    # begin until t=5.062, and closure was still above the 0.35/s entry cap.
+    # begin until t=5.062, and closure was still above the controlled-approach
+    # target.  This remains evidence of no live overlap, not a scalar veto.
     rows = (
         # t, frame, x, y, bbox width/height, pitch, optional aperture half-size
         (4.359, 1907073, -0.13125, 0.04444444444444451, 0.1625, 0.2833333333333333, -0.4576878453806965, (0.048412277765566725, 0.08626446521721656)),
@@ -4101,10 +4109,166 @@ def test_f162_observations_have_no_live_aperture_commit_overlap():
     assert last_usable_s < first_proximity_s
     assert proximity_closures
     assert min(proximity_closures) > (
-        controller.config.commit_entry_max_expansion_rate_s
+        controller.config.closure_target_rate_s
     )
     assert controller.current.aperture_half_x is None
     assert controller.current.aperture_half_y is None
+
+
+def _f163_trace_track(
+    *,
+    outer_center,
+    outer_span,
+    aperture_center=None,
+    aperture_half=None,
+    clipping=FrameEdge.NONE,
+):
+    """Faithful recorded-state adapter using the real tracker unit contract.
+
+    ``bbox_norm`` is [0, 1], while centers and aperture half-extents are in
+    [-1, 1].  Thus a bbox width is already an outer half-extent in center
+    coordinates.  This helper deliberately does not reuse the older compact
+    ``_track`` fixture, whose square shorthand masks that conversion.
+    """
+
+    x, y = outer_center
+    width, height = outer_span
+    center_unit_x = 0.5 * (x + 1.0)
+    center_unit_y = 0.5 * (y + 1.0)
+    aperture = None
+    if aperture_center is not None:
+        aperture = SimpleNamespace(
+            center_norm=tuple(float(v) for v in aperture_center),
+            log_scale=math.log(
+                max(1e-6, math.sqrt(4.0 * aperture_half[0] * aperture_half[1]))
+            ),
+            confidence=0.90,
+            measurement_std=(0.006, 0.009, 0.03),
+            passage_usable=True,
+            half_size_norm=tuple(float(v) for v in aperture_half),
+        )
+    return SimpleNamespace(
+        track_id="recorded-current",
+        center_norm=(float(x), float(y)),
+        bbox_norm=(
+            center_unit_x - width / 2.0,
+            center_unit_y - height / 2.0,
+            center_unit_x + width / 2.0,
+            center_unit_y + height / 2.0,
+        ),
+        apparent_scale=math.sqrt(width * height),
+        confidence=0.90,
+        association_confidence=0.90,
+        clipping=clipping,
+        center_censored=clipping != FrameEdge.NONE,
+        ambiguous=False,
+        visible=True,
+        inner_aperture=aperture,
+    )
+
+
+def _replay_f163_rows(rows, *, gate_index):
+    controller = CleanCourseController(_config())
+    first = rows[0]
+
+    def track(row):
+        return _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            aperture_center=row[6],
+            aperture_half=row[7],
+            clipping=row[9],
+        )
+
+    controller.initialize(
+        _update([track(first)], frame_id=first[1]),
+        gate_index=gate_index,
+        fallback_center_norm=first[2],
+        fallback_apparent_scale=math.sqrt(first[3][0] * first[3][1]),
+        now_s=100.0 + first[0],
+    )
+    controller._alt_est_m = 2.0
+    outputs = []
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        if index:
+            controller.observe(
+                _update([track(row)], frame_id=row[1]),
+                now_s=now,
+                body_rates=row[8],
+            )
+        outputs.append(_command(controller, now, pitch=row[4], yaw=0.0))
+    return controller, outputs
+
+
+def test_f163_gate0_trace_reaches_owned_commit_before_bottom_censorship():
+    # Positive-labeled F163 Gate 0: the old scalar law rejected every frame at
+    # ~0.78/s closure, yet authoritative race status subsequently credited the
+    # crossing.  Public observations now produce a contained aperture tube and
+    # the outer-only point-of-no-return model reaches COMMIT before BOTTOM.
+    rows = (
+        (1.953, 2052998, (0.053125, 0.161111), (0.25, 0.408333), -0.429284, 0, (0.040326, 0.148286), (0.118122, 0.212459), (-0.069072, -0.117701, -0.093605), FrameEdge.NONE),
+        (2.141, 2053004, (0.06875, 0.205556), (0.2828125, 0.486111), -0.445374, 0, (0.064315, 0.182856), (0.136344, 0.246483), (-0.046209, -0.054793, -0.075266), FrameEdge.NONE),
+        (2.297, 2053009, (0.084375, 0.238889), (0.3328125, 0.577778), -0.452093, 0, (0.082114, 0.200117), (0.157505, 0.286893), (-0.005388, -0.033068, -0.031834), FrameEdge.NONE),
+        (2.422, 2053012, (0.09375, 0.261111), (0.375, 0.647222), -0.455251, 0, (0.088084, 0.210567), (0.173966, 0.319578), (0.047329, -0.020963, 0.016417), FrameEdge.NONE),
+        (2.469, 2053014, (0.034375, 0.283333), (0.4828125, 0.713889), -0.456153, 0, None, None, (0.065514, -0.016982, 0.029759), FrameEdge.BOTTOM),
+    )
+    controller, outputs = _replay_f163_rows(rows, gate_index=0)
+
+    assert controller.gate_index == 0
+    assert any(out.state is CleanCourseState.COMMIT for out in outputs[:-1])
+    assert controller.state is CleanCourseState.COMMIT
+    assert controller._last_commit_admission.status in {
+        "admissible",
+        "directionally-censored",
+    }
+    certificate = controller.current.corridor_certificate
+    assert certificate is not None
+    assert certificate.gate_index == 0
+    assert certificate.source_s == pytest.approx(102.422, abs=1e-6)
+
+    old_current = controller.current
+    assert controller.note_race(
+        gate_index=1, race_boot_ms=3000, now_s=103.438
+    )
+    assert controller.gate_index == 1
+    assert old_current.corridor_certificate.gate_index == 0
+    assert controller.current is None
+
+
+def test_f163_gate1_trace_transports_geometry_without_modality_false_closure():
+    # Negative-labeled F163 Gate 1: the last usable aperture is genuinely left
+    # of its corridor.  The certificate remains inspectable for the 0.438 s fit
+    # gap, while outer-only closure stays near the recorded 0.473/s instead of
+    # jumping to the mixed-modality ~2/s value.  Admission must remain false.
+    rows = (
+        (3.438, 2053043, (-0.38125, 0.127778), (0.1140625, 0.202778), -0.450153, 1, (-0.395507, 0.087350), (0.045135, 0.077757), (-0.223011, 0.006873, -0.331034), FrameEdge.NONE),
+        (4.328, 2053069, (-0.15, 0.044444), (0.15625, 0.280556), -0.456161, 1, (-0.176428, -0.010396), (0.044799, 0.073925), (-0.278520, -0.010782, -0.175512), FrameEdge.NONE),
+        (4.516, 2053075, (-0.128125, 0.027778), (0.171875, 0.302778), -0.453767, 1, (-0.156181, -0.028572), (0.054077, 0.090570), (-0.223875, 0.047371, -0.219492), FrameEdge.NONE),
+        (4.672, 2053080, (-0.109375, 0.011111), (0.1875, 0.319444), -0.449502, 1, (-0.140326, -0.044394), (0.055520, 0.099789), (-0.157176, 0.066117, -0.200226), FrameEdge.NONE),
+        (5.110, 2053093, (-0.1, 0.027778), (0.240625, 0.380556), -0.457940, 1, None, None, (0.041316, -0.008344, -0.064853), FrameEdge.NONE),
+    )
+    controller, _outputs = _replay_f163_rows(rows, gate_index=1)
+    corridor = controller._transported_corridor(
+        controller.current, now_s=105.110
+    )
+
+    assert controller.gate_index == 1
+    assert controller.state is CleanCourseState.TRACK
+    assert corridor is not None
+    assert corridor.source_age_s == pytest.approx(0.438, abs=1e-6)
+    assert not corridor.live
+    assert corridor.center_x == pytest.approx(-0.138, abs=0.015)
+    assert corridor.half_x == pytest.approx(0.07125, abs=0.004)
+    assert corridor.half_y == pytest.approx(0.11888, abs=0.006)
+    assert controller.current.outer_expansion_rate == pytest.approx(
+        0.473, abs=0.16
+    )
+    assert controller.current.expansion_rate < 1.0
+    assert controller._last_commit_admission.status == (
+        "corridor-known/not-contained"
+    )
+    assert not controller._last_commit_admission.admissible
 
 
 def test_commit_entry_requires_inner_aperture_budget():
@@ -4186,9 +4350,9 @@ def test_near_plane_hold_brakes_without_self_blinding():
     # recovers to center with closure still hot, the floor admits brake.
     early = _commit_controller()
     current = early.current
-    current.x_axis.p = -0.12
+    current.x_axis.p = -0.13
     current.y_axis.p = 0.31
-    current.raw_x = -0.12
+    current.raw_x = -0.13
     current.raw_y = 0.31
     current.scale_axis.p = -1.00
     current.scale_axis.v = 0.85
@@ -4859,7 +5023,12 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     # gain as TRACK and pending credit.  At this near-plane fixture the
     # ex=+0.10 request is yaw-capped and asks for 0.125 rad bank.
     assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
-    assert out.target_roll_rad == pytest.approx(0.125, abs=1e-9)
+    assert out.target_roll_rad == pytest.approx(
+        0.50
+        * controller._course_steer_gain(controller.current)
+        * controller._lateral_intercept_reference_x,
+        abs=1e-9,
+    )
     # F58: the real 0.15 rad advance drive, not the coast's 0.05 nudge.
     # F66: the F60 vertical-aim term is deleted — in commit the attitude is
     # the forward drive only; vertical translation is the servo's alone.
@@ -5671,14 +5840,15 @@ def test_yaw_command_output_never_exceeds_the_0p15_production_cap():
     assert out.yaw_rate_rad_s == pytest.approx(-0.15, abs=1e-9)
 
 
-def test_commit_entry_refuses_excessive_closure():
-    # Arrival energy is the uncontrolled budget: an approach still closing
-    # faster than the governor target (expansion rate 0.50/s > 0.35) is
-    # refused even with a usable aperture and a centered, settled bearing —
-    # TRACK keeps controlling energy outside the censorship blackout
-    # instead of committing a hot crossing.
+def test_commit_entry_holds_hot_closure_before_blackout_point_of_no_return():
+    # Fast closure is not a scalar veto, but a contained approach still holds
+    # while enough visible braking window remains.  At the first proximity
+    # boundary, 0.50/s leaves 0.60 s before the -0.9 blackout regime, longer
+    # than the modeled 0.50 s blackout horizon.
     closing = _commit_controller()
     closing.current.scale_axis.v = 0.50
+    closing.current.scale_axis.p = -1.20
+    closing.current.outer_log_scale = -1.20
     _drive_commit_window(closing, 100.10)
     assert closing.state is CleanCourseState.TRACK
 

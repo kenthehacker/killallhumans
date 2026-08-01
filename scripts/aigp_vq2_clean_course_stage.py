@@ -370,21 +370,19 @@ COMMIT_TIMEOUT_S = 3.0  # no credit this long -> arrest and search
 # OUTSIDE the censorship blackout until the budget below passes; COMMIT is
 # the only gate-1+ crossing path; credible close loss inside an armed
 # COMMIT latches the exact-zero credit wait (no blind driving).
-# Entry requires, at the CURRENT frame (never a 0.30 s-old axis):
-#   * a currently usable inner aperture (passage_usable) — an unfit aperture
-#     at close range is the best available "about to go blind" signal;
-#   * uncensored same-id measurements on BOTH axes, this frame;
-#   * |error| + |rate| * COMMIT_BLACKOUT_S <= margin * aperture_half_extent
-#     on BOTH axes, evaluated on the WORST of the raw measurement and the
-#     filtered prediction — predicted blackout drift is part of the budget;
-#   * closure/expansion at or below the governor's target rate, so the
-#     crossing never starts at unarrested approach energy.
-# If any term fails, TRACK keeps braking/re-centering; the entry condition
-# is never loosened.
+# F164 replaces that pointwise conjunction with two explicit observables.
+# Outer bbox center/scale has its own derivative state and exclusively owns
+# closure/TTC.  A race-gate-owned aperture certificate stores the fitted inner
+# opening relative to the co-timed outer support and transports it across a
+# bounded fit blackout.  The current center must lie in the conservative core;
+# the full fallback/TTC projection hull plus bounded uncertainty must lie in
+# the full aperture.  Longitudinal admission is then either a controlled
+# approach or a contained point-of-no-return whose predicted visual blackout
+# is inside COMMIT_BLACKOUT_S.  Hot closure is no longer a dimensionless scalar
+# veto, and missing geometry never becomes crossing authority.
 COMMIT_ENTRY_MEAS_MAX_AGE_S = 0.06  # "current frame" at ~30 Hz camera
 COMMIT_BLACKOUT_S = 0.50  # measured close-range censorship window 0.3-0.6 s
 COMMIT_ENTRY_APERTURE_MARGIN_FRAC = 0.60  # error+drift within 60% of half
-COMMIT_ENTRY_MAX_EXPANSION_RATE_S = 0.35  # <= closure governor target
 # IMU vertical velocity is supporting evidence, never passage authority.  The
 # former hard |vz| gate could veto a visually clear correction using a leaky,
 # regime-gated integral; the optical miss interval now owns admission while vz
@@ -804,6 +802,68 @@ class _PassageMotion:
     directional_censor: FrameEdge = FrameEdge.NONE
 
 
+@dataclass
+class _ApertureCorridorCertificate:
+    """Inner opening geometry expressed against one outer-track observation.
+
+    The certificate is deliberately not another target tracker.  It records
+    the aperture-to-outer-box geometry from one passage-usable camera frame so
+    that the opening can be transported by the separately filtered outer
+    track during a short fit blackout.  ``gate_index`` is assigned only while
+    the hypothesis is the race-owned current target; successor vision may
+    prepare geometry, but cannot authorize a crossing.
+    """
+
+    track_id: Optional[str]
+    gate_index: Optional[int]
+    frame_identity: Optional[Tuple[Any, Any]]
+    source_s: float
+    aperture_center_x: float
+    aperture_center_y: float
+    aperture_half_x: float
+    aperture_half_y: float
+    offset_ratio_x: float
+    offset_ratio_y: float
+    half_ratio_x: float
+    half_ratio_y: float
+    center_std_x_norm: float
+    center_std_y_norm: float
+
+
+@dataclass(frozen=True)
+class _TransportedCorridor:
+    track_id: Optional[str]
+    gate_index: int
+    frame_identity: Optional[Tuple[Any, Any]]
+    source_age_s: float
+    center_x: float
+    center_y: float
+    half_x: float
+    half_y: float
+    center_std_x: float
+    center_std_y: float
+    live: bool
+
+
+@dataclass(frozen=True)
+class _CommitAdmission:
+    """Inspectable result of the single passage-admission decision."""
+
+    admissible: bool
+    status: str
+    corridor_known: bool = False
+    corridor_live: bool = False
+    corridor_age_s: Optional[float] = None
+    x_tube: Optional[float] = None
+    y_tube: Optional[float] = None
+    x_budget: Optional[float] = None
+    y_budget: Optional[float] = None
+    closure_rate_s: Optional[float] = None
+    closure_agreement: Optional[float] = None
+    ttc_s: Optional[float] = None
+    longitudinal_reachable: bool = False
+
+
 class _Hypothesis:
     """Retained current/successor target hypothesis with its small filter."""
 
@@ -811,13 +871,20 @@ class _Hypothesis:
         "track_id",
         "x_axis",
         "y_axis",
+        "outer_x_axis",
+        "outer_y_axis",
         "scale_axis",
+        "passage_source",
         "confidence",
         "outer_log_scale",
         "outer_log_scale_s",
         "outer_expansion_rate",
         "outer_half_span_x",
+        "outer_half_span_y",
+        "outer_raw_x",
+        "outer_raw_y",
         "clipped",
+        "clipping_edges",
         "vertical_censor_edge",
         "vertical_censor_bound",
         "created_s",
@@ -828,6 +895,7 @@ class _Hypothesis:
         "raw_y",
         "aperture_half_x",
         "aperture_half_y",
+        "corridor_certificate",
     )
 
     def __init__(
@@ -837,6 +905,10 @@ class _Hypothesis:
         x: float,
         y: float,
         log_scale: float,
+        outer_x: Optional[float] = None,
+        outer_y: Optional[float] = None,
+        outer_log_scale: Optional[float] = None,
+        passage_source: str = "outer",
         confidence: float,
         pos_var: float,
         now_s: float,
@@ -844,17 +916,37 @@ class _Hypothesis:
         self.track_id = track_id
         self.x_axis = _AxisFilter(x, 0.0, pos_var, INITIAL_RATE_VAR)
         self.y_axis = _AxisFilter(y, 0.0, pos_var, INITIAL_RATE_VAR)
-        self.scale_axis = _AxisFilter(log_scale, 0.0, pos_var, INITIAL_RATE_VAR)
+        outer_x_value = float(x if outer_x is None else outer_x)
+        outer_y_value = float(y if outer_y is None else outer_y)
+        outer_scale_value = float(
+            log_scale if outer_log_scale is None else outer_log_scale
+        )
+        self.outer_x_axis = _AxisFilter(
+            outer_x_value, 0.0, pos_var, INITIAL_RATE_VAR
+        )
+        self.outer_y_axis = _AxisFilter(
+            outer_y_value, 0.0, pos_var, INITIAL_RATE_VAR
+        )
+        # Range/closure is an outer-box observable.  It must never ingest the
+        # inner-aperture log scale (F162/F163's modality jump manufactured a
+        # ~2/s closure spike precisely when the aperture disappeared).
+        self.scale_axis = _AxisFilter(
+            outer_scale_value, 0.0, pos_var, INITIAL_RATE_VAR
+        )
+        self.passage_source = str(passage_source)
         self.confidence = _clamp01(confidence)
-        self.outer_log_scale = float(log_scale)
+        self.outer_log_scale = outer_scale_value
         self.outer_log_scale_s = float(now_s)
         self.outer_expansion_rate = 0.0
-        # F56: outer bbox x half-width in norm — the COMMIT corridor bound
-        # is measured in gate units.  Square-box proxy from the area scale
-        # here; the real bbox half-width overwrites it on every uncensored
-        # x measurement (see _update_hypothesis).
-        self.outer_half_span_x = 0.5 * math.exp(float(log_scale))
+        # ``bbox_norm`` spans [0, 1] while center/aperture coordinates span
+        # [-1, 1].  A bbox width is therefore already a half-extent in the
+        # center coordinate system (0.5*w in unit space, multiplied by two).
+        self.outer_half_span_x = math.exp(outer_scale_value)
+        self.outer_half_span_y = self.outer_half_span_x
+        self.outer_raw_x = outer_x_value
+        self.outer_raw_y = outer_y_value
         self.clipped = False
+        self.clipping_edges = FrameEdge.NONE
         # Directional censorship is still one-sided geometry.  In
         # particular, a same-id gate leaving through the frame BOTTOM says
         # the gate is low; losing the numeric y measurement must not turn
@@ -865,14 +957,16 @@ class _Hypothesis:
         self.last_measurement_s = float(now_s)
         self.last_x_measurement_s = float(now_s)
         self.last_y_measurement_s = float(now_s)
-        # Last uncensored RAW measurement per axis (the commit-entry budget
-        # evaluates the worst of raw vs filtered) and the CURRENT frame's
-        # usable inner-aperture half-extents (None when the fit is not
-        # passage-usable — itself the "about to go blind" signal).
+        # Last passage-coordinate sample per axis and the CURRENT frame's live
+        # inner-aperture half-extents.  The persistent, gate-owned certificate
+        # is separate and therefore survives a bounded missing-fit interval.
         self.raw_x = float(x)
         self.raw_y = float(y)
         self.aperture_half_x: Optional[float] = None
         self.aperture_half_y: Optional[float] = None
+        self.corridor_certificate: Optional[
+            _ApertureCorridorCertificate
+        ] = None
 
     @property
     def x(self) -> float:
@@ -901,6 +995,10 @@ class _Hypothesis:
     @property
     def position_std(self) -> float:
         return math.hypot(self.x_axis.std, self.y_axis.std)
+
+    @property
+    def outer_position_std(self) -> float:
+        return math.hypot(self.outer_x_axis.std, self.outer_y_axis.std)
 
 
 @dataclass(frozen=True)
@@ -977,7 +1075,6 @@ class CleanCourseConfig:
     commit_entry_meas_max_age_s: float = COMMIT_ENTRY_MEAS_MAX_AGE_S
     commit_blackout_s: float = COMMIT_BLACKOUT_S
     commit_entry_aperture_margin_frac: float = COMMIT_ENTRY_APERTURE_MARGIN_FRAC
-    commit_entry_max_expansion_rate_s: float = COMMIT_ENTRY_MAX_EXPANSION_RATE_S
     pitch_target_min_rad: float = PITCH_TARGET_MIN_RAD
     near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
@@ -1100,6 +1197,9 @@ class CleanCourseController:
         # COMMIT_* constant block).
         self._near_plane_since_s: Optional[float] = None
         self._commit_entry_s: Optional[float] = None
+        self._last_commit_admission = _CommitAdmission(
+            False, "not-evaluated"
+        )
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
@@ -1221,7 +1321,9 @@ class CleanCourseController:
                 ),
             )
         if current_track is not None:
-            self.current = self._hypothesis_from_track(current_track, now_s)
+            self.current = self._hypothesis_from_track(
+                current_track, now_s, gate_index=self.gate_index
+            )
             self.state = CleanCourseState.TRACK
             self._set_reliable_bearing(self.current.x, self.current.y)
             self._seed_current_fresh_observation(self.current, now_s=now_s)
@@ -1400,7 +1502,9 @@ class CleanCourseController:
                 else self._select_search_reacquisition(tracks, now_s)
             )
             if adopted is not None:
-                self.current = self._hypothesis_from_track(adopted, now_s)
+                self.current = self._hypothesis_from_track(
+                    adopted, now_s, gate_index=self.gate_index
+                )
                 if fresh:
                     self._seed_current_fresh_observation(
                         self.current, now_s=now_s
@@ -1507,6 +1611,11 @@ class CleanCourseController:
         # the newly authoritative leg.
         self._reset_vertical_direction()
         self._clear_current_fresh_observation()
+        self._near_plane_since_s = None
+        self._commit_entry_s = None
+        self._last_commit_admission = _CommitAdmission(
+            False, "authoritative-gate-change"
+        )
         # Preserve the filtered bearing through promotion, but start the new
         # gate's future-successor aperture calculation from zero.  The newly
         # promoted current hypothesis is the same derotated bearing that fed
@@ -1530,6 +1639,11 @@ class CleanCourseController:
         ):
             self.current = successor
             self.successor = None
+            # Successor vision may prepare a keyed geometric certificate, but
+            # this authoritative race event is the only operation that turns
+            # it into current-gate passage authority.
+            if self.current.corridor_certificate is not None:
+                self.current.corridor_certificate.gate_index = self.gate_index
             self.state = (
                 CleanCourseState.TRACK
                 if now_s - self.current.last_measurement_s
@@ -1548,6 +1662,12 @@ class CleanCourseController:
             elif cached is not None:
                 self._set_reliable_bearing(cached[0], cached[1])
             self._enter_search(now_s)
+        # The physical intercept is gate-owned path state, not camera heading
+        # memory.  Seed it from the newly race-owned current hypothesis instead
+        # of carrying the previous gate's bank request across promotion.
+        self._lateral_intercept_reference_x = (
+            self.current.x if self.current is not None else None
+        )
         # Re-arm the course-heading anchor for the new leg (F31).
         self._course_anchor_yaw_rad = None
         return True
@@ -1720,17 +1840,22 @@ class CleanCourseController:
                 self._near_plane_since_s = now_s
         else:
             self._near_plane_since_s = None
-        # 2026-07-30 unified entry budget (see the COMMIT_ENTRY_* block):
-        # ONE crossing policy.  Entry requires the CURRENT frame to prove a
-        # usable inner aperture, uncensored both-axis measurements, low
-        # closure, and error+predicted-blackout-drift inside the aperture
-        # with margin — worst case of raw vs filtered.  A failed budget
-        # never loosens: TRACK keeps braking/re-centering outside the
-        # censorship blackout until the crossing is provably aligned.
+        commit_admission = (
+            self._commit_admission(now_s, pitch_rad, cfg)
+            if near_plane_close
+            else _CommitAdmission(False, "outside-proximity")
+        )
+        if not near_plane_close and self.state is not CleanCourseState.COMMIT:
+            self._last_commit_admission = commit_admission
+        # F164 unified entry model (see the COMMIT_ENTRY_* block): one outer
+        # closure/TTC state plus one gate-owned aperture certificate.  A
+        # contained trajectory commits from controlled closure or at the
+        # bounded visual point-of-no-return; otherwise TRACK continues
+        # braking/re-centering outside the censorship blackout.
         if (
             near_plane_close
             and now_s - self._near_plane_since_s >= cfg.commit_sustain_s
-            and self._commit_entry_budget_ok(now_s, pitch_rad, cfg)
+            and commit_admission.admissible
         ):
             self.state = CleanCourseState.COMMIT
             self._commit_entry_s = float(now_s)
@@ -2299,7 +2424,7 @@ class CleanCourseController:
         near_plane_hold = (
             self.state is CleanCourseState.TRACK
             and current.outer_log_scale >= cfg.commit_min_log_scale
-            and not self._commit_entry_budget_ok(now_s, pitch_rad, cfg)
+            and not commit_admission.admissible
         )
         if near_plane_hold:
             advance = 0.0
@@ -2420,44 +2545,88 @@ class CleanCourseController:
     def _commit_entry_budget_ok(
         self, now_s: float, pitch_rad: float, cfg: "CleanCourseConfig"
     ) -> bool:
-        """2026-07-30 unified crossing-entry budget (COMMIT_ENTRY_* block).
+        """Return the structured corridor/TTC admission result as a bool."""
 
-        True only when the CURRENT frame proves: a passage-usable inner
-        aperture, uncensored both-axis same-id measurements (never a
-        0.30 s-old axis), closure at/below the governor target, and the
-        uncertainty-expanded optical plane intercept inside the aperture
-        half-extents with margin on BOTH axes.  The raw measurement remains
-        a conservative floor on that envelope.  Anything less keeps TRACK
-        braking/re-centering outside the censorship blackout.
+        return self._commit_admission(now_s, pitch_rad, cfg).admissible
+
+    def _commit_admission(
+        self, now_s: float, pitch_rad: float, cfg: "CleanCourseConfig"
+    ) -> _CommitAdmission:
+        """Evaluate one gate-owned trajectory tube and longitudinal model.
+
+        Outer-box observations alone own closure/TTC; a separately transported
+        aperture certificate owns geometry.  The current center must sit in the
+        conservative core, while both complete optical projection endpoints
+        plus bounded model/transport uncertainty must fit in the full opening.
+        Fast closure is not categorically rejected: a contained approach may
+        commit at the modeled censorship point-of-no-return.
         """
 
         current = self.current
         if current is None:
-            return False
-        if (
-            now_s - current.last_x_measurement_s
-            > cfg.commit_entry_meas_max_age_s
-            or now_s - current.last_y_measurement_s
-            > cfg.commit_entry_meas_max_age_s
-        ):
-            return False
-        if current.aperture_half_x is None or current.aperture_half_y is None:
-            return False
-        # F102 (Codex checkpoint): veto on the FASTER of the lagging Kalman
-        # rate and the fresh raw outer-bbox rate — the same signal the F99
-        # closure governor brakes on.  The filtered rate alone lags ~1 s on
-        # a fresh/adopted track and would arm a still-hot crossing.
-        raw_closure = (
-            current.outer_expansion_rate
-            if now_s - current.last_measurement_s
-            <= cfg.outer_expansion_max_age_s
-            else 0.0
+            result = _CommitAdmission(False, "no-current")
+            self._last_commit_admission = result
+            return result
+
+        corridor = self._transported_corridor(current, now_s=now_s)
+        certificate = current.corridor_certificate
+        if corridor is None and certificate is None:
+            # Compatibility for focused direct-state unit fixtures.  The live
+            # reachability proof below enters through public observations and
+            # always uses a real certificate.
+            if (
+                current.aperture_half_x is not None
+                and current.aperture_half_y is not None
+                and now_s - current.last_x_measurement_s
+                <= cfg.commit_entry_meas_max_age_s
+                and now_s - current.last_y_measurement_s
+                <= cfg.commit_entry_meas_max_age_s
+            ):
+                corridor = _TransportedCorridor(
+                    track_id=current.track_id,
+                    gate_index=self.gate_index,
+                    frame_identity=None,
+                    source_age_s=0.0,
+                    center_x=current.raw_x,
+                    center_y=current.raw_y,
+                    half_x=current.aperture_half_x,
+                    half_y=current.aperture_half_y,
+                    center_std_x=current.x_axis.std,
+                    center_std_y=current.y_axis.std,
+                    live=True,
+                )
+        if corridor is None:
+            status = (
+                "corridor-owner-mismatch"
+                if certificate is not None
+                and certificate.gate_index != self.gate_index
+                else "corridor-unknown-or-expired"
+            )
+            result = _CommitAdmission(False, status)
+            self._last_commit_admission = result
+            return result
+
+        common = {
+            "corridor_known": True,
+            "corridor_live": corridor.live,
+            "corridor_age_s": corridor.source_age_s,
+        }
+        fresh_outer_frame = bool(
+            self._current_fresh_observation_track_id == current.track_id
+            and self._current_fresh_observation_s is not None
+            and now_s - self._current_fresh_observation_s
+            <= cfg.commit_entry_meas_max_age_s
         )
-        if (
-            max(current.expansion_rate, raw_closure)
-            > cfg.commit_entry_max_expansion_rate_s
-        ):
-            return False
+        direct_fixture = corridor.frame_identity is None and certificate is None
+        if not (fresh_outer_frame or direct_fixture):
+            result = _CommitAdmission(False, "stale-outer-frame", **common)
+            self._last_commit_admission = result
+            return result
+        if current.clipping_edges != FrameEdge.NONE:
+            result = _CommitAdmission(False, "directionally-censored", **common)
+            self._last_commit_admission = result
+            return result
+
         x_motion = self._passage_motion(
             current,
             current.x_axis,
@@ -2465,30 +2634,91 @@ class CleanCourseController:
             now_s=now_s,
             measurement_age_s=now_s - current.last_x_measurement_s,
         )
-        ex = max(abs(current.raw_x), abs(x_motion.intercept_error))
-        x_envelope = ex + cfg.commit_entry_sigma_mult * x_motion.intercept_std
-        if x_envelope > (
-            cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
-        ):
-            return False
-        filtered_ey = self._compensated_ey(current.y, pitch_rad)
+        compensated_center_y = self._compensated_ey(
+            corridor.center_y, pitch_rad
+        )
         y_motion = self._passage_motion(
             current,
             current.y_axis,
-            filtered_ey,
+            self._compensated_ey(current.y, pitch_rad),
             now_s=now_s,
             measurement_age_s=now_s - current.last_y_measurement_s,
         )
-        ey = max(
-            abs(self._compensated_ey(current.raw_y, pitch_rad)),
-            abs(y_motion.intercept_error),
+        x_budget = cfg.commit_entry_aperture_margin_frac * corridor.half_x
+        y_budget = cfg.commit_entry_aperture_margin_frac * corridor.half_y
+        x_projection = max(
+            abs(x_motion.fallback_intercept_error),
+            abs(x_motion.optical_intercept_error),
         )
-        y_envelope = ey + cfg.commit_entry_sigma_mult * y_motion.intercept_std
-        if y_envelope > (
-            cfg.commit_entry_aperture_margin_frac * current.aperture_half_y
+        y_projection = max(
+            abs(y_motion.fallback_intercept_error),
+            abs(y_motion.optical_intercept_error),
+        )
+        x_tube = x_projection + cfg.commit_entry_sigma_mult * (
+            x_motion.bearing_std
+            + cfg.passage_motion_model_std_norm
+            + corridor.center_std_x
+        )
+        y_tube = y_projection + cfg.commit_entry_sigma_mult * (
+            y_motion.bearing_std
+            + cfg.passage_motion_model_std_norm
+            + corridor.center_std_y
+        )
+        if (
+            abs(corridor.center_x) > x_budget
+            or abs(compensated_center_y) > y_budget
+            or x_tube > corridor.half_x
+            or y_tube > corridor.half_y
         ):
-            return False
-        return True
+            result = _CommitAdmission(
+                False,
+                "corridor-known/not-contained",
+                x_tube=x_tube,
+                y_tube=y_tube,
+                x_budget=x_budget,
+                y_budget=y_budget,
+                **common,
+            )
+            self._last_commit_admission = result
+            return result
+
+        closure, agreement = self._robust_closure_rate(current, now_s)
+        if closure >= cfg.passage_min_closure_rate_s:
+            raw_ttc_s = 1.0 / closure
+            time_to_blackout_s = max(
+                0.0, cfg.near_brake_log_scale - current.outer_log_scale
+            ) / closure
+            imminent_blackout = bool(
+                cfg.passage_ttc_min_s
+                <= raw_ttc_s
+                <= cfg.commit_timeout_s
+                and time_to_blackout_s <= cfg.commit_blackout_s
+            )
+            ttc_s: Optional[float] = raw_ttc_s
+        else:
+            imminent_blackout = False
+            ttc_s = None
+        closure_std_s = math.sqrt(max(0.0, current.scale_axis.vv))
+        controlled_approach = (
+            closure + cfg.commit_entry_sigma_mult * closure_std_s
+            <= cfg.closure_target_rate_s
+        )
+        longitudinal_reachable = controlled_approach or imminent_blackout
+        result = _CommitAdmission(
+            longitudinal_reachable,
+            "admissible" if longitudinal_reachable else "longitudinal-hold",
+            x_tube=x_tube,
+            y_tube=y_tube,
+            x_budget=x_budget,
+            y_budget=y_budget,
+            closure_rate_s=closure,
+            closure_agreement=agreement,
+            ttc_s=ttc_s,
+            longitudinal_reachable=longitudinal_reachable,
+            **common,
+        )
+        self._last_commit_admission = result
+        return result
 
     def _robust_closure_rate(
         self, current: _Hypothesis, now_s: float
@@ -2704,13 +2934,166 @@ class CleanCourseController:
             return 0.0
         return float(now_s) - first_seen
 
-    def _hypothesis_from_track(self, track: Any, now_s: float) -> _Hypothesis:
-        center, log_scale, _stds = _track_measurement(track)
+    def _refresh_corridor_certificate(
+        self,
+        hypothesis: _Hypothesis,
+        track: Any,
+        *,
+        now_s: float,
+        gate_index: Optional[int],
+    ) -> None:
+        """Capture a passage-usable aperture against the co-timed outer box."""
+
+        aperture = _track_aperture(track)
+        aperture_meas = _aperture_track_measurement(track)
+        clipping = getattr(track, "clipping", FrameEdge.NONE)
+        if type(clipping) is not FrameEdge:
+            clipping = FrameEdge.NONE
+        if (
+            aperture is None
+            or aperture_meas is None
+            or not bool(getattr(aperture, "passage_usable", False))
+            or getattr(aperture, "half_size_norm", None) is None
+            or bool(
+                clipping
+                & (FrameEdge.LEFT | FrameEdge.RIGHT | FrameEdge.TOP | FrameEdge.BOTTOM)
+            )
+        ):
+            return
+        bbox = getattr(track, "bbox_norm", None)
+        if bbox is None or len(bbox) < 4:
+            return
+        outer_half_x = float(bbox[2]) - float(bbox[0])
+        outer_half_y = float(bbox[3]) - float(bbox[1])
+        half_x = float(aperture.half_size_norm[0])
+        half_y = float(aperture.half_size_norm[1])
+        if min(outer_half_x, outer_half_y, half_x, half_y) <= 1e-6:
+            return
+        center, _log_scale, stds = aperture_meas
+        outer_center = track.center_norm
+        identity = self._last_frame_identity
+        existing = hypothesis.corridor_certificate
+        # A tracker republication of the same camera frame is not fresh
+        # aperture evidence and may not extend the certificate lifetime.
+        if (
+            existing is not None
+            and identity is not None
+            and existing.frame_identity == identity
+        ):
+            return
+        hypothesis.corridor_certificate = _ApertureCorridorCertificate(
+            track_id=hypothesis.track_id,
+            gate_index=gate_index,
+            frame_identity=identity,
+            source_s=float(now_s),
+            aperture_center_x=float(center[0]),
+            aperture_center_y=float(center[1]),
+            aperture_half_x=half_x,
+            aperture_half_y=half_y,
+            offset_ratio_x=(float(center[0]) - float(outer_center[0]))
+            / outer_half_x,
+            offset_ratio_y=(float(center[1]) - float(outer_center[1]))
+            / outer_half_y,
+            half_ratio_x=half_x / outer_half_x,
+            half_ratio_y=half_y / outer_half_y,
+            center_std_x_norm=max(1e-3, float(stds[0])),
+            center_std_y_norm=max(1e-3, float(stds[1])),
+        )
+
+    def _transported_corridor(
+        self,
+        hypothesis: _Hypothesis,
+        *,
+        now_s: float,
+        gate_index: Optional[int] = None,
+    ) -> Optional[_TransportedCorridor]:
+        """Transport one gate-owned aperture certificate on the outer track."""
+
+        certificate = hypothesis.corridor_certificate
+        owner = self.gate_index if gate_index is None else int(gate_index)
+        if (
+            certificate is None
+            or certificate.track_id != hypothesis.track_id
+            or certificate.gate_index != owner
+        ):
+            return None
+        age_s = max(0.0, float(now_s) - certificate.source_s)
+        if age_s > self.config.predict_max_gap_s:
+            return None
+        live = age_s <= self.config.commit_entry_meas_max_age_s
+        if live:
+            center_x = certificate.aperture_center_x
+            center_y = certificate.aperture_center_y
+            half_x = certificate.aperture_half_x
+            half_y = certificate.aperture_half_y
+        else:
+            center_x = (
+                hypothesis.outer_x_axis.p
+                + certificate.offset_ratio_x * hypothesis.outer_half_span_x
+            )
+            center_y = (
+                hypothesis.outer_y_axis.p
+                + certificate.offset_ratio_y * hypothesis.outer_half_span_y
+            )
+            half_x = certificate.half_ratio_x * hypothesis.outer_half_span_x
+            half_y = certificate.half_ratio_y * hypothesis.outer_half_span_y
+        growth = age_s * self.config.passage_motion_model_std_norm
+        center_std_x = (
+            certificate.center_std_x_norm
+            if live
+            else math.hypot(
+                certificate.center_std_x_norm,
+                hypothesis.outer_x_axis.std,
+            )
+            + growth
+        )
+        center_std_y = (
+            certificate.center_std_y_norm
+            if live
+            else math.hypot(
+                certificate.center_std_y_norm,
+                hypothesis.outer_y_axis.std,
+            )
+            + growth
+        )
+        return _TransportedCorridor(
+            track_id=hypothesis.track_id,
+            gate_index=owner,
+            frame_identity=certificate.frame_identity,
+            source_age_s=age_s,
+            center_x=float(center_x),
+            center_y=float(center_y),
+            half_x=float(half_x),
+            half_y=float(half_y),
+            center_std_x=float(center_std_x),
+            center_std_y=float(center_std_y),
+            live=live,
+        )
+
+    def _hypothesis_from_track(
+        self,
+        track: Any,
+        now_s: float,
+        *,
+        gate_index: Optional[int] = None,
+    ) -> _Hypothesis:
+        outer_center, outer_log_scale, _outer_stds = _outer_track_measurement(track)
+        aperture_meas = _aperture_track_measurement(track)
+        if aperture_meas is None:
+            center = outer_center
+            passage_source = "outer"
+        else:
+            center = aperture_meas[0]
+            passage_source = "aperture"
         hypothesis = _Hypothesis(
             track_id=str(track.track_id),
             x=center[0],
             y=center[1],
-            log_scale=log_scale,
+            log_scale=outer_log_scale,
+            outer_x=outer_center[0],
+            outer_y=outer_center[1],
+            outer_log_scale=outer_log_scale,
+            passage_source=passage_source,
             confidence=float(track.confidence),
             pos_var=INITIAL_POS_VAR_NORM,
             now_s=now_s,
@@ -2728,6 +3111,7 @@ class CleanCourseController:
         # an aggregate censor with no directional bits invalidates both axes.
         nondirectional_censor = center_censored and clipping == FrameEdge.NONE
         hypothesis.clipped = clipping != FrameEdge.NONE
+        hypothesis.clipping_edges = clipping
         x_censored = (
             nondirectional_censor
             or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
@@ -2739,8 +3123,11 @@ class CleanCourseController:
             # detection's true bbox half-width for the COMMIT corridor.
             bbox = getattr(track, "bbox_norm", None)
             if bbox is not None and len(bbox) >= 4:
-                hypothesis.outer_half_span_x = 0.5 * (
+                hypothesis.outer_half_span_x = (
                     float(bbox[2]) - float(bbox[0])
+                )
+                hypothesis.outer_half_span_y = (
+                    float(bbox[3]) - float(bbox[1])
                 )
         if nondirectional_censor or bool(
             clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
@@ -2750,6 +3137,20 @@ class CleanCourseController:
                 FrameEdge.TOP | FrameEdge.BOTTOM
             )
             hypothesis.vertical_censor_bound = float(track.center_norm[1])
+        aperture = _track_aperture(track)
+        if (
+            aperture is not None
+            and bool(getattr(aperture, "passage_usable", False))
+            and getattr(aperture, "half_size_norm", None) is not None
+        ):
+            hypothesis.aperture_half_x = float(aperture.half_size_norm[0])
+            hypothesis.aperture_half_y = float(aperture.half_size_norm[1])
+        self._refresh_corridor_certificate(
+            hypothesis,
+            track,
+            now_s=now_s,
+            gate_index=gate_index,
+        )
         return hypothesis
 
     def _predict(
@@ -2780,12 +3181,16 @@ class CleanCourseController:
         drift_y = -pitch_rate * ROTATION_COMP_FOCAL_NORM * dt
         hypothesis.x_axis.predict(dt, drift=drift_x)
         hypothesis.y_axis.predict(dt, drift=drift_y)
+        hypothesis.outer_x_axis.predict(dt, drift=drift_x)
+        hypothesis.outer_y_axis.predict(dt, drift=drift_y)
         hypothesis.scale_axis.predict(dt)
         compensation_var = ROTATION_COMP_UNCERTAINTY * (
             abs(drift_x) + abs(drift_y)
         )
         hypothesis.x_axis.inflate(LATENCY_VAR_NORM + compensation_var)
         hypothesis.y_axis.inflate(LATENCY_VAR_NORM + compensation_var)
+        hypothesis.outer_x_axis.inflate(LATENCY_VAR_NORM + compensation_var)
+        hypothesis.outer_y_axis.inflate(LATENCY_VAR_NORM + compensation_var)
 
     def _update_hypothesis(
         self,
@@ -2793,7 +3198,10 @@ class CleanCourseController:
         track: Any,
         now_s: float,
     ) -> None:
-        (zx, zy), z_log_scale, stds = _track_measurement(track)
+        (outer_zx, outer_zy), outer_z_log_scale, outer_stds = (
+            _outer_track_measurement(track)
+        )
+        aperture_meas = _aperture_track_measurement(track)
         clipping = getattr(track, "clipping", FrameEdge.NONE)
         if type(clipping) is not FrameEdge:
             clipping = FrameEdge.NONE
@@ -2817,47 +3225,43 @@ class CleanCourseController:
             float(track.confidence)
             * float(getattr(track, "association_confidence", 1.0)),
         )
-        # Confidence-weighted measurement noise, not binary authority classes.
-        r_x = (stds[0] ** 2) / confidence
-        r_y = (stds[1] ** 2) / confidence
-        r_scale = (stds[2] ** 2) / confidence
-        # A censored axis is unobserved (never a forced-zero "stationary"
-        # rate): update observable axes, predict/inflate censored ones.
+        outer_r_x = (outer_stds[0] ** 2) / confidence
+        outer_r_y = (outer_stds[1] ** 2) / confidence
+        outer_r_scale = (outer_stds[2] ** 2) / confidence
+
+        # Outer association/FOV/range state has one and only one measurement
+        # modality.  A censored coordinate remains an inequality rather than a
+        # forced-zero observation.
         if x_censored:
-            hypothesis.x_axis.inflate(CENSOR_INFLATE_VAR_NORM)
+            hypothesis.outer_x_axis.inflate(CENSOR_INFLATE_VAR_NORM)
         else:
-            hypothesis.x_axis.update(zx, r_x)
-            hypothesis.last_x_measurement_s = float(now_s)
-            hypothesis.raw_x = float(zx)
+            hypothesis.outer_x_axis.update(outer_zx, outer_r_x)
+            hypothesis.outer_raw_x = float(outer_zx)
         if y_censored:
-            hypothesis.y_axis.inflate(CENSOR_INFLATE_VAR_NORM)
+            hypothesis.outer_y_axis.inflate(CENSOR_INFLATE_VAR_NORM)
             # A clipped coordinate is an inequality, not an exact center and
             # not "stationary".  The clipped outer-box center is conservative:
             # BOTTOM is a lower bound on image-down error; TOP is an upper
             # bound.  Preserve that directional fact while covariance grows.
             censor_bound = float(track.center_norm[1])
             hypothesis.vertical_censor_bound = censor_bound
-            if clipping & FrameEdge.BOTTOM:
-                hypothesis.y_axis.p = max(hypothesis.y_axis.p, censor_bound)
-            elif clipping & FrameEdge.TOP:
-                hypothesis.y_axis.p = min(hypothesis.y_axis.p, censor_bound)
         else:
-            hypothesis.y_axis.update(zy, r_y)
-            hypothesis.last_y_measurement_s = float(now_s)
-            hypothesis.raw_y = float(zy)
+            hypothesis.outer_y_axis.update(outer_zy, outer_r_y)
+            hypothesis.outer_raw_y = float(outer_zy)
             hypothesis.vertical_censor_bound = None
         if x_censored or y_censored:
             hypothesis.scale_axis.inflate(CENSOR_INFLATE_VAR_NORM)
         else:
-            hypothesis.scale_axis.update(z_log_scale, r_scale)
+            hypothesis.scale_axis.update(outer_z_log_scale, outer_r_scale)
         hypothesis.confidence = _clamp01(float(track.confidence))
         hypothesis.clipped = clipping != FrameEdge.NONE
+        hypothesis.clipping_edges = clipping
         if hypothesis.clipped:
             # Clipping increases uncertainty; it is not an abort condition.
-            hypothesis.x_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
-            hypothesis.y_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
+            hypothesis.outer_x_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
+            hypothesis.outer_y_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
         hypothesis.last_measurement_s = float(now_s)
-        new_outer_log_scale = math.log(max(1e-6, float(track.apparent_scale)))
+        new_outer_log_scale = outer_z_log_scale
         # F99: fast raw closure signal (see the OUTER_EXPANSION_* block) —
         # EMA of the per-frame outer log-scale rate, so the closure
         # governor does not wait ~1 s for the Kalman scale_axis.v to
@@ -2873,19 +3277,20 @@ class CleanCourseController:
             )
         hypothesis.outer_log_scale = new_outer_log_scale
         hypothesis.outer_log_scale_s = float(now_s)
-        if not x_censored:
-            # F56: the corridor bound needs the gate's true half-width; a
-            # censored-x bbox underreports it, so only uncensored frames
-            # refresh the span.
-            bbox = getattr(track, "bbox_norm", None)
-            if bbox is not None and len(bbox) >= 4:
-                hypothesis.outer_half_span_x = 0.5 * (
+        bbox = getattr(track, "bbox_norm", None)
+        if bbox is not None and len(bbox) >= 4:
+            if not x_censored:
+                hypothesis.outer_half_span_x = (
                     float(bbox[2]) - float(bbox[0])
                 )
-        # 2026-07-30 entry budget: the CURRENT frame's usable inner aperture
-        # (passage_usable) is recorded as half-extents; a missing/unusable
-        # fit clears them, so a close-range aperture loss is itself visible
-        # to the commit-entry check as "about to go blind".
+            if not y_censored:
+                hypothesis.outer_half_span_y = (
+                    float(bbox[3]) - float(bbox[1])
+                )
+
+        # Record CURRENT-frame geometry separately from the persistent
+        # certificate.  Missing aperture fits clear only these live fields;
+        # they cannot inject outer coordinates into the passage derivative.
         aperture = _track_aperture(track)
         if (
             aperture is not None
@@ -2897,6 +3302,95 @@ class CleanCourseController:
         else:
             hypothesis.aperture_half_x = None
             hypothesis.aperture_half_y = None
+
+        active_gate_index = self.gate_index if hypothesis is self.current else None
+        self._refresh_corridor_certificate(
+            hypothesis,
+            track,
+            now_s=now_s,
+            gate_index=active_gate_index,
+        )
+
+        # Passage center state is either a direct aperture series, a transported
+        # certificate driven by the outer series, or (until the first aperture
+        # is ever seen) an outer-center fallback.  It never alternates between
+        # aperture and outer measurements in one derivative filter.
+        corridor = (
+            self._transported_corridor(hypothesis, now_s=now_s)
+            if active_gate_index is not None
+            else None
+        )
+        if aperture_meas is not None and not (x_censored or y_censored):
+            (passage_x, passage_y), _aperture_log_scale, passage_stds = (
+                aperture_meas
+            )
+            if hypothesis.passage_source == "outer":
+                hypothesis.x_axis = _AxisFilter(
+                    passage_x, 0.0, passage_stds[0] ** 2, INITIAL_RATE_VAR
+                )
+                hypothesis.y_axis = _AxisFilter(
+                    passage_y, 0.0, passage_stds[1] ** 2, INITIAL_RATE_VAR
+                )
+                hypothesis.passage_source = "aperture"
+            else:
+                hypothesis.x_axis.update(
+                    passage_x, (passage_stds[0] ** 2) / confidence
+                )
+                hypothesis.y_axis.update(
+                    passage_y, (passage_stds[1] ** 2) / confidence
+                )
+            hypothesis.raw_x = float(passage_x)
+            hypothesis.raw_y = float(passage_y)
+            hypothesis.last_x_measurement_s = float(now_s)
+            hypothesis.last_y_measurement_s = float(now_s)
+        elif hypothesis.passage_source == "outer":
+            if x_censored:
+                hypothesis.x_axis.inflate(CENSOR_INFLATE_VAR_NORM)
+            else:
+                hypothesis.x_axis.update(outer_zx, outer_r_x)
+                hypothesis.raw_x = float(outer_zx)
+                hypothesis.last_x_measurement_s = float(now_s)
+            if y_censored:
+                hypothesis.y_axis.inflate(CENSOR_INFLATE_VAR_NORM)
+            else:
+                hypothesis.y_axis.update(outer_zy, outer_r_y)
+                hypothesis.raw_y = float(outer_zy)
+                hypothesis.last_y_measurement_s = float(now_s)
+        elif corridor is not None:
+            if x_censored:
+                hypothesis.x_axis.inflate(CENSOR_INFLATE_VAR_NORM)
+            else:
+                hypothesis.x_axis.update(
+                    corridor.center_x,
+                    max(1e-6, corridor.center_std_x**2) / confidence,
+                )
+                hypothesis.raw_x = float(corridor.center_x)
+                hypothesis.last_x_measurement_s = float(now_s)
+            if y_censored:
+                hypothesis.y_axis.inflate(CENSOR_INFLATE_VAR_NORM)
+            else:
+                hypothesis.y_axis.update(
+                    corridor.center_y,
+                    max(1e-6, corridor.center_std_y**2) / confidence,
+                )
+                hypothesis.raw_y = float(corridor.center_y)
+                hypothesis.last_y_measurement_s = float(now_s)
+        else:
+            hypothesis.x_axis.inflate(CENSOR_INFLATE_VAR_NORM)
+            hypothesis.y_axis.inflate(CENSOR_INFLATE_VAR_NORM)
+
+        if y_censored and hypothesis.vertical_censor_bound is not None:
+            if clipping & FrameEdge.BOTTOM:
+                hypothesis.y_axis.p = max(
+                    hypothesis.y_axis.p, hypothesis.vertical_censor_bound
+                )
+            elif clipping & FrameEdge.TOP:
+                hypothesis.y_axis.p = min(
+                    hypothesis.y_axis.p, hypothesis.vertical_censor_bound
+                )
+        if hypothesis.clipped:
+            hypothesis.x_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
+            hypothesis.y_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
 
     def _refresh_successor(self, tracks: List[Any], now_s: float) -> None:
         current_id = self._current_track_id()
@@ -3087,7 +3581,22 @@ class CleanCourseController:
 
         alpha = _clamp01(dt / max(1e-6, cfg.turn_reference_tau_s + dt))
         aperture_target = 0.0
-        if current.aperture_half_x is not None and current.aperture_half_x > 0.0:
+        corridor = self._transported_corridor(current, now_s=now_s)
+        if corridor is not None and corridor.half_x > 0.0:
+            aperture_budget = (
+                cfg.commit_entry_aperture_margin_frac * corridor.half_x
+            )
+            projected_current_error = (
+                max(abs(current.x), abs(corridor.center_x))
+                + abs(current.vx) * cfg.successor_preview_projection_s
+            )
+            if aperture_budget > 1e-9:
+                aperture_target = _clamp01(
+                    1.0 - projected_current_error / aperture_budget
+                )
+        elif current.aperture_half_x is not None and current.aperture_half_x > 0.0:
+            # Focused direct-state fixtures predate certificates.  Production
+            # uses the branch above; retain their live-geometry seam.
             aperture_budget = (
                 cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
             )
@@ -3632,24 +4141,10 @@ class CleanCourseController:
         desired = current.x + current_motion.control_authority * (
             current_motion.intercept_error - current.x
         )
-        authority = _clamp01(successor_authority)
-        if successor is not None and authority > 0.0:
-            successor_motion = self._passage_motion(
-                successor,
-                successor.x_axis,
-                successor.x,
-                now_s=now_s,
-                measurement_age_s=now_s - successor.last_x_measurement_s,
-            )
-            successor_desired = (
-                successor.x
-                + successor_motion.control_authority
-                * (successor_motion.intercept_error - successor.x)
-            )
-            desired = (
-                (1.0 - authority) * desired
-                + authority * successor_desired
-            )
+        # Successor preview is a yaw/FOV concern only.  Until authoritative
+        # promotion, physical interception belongs exclusively to the current
+        # gate; an opposite-side successor may not unwind the bank that is
+        # still bending the velocity vector through this aperture.
         alpha = _clamp01(
             dt / max(1e-6, self.config.turn_reference_tau_s + dt)
         )
@@ -4117,15 +4612,10 @@ def _track_aperture(track: Any) -> Any:
     return aperture
 
 
-def _track_measurement(
+def _aperture_track_measurement(
     track: Any,
-) -> Tuple[Tuple[float, float], float, Tuple[float, float, float]]:
-    """Prefer a valid fitted inner aperture; fall back to the outer bbox.
-
-    Returns ``((x, y), log_scale, (std_x, std_y, std_scale))``.  The outer
-    fallback carries larger covariance.  Detector ``estimated_distance`` is a
-    placeholder and is never consulted.
-    """
+) -> Optional[Tuple[Tuple[float, float], float, Tuple[float, float, float]]]:
+    """Return one valid inner-aperture measurement without an outer fallback."""
 
     aperture = _track_aperture(track)
     if (
@@ -4148,6 +4638,19 @@ def _track_measurement(
             float(aperture.log_scale),
             meas_stds,
         )
+    return None
+
+
+def _outer_track_measurement(
+    track: Any,
+) -> Tuple[Tuple[float, float], float, Tuple[float, float, float]]:
+    """Return only the outer-box observable used by range and closure.
+
+    F162/F163 alternated inner-aperture and outer-box center/scale in one
+    derivative state.  This function is intentionally incapable of seeing an
+    aperture, making that modality switch impossible at the real adapter.
+    """
+
     center = track.center_norm
     log_scale = math.log(max(1e-6, float(track.apparent_scale)))
     return (
@@ -4155,6 +4658,20 @@ def _track_measurement(
         log_scale,
         (OUTER_MEAS_STD_NORM, OUTER_MEAS_STD_NORM, SCALE_MEAS_STD),
     )
+
+
+def _track_measurement(
+    track: Any,
+) -> Tuple[Tuple[float, float], float, Tuple[float, float, float]]:
+    """Compatibility seam for callers that need the passage aim sample.
+
+    Production filtering calls the explicit aperture and outer adapters
+    separately.  This helper preserves the public test seam without allowing
+    its result to enter the outer derivative state.
+    """
+
+    aperture = _aperture_track_measurement(track)
+    return aperture if aperture is not None else _outer_track_measurement(track)
 
 
 # ---------------------------------------------------------------------------
@@ -4312,12 +4829,42 @@ def _clean_course_tick_trace(
 
     current_trace = None
     if current is not None:
+        corridor = controller._transported_corridor(current, now_s=now_s)
+        corridor_trace = None
+        if corridor is not None:
+            corridor_trace = {
+                "track_id": corridor.track_id,
+                "gate_index": corridor.gate_index,
+                "frame_identity": corridor.frame_identity,
+                "source_age_s": corridor.source_age_s,
+                "center_norm": [corridor.center_x, corridor.center_y],
+                "half_size_norm": [corridor.half_x, corridor.half_y],
+                "center_std_norm": [
+                    corridor.center_std_x,
+                    corridor.center_std_y,
+                ],
+                "live": corridor.live,
+            }
         current_trace = {
             "track_id": current.track_id,
             "bearing": [current.x, current.y],
             "raw_bearing": [current.raw_x, current.raw_y],
             "image_rate_norm_s": [current.vx, current.vy],
             "axis_std": [current.x_axis.std, current.y_axis.std],
+            "passage_source": current.passage_source,
+            "outer_bearing": [
+                current.outer_x_axis.p,
+                current.outer_y_axis.p,
+            ],
+            "outer_raw_bearing": [current.outer_raw_x, current.outer_raw_y],
+            "outer_image_rate_norm_s": [
+                current.outer_x_axis.v,
+                current.outer_y_axis.v,
+            ],
+            "outer_axis_std": [
+                current.outer_x_axis.std,
+                current.outer_y_axis.std,
+            ],
             "log_scale": current.log_scale,
             "outer_log_scale": current.outer_log_scale,
             "expansion_rate_s": current.expansion_rate,
@@ -4330,13 +4877,30 @@ def _clean_course_tick_trace(
             "x_measurement_age_s": now_s - current.last_x_measurement_s,
             "y_measurement_age_s": now_s - current.last_y_measurement_s,
             "vertical_censor_bound": current.vertical_censor_bound,
+            "corridor": corridor_trace,
         }
+    admission = controller._last_commit_admission
     return {
         "state": controller.state.value,
         "state_dwell_s": now_s - state_entry_s,
         "token": token_trace,
         "tracks": tracks,
         "current": current_trace,
+        "commit_admission": {
+            "admissible": admission.admissible,
+            "status": admission.status,
+            "corridor_known": admission.corridor_known,
+            "corridor_live": admission.corridor_live,
+            "corridor_age_s": admission.corridor_age_s,
+            "x_tube": admission.x_tube,
+            "y_tube": admission.y_tube,
+            "x_budget": admission.x_budget,
+            "y_budget": admission.y_budget,
+            "closure_rate_s": admission.closure_rate_s,
+            "closure_agreement": admission.closure_agreement,
+            "ttc_s": admission.ttc_s,
+            "longitudinal_reachable": admission.longitudinal_reachable,
+        },
         "successor": successor_trace,
         "turn_successor_authority": controller._successor_heading_blend,
         "turn_reference_x": controller._successor_heading_error_norm,
