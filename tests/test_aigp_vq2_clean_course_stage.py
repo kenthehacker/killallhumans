@@ -1237,8 +1237,7 @@ def test_course_leg_brake_doubles_authority():
     # ~5 m/s inherited from the gate-0 crossing outran ~1.5 m/s^2 of brake,
     # and the drone passed ~2 m right of the aperture with yaw at the cap.
     # Course legs (gate_index >= 1) get twice the brake offset (-0.30 from
-    # spawn, effective -0.61); Gate 0 keeps the proved -0.15 until its
-    # near-plane entry budget is false.
+    # spawn, effective -0.61); Gate 0 keeps the bounded -0.20 throughout.
     # F84 (20260730T121408Z-visual-course-533d563c): -0.61 rad sat 0.001 rad
     # inside the runner's -35 deg pitch watchdog and the sustained brake
     # slewed into the abort.  Every pitch target is now clamped at
@@ -1298,7 +1297,7 @@ def test_closure_governor_distrusts_tiny_track_expansion():
 
 def test_closure_governor_is_a_continuous_blend():
     # Mid-band closure: the pitch target blends partway from the advance
-    # law (spawn base) toward the spawn-0.15 Gate-0 brake attitude,
+    # law (spawn base) toward the spawn-0.20 Gate-0 brake attitude,
     # without latching the fast-slew brake flag.
     # F101: at log -1.40 the range-ramped target is 0.30, so 0.375/s sits
     # inside the continuous response band below the 0.60 full-brake rate.
@@ -1316,7 +1315,7 @@ def test_closure_governor_is_a_continuous_blend():
         out = _command(controller, now)
     assert not controller._pre_cross_brake_active
     assert (
-        SPAWN_PITCH - 0.15 + 1e-9
+        SPAWN_PITCH - 0.20 + 1e-9
         < out.target_pitch_rad
         < SPAWN_PITCH - 1e-9
     )
@@ -1399,8 +1398,8 @@ def test_pitch_offsets_follow_the_configured_spawn_attitude():
         controller.current.last_x_measurement_s = now
         out = _command(controller, now, pitch=config.spawn_pitch_rad)
     assert controller._pre_cross_brake_active
-    # -0.20 spawn + the Gate-0 -0.15 pre-cross offset = -0.35.
-    assert out.target_pitch_rad == pytest.approx(-0.35, abs=1e-9)
+    # -0.20 spawn + the Gate-0 -0.20 pre-cross offset = -0.40.
+    assert out.target_pitch_rad == pytest.approx(-0.40, abs=1e-9)
 
 
 def test_heading_anchor_clamps_outward_yaw_only():
@@ -2556,7 +2555,7 @@ def test_gate_zero_budget_false_near_plane_hold_keeps_gentle_brake():
     # F109: the F104/F108 full-course escalation pitched Gate 0 sharply up
     # while sinking and twice struck object 1001 without credit.  The
     # near-plane budget-false hold still suppresses advance and demands the
-    # brake, but Gate 0 keeps the F102/F103 live-proven -0.15 attitude.
+    # brake, but Gate 0 keeps the bounded F111 -0.20 attitude.
     controller = _commit_controller_gate_zero()
     current = controller.current
     current.x_axis.p = 0.0
