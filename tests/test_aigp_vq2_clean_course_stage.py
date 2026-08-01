@@ -1542,15 +1542,18 @@ def test_pre_cross_brake_custody_floor_scales_with_compensated_ey():
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH, abs=1e-9)
     # Approaching the bound the floor admits a partial brake.
     controller.current.y_axis.p = 0.50
+    controller.current.raw_y = 0.50
     assert drive().target_pitch_rad == pytest.approx(
         SPAWN_PITCH - (0.55 - 0.50) / 1.6, abs=1e-9
     )
     controller.current.y_axis.p = 0.40
+    controller.current.raw_y = 0.40
     assert drive().target_pitch_rad == pytest.approx(
         SPAWN_PITCH - (0.55 - 0.40) / 1.6, abs=1e-9
     )
     # Centered: the floor sits below the Gate-0 brake attitude — full demand.
     controller.current.y_axis.p = 0.0
+    controller.current.raw_y = 0.0
     assert drive().target_pitch_rad == pytest.approx(
         controller.config.spawn_pitch_rad
         + controller.config.pre_cross_brake_pitch_rad,
@@ -1636,6 +1639,42 @@ def test_course_leg_custody_floor_relaxes_the_single_brake():
     assert out0.target_pitch_rad == pytest.approx(
         SPAWN_PITCH - (0.30 - 0.22) / 1.6, abs=1e-9
     )
+
+
+def test_fresh_downward_image_motion_only_advances_the_brake_custody_floor():
+    # F127: Gate 1 remained physically inside the compensated-y corridor, but
+    # accelerated down-frame under the nose-up brake and bottom-censored only
+    # ~0.19 s after compensated y crossed zero.  Fresh image rate predicts the
+    # existing F94 custody constraint over the existing blackout horizon.  It
+    # may relax pitch earlier, but it must not become the F96 collective D term.
+    def drive(image_rate):
+        controller = _tracked_controller(_track("A", 0.30, 0.0, scale=0.50))
+        controller.gate_index = 1
+        controller.current.scale_axis.v = 0.0
+        controller.current.y_axis.v = image_rate
+        now = 100.10
+        out = None
+        for _ in range(20):
+            now += 0.033
+            controller.current.last_measurement_s = now
+            controller.current.last_x_measurement_s = now
+            controller.current.last_y_measurement_s = now
+            out = _command(controller, now, pitch=SPAWN_PITCH)
+        assert controller._pre_cross_brake_active
+        assert out.vertical_qualified
+        return out
+
+    stationary = drive(0.0)
+    downward = drive(0.30)
+    upward = drive(-0.30)
+
+    assert downward.target_pitch_rad > stationary.target_pitch_rad
+    assert downward.target_pitch_rad <= SPAWN_PITCH
+    assert upward.target_pitch_rad == pytest.approx(
+        stationary.target_pitch_rad, abs=1e-9
+    )
+    assert downward.thrust == pytest.approx(stationary.thrust, abs=1e-9)
+    assert upward.thrust == pytest.approx(stationary.thrust, abs=1e-9)
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():
@@ -1923,52 +1962,6 @@ def test_continuous_turn_reference_coordinates_yaw_and_bank_only():
     )
     assert turn.gate_index == 0
     assert turn.current.track_id == "A"
-
-
-def test_turn_aperture_margin_uses_leg_relative_not_camera_x():
-    # F127: a useful left preturn moved the still-safe Gate 0 right in-frame,
-    # and the aperture scheduler misread that expected optical flow as physical
-    # passage loss.  Equivalent centered and yaw-shifted geometry must retain
-    # the same reserve; the same image displacement without yaw is real error.
-    centered = _turn_reference_controller(current_x=0.0)
-    yaw_shifted = _turn_reference_controller(current_x=0.16)
-    physically_shifted = _turn_reference_controller(current_x=0.16)
-    for controller in (centered, yaw_shifted, physically_shifted):
-        controller._course_anchor_yaw_rad = 0.0
-        controller._turn_reference_x = None
-        controller._turn_reference_yaw_rad = None
-
-    centered._turn_reference(
-        centered.current,
-        centered.successor,
-        current_error=0.0,
-        now_s=100.10,
-        yaw_rad=0.0,
-        dt=0.04,
-    )
-    yaw_shifted._turn_reference(
-        yaw_shifted.current,
-        yaw_shifted.successor,
-        current_error=0.16,
-        now_s=100.10,
-        yaw_rad=-0.10,
-        dt=0.04,
-    )
-    physically_shifted._turn_reference(
-        physically_shifted.current,
-        physically_shifted.successor,
-        current_error=0.16,
-        now_s=100.10,
-        yaw_rad=0.0,
-        dt=0.04,
-    )
-
-    assert yaw_shifted._turn_aperture_reserve == pytest.approx(
-        centered._turn_aperture_reserve, abs=1e-12
-    )
-    assert physically_shifted._turn_aperture_reserve < (
-        0.1 * centered._turn_aperture_reserve
-    )
 
 
 def test_continuous_turn_reference_continues_through_safe_commit():

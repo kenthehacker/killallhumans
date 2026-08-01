@@ -2252,8 +2252,24 @@ class CleanCourseController:
             if commit_regime
             else cfg.brake_relax_ey_norm
         )
+        # F129: custody is a camera-motion constraint, so fresh downward
+        # image motion belongs here rather than in the world-vertical-rate
+        # owner.  F127's compensated center stayed inside the static bound
+        # until only ~0.19 s before bottom censorship; the full brake then
+        # could not pitch the camera back down in time.  Project the fresher
+        # of the filtered/raw compensated bearings over the already-bounded
+        # crossing blackout.  This continuously relaxes only the existing
+        # brake request; it neither adds collective authority nor revives the
+        # F96 image-rate D term.  Stale/unqualified geometry keeps the F94
+        # derotated-hypothesis floor unchanged.
+        custody_ey = ey_vertical
+        if vertical_qualified:
+            custody_ey = max(
+                custody_ey,
+                self._compensated_ey(current.raw_y, pitch_rad),
+            ) + max(0.0, current.vy) * cfg.commit_blackout_s
         custody_floor = cfg.spawn_pitch_rad - (
-            (relax_bound - ey_vertical) / cfg.vertical_pitch_comp_norm_per_rad
+            (relax_bound - custody_ey) / cfg.vertical_pitch_comp_norm_per_rad
         )
         custody_floor = min(
             custody_floor,
@@ -2761,29 +2777,8 @@ class CleanCourseController:
             aperture_budget = (
                 cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
             )
-            # F128: passage margin is a leg-relative physical quantity, not a
-            # camera-heading error.  F127's useful left preturn moved Gate 0
-            # right in-frame by almost exactly ``-focal * delta_yaw``; feeding
-            # that optical motion back here collapsed aperture reserve and
-            # suppressed the same successor turn that caused it.  Derotate the
-            # fresh/predicted position against the existing race-leg heading
-            # anchor only for passage eligibility.  Current-gate pursuit still
-            # consumes the camera bearing, and the conservative vx projection
-            # remains unchanged for this discriminating candidate.
-            passage_yaw_offset = 0.0
-            if yaw_rad is not None and self._course_anchor_yaw_rad is not None:
-                passage_yaw_offset = (
-                    math.atan2(
-                        math.sin(float(yaw_rad) - self._course_anchor_yaw_rad),
-                        math.cos(float(yaw_rad) - self._course_anchor_yaw_rad),
-                    )
-                    * ROTATION_COMP_FOCAL_NORM
-                )
             projected_current_error = (
-                max(
-                    abs(current.x + passage_yaw_offset),
-                    abs(current.raw_x + passage_yaw_offset),
-                )
+                max(abs(current.x), abs(current.raw_x))
                 + abs(current.vx) * cfg.successor_preview_projection_s
             )
             if aperture_budget > 1e-9:
