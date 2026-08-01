@@ -639,10 +639,12 @@ SEARCH_SWEEP_GAIN = 2.0  # heading-error gain to the bounded yaw rate
 # yaw.  One filtered reference now blends passage alignment and the retained
 # successor hypothesis.  The hypothesis is IMU-derotated in _predict(); its
 # confidence, covariance, measurement age, range ordering, closure, and the
-# filtered current-aperture reserve all reduce authority continuously.  F124
-# removes the second age-gated authority filter: successor selection already
-# owns persistence, while this sole derotated reference owns command smoothing.
+# filtered current-aperture reserve all reduce authority continuously.  F127
+# carries their product continuously across tracker-id reassociation without
+# restoring the deleted persistence/age qualification.  The derotated reference
+# remains the sole command-bearing state.
 TURN_REFERENCE_TAU_S = 0.15
+BLEND_FAR_LOG_SCALE = -1.6  # below this the successor gets no blend
 BLEND_NEAR_LOG_SCALE = -0.9  # at this apparent scale closure reaches one
 SUCCESSOR_MIN_LOG_SCALE_GAP = 0.25  # successor must remain visibly farther
 SUCCESSOR_PREVIEW_PROJECTION_S = 0.10
@@ -996,6 +998,7 @@ class CleanCourseConfig:
     search_sweep_gain: float = SEARCH_SWEEP_GAIN
     pending_credit_hold_s: float = PENDING_CREDIT_HOLD_S
     turn_reference_tau_s: float = TURN_REFERENCE_TAU_S
+    blend_far_log_scale: float = BLEND_FAR_LOG_SCALE
     blend_near_log_scale: float = BLEND_NEAR_LOG_SCALE
     successor_min_log_scale_gap: float = SUCCESSOR_MIN_LOG_SCALE_GAP
     successor_preview_projection_s: float = SUCCESSOR_PREVIEW_PROJECTION_S
@@ -1120,6 +1123,7 @@ class CleanCourseController:
         self._turn_reference_x: Optional[float] = None
         self._turn_reference_yaw_rad: Optional[float] = None
         self._turn_aperture_reserve = 0.0
+        self._turn_successor_authority = 0.0
         self._successor_heading_blend = 0.0
         self._successor_heading_error_norm: Optional[float] = None
         # Course-heading anchor (F31): yaw at the leg start (lazily
@@ -1152,6 +1156,7 @@ class CleanCourseController:
         self._turn_reference_x = None
         self._turn_reference_yaw_rad = None
         self._turn_aperture_reserve = 0.0
+        self._turn_successor_authority = 0.0
         identity = _frame_identity(update)
         if identity is not None:
             self._last_frame_identity = identity
@@ -1429,6 +1434,7 @@ class CleanCourseController:
         # promoted current hypothesis is the same derotated bearing that fed
         # the pre-credit reference, so no control overlay changes sign here.
         self._turn_aperture_reserve = 0.0
+        self._turn_successor_authority = 0.0
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             self._exit_coast()
         # An authoritative increment settles the pending-credit hold.
@@ -2777,16 +2783,17 @@ class CleanCourseController:
         )
         self._turn_aperture_reserve = _clamp01(self._turn_aperture_reserve)
 
-        evidence_weight = 0.0
+        desired_authority = 0.0
         desired = float(current_error)
         if successor is not None:
-            # F126 removes the far-closure cutoff that held a visible left
-            # successor at exactly zero authority for the first ~1.25 s of
-            # F125.  Apparent scale relative to the near-plane scale is a
-            # continuous passage-progress signal: positive at every finite
-            # range, asymptotically small when far, and one at/after near.
-            closure = math.exp(
-                min(0.0, current.outer_log_scale - cfg.blend_near_log_scale)
+            closure_span = cfg.blend_near_log_scale - cfg.blend_far_log_scale
+            closure = (
+                _clamp01(
+                    (current.outer_log_scale - cfg.blend_far_log_scale)
+                    / closure_span
+                )
+                if abs(closure_span) > 1e-9
+                else 0.0
             )
             confidence = _clamp01(successor.confidence)
             uncertainty = _clamp01(
@@ -2802,13 +2809,14 @@ class CleanCourseController:
                 (current.outer_log_scale - successor.outer_log_scale)
                 / max(1e-6, cfg.successor_min_log_scale_gap)
             )
-            # Successor selection already owns track persistence.  Applying
-            # age again here made a freshly re-associated, high-confidence
-            # Gate 1 contribute exactly zero at the Gate-0 plane (F122), then
-            # the separately filtered authority and reference delayed the
-            # turn twice.  Evidence quality is continuous here; the one
-            # derotated reference below is the only command-smoothing state.
-            evidence_weight = (
+            # Successor selection already owns persistence, so track age is
+            # deliberately absent here.  F125/F126 showed that feeding this
+            # product directly into the reference still let covariance loss
+            # followed by a fresh tracker id create a 0.126 rad/s yaw jump.
+            # Carry the evidence product continuously; weak evidence changes
+            # authority instead of resetting it, while the one reference below
+            # remains the only state that can command yaw and bank.
+            desired_authority = (
                 closure
                 * self._turn_aperture_reserve
                 * confidence
@@ -2816,15 +2824,24 @@ class CleanCourseController:
                 * freshness
                 * range_order
             )
+        self._turn_successor_authority += alpha * (
+            desired_authority - self._turn_successor_authority
+        )
+        self._turn_successor_authority = _clamp01(
+            self._turn_successor_authority
+        )
+        authority = (
+            self._turn_successor_authority if successor is not None else 0.0
+        )
         if successor is not None:
             # A true convex blend has no low-authority dead zone: weak
             # successor evidence leaves current-passage alignment in charge,
             # while credible evidence transfers that same coordinated yaw
             # and bank reference toward the successor.  The filtered
-            # aperture reserve is already one factor in ``evidence_weight``.
+            # aperture reserve is already one factor in the carried authority.
             desired = (
-                (1.0 - evidence_weight) * float(current_error)
-                + evidence_weight * successor.x
+                (1.0 - authority) * float(current_error)
+                + authority * successor.x
             )
 
         if self._turn_reference_x is None:
@@ -2835,17 +2852,6 @@ class CleanCourseController:
             )
         self._turn_reference_x = _clamp(self._turn_reference_x, -1.0, 1.0)
 
-        # Report the reference's effective mixture, not the instantaneous
-        # evidence product.  Thus weak/flickering evidence decays authority
-        # with the same single filter that actually owns yaw and bank.
-        authority = 0.0
-        if successor is not None:
-            blend_span = successor.x - float(current_error)
-            if abs(blend_span) > 1e-9:
-                authority = _clamp01(
-                    (self._turn_reference_x - float(current_error))
-                    / blend_span
-                )
         self._successor_heading_blend = authority
         self._successor_heading_error_norm = self._turn_reference_x
         return self._turn_reference_x, authority

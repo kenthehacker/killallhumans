@@ -1868,21 +1868,17 @@ def _turn_reference_controller(
     *,
     successor_x=-0.45,
     current_x=0.02,
-    current_scale=0.45,
-    successor_scale=0.10,
     now_s=100.10,
 ):
     """Fresh Gate-0 geometry with optional persistent farther Gate 1."""
 
     controller = _tracked_controller(
-        _track("A", current_x, 0.0, scale=current_scale),
+        _track("A", current_x, 0.0, scale=0.45),
         config=_config(ex_trim_gain=0.0),
     )
-    tracks = [_track("A", current_x, 0.0, scale=current_scale)]
+    tracks = [_track("A", current_x, 0.0, scale=0.45)]
     if successor_x is not None:
-        tracks.append(
-            _track("B", successor_x, 0.05, scale=successor_scale)
-        )
+        tracks.append(_track("B", successor_x, 0.05, scale=0.10))
     controller.observe(_update(tracks, frame_id=3), now_s=now_s - 0.02)
     if successor_x is not None:
         controller._track_first_seen_s["B"] = now_s - 1.0
@@ -2093,42 +2089,56 @@ def test_fresh_reassociated_successor_has_no_second_turn_age_gate():
     assert out.target_roll_rad < 0.0
 
 
-def test_visible_left_successor_has_continuous_closure_authority_from_far():
-    # F125: Gate 1 was visible from launch, but the far-closure threshold held
-    # its weight at exactly zero and let current-gate steering reverse right
-    # just before credit.  Scale-relative closure must build the same left
-    # reference continuously across a representative approach time series.
-    controller = _turn_reference_controller(
-        current_x=0.0,
-        current_scale=0.12,
-        successor_scale=0.025,
-    )
-    now = 100.10
-    outputs = []
-    approach = (
-        (-2.10, 0.00),
-        (-1.90, 0.01),
-        (-1.70, 0.02),
-        (-1.50, 0.03),
-        (-1.30, 0.04),
-        (-1.10, 0.04),
-        (-0.90, 0.02),
-    )
-    for outer_log_scale, current_x in approach:
-        for _ in range(4):
-            now += 0.04
-            controller.current.outer_log_scale = outer_log_scale
-            controller.current.x_axis.p = current_x
-            controller.current.raw_x = current_x
-            controller.successor.last_measurement_s = now
-            controller.successor.last_x_measurement_s = now
-            outputs.append(
-                _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
-            )
+def test_successor_reassociation_cannot_recreate_precredit_s_turn():
+    """F125/F126: covariance flicker and a new id keep one left handoff."""
 
-    assert all(output.successor_blend > 0.0 for output in outputs)
-    assert all(output.yaw_rate_rad_s < 0.0 for output in outputs)
-    assert all(output.target_roll_rad < 0.0 for output in outputs)
+    controller = _turn_reference_controller(current_x=0.04)
+    now = 100.10
+    controller.state = CleanCourseState.PREDICT
+    controller.current.outer_log_scale = -0.95
+    controller.current.aperture_half_x = None
+    controller.current.aperture_half_y = None
+    controller._last_engulfing_anchor_s = now
+
+    # Start at the last credible same-sign F122/F125 handoff state.  The old
+    # successor then loses covariance/freshness before the detector assigns a
+    # fresh id to the same consistently-left Gate 1.  F125 fed the evidence
+    # product directly to the reference: yaw went right, then jumped left by
+    # 0.126 rad/s on this reassociation.  Track age must not be reintroduced;
+    # only continuous evidence authority is carried across the id change.
+    controller._turn_aperture_reserve = 0.75
+    controller._turn_successor_authority = 0.07
+    controller._turn_reference_x = -0.007
+    controller._turn_reference_yaw_rad = 0.0
+    samples = []
+    variations = (
+        (0.40, 0.40, None),
+        (0.48, 0.50, None),
+        (0.565, 0.59, None),
+        (0.141, 0.0, "B-reassociated"),
+        (0.014, 0.0, None),
+        (0.014, 0.0, None),
+    )
+    for std, age_s, replacement_id in variations:
+        now += 0.047
+        variance = (std / math.sqrt(2.0)) ** 2
+        controller.successor.x_axis.pp = variance
+        controller.successor.y_axis.pp = variance
+        controller.successor.last_measurement_s = now - age_s
+        controller.successor.last_x_measurement_s = now - age_s
+        if replacement_id is not None:
+            controller.successor.track_id = replacement_id
+            controller._track_first_seen_s[replacement_id] = now
+        controller._last_engulfing_anchor_s = now
+        samples.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
+
+    assert all(sample.yaw_rate_rad_s < 0.0 for sample in samples)
+    assert all(sample.target_roll_rad < 0.0 for sample in samples)
+    yaw_steps = [
+        abs(right.yaw_rate_rad_s - left.yaw_rate_rad_s)
+        for left, right in zip(samples, samples[1:])
+    ]
+    assert max(yaw_steps) < 0.08
 
 
 def test_weak_successor_evidence_decays_turn_reference_smoothly():
