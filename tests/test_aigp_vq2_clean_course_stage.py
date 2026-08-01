@@ -1385,7 +1385,7 @@ def test_closure_governor_does_not_brake_below_target_rate():
     # governor contributes nothing and the advance law still closes.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller.current.scale_axis.v = 0.1
-    out = _command(controller, 100.10)
+    out = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert not controller._pre_cross_brake_active
     # Advance law still closes: above the level (spawn) brake base.
     assert out.target_pitch_rad > SPAWN_PITCH
@@ -1399,7 +1399,7 @@ def test_closure_governor_distrusts_tiny_track_expansion():
     # governor stays out no matter how large the reported expansion is.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.05))
     controller.current.scale_axis.v = 0.9  # noise-level expansion
-    out = _command(controller, 100.10)
+    out = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert not controller._pre_cross_brake_active
     # Advance law still closes: above the level (spawn) brake base.
     assert out.target_pitch_rad > SPAWN_PITCH
@@ -1457,13 +1457,54 @@ def test_closure_governor_is_a_continuous_blend():
     out = None
     for _ in range(25):  # generic slew converges to the blended target
         now += 0.033
-        out = _command(controller, now)
+        out = _command(controller, now, pitch=SPAWN_PITCH)
     assert not controller._pre_cross_brake_active
     assert (
         SPAWN_PITCH - 0.15 + 1e-9
         < out.target_pitch_rad
         < SPAWN_PITCH - 1e-9
     )
+
+
+def test_misalignment_brake_is_invariant_to_its_own_camera_pitch():
+    # F116 Gate 0 began with a small physical vertical error.  The raw-y
+    # brake pitched the camera up, which moved the gate down in-frame and
+    # recursively demanded more nose-up brake until the top-structure hit.
+    # The same world-relative gate error must produce the same forward law at
+    # level and at a nose-up camera attitude; thrust remains the only vertical
+    # translation channel.
+    physical_ey = 0.05
+
+    def _at_pitch(pitch_rad):
+        raw_ey = physical_ey + (
+            (SPAWN_PITCH - pitch_rad) * 1.6
+        )
+        controller = _tracked_controller(
+            _track("A", 0.0, raw_ey, scale=math.exp(-1.50)),
+            config=_config(
+                target_slew_rad_s=100.0,
+                pre_cross_brake_slew_rad_s=100.0,
+            ),
+        )
+        controller.current.scale_axis.v = 0.0
+        controller.current.outer_expansion_rate = 0.0
+        out = _command(controller, 100.10, pitch=pitch_rad)
+        assert controller._compensated_ey(
+            controller.current.y, pitch_rad
+        ) == pytest.approx(physical_ey, abs=1e-9)
+        return controller, out
+
+    level, level_out = _at_pitch(SPAWN_PITCH)
+    braked, braked_out = _at_pitch(-0.44)
+
+    assert braked.current.y > level.current.y + 0.20  # camera artifact exists
+    assert braked_out.advance_factor == pytest.approx(
+        level_out.advance_factor, abs=1e-9
+    )
+    assert braked_out.target_pitch_rad == pytest.approx(
+        level_out.target_pitch_rad, abs=1e-9
+    )
+    assert braked._pre_cross_brake_active == level._pre_cross_brake_active
 
 
 def test_misaligned_far_gate_brakes_and_climbs():
@@ -1636,14 +1677,14 @@ def test_lone_small_fragment_creeps_instead_of_advancing():
     for _ in range(20):  # generic slew converges to the law target
         now += 0.033
         fragment.current.last_x_measurement_s = now
-        out = _command(fragment, now)
+        out = _command(fragment, now, pitch=SPAWN_PITCH)
     # Never the full advance offset on fragment evidence: capped at the
     # creep offset (spawn + 0.03) while centering.
     assert out.target_pitch_rad == pytest.approx(SPAWN_PITCH + 0.03, abs=1e-9)
     # Centering authority (yaw) is untouched on a fragment.
     offset = _tracked_controller(_track("A", 0.30, 0.0, scale=0.06))
     offset.current.last_x_measurement_s = 100.10
-    assert _command(offset, 100.10).yaw_rate_rad_s > 0.0
+    assert _command(offset, 100.10, pitch=SPAWN_PITCH).yaw_rate_rad_s > 0.0
     # A confidently whole gate (span above the bound) advances fully.
     whole = _tracked_controller(_track("A", 0.0, 0.0, scale=0.20))
     now = 100.10
@@ -1651,7 +1692,7 @@ def test_lone_small_fragment_creeps_instead_of_advancing():
     for _ in range(20):
         now += 0.033
         whole.current.last_x_measurement_s = now
-        out = _command(whole, now)
+        out = _command(whole, now, pitch=SPAWN_PITCH)
     assert out.target_pitch_rad > SPAWN_PITCH + 0.04  # full advance, no creep cap
 
 

@@ -2195,10 +2195,11 @@ class CleanCourseController:
         ey = current.y
         # F50: the VERTICAL channel servos on the pitch-attitude-compensated
         # error (nose-up brake attitude reads the world LOW in frame; see
-        # the VERTICAL_PITCH_COMP_NORM_PER_RAD block).  The angular-error
-        # brake below keeps the RAW ey: it measures camera pointing, and
-        # pitch attitude is itself the braking actuator, so compensating it
-        # there would release the brake while still pitched up.
+        # the VERTICAL_PITCH_COMP_NORM_PER_RAD block).  F117 uses that same
+        # physical error for the forward misalignment brake.  F116 showed the
+        # old RAW-ey coupling was positive feedback: braking pitched the
+        # camera up, moved Gate 0 down in-frame, and the camera artifact asked
+        # for still more brake until the vehicle met the top structure.
         ey_vertical = self._compensated_ey(ey, pitch_rad)
         # F40 (20260729T193134Z-visual-course-63ed6342): never steer on an
         # x-axis without a fresh accepted measurement — an unmeasured or
@@ -2366,7 +2367,7 @@ class CleanCourseController:
         # structure.  Speed with no alignment is pure risk: blend toward
         # the TRUE brake attitude with the same signal that suppresses
         # advance.
-        angular_error = math.hypot(ex, ey)
+        angular_error = math.hypot(ex, ey_vertical)
         align = _clamp01(1.0 - angular_error / cfg.angular_full_brake_norm)
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
