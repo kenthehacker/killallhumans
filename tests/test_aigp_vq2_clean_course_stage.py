@@ -286,6 +286,28 @@ def test_vertical_error_is_pitch_attitude_compensated():
     )
 
 
+def test_vertical_reference_continuously_transfers_to_passage_alignment():
+    # F151: F150's raw Gate-1 y moved downward while full pitch compensation
+    # kept requesting climb until 0.125 s before bottom censorship.  The one
+    # vertical reference keeps physical bearing far away and continuously
+    # transfers to the visible aperture error over the existing range ramp.
+    controller = _tracked_controller(_track("A", 0.0, 0.10, scale=0.10))
+    current = controller.current
+    pitch = SPAWN_PITCH - 0.15
+    compensated = controller._compensated_ey(current.y, pitch)
+    assert compensated == pytest.approx(-0.14)
+
+    errors = []
+    for log_scale in (-2.10, -2.00, -1.80, -1.60, -1.40, -1.20, -1.10):
+        current.outer_log_scale = log_scale
+        errors.append(controller._course_vertical_error(current, pitch))
+
+    assert errors[0] == pytest.approx(compensated)
+    assert errors[-1] == pytest.approx(current.y)
+    assert all(right >= left for left, right in zip(errors, errors[1:]))
+    assert max(abs(right - left) for left, right in zip(errors, errors[1:])) < 0.07
+
+
 def test_gate0_takeoff_boost_is_feedforward_only():
     # Boost-window behavior isolated from the gate-0 climb offset.  A far
     # track keeps the brake ceiling band out of the window (with the F49
@@ -507,10 +529,10 @@ def test_vertical_rate_owner_applies_in_predict_and_search():
     )
 
 
-def test_near_plane_compensated_gate_y_keeps_physical_sink_damping():
-    # F147: compensated geometry still sets the desired rate at the crossing,
-    # but it must not erase measured vertical energy.  F146 reached Gate-0
-    # credit sinking -0.55 m/s after the range fade removed this damping.
+def test_near_plane_passage_y_keeps_physical_sink_damping():
+    # F151 transfers the desired rate to visible passage alignment near the
+    # plane, but it must not erase measured vertical energy.  F146 reached
+    # Gate-0 credit sinking -0.55 m/s after range fade removed this damping.
     brake_pitch = -0.46
     controller = _tracked_controller(_track("A", 0.0, 0.10))
     controller.current.outer_log_scale = controller.config.commit_min_log_scale
@@ -519,8 +541,12 @@ def test_near_plane_compensated_gate_y_keeps_physical_sink_damping():
     support = SPAWN_SUPPORT / math.cos(brake_pitch - SPAWN_PITCH)
     compensated = controller._compensated_ey(0.10, brake_pitch)
     assert compensated < 0.0
+    passage_error = controller._course_vertical_error(
+        controller.current, brake_pitch
+    )
+    assert passage_error == pytest.approx(0.10)
     assert out.thrust == pytest.approx(
-        support + 0.12 * (-compensated - controller._vz_est_m_s), abs=1e-9
+        support + 0.12 * (-passage_error - controller._vz_est_m_s), abs=1e-9
     )
     assert out.thrust > support
 

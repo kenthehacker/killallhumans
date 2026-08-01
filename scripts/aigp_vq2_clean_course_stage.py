@@ -1688,8 +1688,8 @@ class CleanCourseController:
                     and self.current.y_axis.std
                     <= cfg.search_covariance_std_norm
                 )
-                commit_ey = self._compensated_ey(
-                    self.current.y, pitch_rad
+                commit_ey = self._course_vertical_error(
+                    self.current, pitch_rad
                 )
                 commit_vz_des = self._course_vz_setpoint(
                     self.current,
@@ -1858,14 +1858,15 @@ class CleanCourseController:
         ex = current.x
         heading_ex = ex
         ey = current.y
-        # F50: the VERTICAL channel servos on the pitch-attitude-compensated
-        # error (nose-up brake attitude reads the world LOW in frame; see
-        # the VERTICAL_PITCH_COMP_NORM_PER_RAD block).  F117 uses that same
-        # physical error for the forward misalignment brake.  F116 showed the
-        # old RAW-ey coupling was positive feedback: braking pitched the
-        # camera up, moved Gate 0 down in-frame, and the camera artifact asked
-        # for still more brake until the vehicle met the top structure.
-        ey_vertical = self._compensated_ey(ey, pitch_rad)
+        # F50's compensated bearing remains the forward-brake/custody signal:
+        # pitch motion must not create a positive-feedback brake demand.  F151
+        # separates the sole translational vertical reference from that camera
+        # artifact continuously with range.  Far away it is the compensated
+        # world bearing; at passage range it is the visible aperture error.
+        # F150 held the compensated request negative until 0.125 s before
+        # bottom censorship even though raw gate-y was already moving down.
+        ey_physical = self._compensated_ey(ey, pitch_rad)
+        ey_vertical = self._course_vertical_error(current, pitch_rad)
         # F40 (20260729T193134Z-visual-course-63ed6342): never steer on an
         # x-axis without a fresh accepted measurement — an unmeasured or
         # stale x (edge-clipped splinter, censored axis) is a garbage aim
@@ -2015,7 +2016,7 @@ class CleanCourseController:
         # structure.  Speed with no alignment is pure risk: blend toward
         # the TRUE brake attitude with the same signal that suppresses
         # advance.
-        angular_error = math.hypot(ex, ey_vertical)
+        angular_error = math.hypot(ex, ey_physical)
         align = _clamp01(1.0 - angular_error / cfg.angular_full_brake_norm)
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
@@ -2211,7 +2212,7 @@ class CleanCourseController:
             else cfg.brake_relax_ey_norm
         )
         custody_floor = cfg.spawn_pitch_rad - (
-            (relax_bound - ey_vertical) / cfg.vertical_pitch_comp_norm_per_rad
+            (relax_bound - ey_physical) / cfg.vertical_pitch_comp_norm_per_rad
         )
         custody_floor = min(
             custody_floor,
@@ -2316,8 +2317,12 @@ class CleanCourseController:
         ):
             return False
         ey = max(
-            abs(self._compensated_ey(current.y, pitch_rad)),
-            abs(self._compensated_ey(current.raw_y, pitch_rad)),
+            abs(self._course_vertical_error(current, pitch_rad)),
+            abs(
+                self._course_vertical_error(
+                    current, pitch_rad, image_ey=current.raw_y
+                )
+            ),
         )
         if ey + abs(current.vy) * cfg.commit_blackout_s > (
             cfg.commit_entry_aperture_margin_frac * current.aperture_half_y
@@ -2338,6 +2343,20 @@ class CleanCourseController:
             (cfg.spawn_pitch_rad - float(pitch_rad))
             * cfg.vertical_pitch_comp_norm_per_rad
         )
+
+    def _course_vertical_error(
+        self,
+        current: _Hypothesis,
+        pitch_rad: float,
+        *,
+        image_ey: Optional[float] = None,
+    ) -> float:
+        """Blend world bearing far away into visible passage error near plane."""
+
+        ey = current.y if image_ey is None else float(image_ey)
+        compensated = self._compensated_ey(ey, pitch_rad)
+        passage = self._course_range_ramp(current)
+        return compensated + passage * (ey - compensated)
 
     def _successor_track_id(self) -> Optional[str]:
         return self.successor.track_id if self.successor is not None else None
