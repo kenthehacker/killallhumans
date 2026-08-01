@@ -515,7 +515,7 @@ FRAGMENT_CREEP_PITCH_RAD = 0.03  # creep OFFSET from spawn while centering a lon
 # climb budget; F32's climb-into-frame came from the fh floor and the
 # high-gate bias, which this band still caps.
 BRAKE_CEILING_BAND = 0.04
-PRE_CROSS_BRAKE_PITCH_RAD = -0.15  # nose-up Gate-0 brake OFFSET from spawn.
+PRE_CROSS_BRAKE_PITCH_RAD = -0.15  # one nose-up brake OFFSET from spawn
 # TRUE nose-up brake attitude under the verified F38 convention.  F111 moved
 # this from -0.15 to -0.20 to reduce inherited Gate-1 closure, but F113 and
 # F114 then struck Gate 0's object-1001 structure without credit.  Across the
@@ -531,19 +531,12 @@ PRE_CROSS_BRAKE_PITCH_RAD = -0.15  # nose-up Gate-0 brake OFFSET from spawn.
 # as an offset: with level flight at -0.31, the effective -0.46 roughly
 # doubles it so a misaligned approach actually stops.
 PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
-# F80: course-leg brake authority (gate_index >= 1).  F79
-# (20260730T093737Z-visual-course-14d98732) held the -0.46 TRUE brake for
-# the whole gate-1 leg (misalignment demand saturated from the first tick)
-# and still closed log-scale -1.6 -> -0.57 in 2.4 s: the leg inherits the
-# gate-0 crossing's ~5 m/s, and ~1.5 m/s^2 of brake bleeds <3 m/s before
-# the plane, so the drone passed ~2 m right of the aperture with yaw at
-# the cap (parallax outran yaw authority again).  Course legs start hot by
-# construction (COMMIT drives through the previous plane), so they get
-# twice the brake offset: -0.30 from spawn (effective -0.61, ~3 m/s^2 +
-# drag), enough to stop inside the observed far window and re-center at
-# hover as the F54 hold intends.  The F51/F65 vision-custody relax still
-# outranks the brake near the plane; gate 0 uses the live-proven -0.15.
-COURSE_PRE_CROSS_BRAKE_PITCH_RAD = -0.30
+# F125 removes the Gate-1-only doubled brake.  F124's otherwise improved
+# handoff switched from the Gate-0 brake to -0.30 at promotion, pitched the
+# camera to -0.578, and drove Gate 1 from raw y +0.128 to +0.600 before the
+# custody floor could react.  One continuous -0.15 brake reference now owns
+# every leg; authoritative promotion cannot change pitch mode under the same
+# closure/alignment evidence.
 # F51 near-plane brake self-blinding guard (F50 t=15 episode): the brake
 # attitude (rpy_p ~-0.45, ~0.14 rad nose-up from spawn) pitches the camera
 # up, so near the plane the gate slides DOWN the frame — measured ey
@@ -985,7 +978,6 @@ class CleanCourseConfig:
     fragment_advance_min_log_scale: float = FRAGMENT_ADVANCE_MIN_LOG_SCALE
     fragment_creep_pitch_rad: float = FRAGMENT_CREEP_PITCH_RAD
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
-    course_pre_cross_brake_pitch_rad: float = COURSE_PRE_CROSS_BRAKE_PITCH_RAD
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     brake_relax_ey_norm: float = BRAKE_RELAX_EY_NORM
     near_brake_relax_ey_norm: float = NEAR_BRAKE_RELAX_EY_NORM
@@ -2220,20 +2212,11 @@ class CleanCourseController:
             law_pitch = min(
                 law_pitch, cfg.spawn_pitch_rad + cfg.fragment_creep_pitch_rad
             )
-        # F80 (see the COURSE_PRE_CROSS_BRAKE_PITCH_RAD block): course legs
-        # inherit the previous crossing's energy, so the TRUE brake doubles
-        # to -0.30 from spawn at gate_index >= 1.  Gate 0 keeps the proved
-        # -0.15 attitude throughout.  F104/F108's near-plane escalation made
-        # the first gate pitch sharply up while sinking and produced two
-        # object-1001 strikes without credit; F102/F103 crossed with this
-        # gentle Gate-0 regime.  Same single blend and custody floor throughout.
-        brake_pitch_offset = (
-            cfg.course_pre_cross_brake_pitch_rad
-            if self.gate_index >= 1
-            else cfg.pre_cross_brake_pitch_rad
-        )
+        # F125: promotion does not select a deeper course-specific brake.
+        # Closure and alignment continuously set brake demand, while this one
+        # reference and the one custody floor remain unchanged across legs.
         target_pitch = law_pitch + brake_demand * (
-            (cfg.spawn_pitch_rad + brake_pitch_offset) - law_pitch
+            (cfg.spawn_pitch_rad + cfg.pre_cross_brake_pitch_rad) - law_pitch
         )
         # F94 custody-preserving brake floor — REPLACES the F51/F65/F71
         # binary relax latch, its hysteresis, and the F73b/F75

@@ -1069,43 +1069,27 @@ def test_closure_governor_full_brake_at_high_expansion_rate():
     assert out.thrust > 0.0  # the vz governor keeps the collective alive
 
 
-def test_course_leg_brake_doubles_authority():
-    # F80 (20260730T093737Z-visual-course-14d98732): the gate-1 leg held
-    # the -0.46 TRUE brake from the first TRACK tick (misalignment demand
-    # saturated) and still closed log-scale -1.6 -> -0.57 in 2.4 s — the
-    # ~5 m/s inherited from the gate-0 crossing outran ~1.5 m/s^2 of brake,
-    # and the drone passed ~2 m right of the aperture with yaw at the cap.
-    # Course legs (gate_index >= 1) get twice the brake offset (-0.30 from
-    # spawn, effective -0.61); Gate 0 keeps the proved -0.15 throughout.
-    # F84 (20260730T121408Z-visual-course-533d563c): -0.61 rad sat 0.001 rad
-    # inside the runner's -35 deg pitch watchdog and the sustained brake
-    # slewed into the abort.  Every pitch target is now clamped at
-    # PITCH_TARGET_MIN_RAD (-33 deg), which keeps ~89% of the F80 offset.
+def test_authoritative_promotion_does_not_switch_brake_reference():
+    # F124: promotion selected a doubled Gate-1 brake even though closure and
+    # alignment remained the same.  That mode switch pitched the camera up
+    # until Gate 1 bottom-censored.  F125 keeps one continuous brake reference
+    # on every authoritative leg.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     _promote_to_gate_one(controller)
-    # F79 geometry: ex pinned far off-axis the whole leg (refreshed each
-    # tick — the axis filter's predict decays an unmeasured value).
     now = 100.12
     out = None
-    for _ in range(20):  # fast slew attains the deeper course brake
+    for _ in range(20):
         now += 0.033
         controller.current.x_axis.p = -0.40
-        # Fresh x measurements keep arriving (the F40 x-freshness gate
-        # otherwise zeroes steering after 0.5 s without one).
         controller.current.last_x_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
-    # The raw F80 target exceeds the clamp; the emitted target sits AT the
-    # floor, clear of the runner's MIN_PITCH_RAD (-35 deg) abort.
-    assert (
-        controller.config.spawn_pitch_rad
-        + controller.config.course_pre_cross_brake_pitch_rad
-    ) < controller.config.pitch_target_min_rad
     assert out.target_pitch_rad == pytest.approx(
-        controller.config.pitch_target_min_rad, abs=1e-9
+        controller.config.spawn_pitch_rad
+        + controller.config.pre_cross_brake_pitch_rad,
+        abs=1e-9,
     )
-    assert controller.config.pitch_target_min_rad > math.radians(-35.0)
     assert out.yaw_rate_rad_s == pytest.approx(-0.15, abs=1e-9)  # pursuit alive
 
 
@@ -1604,7 +1588,7 @@ def test_near_plane_custody_floor_runs_on_the_stale_hypothesis():
     )
 
 
-def test_course_leg_custody_floor_uses_the_tighter_bound():
+def test_course_leg_custody_floor_relaxes_the_single_brake():
     # F71 (20260730T060005Z-visual-course-f05911e4): on the gate-1 leg the
     # 0.30 bound sat a hair above the achieved hypothesis ey (0.22-0.30
     # through the final second), so the brake attitude walked the gate into
@@ -1635,10 +1619,11 @@ def test_course_leg_custody_floor_uses_the_tighter_bound():
     assert drive().target_pitch_rad == pytest.approx(
         SPAWN_PITCH - (0.18 - 0.05) / 1.6, abs=1e-9
     )
-    # ey -0.15: the floor admits most of the course brake.
+    # ey -0.15 would admit a deeper attitude, but F125's one brake reference
+    # remains the maximum request; custody is only allowed to relax it.
     controller.current.y_axis.p = -0.15
     assert drive().target_pitch_rad == pytest.approx(
-        SPAWN_PITCH - (0.18 + 0.15) / 1.6, abs=1e-9
+        SPAWN_PITCH + controller.config.pre_cross_brake_pitch_rad, abs=1e-9
     )
     # Gate 0 keeps the wider 0.30 bound: the same ey 0.22 leaves MORE
     # brake authority, not less.
@@ -2969,7 +2954,7 @@ def test_near_plane_hold_brakes_without_self_blinding():
     )
 
 
-def test_hot_closure_brake_survives_the_attitude_artifact():
+def test_hot_closure_keeps_the_single_brake_through_attitude_artifact():
     # F93 (20260730T143851Z-visual-course-7e67b464): the held course brake
     # (-0.577 attitude, 0.267 rad nose-up) had HALVED the closure rate when
     # the attitude artifact walked RAW ey to +0.24; the F71 relax read
@@ -3000,12 +2985,11 @@ def test_hot_closure_brake_survives_the_attitude_artifact():
         out = _command(controller, now, pitch=brake_attitude)
     assert controller.state is CleanCourseState.TRACK  # COMMIT never arms
     assert controller._pre_cross_brake_active
-    # Compensated ey = 0.24 - 0.267*1.6 ~= -0.19, so the floor sits at
-    # spawn - (0.18 + 0.19)/1.6 ~= spawn - 0.23: a hard custody-compatible
-    # brake, never the level surrender that re-advanced F93 into the plane.
-    assert out.target_pitch_rad <= SPAWN_PITCH - 0.15
+    # Compensated ey = 0.24 - 0.267*1.6 ~= -0.19, so custody does not relax
+    # the request.  F125 removes the obsolete deeper course mode; the one
+    # brake remains fully applied instead of surrendering to level.
     assert out.target_pitch_rad == pytest.approx(
-        SPAWN_PITCH - (0.18 - (0.24 - 0.267 * 1.6)) / 1.6, abs=1e-9
+        SPAWN_PITCH + controller.config.pre_cross_brake_pitch_rad, abs=1e-9
     )
 
 
@@ -3317,8 +3301,8 @@ def test_closure_governor_demands_energy_reduction_early():
     # log/s at the plane (COMMIT expansion veto, blind structure strike).
     # The target now ramps down with range: at the F100 mid-leg state
     # (outer log -1.90, closure 0.43) the ramped target is 0.17, the
-    # governor LATCHES the brake (parent: flat 0.35 -> brake 0.32,
-    # pitch -0.386, no latch) and the pitch sits ~0.09 rad deeper.
+    # governor continuously demands a meaningful fraction of the one F125
+    # brake reference rather than leaving the attitude at spawn.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.15))
     controller._alt_est_m = 2.0
     _promote_to_gate_one(controller)
@@ -3336,7 +3320,7 @@ def test_closure_governor_demands_energy_reduction_early():
         current.last_measurement_s = now  # raw signal fresh
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad < -0.44  # parent: -0.386, no latch
+    assert out.target_pitch_rad < SPAWN_PITCH - 0.05
 
 
 def test_blind_hold_tracks_zero_vz_when_fh_trusted():
