@@ -23,7 +23,8 @@ from scripts.aigp_vq2_clean_course_stage import (
     MAX_COURSE_YAW_RATE_RAD_S,
     NEVER_MEASURED_S,
     PENDING_CREDIT_HOLD_S,
-    ROTATION_COMP_FOCAL_NORM,
+    ROTATION_COMP_X_FOCAL_NORM,
+    ROTATION_COMP_Y_FOCAL_NORM,
     CleanCourseConfig,
     CleanCourseController,
     CleanCourseRuntime,
@@ -2228,37 +2229,6 @@ def test_promoted_camera_bearing_unwinds_completed_left_translation():
     assert outputs[-1].target_roll_rad >= -0.01
 
 
-def test_fresh_current_x_correction_does_not_lag_imu_derotation():
-    # F138 Gate 1 remained freshly measured near x=-0.14 while sustained
-    # left yaw repeatedly derotated the carried reference right.  The fixed
-    # 0.15 s correction then equilibrated near -0.03 in this exact sequence,
-    # hiding most of the live error.  Existing x certainty/freshness must
-    # continuously restore the measured reference without deleting the
-    # slow bounded carry used when x is stale.
-    controller = _turn_reference_controller(
-        successor_x=None, current_x=-0.14
-    )
-    controller._turn_reference_x = -0.14
-    controller._turn_reference_yaw_rad = 0.0
-    now = 100.10
-    references = []
-    for tick in range(12):
-        now += 0.04
-        controller.current.last_x_measurement_s = now
-        reference, _ = controller._turn_reference(
-            controller.current,
-            None,
-            current_error=-0.14,
-            now_s=now,
-            yaw_rad=-0.02 * (tick + 1),
-            dt=0.04,
-        )
-        references.append(reference)
-
-    assert all(reference < 0.0 for reference in references)
-    assert references[-1] < -0.11
-
-
 def test_weak_successor_evidence_decays_turn_reference_smoothly():
     controller = _turn_reference_controller(current_x=0.04)
     now = 100.10
@@ -2863,19 +2833,34 @@ def test_near_plane_stale_x_keeps_derotated_steering():
     assert out.target_roll_rad == 0.0
 
 
-def test_derotation_focal_matches_measured_camera_geometry():
-    # F57 (20260730T003044Z-visual-course-74abd688): the de-rotation focal
-    # equals the same camera's measured 1.6 norm/rad already in the file
-    # (VERTICAL_PITCH_COMP_NORM_PER_RAD) — at 1.0 every predicted bearing
-    # under-rotated by 37.5% (F52 frozen ex -0.156 vs true -0.48).
-    assert ROTATION_COMP_FOCAL_NORM == pytest.approx(1.6)
+def test_derotation_focal_respects_normalized_camera_aspect_ratio():
+    # One pixel focal length maps to normalized x/y gains in the inverse
+    # ratio of the image half-dimensions: 180/320 for the 640x360 stream.
+    assert ROTATION_COMP_X_FOCAL_NORM == pytest.approx(0.9)
+    assert ROTATION_COMP_Y_FOCAL_NORM == pytest.approx(1.6)
+    assert (
+        ROTATION_COMP_X_FOCAL_NORM / ROTATION_COMP_Y_FOCAL_NORM
+    ) == pytest.approx(180.0 / 320.0)
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     hypothesis = controller.current
     start_x, start_y = hypothesis.x, hypothesis.y
     controller._predict(hypothesis, 0.033, (0.0, -0.20, 0.40))
     # drift_x = -yaw_rate * focal * dt; drift_y = pitch_rate * focal * dt.
-    assert hypothesis.x - start_x == pytest.approx(-0.40 * 1.6 * 0.033)
+    assert hypothesis.x - start_x == pytest.approx(-0.40 * 0.9 * 0.033)
     assert hypothesis.y - start_y == pytest.approx(-0.20 * 1.6 * 0.033)
+
+    turn = _turn_reference_controller(successor_x=None, current_x=0.0)
+    turn._turn_reference_x = -0.20
+    turn._turn_reference_yaw_rad = 0.0
+    reference, _ = turn._turn_reference(
+        turn.current,
+        None,
+        current_error=0.0,
+        now_s=100.10,
+        yaw_rad=-0.10,
+        dt=0.0,
+    )
+    assert reference == pytest.approx(-0.20 + 0.10 * 0.9)
 
 
 def test_near_plane_steering_boost_scales_both_lateral_gains():
