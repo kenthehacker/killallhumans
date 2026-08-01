@@ -3197,11 +3197,15 @@ class CleanCourseController:
             # F112 (20260801T060914Z-visual-course-39579943): the full
             # support+0.05 regime floor remained pinned after the correctly
             # tracked Gate 1 moved BELOW the vehicle (compensated ey +0.44).
-            # Closure was finally inside budget (~0.22/s), but the floor
-            # overruled fresh camera descent demand and the vertical entry
-            # budget could never pass.  On course legs only, taper that extra
-            # deficit margin as fresh compensated geometry moves from center
-            # to the existing low-gate custody bound.  Bare level support is
+            # F113 (20260801T062148Z-visual-course-0732ea2d): tapering only
+            # over [center, +custody_bound] released the floor one response
+            # window too late.  At the first usable entry scale ey was
+            # already +0.32, so the entry budget correctly refused COMMIT
+            # and the gate left the frame bottom.  On course legs only,
+            # taper that extra deficit margin while fresh compensated
+            # geometry APPROACHES center from one custody bound high.  Full
+            # margin remains for a gate at/above -bound; it reaches zero at
+            # center and stays zero for a low gate.  Bare level support is
             # still a hard floor: untrusted IMU state can never command the
             # historical sub-support blind sink.
             if (
@@ -3209,9 +3213,8 @@ class CleanCourseController:
                 and gate_y is not None
                 and self.config.near_brake_relax_course_ey_norm > 1e-9
             ):
-                floor_margin *= 1.0 - _clamp01(
-                    max(0.0, gate_y)
-                    / self.config.near_brake_relax_course_ey_norm
+                floor_margin *= _clamp01(
+                    -gate_y / self.config.near_brake_relax_course_ey_norm
                 )
             floor = min(support, level_support) + floor_margin
             governed = _clamp(

@@ -1168,20 +1168,21 @@ def test_descent_floor_cannot_fire_from_frozen_vz_est():
     assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-9)
 
 
-def test_fh_untrusted_course_floor_tapers_when_gate_is_low():
+def test_fh_untrusted_course_floor_tapers_before_gate_reaches_center():
     # F83 (20260730T113315Z-visual-course-57671d35): at the -0.55 pre-cross
     # brake attitude the tilt-compensated support rose 0.2594 -> 0.2906, so
     # the F21 fh-untrusted floor (support + 0.05) pinned MAX thrust for the
     # whole 1.3 s latch while the same latch disabled the vz climb governor
     # — an open-loop +2.4 m/s^2 balloon carried the drone OVER gate 1 (no
     # credit; ground collision after the fall).  The floor's support term
-    # remains bounded at spawn-level tilt compensation.  F112 also tapers
-    # only the extra deficit margin when fresh course-gate geometry is low.
-    controller = _tracked_controller(_track("A", 0.0, 0.50))
+    # remains bounded at spawn-level tilt compensation.  F112 first tapered
+    # only after the gate moved low; F113 starts within one custody bound of
+    # center so the vehicle can bleed inherited climb before overshooting.
+    controller = _tracked_controller(_track("A", 0.0, 0.30))
     now = 100.10
     # Promote to gate 1 (F83's leg; the gate-0 brake band is out of scope).
     controller.observe(
-        _update([_track("A", 0.0, 0.50), _track("S1", 0.0, 0.50)], frame_id=3),
+        _update([_track("A", 0.0, 0.30), _track("S1", 0.0, 0.30)], frame_id=3),
         now_s=now,
     )
     controller._track_first_seen_s["A"] = now - 1.0
@@ -1190,9 +1191,10 @@ def test_fh_untrusted_course_floor_tapers_when_gate_is_low():
     assert controller.state is CleanCourseState.TRACK
     controller._alt_est_m = 2.0  # honest altitude (pre-gate-1 floor quiet)
     # Latch fh-untrusted (0.3 s sustain over the 5.0 trigger) at the F83
-    # brake attitude.  The gate sits LOW (compensated ey ~+0.12 at this
-    # pitch), so the qualified PD asks below the old pinned floor.  The extra
-    # margin now tapers continuously toward bare level support.
+    # brake attitude.  The gate is still slightly HIGH (compensated ey
+    # ~-0.08 at this pitch), but it is approaching center inside the 0.18
+    # custody window.  The qualified PD asks below the old pinned floor, so
+    # this isolates the earlier continuous margin taper.
     out = None
     for _ in range(12):
         now += 0.033
@@ -1201,10 +1203,10 @@ def test_fh_untrusted_course_floor_tapers_when_gate_is_low():
         out = _command(controller, now, pitch=-0.55, fh=6.0)
     assert controller._fh_untrusted
     assert out.vertical_qualified
-    compensated_ey = controller._compensated_ey(0.50, -0.55)
-    margin_fraction = 1.0 - min(
+    compensated_ey = controller._compensated_ey(0.30, -0.55)
+    margin_fraction = min(
         1.0,
-        max(0.0, compensated_ey)
+        max(0.0, -compensated_ey)
         / controller.config.near_brake_relax_course_ey_norm,
     )
     assert out.thrust == pytest.approx(
