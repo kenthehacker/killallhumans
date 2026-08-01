@@ -137,6 +137,11 @@ GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
 COURSE_VZ_DES_PER_NORM = 1.0  # m/s desired climb per norm of compensated ey
 COURSE_VZ_DES_MAX_M_S = 0.5
 COURSE_VZ_TRACK_GAIN = 0.12  # collective per m/s of vz tracking error
+# F142 restores one bounded visual derivative as the qualified rate feedback.
+# The hypothesis rate is already pitch-derotated in _predict(); this is the
+# original live-proved camera-rate envelope, used here INSTEAD OF the drifting
+# IMU vertical integrator rather than stacked with it.
+VERTICAL_MAX_ABS_RATE_NORM_S = 5.0 / 3.0
 # F97 (20260730T160909Z-visual-course-a4bfb6d3): F96 flew smoothly but the
 # tracker's vz_des saturated at -0.5 pulling a low-sitting gate to center,
 # holding vz -0.46 into the plane — COMMIT's |vz| <= 0.25 entry budget
@@ -923,6 +928,7 @@ class CleanCourseConfig:
     course_vz_des_per_norm: float = COURSE_VZ_DES_PER_NORM
     course_vz_des_max_m_s: float = COURSE_VZ_DES_MAX_M_S
     course_vz_track_gain: float = COURSE_VZ_TRACK_GAIN
+    vertical_max_abs_rate_norm_s: float = VERTICAL_MAX_ABS_RATE_NORM_S
     course_vz_des_commit_m_s: float = COURSE_VZ_DES_COMMIT_M_S
     course_vz_des_ramp_start_log_scale: float = COURSE_VZ_DES_RAMP_START_LOG_SCALE
     course_vz_des_ground_m_s: float = COURSE_VZ_DES_GROUND_M_S
@@ -1720,33 +1726,36 @@ class CleanCourseController:
                     and self.current.y_axis.std
                     <= cfg.search_covariance_std_norm
                 )
-                commit_geometry_ey = self._compensated_ey(
+                commit_ey = self._compensated_ey(
                     self.current.y, pitch_rad
                 )
                 commit_vz_des = self._course_vz_setpoint(
                     self.current,
-                    vertical_error=self.current.y,
+                    vertical_error=commit_ey,
                     vertical_qualified=commit_vertical_qualified,
                 )
-                # F141: a fresh image-y measurement owns the qualified
-                # vertical correction directly.  The leaky IMU estimate
-                # remains the zero-rate arrest only when image-y is not
-                # observable, and remains authoritative in the COMMIT entry
-                # safety budget; it cannot veto fresh vision here.
-                commit_rate_error = commit_vz_des
-                if not commit_vertical_qualified:
-                    commit_rate_error -= self._vz_est_m_s
+                # F142: qualified vision owns both terms of one continuous
+                # reference: compensated position supplies desired motion,
+                # and the already pitch-derotated visual rate damps it.  The
+                # drifting IMU integral is not stacked with fresh vision; it
+                # remains the zero-rate hold when y is unobservable and the
+                # independent COMMIT-entry safety veto.
+                if commit_vertical_qualified:
+                    commit_rate_feedback = _clamp(
+                        self.current.y_axis.v,
+                        -cfg.vertical_max_abs_rate_norm_s,
+                        cfg.vertical_max_abs_rate_norm_s,
+                    )
+                    commit_rate_error = commit_vz_des - commit_rate_feedback
+                else:
+                    commit_rate_error = 0.0 - self._vz_est_m_s
                 commit_hold = (
                     support + cfg.course_vz_track_gain * commit_rate_error
                 )
                 commit_target = self._governed_collective(
                     commit_hold,
                     support,
-                    gate_y=(
-                        commit_geometry_ey
-                        if commit_vertical_qualified
-                        else None
-                    ),
+                    gate_y=(commit_ey if commit_vertical_qualified else None),
                 )
                 # F66: the F60 vertical-aim pitch term is DELETED.  In
                 # commit the attitude is the forward drive, not a second
@@ -2076,23 +2085,27 @@ class CleanCourseController:
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
         self._pre_cross_brake_active = pre_cross_brake
-        # F141 discriminating experiment: F140 reached x=-0.109 while the
-        # raw Gate-1 y was near center, but pitch compensation still read
-        # strongly high and the negative leaky vz estimate kept collective
-        # above support until bottom censorship.  Qualified raw image-y owns
-        # the one bounded vertical reference directly.  Compensated y stays
-        # the physical geometry used by braking and crossing safety; loss of
-        # image-y qualification falls back within this same owner to the
-        # existing IMU zero-rate arrest.  No mode, latch, or additive margin
-        # is introduced.
+        # F142: F141's raw-position/no-rate discriminator mistook the braking
+        # attitude for a low gate, then drove an undamped -1.15 m/s sink into
+        # Gate 0.  Return to the F127 compensated geometry, but replace the
+        # contradictory qualified IMU integrator with the tracker's already
+        # pitch-derotated image rate.  It is the sole qualified derivative,
+        # not an overlay; the same owner and carried collective span TRACK,
+        # COMMIT, and visual loss.
         vz_des = self._course_vz_setpoint(
             current,
-            vertical_error=ey - vertical_setpoint_offset,
+            vertical_error=ey_vertical - vertical_setpoint_offset,
             vertical_qualified=vertical_qualified,
         )
-        vertical_rate_error = vz_des
-        if not vertical_qualified:
-            vertical_rate_error -= self._vz_est_m_s
+        if vertical_qualified:
+            visual_rate = _clamp(
+                current.y_axis.v,
+                -cfg.vertical_max_abs_rate_norm_s,
+                cfg.vertical_max_abs_rate_norm_s,
+            )
+            vertical_rate_error = vz_des - visual_rate
+        else:
+            vertical_rate_error = 0.0 - self._vz_est_m_s
         collective = support + cfg.course_vz_track_gain * vertical_rate_error
         if not vertical_qualified:
             # A stale visual rate is never reused.  The same vertical owner

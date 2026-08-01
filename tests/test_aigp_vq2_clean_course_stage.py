@@ -158,10 +158,10 @@ def test_support_tilt_compensation_is_spawn_relative():
     # (F90/F91/F93/F94) and F94's gate slid out the bottom of the frame
     # into a ground collision (id 1002).  Compensation must be relative
     # to the level attitude; at level both formulas agree (0.2594).
-    # F141 isolates the support calculation with a raw-centered qualified
-    # gate.  Pitch-compensated image geometry is no longer the collective
-    # feedback signal.
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    # A raw y of +0.427 at this brake attitude compensates back to a
+    # world-centered gate, isolating the support calculation from the
+    # qualified position and rate feedback.
+    controller = _tracked_controller(_track("A", 0.0, 0.427))
     brake_attitude = SPAWN_PITCH - 0.267
     now = 100.10
     out = None
@@ -249,7 +249,7 @@ def test_vertical_sign_is_the_gate0_minus_form_by_default():
     )
 
 
-def test_pitch_compensation_is_geometry_only_for_qualified_vertical_control():
+def test_vertical_error_is_pitch_attitude_compensated():
     # F50 (flight 20260729T222920Z-visual-course-3a8ed087): the vertical
     # servo read image-y with NO attitude compensation, so the F49 nose-up
     # brake (0.15 rad up from spawn) tilted the camera up and the world
@@ -267,13 +267,13 @@ def test_pitch_compensation_is_geometry_only_for_qualified_vertical_control():
     assert controller._compensated_ey(
         0.0, SPAWN_PITCH + 0.15
     ) == pytest.approx(0.24)
-    # End to end, that compensated quantity remains geometry-only.  Fresh
-    # raw y=+0.24 directly requests descent at the brake attitude.
+    # End to end, raw y=+0.24 at the nose-up brake attitude compensates to
+    # a level gate and therefore requests tilt-compensated support.
     braked = _tracked_controller(_track("A", 0.0, 0.24))
     braked._alt_est_m = 2.0  # keep the near-ground sink taper out of this check
     out = _command(braked, 100.10, pitch=SPAWN_PITCH - 0.15)
     assert out.thrust == pytest.approx(
-        SPAWN_SUPPORT / math.cos(0.15) - 0.12 * 0.24, abs=1e-9
+        SPAWN_SUPPORT / math.cos(0.15), abs=1e-9
     )
     # ...while the same reading at the spawn attitude really is low.
     # (F100: vz_des = -0.24 tracked at 0.12/m/s, vz_est 0; honest altitude
@@ -477,19 +477,17 @@ def test_gate0_climb_offset_never_lifts_aim_above_center():
     assert output.thrust < SPAWN_SUPPORT
 
 
-def test_gate0_image_rate_is_not_a_vertical_term():
-    # F100: gate 0 shares the unified vz-tracking law (the F96
-    # double-count deletion, now global) — the camera y-rate is a lagged
-    # image copy of vz and must NOT move the collective on the fh-trusted
-    # path; IMU vz_est is the only vertical rate feedback.  The old
-    # full-authority image-D test lived on the deleted gate-0 PD.
+def test_gate0_visual_rate_is_the_sole_qualified_damping_term():
+    # F142: gate 0 shares the unified law, but the already pitch-derotated
+    # camera y-rate is now the sole qualified damping term.  It replaces the
+    # drifting IMU integral instead of being stacked with it.
     config = _config(gate0_climb_vertical_offset_norm=0.25)
     controller = _tracked_controller(_track("A", 0.0, -0.10), config=config)
-    controller.current.y_axis.v = 1.0  # strong image rate, ignored
+    controller.current.y_axis.v = 0.10
     output = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert output.vertical_qualified
-    # vz_des = +0.35 from the error alone, tracked at 0.12 with vz_est 0.
-    assert output.thrust == pytest.approx(SPAWN_SUPPORT + 0.12 * 0.35, abs=1e-9)
+    # vz_des=+0.35 and visual rate=+0.10 leave one +0.25 rate error.
+    assert output.thrust == pytest.approx(SPAWN_SUPPORT + 0.12 * 0.25, abs=1e-9)
 
 
 def test_vertical_rate_owner_applies_in_predict_and_search():
@@ -508,33 +506,35 @@ def test_vertical_rate_owner_applies_in_predict_and_search():
     )
 
 
-def test_qualified_raw_gate_y_cannot_be_vetoed_by_attitude_or_vz_estimate():
-    # F140: at Gate-1 credit raw y was already +0.10 (descent demanded),
-    # while pitch compensation inverted it to -0.139 and vz_est=-0.127 added
-    # another climb request.  Fresh raw image-y owns the F141 correction.
+def test_qualified_compensated_gate_y_cannot_be_vetoed_by_vz_estimate():
+    # F141 proved raw +y under the brake can be an attitude artifact.  The
+    # compensated high-gate geometry owns position while a phantom negative
+    # vz estimate is excluded from the qualified request.
     brake_pitch = -0.46
     controller = _tracked_controller(_track("A", 0.0, 0.10))
     controller._vz_est_m_s = -0.35
     out = _command(controller, 100.10, pitch=brake_pitch)
     support = SPAWN_SUPPORT / math.cos(brake_pitch - SPAWN_PITCH)
-    assert controller._compensated_ey(0.10, brake_pitch) < 0.0
-    assert out.thrust == pytest.approx(support - 0.12 * 0.10, abs=1e-9)
-    assert out.thrust < support
+    compensated = controller._compensated_ey(0.10, brake_pitch)
+    assert compensated < 0.0
+    assert out.thrust == pytest.approx(support - 0.12 * compensated, abs=1e-9)
+    assert out.thrust > support
 
 
-def test_qualified_raw_gate_y_crosses_below_support_continuously():
-    # Exact time-series discriminator for the live loss.  Even with the
-    # negative vz estimate that formerly cancelled descent, a fresh gate
-    # moving from above to below center must produce one smooth collective
-    # reversal and cross below support before bottom censorship.
+def test_qualified_visual_rate_reverses_collective_continuously():
+    # Exact time-series discriminator for F142.  At fixed compensated
+    # position, a gate first moving up and then down must reverse the one
+    # carried collective smoothly; a contradictory IMU estimate cannot
+    # suppress or flip qualified visual damping.
     brake_pitch = -0.46
-    controller = _tracked_controller(_track("A", 0.0, -0.10))
+    controller = _tracked_controller(_track("A", 0.0, 0.24))
     controller._vz_est_m_s = -0.16
-    now = 100.10
-    for _ in range(12):
+    now = 101.0  # outside the Gate-0 launch feedforward window
+    for _ in range(20):
         now += 0.033
-        controller.current.y_axis.p = -0.10
-        controller.current.raw_y = -0.10
+        controller.current.y_axis.p = 0.24
+        controller.current.raw_y = 0.24
+        controller.current.y_axis.v = -0.30
         controller.current.last_measurement_s = now
         controller.current.last_y_measurement_s = now
         high_request = _command(controller, now, pitch=brake_pitch)
@@ -543,10 +543,11 @@ def test_qualified_raw_gate_y_crosses_below_support_continuously():
     assert high_request.thrust > support
 
     thrusts = []
-    for _ in range(20):
+    for _ in range(30):
         now += 0.033
-        controller.current.y_axis.p = 0.25
-        controller.current.raw_y = 0.25
+        controller.current.y_axis.p = 0.24
+        controller.current.raw_y = 0.24
+        controller.current.y_axis.v = 0.30
         controller.current.last_measurement_s = now
         controller.current.last_y_measurement_s = now
         thrusts.append(_command(controller, now, pitch=brake_pitch).thrust)
@@ -3141,32 +3142,16 @@ def _converged_gate_one_vertical(vz_m_s):
 
 
 def test_qualified_vertical_reference_is_not_vz_estimate_dependent():
-    # F78 (20260730T082159Z-visual-course-7e18243d): the gate-1 approach
-    # climbed at vz +0.65 THROUGH the opening — ey sat ~-0.10 (gate just
-    # above center), the PD's small P-term kept the climb alive, and the
-    # 0.5 m/s course governor only caps the RATE, so the gate sank
-    # ey -0.10 -> +0.16/+0.27 before censorship and the crossing went
-    # high.  F96: the gate-1+ vz-tracking law drives desired vz toward
-    # zero as the compensated error approaches center (vz_des scales
-    # with ey) — the arrest semantics as a setpoint, one coherent gain.
+    # The qualified F142 reference uses compensated position and visual
+    # rate.  With visual rate held at zero, a phantom IMU climb or sink must
+    # not change the request.
     climbing = _converged_gate_one_vertical(0.60)
     settled = _converged_gate_one_vertical(0.0)
-    # A +0.6 m/s climb at ey -0.10 is arrested HARD: vz_des is +0.10, so
-    # the tracker subtracts 0.12*(0.6-0.1) = 0.06 below the settled case.
     assert climbing.thrust == pytest.approx(settled.thrust, abs=1e-9)
-    # Descending (or a descend command) is untouched: no blanket
-    # reduction, no manufactured sink.
     sinking = _converged_gate_one_vertical(-0.30)
-    # No blanket reduction, no manufactured sink: the output is never
-    # BELOW the settled case.  With the gate at/above center a sink is
-    # never the intent, so the tracker (and the F88 vertical centering
-    # trim) may add its bounded correction here — never a subtraction.
     assert sinking.thrust == pytest.approx(settled.thrust, abs=1e-9)
     assert settled.thrust == pytest.approx(SPAWN_SUPPORT + 0.12 * 0.10)
-    # F100: gate 0 shares the unified vz-tracking law — the old "proved
-    # PD envelope" special case is deleted (the F99 gate-0 sink into the
-    # lower structure, id 1001, ran on it).  The same +0.6 m/s climb at
-    # ey -0.10 is arrested by the tracker on gate 0 too.
+    # The same qualified ownership applies at Gate 0.
     def _gate0_thrust(vz_m_s):
         gate0 = _tracked_controller(_track("A", 0.0, -0.10, scale=0.20))
         gate0._alt_est_m = 2.0
@@ -3189,20 +3174,17 @@ def test_qualified_vertical_reference_is_not_vz_estimate_dependent():
 
     gate0_climbing = _gate0_thrust(0.60)
     gate0_settled = _gate0_thrust(0.0)
-    # vz_des +0.10: the tracker pulls 0.12*(0.60-0.10) = 0.06 below settled.
     assert gate0_climbing.thrust == pytest.approx(
         gate0_settled.thrust, abs=1e-9
     )
 
 
-def test_course_leg_vertical_drops_image_rate_double_count():
+def test_course_leg_vertical_uses_one_visual_rate_term():
     # F96 (20260730T153947Z-visual-course-a2741311): the gate-1 leg
     # oscillated clamp-to-clamp (thrust 0.21 <-> 0.34, vz +/-0.4..0.5)
-    # because vz feedback was stacked incoherently — the camera y-rate
-    # D term (a lagged image copy of vz) PLUS the arrest PLUS the trim
-    # PLUS the governor, each tuned as if alone.  The replacement is
-    # ONE vz-tracking term; with vz_est at zero and the gate centered,
-    # image motion alone must not move the collective.
+    # because four rate/arrest/trim terms were stacked incoherently.  F142
+    # restores camera y-rate only as the sole qualified derivative; at a
+    # centered gate, +0.30 norm/s produces exactly one -0.036 request.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.20))
     _promote_to_gate_one(controller)
     controller._alt_est_m = 2.0  # honest altitude (floor quiet)
@@ -3223,7 +3205,7 @@ def test_course_leg_vertical_drops_image_rate_double_count():
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.TRACK
     assert out.vertical_qualified
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-3)
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.12 * 0.30, abs=1e-3)
 
 
 def test_course_leg_closure_excess_leaves_collective_alone():
@@ -3330,7 +3312,7 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
         current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.TRACK
-    # Qualified raw-y owns the request: vz_des is capped at -0.20 without
+    # Qualified compensated-y owns the request: vz_des is capped at -0.20 without
     # the old +0.10 estimator term cancelling or amplifying it.
     assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.024, abs=1e-3)
     # Far away the full -0.30 setpoint applies, also independent of vz_est.
@@ -3499,14 +3481,12 @@ def test_qualified_low_gate_request_is_independent_of_vz_estimate():
 
     climbing = _gate_low_thrust(0.30)
     settled = _gate_low_thrust(0.0)
-    # A +0.30 m/s climb at ey +0.03 is arrested hard (allowance 0.03):
-    # subtraction 0.15 * (0.30 - 0.03) = 0.040.  On the one-sided parent
-    # the arrest never engages and the two outputs are identical (the
-    # vz governor is quiet at 0.30 < 0.5 and the trim leak starts at 0).
+    # Qualified control excludes the IMU integral, so only compensated
+    # position and visual rate can change the request.
     assert climbing.thrust == pytest.approx(settled.thrust, abs=1e-9)
 
 
-def test_qualified_raw_position_owns_collective_reference():
+def test_qualified_compensated_position_owns_collective_reference():
     def _approach_thrust(ey, vz_m_s, ticks=5):
         controller = _tracked_controller(_track("A", 0.0, ey, scale=0.20))
         _promote_to_gate_one(controller)
@@ -3531,8 +3511,8 @@ def test_qualified_raw_position_owns_collective_reference():
         assert controller.state is CleanCourseState.TRACK
         return out
 
-    # Qualified raw-y is the sole feedback signal; a phantom negative vz
-    # cannot add climb or cancel descent.
+    # At the neutral attitude compensated-y equals raw-y; a phantom negative
+    # IMU vz cannot add climb or cancel descent on this qualified path.
     centered = _approach_thrust(0.0, -0.40)
     assert centered.thrust == pytest.approx(SPAWN_SUPPORT)
     low = _approach_thrust(0.15, -0.40)
@@ -3800,6 +3780,32 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     assert reference == pytest.approx(0.10, abs=0.005)
     assert out.yaw_rate_rad_s == pytest.approx(0.90 * reference, abs=1e-9)
     assert out.target_roll_rad == pytest.approx(0.50 * reference, abs=1e-9)
+
+
+def test_commit_qualified_vertical_uses_same_visual_rate_reference():
+    controller = _commit_controller()
+    _, now = _drive_commit_window(controller, 100.10)
+    assert controller.state is CleanCourseState.COMMIT
+
+    # Entered safely; a later phantom IMU sink must not alter qualified
+    # control.  With compensated position centered, +0.30 norm/s is the
+    # same sole -0.036 collective term used by TRACK.
+    controller._vz_est_m_s = -0.80
+    controller.current.y_axis.p = 0.0
+    controller.current.raw_y = 0.0
+    controller.current.y_axis.v = 0.30
+    out = None
+    for _ in range(30):
+        now += 0.033
+        controller.current.last_measurement_s = now
+        controller.current.last_x_measurement_s = now
+        controller.current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+
+    assert controller.state is CleanCourseState.COMMIT
+    assert out.thrust == pytest.approx(
+        SPAWN_SUPPORT - 0.12 * 0.30, abs=1e-3
+    )
 
 
 def test_commit_stale_y_relaxes_continuously_to_zero_vz_reference():
