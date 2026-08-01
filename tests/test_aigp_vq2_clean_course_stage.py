@@ -2512,10 +2512,11 @@ def test_gate_zero_far_closure_avoids_early_fast_brake_dive():
     )
 
 
-def test_gate_zero_budget_false_near_plane_hold_uses_full_course_brake():
-    # F104's stronger near-plane hold remains: once Gate 0 reaches the
-    # COMMIT regime with an invalid expansion budget, use the bounded course
-    # brake while the existing custody floor remains the final authority.
+def test_gate_zero_budget_false_near_plane_hold_keeps_gentle_brake():
+    # F109: the F104/F108 full-course escalation pitched Gate 0 sharply up
+    # while sinking and twice struck object 1001 without credit.  The
+    # near-plane budget-false hold still suppresses advance and demands the
+    # brake, but Gate 0 keeps the F102/F103 live-proven -0.15 attitude.
     controller = _commit_controller_gate_zero()
     current = controller.current
     current.x_axis.p = 0.0
@@ -2541,16 +2542,7 @@ def test_gate_zero_budget_false_near_plane_hold_uses_full_course_brake():
 
     assert controller.state is CleanCourseState.TRACK
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad < weak_brake_attitude - 0.05
-    compensated_ey = (
-        0.15
-        - 0.15 * controller.config.vertical_pitch_comp_norm_per_rad
-    )
-    custody_floor = controller.config.spawn_pitch_rad - (
-        (controller.config.near_brake_relax_ey_norm - compensated_ey)
-        / controller.config.vertical_pitch_comp_norm_per_rad
-    )
-    assert out.target_pitch_rad == pytest.approx(custody_floor, abs=1e-9)
+    assert out.target_pitch_rad == pytest.approx(weak_brake_attitude, abs=1e-9)
 
 
 def test_commit_entry_fires_sustained_aligned_near_plane():

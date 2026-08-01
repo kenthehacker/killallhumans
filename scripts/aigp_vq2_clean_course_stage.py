@@ -2579,15 +2579,14 @@ class CleanCourseController:
             )
         # F80 (see the COURSE_PRE_CROSS_BRAKE_PITCH_RAD block): course legs
         # inherit the previous crossing's energy, so the TRUE brake doubles
-        # to -0.30 from spawn at gate_index >= 1.  F104 applies that same
-        # bounded brake to Gate 0 only when the near-plane COMMIT budget is
-        # false.  F106 showed that applying it throughout Gate 0 pitched the
-        # gate below the frame before credit; F108 also restores the proved
-        # far-range governor response.  Same single blend and custody floor
-        # throughout.
+        # to -0.30 from spawn at gate_index >= 1.  Gate 0 keeps the proved
+        # -0.15 attitude throughout.  F104/F108's near-plane escalation made
+        # the first gate pitch sharply up while sinking and produced two
+        # object-1001 strikes without credit; F102/F103 crossed with this
+        # gentle Gate-0 brake.  Same single blend and custody floor throughout.
         brake_pitch_offset = (
             cfg.course_pre_cross_brake_pitch_rad
-            if self.gate_index >= 1 or near_plane_hold
+            if self.gate_index >= 1
             else cfg.pre_cross_brake_pitch_rad
         )
         target_pitch = law_pitch + brake_demand * (
