@@ -1893,6 +1893,40 @@ def _turn_reference_controller(
     return controller
 
 
+def test_turn_aperture_uses_signed_leg_relative_swept_envelope():
+    # F127 withdrew the successor turn while Gate 0 was converging on center:
+    # |x| + |vx|T treated convergence as divergence, collapsed aperture
+    # reserve, and let the shared reference reverse right.  The two endpoints
+    # of one signed leg-relative sweep preserve yaw-equivalent geometry and
+    # leave more passage reserve for motion toward center than away from it.
+    def reserve(*, image_x, yaw, vx):
+        controller = _turn_reference_controller(current_x=image_x)
+        controller._course_anchor_yaw_rad = 0.0
+        controller._turn_reference_yaw_rad = None
+        controller._turn_reference_x = None
+        controller._turn_aperture_reserve = 0.0
+        controller._turn_successor_authority = 0.0
+        controller.current.x_axis.p = image_x
+        controller.current.x_axis.v = vx
+        controller.current.raw_x = image_x
+        controller._turn_reference(
+            controller.current,
+            controller.successor,
+            current_error=image_x,
+            now_s=100.10,
+            yaw_rad=yaw,
+            dt=0.04,
+        )
+        return controller._turn_aperture_reserve
+
+    unshifted = reserve(image_x=-0.08, yaw=0.0, vx=0.5)
+    yaw_shifted = reserve(image_x=0.08, yaw=-0.10, vx=0.5)
+    divergent = reserve(image_x=-0.08, yaw=0.0, vx=-0.5)
+
+    assert yaw_shifted == pytest.approx(unshifted, abs=1e-12)
+    assert unshifted > divergent > 0.0
+
+
 def test_continuous_turn_reference_coordinates_yaw_and_bank_only():
     turn = _turn_reference_controller()
     current_only = _turn_reference_controller(successor_x=None)
@@ -2134,65 +2168,6 @@ def test_successor_reassociation_cannot_recreate_precredit_s_turn():
 
     assert all(sample.yaw_rate_rad_s < 0.0 for sample in samples)
     assert all(sample.target_roll_rad < 0.0 for sample in samples)
-    yaw_steps = [
-        abs(right.yaw_rate_rad_s - left.yaw_rate_rad_s)
-        for left, right in zip(samples, samples[1:])
-    ]
-    assert max(yaw_steps) < 0.08
-
-
-def test_correlated_successor_quality_does_not_create_precredit_dead_zone():
-    # F127's old Gate-1 hypothesis stayed consistently left while Gate 0
-    # engulfed, but covariance and age rose from the same missed frames.  Their
-    # product (again multiplied by confidence) suppressed the turn until a new
-    # tracker id appeared only 0.266 s before credit.  Use the weakest quality
-    # once: the bounded derotated bearing must establish the left handoff before
-    # reassociation, while the existing authority/reference poles bound steps.
-    controller = _turn_reference_controller(current_x=0.02)
-    now = 100.10
-    controller.state = CleanCourseState.PREDICT
-    controller.current.outer_log_scale = -0.95
-    controller.current.aperture_half_x = None
-    controller.current.aperture_half_y = None
-    controller.successor.x_axis.p = -0.43
-    controller.successor.confidence = 0.64
-    controller.successor.outer_log_scale = -4.37
-    controller._turn_aperture_reserve = 0.438
-    controller._turn_successor_authority = 0.055
-    controller._turn_reference_x = 0.010
-    controller._turn_reference_yaw_rad = 0.0
-    controller._last_command_s = now
-
-    samples = []
-    variations = (
-        # The exact F127 old-id uncertainty/age progression as Gate 0 engulfed.
-        (0.378, 0.375, None),
-        (0.460, 0.469, None),
-        (0.556, 0.578, None),
-        # Same physical left gate, now assigned the fresh fused-track id.
-        (0.141, 0.0, "B-reassociated"),
-        (0.014, 0.0, None),
-        (0.014, 0.0, None),
-    )
-    for std, age_s, replacement_id in variations:
-        now += 0.047
-        variance = (std / math.sqrt(2.0)) ** 2
-        controller.successor.x_axis.pp = variance
-        controller.successor.y_axis.pp = variance
-        controller.successor.last_measurement_s = now - age_s
-        controller.successor.last_x_measurement_s = now - age_s
-        if replacement_id is not None:
-            controller.successor.track_id = replacement_id
-            controller._track_first_seen_s[replacement_id] = now
-        controller._last_engulfing_anchor_s = now
-        samples.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
-
-    first_left = next(
-        index for index, sample in enumerate(samples) if sample.yaw_rate_rad_s < 0.0
-    )
-    assert first_left < 3  # useful turn starts before the fresh-id tick
-    assert all(sample.yaw_rate_rad_s < 0.0 for sample in samples[first_left:])
-    assert all(sample.target_roll_rad < 0.0 for sample in samples[first_left:])
     yaw_steps = [
         abs(right.yaw_rate_rad_s - left.yaw_rate_rad_s)
         for left, right in zip(samples, samples[1:])

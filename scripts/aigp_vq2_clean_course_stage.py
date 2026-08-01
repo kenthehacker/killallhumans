@@ -2761,9 +2761,30 @@ class CleanCourseController:
             aperture_budget = (
                 cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
             )
-            projected_current_error = (
-                max(abs(current.x), abs(current.raw_x))
-                + abs(current.vx) * cfg.successor_preview_projection_s
+            # F131: evaluate passage margin in the leg frame and preserve the
+            # sign of predicted motion.  The former |x| + |vx|T bound charged
+            # motion toward the opening exactly like motion away from it, so
+            # F127 withdrew successor authority during a converging approach
+            # and reversed the shared turn reference.  ``vx`` is already the
+            # derivative of the IMU-derotated bearing; shift only the measured
+            # endpoints from camera coordinates into the leg frame.
+            yaw_offset = 0.0
+            if yaw_rad is not None and self._course_anchor_yaw_rad is not None:
+                yaw_offset = (
+                    math.remainder(
+                        float(yaw_rad) - self._course_anchor_yaw_rad,
+                        2.0 * math.pi,
+                    )
+                    * ROTATION_COMP_FOCAL_NORM
+                )
+            filtered_x = current.x + yaw_offset
+            raw_x = current.raw_x + yaw_offset
+            projected_dx = current.vx * cfg.successor_preview_projection_s
+            projected_current_error = max(
+                abs(filtered_x),
+                abs(filtered_x + projected_dx),
+                abs(raw_x),
+                abs(raw_x + projected_dx),
             )
             if aperture_budget > 1e-9:
                 aperture_target = _clamp01(
@@ -2810,20 +2831,18 @@ class CleanCourseController:
                 / max(1e-6, cfg.successor_min_log_scale_gap)
             )
             # Successor selection already owns persistence, so track age is
-            # deliberately absent here.  F130 also stops multiplying three
-            # correlated views of the same observation quality.  In F127 the
-            # stable, correctly-left IMU-derotated bearing became older and
-            # more uncertain exactly while Gate 0's aperture reserve opened;
-            # confidence * uncertainty * freshness created an artificial
-            # authority valley until a fresh tracker id appeared.  The weakest
-            # quality remains fully authoritative and continuous without
-            # counting the same missed frames two more times.  The carried
-            # authority and reference below still own command smoothing.
-            evidence_quality = min(confidence, uncertainty, freshness)
+            # deliberately absent here.  F125/F126 showed that feeding this
+            # product directly into the reference still let covariance loss
+            # followed by a fresh tracker id create a 0.126 rad/s yaw jump.
+            # Carry the evidence product continuously; weak evidence changes
+            # authority instead of resetting it, while the one reference below
+            # remains the only state that can command yaw and bank.
             desired_authority = (
                 closure
                 * self._turn_aperture_reserve
-                * evidence_quality
+                * confidence
+                * uncertainty
+                * freshness
                 * range_order
             )
         self._turn_successor_authority += alpha * (
