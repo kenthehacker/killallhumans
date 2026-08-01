@@ -1728,11 +1728,8 @@ class CleanCourseController:
                     vertical_error=commit_ey,
                     vertical_qualified=commit_vertical_qualified,
                 )
-                commit_rate_error = commit_vz_des
-                if not commit_vertical_qualified:
-                    commit_rate_error -= self._vz_est_m_s
-                commit_hold = (
-                    support + cfg.course_vz_track_gain * commit_rate_error
+                commit_hold = support + cfg.course_vz_track_gain * (
+                    commit_vz_des - self._vz_est_m_s
                 )
                 commit_target = self._governed_collective(
                     commit_hold,
@@ -2072,18 +2069,9 @@ class CleanCourseController:
             vertical_error=ey_vertical - vertical_setpoint_offset,
             vertical_qualified=vertical_qualified,
         )
-        # F136 discriminating experiment: in every F122-F135 Gate-1 loss,
-        # qualified compensated-y eventually demanded descent while a
-        # negative integrated vz estimate cancelled that request and kept
-        # thrust at/above support through bottom censorship.  Qualified
-        # vision owns the one bounded vertical reference directly; when that
-        # axis is unobservable, the same owner falls back to the existing IMU
-        # zero-rate hold.  The continuously filtered collective keeps both
-        # seams smooth, and vz_est remains authoritative for COMMIT safety.
-        vertical_rate_error = vz_des
-        if not vertical_qualified:
-            vertical_rate_error -= self._vz_est_m_s
-        collective = support + cfg.course_vz_track_gain * vertical_rate_error
+        collective = support + cfg.course_vz_track_gain * (
+            vz_des - self._vz_est_m_s
+        )
         if not vertical_qualified:
             # A stale visual rate is never reused.  The same vertical owner
             # simply tracks zero world-vertical rate until vision returns.
@@ -2821,21 +2809,43 @@ class CleanCourseController:
                 (current.outer_log_scale - successor.outer_log_scale)
                 / max(1e-6, cfg.successor_min_log_scale_gap)
             )
-            # Successor selection already owns persistence, so track age is
-            # deliberately absent here.  F125/F126 showed that feeding this
-            # product directly into the reference still let covariance loss
-            # followed by a fresh tracker id create a 0.126 rad/s yaw jump.
-            # Carry the evidence product continuously; weak evidence changes
-            # authority instead of resetting it, while the one reference below
-            # remains the only state that can command yaw and bank.
-            desired_authority = (
+            successor_weight = (
                 closure
-                * self._turn_aperture_reserve
                 * confidence
                 * uncertainty
                 * freshness
                 * range_order
             )
+            current_confidence = _clamp01(current.confidence)
+            current_uncertainty = _clamp01(
+                1.0
+                - current.position_std / cfg.search_covariance_std_norm
+            )
+            current_freshness = _clamp01(
+                1.0
+                - max(0.0, now_s - current.last_x_measurement_s)
+                / cfg.x_steer_max_age_s
+            )
+            current_weight = (
+                (1.0 - self._turn_aperture_reserve)
+                * current_confidence
+                * current_uncertainty
+                * current_freshness
+            )
+            # F137: current passage and successor bearing are two continuous
+            # evidence claims, not a full-strength current command plus a
+            # successor product capped by aperture reserve.  F127/F136 kept
+            # steering right while current x aged through PREDICT and a fresh
+            # consistently-left successor remained visible; F134 showed that
+            # fixing passage in a leg frame merely hides completed lateral
+            # translation.  Normalize the two existing camera/IMU-derotated
+            # claims, then keep the one carried authority/reference filters.
+            # Weak current evidence now transfers authority smoothly instead
+            # of countermanding known successor geometry, with no latch,
+            # qualification mode, or second command owner.
+            evidence_sum = current_weight + successor_weight
+            if evidence_sum > 1e-9:
+                desired_authority = successor_weight / evidence_sum
         self._turn_successor_authority += alpha * (
             desired_authority - self._turn_successor_authority
         )
