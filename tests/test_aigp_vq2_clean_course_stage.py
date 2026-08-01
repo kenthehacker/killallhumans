@@ -387,11 +387,13 @@ def test_centered_bearing_does_not_unwind_optical_intercept_bank():
     # the flight path toward the predicted plane intercept.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     current = controller.current
+    _settle_commit_passage_covariance(current)
     current.x_axis.p = 0.0
     current.raw_x = 0.0
     current.x_axis.v = 0.30
     current.scale_axis.v = 0.50
     current.outer_expansion_rate = 0.50
+    current.scale_axis.vv = 0.02**2
     current.last_measurement_s = 100.10
     current.last_x_measurement_s = 100.10
 
@@ -402,8 +404,38 @@ def test_centered_bearing_does_not_unwind_optical_intercept_bank():
     )
     assert controller._last_lateral_motion.physical_rate_norm_s > 0.0
     assert controller._last_lateral_motion.intercept_error > 0.0
+    assert controller._last_lateral_motion.control_authority > 0.0
     assert out.yaw_rate_rad_s == pytest.approx(0.0, abs=1e-12)
     assert out.target_roll_rad > 0.0
+
+
+def test_uncertain_lateral_intercept_falls_back_to_measured_bearing():
+    # A nominal TTC intercept can cross to the opposite image side when the
+    # expansion estimate is extremely uncertain.  That uncertain projection
+    # must not reverse bank: roll falls back to the measured bearing while yaw
+    # continues ordinary FOV centering.
+    controller = _tracked_controller(_track("A", -0.25, 0.0))
+    current = controller.current
+    _settle_commit_passage_covariance(current)
+    current.x_axis.p = -0.25
+    current.raw_x = -0.25
+    current.x_axis.v = 1.0
+    current.scale_axis.v = 0.50
+    current.outer_expansion_rate = 0.50
+    current.scale_axis.vv = 10.0**2
+    current.last_measurement_s = 100.10
+    current.last_x_measurement_s = 100.10
+
+    out = _command(controller, 100.10, pitch=SPAWN_PITCH, yaw=0.0)
+    motion = controller._last_lateral_motion
+
+    assert motion.intercept_error > 0.0
+    assert motion.control_authority == pytest.approx(0.0, abs=1e-12)
+    assert controller._lateral_intercept_reference_x == pytest.approx(
+        current.x, abs=1e-12
+    )
+    assert out.yaw_rate_rad_s < 0.0
+    assert out.target_roll_rad < 0.0
 
 
 def test_gate0_climb_vertical_offset_is_bounded_feedforward():
@@ -546,12 +578,23 @@ def test_gate0_closure_dilation_is_not_a_vertical_term():
         controller.config.passage_ttc_max_s, abs=1e-9
     )
     assert motion.physical_rate_norm_s == pytest.approx(0.0, abs=1e-9)
-    assert motion.intercept_error == pytest.approx(-0.10, abs=1e-9)
+    assert motion.fallback_intercept_error == pytest.approx(-0.11, abs=1e-9)
+    assert motion.optical_intercept_error == pytest.approx(-0.10, abs=1e-9)
+    assert motion.intercept_error == pytest.approx(
+        motion.fallback_intercept_error
+        + motion.projection_authority
+        * (
+            motion.optical_intercept_error
+            - motion.fallback_intercept_error
+        ),
+        abs=1e-12,
+    )
+    assert motion.intercept_error < 0.0
     assert output.thrust == pytest.approx(
         SPAWN_SUPPORT
-        + controller.config.vertical_optical_collective_gain
+        - controller.config.vertical_optical_collective_gain
         * motion.control_authority
-        * 0.10,
+        * motion.intercept_error,
         abs=1e-9,
     )
 
@@ -574,7 +617,22 @@ def test_passage_vertical_projection_keeps_only_physical_image_motion():
     )
     assert dilation_only.ttc_s == pytest.approx(2.0, abs=1e-9)
     assert dilation_only.physical_rate_norm_s == pytest.approx(0.0, abs=1e-9)
-    assert dilation_only.intercept_error == pytest.approx(-0.20, abs=1e-9)
+    assert dilation_only.fallback_intercept_error == pytest.approx(
+        -0.25, abs=1e-9
+    )
+    assert dilation_only.optical_intercept_error == pytest.approx(
+        -0.20, abs=1e-9
+    )
+    assert dilation_only.intercept_error == pytest.approx(
+        dilation_only.fallback_intercept_error
+        + dilation_only.projection_authority
+        * (
+            dilation_only.optical_intercept_error
+            - dilation_only.fallback_intercept_error
+        ),
+        abs=1e-12,
+    )
+    assert dilation_only.intercept_error < 0.0
 
     # Additional image-down motion is de-dilated optical motion.  It is
     # projected over an uncertainty-weighted horizon toward TTC, not treated
@@ -587,13 +645,21 @@ def test_passage_vertical_projection_keeps_only_physical_image_motion():
         now_s=100.10,
         measurement_age_s=0.0,
     )
-    slow_horizon = controller.config.commit_blackout_s + (
-        slow_closure.projection_authority
-        * (slow_closure.ttc_s - controller.config.commit_blackout_s)
-    )
     assert slow_closure.physical_rate_norm_s == pytest.approx(0.30, abs=1e-9)
+    assert slow_closure.fallback_intercept_error == pytest.approx(
+        -0.10, abs=1e-9
+    )
+    assert slow_closure.optical_intercept_error == pytest.approx(
+        0.40, abs=1e-9
+    )
     assert slow_closure.intercept_error == pytest.approx(
-        -0.20 + 0.30 * slow_horizon, abs=1e-9
+        slow_closure.fallback_intercept_error
+        + slow_closure.projection_authority
+        * (
+            slow_closure.optical_intercept_error
+            - slow_closure.fallback_intercept_error
+        ),
+        abs=1e-12,
     )
 
     # The same de-dilated motion has less time to accumulate at twice the
@@ -611,6 +677,97 @@ def test_passage_vertical_projection_keeps_only_physical_image_motion():
     assert fast_closure.ttc_s == pytest.approx(1.0, abs=1e-9)
     assert fast_closure.physical_rate_norm_s == pytest.approx(0.30, abs=1e-9)
     assert fast_closure.intercept_error < slow_closure.intercept_error
+
+
+def test_f161_gate1_weak_closure_blend_preserves_fallback_axis_signs():
+    # Recorded F161 Gate-1 adoption: the newborn raw expansion spike strongly
+    # contradicted the filtered closure estimate.  Full de-dilation/TTC would
+    # flip both axes across the frame (vertical was previously +0.243), while
+    # the trustworthy short image-motion projection remains above and left.
+    controller = _tracked_controller(
+        _track("A", -0.499448, -0.095734)
+    )
+    current = controller.current
+    _settle_commit_passage_covariance(current)
+    current.x_axis.p = -0.499448
+    current.x_axis.v = 0.000182
+    current.y_axis.p = -0.095734
+    current.y_axis.v = -0.010870
+    current.scale_axis.v = 0.223664
+    current.outer_expansion_rate = 7.25808
+    current.scale_axis.vv = 0.02**2
+    current.last_measurement_s = 100.10
+    current.last_x_measurement_s = 100.10
+    current.last_y_measurement_s = 100.10
+
+    x_motion = controller._passage_motion(
+        current,
+        current.x_axis,
+        current.x,
+        now_s=100.10,
+        measurement_age_s=0.0,
+    )
+    y_motion = controller._passage_motion(
+        current,
+        current.y_axis,
+        current.y,
+        now_s=100.10,
+        measurement_age_s=0.0,
+    )
+
+    for motion in (x_motion, y_motion):
+        assert motion.closure_rate_s == pytest.approx(7.25808, abs=1e-9)
+        assert motion.projection_authority < 0.04
+        assert motion.fallback_intercept_error < 0.0
+        assert motion.optical_intercept_error > 0.0
+        assert motion.intercept_error == pytest.approx(
+            motion.fallback_intercept_error
+            + motion.projection_authority
+            * (
+                motion.optical_intercept_error
+                - motion.fallback_intercept_error
+            ),
+            abs=1e-12,
+        )
+        assert motion.intercept_error < 0.0
+
+    assert y_motion.fallback_intercept_error == pytest.approx(
+        -0.095734 + -0.010870 * controller.config.commit_blackout_s,
+        abs=1e-12,
+    )
+    assert x_motion.fallback_intercept_error == pytest.approx(
+        -0.499448 + 0.000182 * controller.config.commit_blackout_s,
+        abs=1e-12,
+    )
+
+
+def test_full_credible_closure_reaches_complete_optical_intercept():
+    controller = _tracked_controller(_track("A", -0.20, 0.0))
+    current = controller.current
+    _settle_commit_passage_covariance(current)
+    current.x_axis.p = -0.20
+    current.x_axis.v = 0.20
+    current.x_axis.pp = 0.0
+    current.scale_axis.v = 0.50
+    current.outer_expansion_rate = 0.50
+    current.scale_axis.vv = 0.02**2
+    current.last_measurement_s = 100.10
+    current.last_x_measurement_s = 100.10
+
+    motion = controller._passage_motion(
+        current,
+        current.x_axis,
+        current.x,
+        now_s=100.10,
+        measurement_age_s=0.0,
+    )
+
+    assert motion.projection_authority == pytest.approx(1.0, abs=1e-12)
+    assert motion.fallback_intercept_error < 0.0
+    assert motion.optical_intercept_error > 0.0
+    assert motion.intercept_error == pytest.approx(
+        motion.optical_intercept_error, abs=1e-12
+    )
 
 
 def test_exact_axis_optical_authority_fades_with_intercept_uncertainty():

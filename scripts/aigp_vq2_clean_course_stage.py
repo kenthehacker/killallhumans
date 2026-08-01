@@ -782,6 +782,8 @@ class _PassageMotion:
     ttc_s: float
     ttc_std_s: float
     projection_authority: float
+    fallback_intercept_error: float
+    optical_intercept_error: float
     intercept_error: float
     intercept_std: float
     control_authority: float
@@ -2413,12 +2415,12 @@ class CleanCourseController:
         With log-scale expansion ``lambda`` and a de-rotated image rate,
         ``q = image_rate - lambda * bearing`` removes pure perspective
         dilation.  ``bearing + q / lambda`` is the constant-velocity plane
-        miss in current-depth units.  The projection horizon moves toward
-        bounded TTC only as fresh position and consistent closure evidence
-        reduce uncertainty; otherwise it falls back to the short blackout
-        horizon while retaining the measured bearing correction.  Position,
-        image-rate, and expansion-rate uncertainty all propagate into the
-        intercept interval used by control and COMMIT admission.
+        miss in current-depth units.  Authority transfers from a short image-
+        motion projection to that complete bounded-TTC model only as fresh
+        position and consistent closure evidence reduce uncertainty; weak
+        closure cannot enter de-dilation at full strength.  Position, image-
+        rate, expansion-rate, and model-disagreement uncertainty all propagate
+        into the intercept interval used by control and COMMIT admission.
         """
 
         cfg = self.config
@@ -2453,7 +2455,8 @@ class CleanCourseController:
         else:
             ttc_s = cfg.commit_blackout_s
             ttc_std_s = 0.0
-        physical_rate = float(axis.v) - model_closure * error
+        image_rate = float(axis.v)
+        physical_rate = image_rate - model_closure * error
         freshness = _clamp01(
             1.0 - max(0.0, float(measurement_age_s)) / cfg.predict_max_gap_s
         )
@@ -2463,32 +2466,51 @@ class CleanCourseController:
         projection_authority = (
             freshness * position_certainty * closure_agreement
         )
-        horizon_s = cfg.commit_blackout_s + projection_authority * (
-            ttc_s - cfg.commit_blackout_s
+        # Blend complete models, never just their horizons.  With weak or
+        # contradictory closure evidence, the short-horizon fallback is
+        # ``p + p_dot*T0`` and does not consume lambda at all.  Only credible
+        # closure transfers authority to the TTC/de-dilated model.  F161's
+        # newborn Gate-1 raw expansion spike (7.26/s versus filtered 0.22/s)
+        # otherwise entered ``q`` at full strength despite 3% agreement and
+        # flipped both vertical and lateral intercept signs.
+        fallback_horizon_s = cfg.commit_blackout_s
+        fallback_intercept = error + image_rate * fallback_horizon_s
+        optical_intercept = error + physical_rate * ttc_s
+        intercept_error = fallback_intercept + projection_authority * (
+            optical_intercept - fallback_intercept
         )
-        intercept_error = error + physical_rate * horizon_s
-        # ``intercept = (1 - lambda*T) * p + T * p_dot``.  Propagate the
-        # actual de-dilated projection, including position/rate covariance;
-        # using the ordinary ``p + T*p_dot`` covariance would assign
-        # uncertainty to perspective dilation that the intercept removed.
-        position_gain = 1.0 - model_closure * horizon_s
+        # The blended intercept is linear in p and p_dot for fixed lambda:
+        #   h = (1-A)*(p + T0*p_dot) + A*((1-lambda*T1)*p + T1*p_dot)
+        # Propagate that actual model, including the position/rate covariance.
+        position_gain = 1.0 - (
+            projection_authority * model_closure * ttc_s
+        )
+        rate_gain = fallback_horizon_s + projection_authority * (
+            ttc_s - fallback_horizon_s
+        )
         projected_variance = (
             position_gain * position_gain * axis.pp
-            + 2.0 * position_gain * horizon_s * axis.pv
-            + horizon_s * horizon_s * axis.vv
+            + 2.0 * position_gain * rate_gain * axis.pv
+            + rate_gain * rate_gain * axis.vv
             + cfg.passage_motion_model_std_norm**2
         )
+        model_disagreement = optical_intercept - fallback_intercept
+        projected_variance += (
+            projection_authority
+            * (1.0 - projection_authority)
+            * model_disagreement
+        ) ** 2
         if closure_credible:
             unclamped_ttc_s = 1.0 / closure
             ttc_gradient = (
-                -projection_authority / (closure * closure)
+                -1.0 / (closure * closure)
                 if cfg.passage_ttc_min_s
                 < unclamped_ttc_s
                 < cfg.passage_ttc_max_s
                 else 0.0
             )
-            closure_sensitivity = (
-                -error * horizon_s + physical_rate * ttc_gradient
+            closure_sensitivity = projection_authority * (
+                -error * ttc_s + physical_rate * ttc_gradient
             )
             projected_variance += (
                 closure_sensitivity * closure_std_s
@@ -2523,6 +2545,8 @@ class CleanCourseController:
             ttc_s=ttc_s,
             ttc_std_s=ttc_std_s,
             projection_authority=projection_authority,
+            fallback_intercept_error=fallback_intercept,
+            optical_intercept_error=optical_intercept,
             intercept_error=intercept_error,
             intercept_std=intercept_std,
             control_authority=control_authority,
@@ -3179,6 +3203,8 @@ class CleanCourseController:
                 ttc_s=motion.ttc_s,
                 ttc_std_s=motion.ttc_std_s,
                 projection_authority=motion.projection_authority,
+                fallback_intercept_error=motion.fallback_intercept_error,
+                optical_intercept_error=motion.optical_intercept_error,
                 intercept_error=intercept,
                 intercept_std=motion.intercept_std,
                 control_authority=motion.control_authority,
@@ -3248,7 +3274,9 @@ class CleanCourseController:
             measurement_age_s=now_s - current.last_x_measurement_s,
         )
         self._last_lateral_motion = current_motion
-        desired = current_motion.intercept_error
+        desired = current.x + current_motion.control_authority * (
+            current_motion.intercept_error - current.x
+        )
         authority = _clamp01(successor_authority)
         if successor is not None and authority > 0.0:
             successor_motion = self._passage_motion(
@@ -3258,9 +3286,14 @@ class CleanCourseController:
                 now_s=now_s,
                 measurement_age_s=now_s - successor.last_x_measurement_s,
             )
+            successor_desired = (
+                successor.x
+                + successor_motion.control_authority
+                * (successor_motion.intercept_error - successor.x)
+            )
             desired = (
                 (1.0 - authority) * desired
-                + authority * successor_motion.intercept_error
+                + authority * successor_desired
             )
         alpha = _clamp01(
             dt / max(1e-6, self.config.turn_reference_tau_s + dt)
@@ -3865,6 +3898,8 @@ def _clean_course_tick_trace(
             "ttc_s": motion.ttc_s,
             "ttc_std_s": motion.ttc_std_s,
             "projection_authority": motion.projection_authority,
+            "fallback_intercept_error": motion.fallback_intercept_error,
+            "optical_intercept_error": motion.optical_intercept_error,
             "intercept_error": motion.intercept_error,
             "intercept_std": motion.intercept_std,
             "control_authority": motion.control_authority,
