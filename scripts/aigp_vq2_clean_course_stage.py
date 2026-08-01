@@ -2740,8 +2740,17 @@ class CleanCourseController:
         """
 
         cfg = self.config
+        yaw_offset = 0.0
         if yaw_rad is not None:
             yaw = float(yaw_rad)
+            if self._course_anchor_yaw_rad is not None:
+                yaw_offset = (
+                    math.remainder(
+                        yaw - self._course_anchor_yaw_rad,
+                        2.0 * math.pi,
+                    )
+                    * ROTATION_COMP_FOCAL_NORM
+                )
             if (
                 self._turn_reference_x is not None
                 and self._turn_reference_yaw_rad is not None
@@ -2750,8 +2759,15 @@ class CleanCourseController:
                     math.sin(yaw - self._turn_reference_yaw_rad),
                     math.cos(yaw - self._turn_reference_yaw_rad),
                 )
+                # F134: the reference is a convex mixture of a leg-relative
+                # passage error and a current-camera successor bearing.  Only
+                # the already-filtered successor share rotates with measured
+                # yaw; full derotation made camera centering erase the bank
+                # needed to bend the physical flight path toward Gate 1.
                 self._turn_reference_x -= (
-                    delta_yaw * ROTATION_COMP_FOCAL_NORM
+                    self._turn_successor_authority
+                    * delta_yaw
+                    * ROTATION_COMP_FOCAL_NORM
                 )
             self._turn_reference_yaw_rad = yaw
 
@@ -2761,30 +2777,9 @@ class CleanCourseController:
             aperture_budget = (
                 cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
             )
-            # F131: evaluate passage margin in the leg frame and preserve the
-            # sign of predicted motion.  The former |x| + |vx|T bound charged
-            # motion toward the opening exactly like motion away from it, so
-            # F127 withdrew successor authority during a converging approach
-            # and reversed the shared turn reference.  ``vx`` is already the
-            # derivative of the IMU-derotated bearing; shift only the measured
-            # endpoints from camera coordinates into the leg frame.
-            yaw_offset = 0.0
-            if yaw_rad is not None and self._course_anchor_yaw_rad is not None:
-                yaw_offset = (
-                    math.remainder(
-                        float(yaw_rad) - self._course_anchor_yaw_rad,
-                        2.0 * math.pi,
-                    )
-                    * ROTATION_COMP_FOCAL_NORM
-                )
-            filtered_x = current.x + yaw_offset
-            raw_x = current.raw_x + yaw_offset
-            projected_dx = current.vx * cfg.successor_preview_projection_s
-            projected_current_error = max(
-                abs(filtered_x),
-                abs(filtered_x + projected_dx),
-                abs(raw_x),
-                abs(raw_x + projected_dx),
+            projected_current_error = (
+                max(abs(current.x), abs(current.raw_x))
+                + abs(current.vx) * cfg.successor_preview_projection_s
             )
             if aperture_budget > 1e-9:
                 aperture_target = _clamp01(
@@ -2804,8 +2799,9 @@ class CleanCourseController:
         )
         self._turn_aperture_reserve = _clamp01(self._turn_aperture_reserve)
 
+        passage_error = float(current_error) + yaw_offset
         desired_authority = 0.0
-        desired = float(current_error)
+        desired = passage_error
         if successor is not None:
             closure_span = cfg.blend_near_log_scale - cfg.blend_far_log_scale
             closure = (
@@ -2855,15 +2851,13 @@ class CleanCourseController:
             self._turn_successor_authority if successor is not None else 0.0
         )
         if successor is not None:
-            # F133: passage reserve continuously releases current-gate
-            # centering independently of successor strength.  F124's convex
-            # weighting kept current camera-x at nearly full authority even
-            # when the leg-relative swept envelope said passage was safe; the
-            # resulting camera-yaw artifact countermanded a known-left gate.
-            # Both bearing terms remain in camera coordinates, while the
-            # signed leg-frame reserve is only the scalar passage authority.
+            # Both terms have coherent ownership: passage alignment is fixed
+            # in the leg frame, while the successor is a fresh or bounded
+            # IMU-propagated current-camera bearing.  The filtered authority
+            # determines both their convex mixture and the yaw derotation
+            # share above; the one reference remains the only command owner.
             desired = (
-                (1.0 - self._turn_aperture_reserve) * float(current_error)
+                (1.0 - authority) * passage_error
                 + authority * successor.x
             )
 

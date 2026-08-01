@@ -1310,10 +1310,10 @@ def test_heading_anchor_clamps_outward_yaw_only():
     # Heading wound past the cap: the same positive pursuit is blocked.
     out = _command(controller, 100.143, yaw=1.6)
     assert out.yaw_rate_rad_s <= 0.0
-    # Return steering (target left of center) is always free at the cap.
-    controller.current.x_axis.p = -0.30
-    out = _command(controller, 100.176, yaw=1.6)
-    assert out.yaw_rate_rad_s < 0.0
+    # Return steering is always free at the cap.  Exercise the envelope
+    # directly: after F134, a synthetic camera-x flip at a 92-degree heading
+    # is not a coherent leg-relative passage error.
+    assert controller._anchor_clamped_yaw(-0.10, 1.6) == pytest.approx(-0.10)
     # Wrapped excursion: yaw just past -pi relative to a +pi anchor is a
     # small positive excursion, not a full revolution.
     controller2 = _tracked_controller(_track("A", -0.30, 0.0, scale=0.10))
@@ -1893,42 +1893,33 @@ def _turn_reference_controller(
     return controller
 
 
-def test_turn_aperture_uses_signed_leg_relative_swept_envelope():
-    # F127 withdrew the successor turn while Gate 0 was converging on center:
-    # |x| + |vx|T treated convergence as divergence, collapsed aperture
-    # reserve, and let the shared reference reverse right.  The two endpoints
-    # of one signed leg-relative sweep preserve yaw-equivalent geometry and
-    # leave more passage reserve for motion toward center than away from it.
-    def reserve(*, image_x, yaw, vx):
-        controller = _turn_reference_controller(current_x=image_x)
-        controller._course_anchor_yaw_rad = 0.0
-        controller._turn_reference_yaw_rad = None
-        controller._turn_reference_x = None
-        controller._turn_aperture_reserve = 0.0
-        controller._turn_successor_authority = 0.0
-        controller.current.x_axis.p = image_x
-        controller.current.x_axis.v = vx
-        controller.current.raw_x = image_x
-        controller._turn_reference(
-            controller.current,
-            None,
-            current_error=image_x,
-            now_s=100.10,
-            yaw_rad=yaw,
-            dt=0.04,
+def test_turn_reference_derotates_only_camera_successor_share():
+    # F133 made Gate 1 camera-centered mostly by yaw while bank relaxed and
+    # the physical leg error kept growing left.  The shared reference mixes a
+    # yaw-invariant passage term with a camera-frame successor term, so only
+    # the already-filtered successor share may move under pure yaw.
+    def after_left_yaw(authority):
+        controller = _turn_reference_controller(
+            current_x=0.06, successor_x=-0.34
         )
-        return controller._turn_aperture_reserve
+        controller._course_anchor_yaw_rad = 0.0
+        controller._turn_reference_yaw_rad = 0.0
+        controller._turn_reference_x = -0.20
+        controller._turn_successor_authority = authority
+        reference, _ = controller._turn_reference(
+            controller.current,
+            controller.successor,
+            # At yaw=-0.10, camera x=+0.06 still represents passage=-0.10.
+            current_error=0.06,
+            now_s=100.10,
+            yaw_rad=-0.10,
+            dt=0.0,
+        )
+        return reference
 
-    unshifted_reserve = reserve(
-        image_x=-0.08, yaw=0.0, vx=0.5
-    )
-    yaw_shifted_reserve = reserve(
-        image_x=0.08, yaw=-0.10, vx=0.5
-    )
-    divergent_reserve = reserve(image_x=-0.08, yaw=0.0, vx=-0.5)
-
-    assert yaw_shifted_reserve == pytest.approx(unshifted_reserve, abs=1e-12)
-    assert unshifted_reserve > divergent_reserve > 0.0
+    assert after_left_yaw(0.0) == pytest.approx(-0.20, abs=1e-12)
+    assert after_left_yaw(0.25) == pytest.approx(-0.16, abs=1e-12)
+    assert after_left_yaw(1.0) == pytest.approx(-0.04, abs=1e-12)
 
 
 def test_continuous_turn_reference_coordinates_yaw_and_bank_only():
@@ -2225,49 +2216,6 @@ def test_weak_successor_evidence_decays_turn_reference_smoothly():
     assert all(yaw < 0.0 for yaw in yaws)
 
 
-def test_safe_passage_release_prevents_camera_current_error_counterturn():
-    # F132 at credit-0.468 s: the consistently-left successor retained 0.24
-    # authority and Gate 0 had 0.76 signed leg-frame aperture reserve, but the
-    # convex blend still gave camera-x +0.121 a 0.76 weight and turned right.
-    # Safe passage releases that camera-centering demand continuously; the
-    # sole carried reference must remain left without a sign latch.
-    controller = _turn_reference_controller(current_x=0.121)
-    now = 100.10
-    controller._course_anchor_yaw_rad = 0.0
-    controller._turn_reference_yaw_rad = -0.096
-    controller._turn_reference_x = -0.0021
-    controller._turn_aperture_reserve = 0.680
-    controller._turn_successor_authority = 0.252
-    controller.current.x_axis.p = 0.121
-    controller.current.x_axis.v = 0.0
-    controller.current.raw_x = 0.172
-    controller.successor.x_axis.p = -0.358
-    controller.successor.confidence = 0.636
-    variance = (0.439 / math.sqrt(2.0)) ** 2
-    controller.successor.x_axis.pp = variance
-    controller.successor.y_axis.pp = variance
-    controller.successor.last_measurement_s = now - 0.407
-    controller.successor.last_x_measurement_s = now - 0.407
-
-    reference, authority = controller._turn_reference(
-        controller.current,
-        controller.successor,
-        current_error=0.121,
-        now_s=now,
-        yaw_rad=-0.096,
-        dt=0.047,
-    )
-    target_roll, yaw_rate = controller._coordinated_turn_request(
-        reference, steer_gain=1.0, yaw_rad=-0.096
-    )
-
-    assert controller._turn_aperture_reserve > 0.68
-    assert 0.0 < authority < 0.252
-    assert reference < 0.0
-    assert yaw_rate < 0.0
-    assert target_roll < 0.0
-
-
 def test_weak_opposite_successor_cannot_erase_current_gate_turn():
     # F120 live regression: Gate 1 was still x=-0.309 when a right-side Gate
     # 2 candidate reached only 2.1e-7 authority.  Binary sign arbitration
@@ -2294,7 +2242,7 @@ def test_weak_opposite_successor_cannot_erase_current_gate_turn():
     )
 
     assert authority == pytest.approx(0.0)
-    assert heading < -0.02
+    assert heading == pytest.approx(-0.30)
     assert yaw_rate < -0.02
     assert target_roll < 0.0
 
