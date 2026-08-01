@@ -2759,13 +2759,18 @@ class CleanCourseController:
                     math.sin(yaw - self._turn_reference_yaw_rad),
                     math.cos(yaw - self._turn_reference_yaw_rad),
                 )
-                # F134: the reference is a convex mixture of a leg-relative
-                # passage error and a current-camera successor bearing.  Only
-                # the already-filtered successor share rotates with measured
-                # yaw; full derotation made camera centering erase the bank
-                # needed to bend the physical flight path toward Gate 1.
+                # F135: aperture reserve continuously interpolates current
+                # passage alignment from camera-relative (reserve=0) to
+                # leg-relative (reserve=1); the successor stays camera-frame.
+                # Derotate the exact complementary camera share of the old
+                # filtered mixture.  F134 treated passage as fully leg-fixed
+                # even with zero reserve, so yaw accumulated without a
+                # translation observation and drove Gate 1 across the frame.
+                camera_share = 1.0 - self._turn_aperture_reserve * (
+                    1.0 - self._turn_successor_authority
+                )
                 self._turn_reference_x -= (
-                    self._turn_successor_authority
+                    camera_share
                     * delta_yaw
                     * ROTATION_COMP_FOCAL_NORM
                 )
@@ -2799,7 +2804,9 @@ class CleanCourseController:
         )
         self._turn_aperture_reserve = _clamp01(self._turn_aperture_reserve)
 
-        passage_error = float(current_error) + yaw_offset
+        passage_error = float(current_error) + (
+            self._turn_aperture_reserve * yaw_offset
+        )
         desired_authority = 0.0
         desired = passage_error
         if successor is not None:
@@ -2851,11 +2858,10 @@ class CleanCourseController:
             self._turn_successor_authority if successor is not None else 0.0
         )
         if successor is not None:
-            # Both terms have coherent ownership: passage alignment is fixed
-            # in the leg frame, while the successor is a fresh or bounded
-            # IMU-propagated current-camera bearing.  The filtered authority
-            # determines both their convex mixture and the yaw derotation
-            # share above; the one reference remains the only command owner.
+            # Passage frame ownership follows the same continuous aperture
+            # evidence above; the successor is a fresh or bounded
+            # IMU-propagated current-camera bearing.  The one reference
+            # remains the only command owner through every race transition.
             desired = (
                 (1.0 - authority) * passage_error
                 + authority * successor.x

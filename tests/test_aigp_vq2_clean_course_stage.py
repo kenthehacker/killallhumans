@@ -1893,18 +1893,19 @@ def _turn_reference_controller(
     return controller
 
 
-def test_turn_reference_derotates_only_camera_successor_share():
-    # F133 made Gate 1 camera-centered mostly by yaw while bank relaxed and
-    # the physical leg error kept growing left.  The shared reference mixes a
-    # yaw-invariant passage term with a camera-frame successor term, so only
-    # the already-filtered successor share may move under pure yaw.
-    def after_left_yaw(authority):
+def test_turn_reference_derotation_matches_continuous_frame_mix():
+    # F134 proved that a fully leg-fixed current term runs away after
+    # promotion, while F127's fully camera-relative term lets yaw erase the
+    # physical setup.  Existing aperture reserve interpolates those frames;
+    # only its exact complementary camera share may move under pure yaw.
+    def after_left_yaw(*, reserve, authority):
         controller = _turn_reference_controller(
             current_x=0.06, successor_x=-0.34
         )
         controller._course_anchor_yaw_rad = 0.0
         controller._turn_reference_yaw_rad = 0.0
         controller._turn_reference_x = -0.20
+        controller._turn_aperture_reserve = reserve
         controller._turn_successor_authority = authority
         reference, _ = controller._turn_reference(
             controller.current,
@@ -1917,9 +1918,49 @@ def test_turn_reference_derotates_only_camera_successor_share():
         )
         return reference
 
-    assert after_left_yaw(0.0) == pytest.approx(-0.20, abs=1e-12)
-    assert after_left_yaw(0.25) == pytest.approx(-0.16, abs=1e-12)
-    assert after_left_yaw(1.0) == pytest.approx(-0.04, abs=1e-12)
+    # No reserve: the current term is camera-relative, so all of the old
+    # reference derotates by +0.16 for a -0.10 rad yaw.
+    assert after_left_yaw(reserve=0.0, authority=0.0) == pytest.approx(
+        -0.04, abs=1e-12
+    )
+    # Full reserve and no successor: leg passage is yaw-invariant.
+    assert after_left_yaw(reserve=1.0, authority=0.0) == pytest.approx(
+        -0.20, abs=1e-12
+    )
+    # With full reserve, only the 0.25 successor share derotates.
+    assert after_left_yaw(reserve=1.0, authority=0.25) == pytest.approx(
+        -0.16, abs=1e-12
+    )
+    # Half reserve and 0.25 successor leave camera share
+    # 1 - 0.5 * (1 - 0.25) = 0.625.
+    assert after_left_yaw(reserve=0.5, authority=0.25) == pytest.approx(
+        -0.10, abs=1e-12
+    )
+
+
+def test_aperture_reserve_continuously_moves_passage_into_leg_frame():
+    def initial_reference(reserve):
+        controller = _turn_reference_controller(
+            current_x=0.06, successor_x=-0.34
+        )
+        controller._course_anchor_yaw_rad = 0.0
+        controller._turn_reference_yaw_rad = None
+        controller._turn_reference_x = None
+        controller._turn_aperture_reserve = reserve
+        controller._turn_successor_authority = 0.25
+        reference, _ = controller._turn_reference(
+            controller.current,
+            controller.successor,
+            current_error=0.06,
+            now_s=100.10,
+            yaw_rad=-0.10,
+            dt=0.0,
+        )
+        return reference
+
+    assert initial_reference(0.0) == pytest.approx(-0.04, abs=1e-12)
+    assert initial_reference(0.5) == pytest.approx(-0.10, abs=1e-12)
+    assert initial_reference(1.0) == pytest.approx(-0.16, abs=1e-12)
 
 
 def test_continuous_turn_reference_coordinates_yaw_and_bank_only():
