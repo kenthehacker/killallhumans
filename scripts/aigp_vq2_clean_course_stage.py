@@ -544,14 +544,12 @@ BRAKE_RELAX_EY_NORM = 0.55  # far-range compensated ey custody bound
 # for the remaining ~7 s (blind wander into the floor/structure).  Inside
 # the commit proximity regime the floor runs on the derotated HYPOTHESIS
 # (the F52 best-evidence rationale), with a lower bound.
-NEAR_BRAKE_RELAX_EY_NORM = 0.30  # commit-regime custody bound
-# F71 (20260730T060005Z-visual-course-f05911e4): on the gate-1 leg the 0.30
-# engage bound sat a hair above the achieved hypothesis ey (0.22-0.30 for
-# the whole final second), so the relax never fired; the -0.41..-0.43 brake
-# attitude walked the gate down the FOV into engulfing at the plane and a
-# one-tick newborn corner splinter was adopted as the aim (collision id
-# 1001, impulse 5.86).  Course legs (gate_index >= 1) get a tighter bound.
-NEAR_BRAKE_RELAX_COURSE_EY_NORM = 0.18  # course-leg custody bound
+# F71 (20260730T060005Z-visual-course-f05911e4): a 0.30 near bound sat above
+# the achieved ey (0.22-0.30), so the brake walked the gate down the FOV into
+# engulfing.  F152 removes the remaining gate-specific/filtered-scale switch:
+# every leg approaches this proved passage-custody bound continuously on the
+# existing outer-range ramp, so race promotion cannot change pitch authority.
+NEAR_BRAKE_RELAX_EY_NORM = 0.18  # passage-range custody bound on every leg
 # Course-heading anchor (F31): after losing the gate-1 track the drone
 # search-swept and edge-chased its heading +2.63 rad off the course
 # bearing, then flew sideways/backwards at ~0.65g drag into structure it
@@ -967,7 +965,6 @@ class CleanCourseConfig:
     pre_cross_brake_slew_rad_s: float = PRE_CROSS_BRAKE_SLEW_RAD_S
     brake_relax_ey_norm: float = BRAKE_RELAX_EY_NORM
     near_brake_relax_ey_norm: float = NEAR_BRAKE_RELAX_EY_NORM
-    near_brake_relax_course_ey_norm: float = NEAR_BRAKE_RELAX_COURSE_EY_NORM
     brake_ceiling_band: float = BRAKE_CEILING_BAND
     course_heading_anchor_cap_rad: float = COURSE_HEADING_ANCHOR_CAP_RAD
     alt_est_min_m: float = ALT_EST_MIN_M
@@ -1688,8 +1685,8 @@ class CleanCourseController:
                     and self.current.y_axis.std
                     <= cfg.search_covariance_std_norm
                 )
-                commit_ey = self._course_vertical_error(
-                    self.current, pitch_rad
+                commit_ey = self._compensated_ey(
+                    self.current.y, pitch_rad
                 )
                 commit_vz_des = self._course_vz_setpoint(
                     self.current,
@@ -1858,15 +1855,14 @@ class CleanCourseController:
         ex = current.x
         heading_ex = ex
         ey = current.y
-        # F50's compensated bearing remains the forward-brake/custody signal:
-        # pitch motion must not create a positive-feedback brake demand.  F151
-        # separates the sole translational vertical reference from that camera
-        # artifact continuously with range.  Far away it is the compensated
-        # world bearing; at passage range it is the visible aperture error.
-        # F150 held the compensated request negative until 0.125 s before
-        # bottom censorship even though raw gate-y was already moving down.
-        ey_physical = self._compensated_ey(ey, pitch_rad)
-        ey_vertical = self._course_vertical_error(current, pitch_rad)
+        # F50: the VERTICAL channel servos on the pitch-attitude-compensated
+        # error (nose-up brake attitude reads the world LOW in frame; see
+        # the VERTICAL_PITCH_COMP_NORM_PER_RAD block).  F117 uses that same
+        # physical error for the forward misalignment brake.  F116 showed the
+        # old RAW-ey coupling was positive feedback: braking pitched the
+        # camera up, moved Gate 0 down in-frame, and the camera artifact asked
+        # for still more brake until the vehicle met the top structure.
+        ey_vertical = self._compensated_ey(ey, pitch_rad)
         # F40 (20260729T193134Z-visual-course-63ed6342): never steer on an
         # x-axis without a fresh accepted measurement — an unmeasured or
         # stale x (edge-clipped splinter, censored axis) is a garbage aim
@@ -2016,7 +2012,7 @@ class CleanCourseController:
         # structure.  Speed with no alignment is pure risk: blend toward
         # the TRUE brake attitude with the same signal that suppresses
         # advance.
-        angular_error = math.hypot(ex, ey_physical)
+        angular_error = math.hypot(ex, ey_vertical)
         align = _clamp01(1.0 - angular_error / cfg.angular_full_brake_norm)
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
@@ -2203,21 +2199,19 @@ class CleanCourseController:
         # above level: a genuinely low gate is re-centered by the vertical
         # channel, never by advancing.  ey_vertical is attitude-invariant
         # by construction, so the floor is stable without any hysteresis.
-        commit_regime = current.log_scale >= cfg.commit_min_log_scale
-        relax_bound = (
-            cfg.near_brake_relax_course_ey_norm
-            if commit_regime and self.gate_index >= 1
-            else cfg.near_brake_relax_ey_norm
-            if commit_regime
-            else cfg.brake_relax_ey_norm
+        # F152: the bound itself now transfers continuously on raw outer
+        # range.  The old filtered-scale/gate-index selector contradicted
+        # F125 by changing camera custody at promotion and engaging too late.
+        passage = self._course_range_ramp(current)
+        relax_bound = cfg.brake_relax_ey_norm + passage * (
+            cfg.near_brake_relax_ey_norm - cfg.brake_relax_ey_norm
         )
         custody_floor = cfg.spawn_pitch_rad - (
-            (relax_bound - ey_physical) / cfg.vertical_pitch_comp_norm_per_rad
+            (relax_bound - ey_vertical) / cfg.vertical_pitch_comp_norm_per_rad
         )
         custody_floor = min(
             custody_floor,
-            cfg.spawn_pitch_rad
-            + (0.0 if commit_regime else cfg.brake_pitch_rad),
+            cfg.spawn_pitch_rad + cfg.brake_pitch_rad,
         )
         target_pitch = max(target_pitch, custody_floor)
 
@@ -2317,12 +2311,8 @@ class CleanCourseController:
         ):
             return False
         ey = max(
-            abs(self._course_vertical_error(current, pitch_rad)),
-            abs(
-                self._course_vertical_error(
-                    current, pitch_rad, image_ey=current.raw_y
-                )
-            ),
+            abs(self._compensated_ey(current.y, pitch_rad)),
+            abs(self._compensated_ey(current.raw_y, pitch_rad)),
         )
         if ey + abs(current.vy) * cfg.commit_blackout_s > (
             cfg.commit_entry_aperture_margin_frac * current.aperture_half_y
@@ -2343,20 +2333,6 @@ class CleanCourseController:
             (cfg.spawn_pitch_rad - float(pitch_rad))
             * cfg.vertical_pitch_comp_norm_per_rad
         )
-
-    def _course_vertical_error(
-        self,
-        current: _Hypothesis,
-        pitch_rad: float,
-        *,
-        image_ey: Optional[float] = None,
-    ) -> float:
-        """Blend world bearing far away into visible passage error near plane."""
-
-        ey = current.y if image_ey is None else float(image_ey)
-        compensated = self._compensated_ey(ey, pitch_rad)
-        passage = self._course_range_ramp(current)
-        return compensated + passage * (ey - compensated)
 
     def _successor_track_id(self) -> Optional[str]:
         return self.successor.track_id if self.successor is not None else None

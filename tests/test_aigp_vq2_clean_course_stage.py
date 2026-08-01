@@ -286,28 +286,6 @@ def test_vertical_error_is_pitch_attitude_compensated():
     )
 
 
-def test_vertical_reference_continuously_transfers_to_passage_alignment():
-    # F151: F150's raw Gate-1 y moved downward while full pitch compensation
-    # kept requesting climb until 0.125 s before bottom censorship.  The one
-    # vertical reference keeps physical bearing far away and continuously
-    # transfers to the visible aperture error over the existing range ramp.
-    controller = _tracked_controller(_track("A", 0.0, 0.10, scale=0.10))
-    current = controller.current
-    pitch = SPAWN_PITCH - 0.15
-    compensated = controller._compensated_ey(current.y, pitch)
-    assert compensated == pytest.approx(-0.14)
-
-    errors = []
-    for log_scale in (-2.10, -2.00, -1.80, -1.60, -1.40, -1.20, -1.10):
-        current.outer_log_scale = log_scale
-        errors.append(controller._course_vertical_error(current, pitch))
-
-    assert errors[0] == pytest.approx(compensated)
-    assert errors[-1] == pytest.approx(current.y)
-    assert all(right >= left for left, right in zip(errors, errors[1:]))
-    assert max(abs(right - left) for left, right in zip(errors, errors[1:])) < 0.07
-
-
 def test_gate0_takeoff_boost_is_feedforward_only():
     # Boost-window behavior isolated from the gate-0 climb offset.  A far
     # track keeps the brake ceiling band out of the window (with the F49
@@ -529,10 +507,10 @@ def test_vertical_rate_owner_applies_in_predict_and_search():
     )
 
 
-def test_near_plane_passage_y_keeps_physical_sink_damping():
-    # F151 transfers the desired rate to visible passage alignment near the
-    # plane, but it must not erase measured vertical energy.  F146 reached
-    # Gate-0 credit sinking -0.55 m/s after range fade removed this damping.
+def test_near_plane_compensated_gate_y_keeps_physical_sink_damping():
+    # F147: compensated geometry still sets the desired rate at the crossing,
+    # but it must not erase measured vertical energy.  F146 reached Gate-0
+    # credit sinking -0.55 m/s after the range fade removed this damping.
     brake_pitch = -0.46
     controller = _tracked_controller(_track("A", 0.0, 0.10))
     controller.current.outer_log_scale = controller.config.commit_min_log_scale
@@ -541,12 +519,8 @@ def test_near_plane_passage_y_keeps_physical_sink_damping():
     support = SPAWN_SUPPORT / math.cos(brake_pitch - SPAWN_PITCH)
     compensated = controller._compensated_ey(0.10, brake_pitch)
     assert compensated < 0.0
-    passage_error = controller._course_vertical_error(
-        controller.current, brake_pitch
-    )
-    assert passage_error == pytest.approx(0.10)
     assert out.thrust == pytest.approx(
-        support + 0.12 * (-passage_error - controller._vz_est_m_s), abs=1e-9
+        support + 0.12 * (-compensated - controller._vz_est_m_s), abs=1e-9
     )
     assert out.thrust > support
 
@@ -1619,7 +1593,7 @@ def test_near_plane_custody_floor_runs_on_the_stale_hypothesis():
     # pre-cross brake attitude pitched the gate out of the FOV; the drone
     # wandered blind for ~7 s into the floor/structure.  Inside the commit
     # proximity regime the F94 custody floor runs on the STALE derotated
-    # hypothesis (no freshness gate): past the 0.30 bound it surrenders to
+    # hypothesis (no freshness gate): past the 0.18 bound it surrenders to
     # level, below it the brake is preserved proportionally.
     controller = _tracked_controller(_track("A", 0.30, 0.43, scale=0.50))
     controller.current.scale_axis.v = 0.7  # rapid expansion: full brake demand
@@ -1638,17 +1612,17 @@ def test_near_plane_custody_floor_runs_on_the_stale_hypothesis():
         now += 0.033
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert out.target_pitch_rad == pytest.approx(
-        SPAWN_PITCH - (0.30 - 0.10) / 1.6, abs=1e-9
+        SPAWN_PITCH - (0.18 - 0.10) / 1.6, abs=1e-9
     )
 
 
-def test_course_leg_custody_floor_relaxes_the_single_brake():
+def test_passage_custody_floor_is_gate_agnostic():
     # F71 (20260730T060005Z-visual-course-f05911e4): on the gate-1 leg the
     # 0.30 bound sat a hair above the achieved hypothesis ey (0.22-0.30
     # through the final second), so the brake attitude walked the gate into
-    # engulfing at the plane.  Course legs (gate_index >= 1) use the tighter
-    # 0.18 bound, and the F94 floor is continuous: more brake as the gate
-    # recovers above the bound, level only when genuinely past it.
+    # engulfing at the plane.  F152 uses the tighter 0.18 passage bound on
+    # every leg: promotion cannot switch pitch authority under identical
+    # evidence.
     controller = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
     controller.gate_index = 1
     # Stopped (expansion 0): the brake demand comes from the ex 0.30
@@ -1679,17 +1653,38 @@ def test_course_leg_custody_floor_relaxes_the_single_brake():
     assert drive().target_pitch_rad == pytest.approx(
         SPAWN_PITCH + controller.config.pre_cross_brake_pitch_rad, abs=1e-9
     )
-    # Gate 0 keeps the wider 0.30 bound: the same ey 0.22 leaves MORE
-    # brake authority, not less.
+    # Gate 0 uses the identical bound: the same geometry emits the same pitch.
     gate0 = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
     gate0.current.scale_axis.v = 0.7
     now0 = 100.10
     for _ in range(20):
         now0 += 0.033
         out0 = _command(gate0, now0, pitch=SPAWN_PITCH)
-    assert out0.target_pitch_rad == pytest.approx(
-        SPAWN_PITCH - (0.30 - 0.22) / 1.6, abs=1e-9
-    )
+    assert out0.target_pitch_rad == pytest.approx(out.target_pitch_rad, abs=1e-9)
+
+
+def test_brake_custody_uses_one_continuous_outer_range_schedule():
+    # F152: replace the far/near filtered-scale selector with the existing
+    # outer-range ramp.  A fixed physical bearing may relax brake authority
+    # smoothly, but cannot jump because a threshold flickers or race promotes.
+    pitches = []
+    for outer_log_scale in (-2.00, -1.80, -1.60, -1.40, -1.20):
+        controller = _tracked_controller(_track("A", 0.30, 0.30, scale=0.10))
+        controller.current.outer_log_scale = outer_log_scale
+        now = 100.10
+        out = None
+        for _ in range(20):
+            now += 0.033
+            controller.current.last_measurement_s = now
+            controller.current.last_x_measurement_s = now
+            controller.current.last_y_measurement_s = now
+            out = _command(controller, now, pitch=SPAWN_PITCH)
+        pitches.append(out.target_pitch_rad)
+
+    assert pitches[0] == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
+    assert pitches[-1] == pytest.approx(SPAWN_PITCH, abs=1e-9)
+    assert all(right >= left for left, right in zip(pitches, pitches[1:]))
+    assert max(abs(right - left) for left, right in zip(pitches, pitches[1:])) < 0.07
 
 
 def test_clipping_increases_uncertainty_but_does_not_abort():
