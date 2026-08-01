@@ -477,17 +477,37 @@ def test_gate0_climb_offset_never_lifts_aim_above_center():
     assert output.thrust < SPAWN_SUPPORT
 
 
-def test_gate0_image_rate_is_not_a_vertical_term():
-    # F143 exposed normalized image rate as perspective- and range-dependent,
-    # not a physical m/s measurement.  Gate 0 therefore uses the same single
-    # IMU rate term as every far-range qualified course leg.
+def test_gate0_closure_dilation_is_not_a_vertical_term():
+    # F160 retains F143's finding that normalized image rate is not physical
+    # m/s.  Pure perspective dilation is removed before the bearing is
+    # projected, so the same single IMU rate term still owns inner damping.
     config = _config(gate0_climb_vertical_offset_norm=0.25)
     controller = _tracked_controller(_track("A", 0.0, -0.10), config=config)
-    controller.current.y_axis.v = 1.0  # strong image rate, ignored
+    controller.current.scale_axis.v = 0.20
+    controller.current.y_axis.v = -0.02  # expansion * y: dilation only
     output = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert output.vertical_qualified
     assert output.thrust == pytest.approx(
         SPAWN_SUPPORT + 0.12 * 0.35, abs=1e-9
+    )
+
+
+def test_passage_vertical_projection_keeps_only_physical_image_motion():
+    controller = _tracked_controller(_track("A", 0.0, -0.20))
+    current = controller.current
+    current.scale_axis.v = 0.50
+
+    # y_dot = expansion*y is a fixed offset growing only through closure.
+    current.y_axis.v = -0.10
+    assert controller._passage_vertical_error(current, -0.20) == pytest.approx(
+        -0.20, abs=1e-9
+    )
+
+    # Additional image-down motion is physical after dilation removal and is
+    # projected over the already-existing 0.5 s crossing horizon.
+    current.y_axis.v = 0.20
+    assert controller._passage_vertical_error(current, -0.20) == pytest.approx(
+        -0.05, abs=1e-9
     )
 
 
@@ -533,7 +553,7 @@ def test_qualified_imu_rate_authority_does_not_fade_with_range():
     for outer_log_scale in (-2.0, -1.8, -1.6, -1.4, -1.2):
         controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
         controller.current.outer_log_scale = outer_log_scale
-        controller.current.y_axis.v = 1.2  # deliberately irrelevant
+        controller.current.y_axis.v = 0.0
         controller._vz_est_m_s = -0.40
         thrusts.append(_command(controller, 100.10, pitch=SPAWN_PITCH).thrust)
 
@@ -2318,126 +2338,6 @@ def test_arbitrarily_weak_successor_remains_weak_after_current_claim_ages():
     assert max(authorities) < 0.03
 
 
-def test_passage_slack_cannot_countermand_consistently_left_successor():
-    # F158 live: Gate 1 remained consistently left, while a small positive
-    # Gate-0 correction drove the shared reference left -> right -> left.
-    # Current-gate x is a passage constraint: inside the already-existing
-    # projected aperture budget it contributes no opposing heading request.
-    controller = _turn_reference_controller(
-        successor_x=-0.42, current_x=0.08
-    )
-    controller.current.outer_log_scale = -0.30
-    controller.current.aperture_half_x = 0.15
-    controller.current.aperture_half_y = 0.15
-    controller.current.raw_x = 0.08
-    controller.current.x_axis.v = 0.05
-    controller.successor.confidence = 0.61
-    controller.successor.outer_log_scale = -3.37
-    controller._turn_aperture_reserve = 0.17
-    controller._turn_successor_authority = 0.12
-    controller._turn_reference_x = -0.005
-    controller._turn_reference_yaw_rad = 0.0
-
-    aperture_budget = (
-        controller.config.commit_entry_aperture_margin_frac
-        * controller.current.aperture_half_x
-    )
-    projected_x = max(
-        abs(controller.current.x), abs(controller.current.raw_x)
-    ) + abs(controller.current.vx) * (
-        controller.config.successor_preview_projection_s
-    )
-    assert projected_x < aperture_budget
-
-    now = 100.10
-    commands = []
-    variations = (
-        (0.004, 0.00),
-        (0.011, 0.03),
-        (0.025, 0.00),
-        (0.10, 0.05),
-        (0.18, 0.12),
-        (0.27, 0.24),
-        (0.35, 0.40),
-        (0.48, 0.55),
-        (0.08, 0.00),
-        (0.02, 0.00),
-    )
-    for std, age_s in variations:
-        now += 0.031
-        controller.current.last_x_measurement_s = now
-        variance = (std / math.sqrt(2.0)) ** 2
-        controller.successor.x_axis.pp = variance
-        controller.successor.y_axis.pp = variance
-        controller.successor.last_measurement_s = now - age_s
-        controller.successor.last_x_measurement_s = now - age_s
-        reference, _ = controller._turn_reference(
-            controller.current,
-            controller.successor,
-            current_error=0.08,
-            now_s=now,
-            yaw_rad=0.0,
-            dt=0.031,
-        )
-        commands.append(
-            controller._coordinated_turn_request(
-                reference, steer_gain=1.0, yaw_rad=0.0
-            )
-        )
-
-    rolls, yaws = zip(*commands)
-    assert all(roll < 0.0 for roll in rolls)
-    assert all(yaw < 0.0 for yaw in yaws)
-    assert max(abs(b - a) for a, b in zip(yaws, yaws[1:])) < 0.06
-
-
-def test_passage_violation_still_overrides_opposite_successor():
-    # The hinge removes only unused passage slack.  A projected current gate
-    # outside the right aperture budget must still produce one coordinated
-    # right correction, even with a left successor retained for handoff.
-    controller = _turn_reference_controller(
-        successor_x=-0.42, current_x=0.25
-    )
-    controller.current.outer_log_scale = -0.30
-    controller.current.aperture_half_x = 0.15
-    controller.current.aperture_half_y = 0.15
-    controller.current.raw_x = 0.25
-    controller.current.x_axis.v = 0.0
-    controller.successor.confidence = 0.40
-    weak_variance = (0.30 / math.sqrt(2.0)) ** 2
-    controller.successor.x_axis.pp = weak_variance
-    controller.successor.y_axis.pp = weak_variance
-    controller._turn_aperture_reserve = 0.0
-    controller._turn_successor_authority = 0.0
-    controller._turn_reference_x = 0.0
-    controller._turn_reference_yaw_rad = 0.0
-
-    now = 100.10
-    commands = []
-    for _ in range(16):
-        now += 0.04
-        controller.current.last_x_measurement_s = now
-        controller.successor.last_measurement_s = now - 0.30
-        controller.successor.last_x_measurement_s = now - 0.30
-        reference, _ = controller._turn_reference(
-            controller.current,
-            controller.successor,
-            current_error=0.25,
-            now_s=now,
-            yaw_rad=0.0,
-            dt=0.04,
-        )
-        commands.append(
-            controller._coordinated_turn_request(
-                reference, steer_gain=1.0, yaw_rad=0.0
-            )
-        )
-
-    rolls, yaws = zip(*commands)
-    assert all(roll > 0.0 for roll in rolls[-8:])
-    assert all(yaw > 0.0 for yaw in yaws[-8:])
-
-
 def test_f143_crossing_reassociation_keeps_one_left_turn_time_series():
     # F143's Gate-1 bearing stayed left while stale Gate-0 x drifted right.
     # Weakening successor evidence and a fresh same-bearing id drove the old
@@ -3509,7 +3409,7 @@ def _converged_gate_one_vertical(vz_m_s):
     current.raw_x = 0.0
     current.y_axis.p = -0.10  # gate slightly ABOVE center -> climb demand
     current.raw_y = -0.10
-    current.y_axis.v = 0.0
+    current.y_axis.v = -0.01  # expansion * y: dilation only
     current.scale_axis.p = -1.6
     current.scale_axis.v = 0.10  # settled closure (closure governor quiet)
     now = 100.10
@@ -3562,19 +3462,18 @@ def test_far_vertical_arrival_damping_uses_one_imu_rate_term():
     assert gate0_climbing.thrust < gate0_settled.thrust - 0.05
 
 
-def test_course_leg_vertical_drops_image_rate_feedback():
-    # F96 (20260730T153947Z-visual-course-a2741311): the gate-1 leg
-    # oscillated clamp-to-clamp (thrust 0.21 <-> 0.34, vz +/-0.4..0.5)
-    # because incoherent rate terms were stacked.  F143 showed that even as a
-    # replacement term, normalized image rate is range dependent.  With IMU
-    # vz zero and the gate centered, image motion cannot move collective.
+def test_course_leg_projects_corrected_image_motion_into_vz_reference():
+    # F160 does not restore F143's range-dependent image rate as inner
+    # damping.  It removes closure dilation, projects the remaining physical
+    # bearing motion into the one position reference, and retains IMU vz as
+    # the sole inner rate feedback.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.20))
     _promote_to_gate_one(controller)
     controller._alt_est_m = 2.0  # honest altitude (floor quiet)
     current = controller.current
     current.y_axis.p = 0.0
     current.raw_y = 0.0
-    current.y_axis.v = 0.30  # gate sliding down the frame (image rate)
+    current.y_axis.v = 0.30  # centered gate moving physically image-down
     current.scale_axis.p = -1.6
     current.scale_axis.v = 0.10
     now = 100.10
@@ -3588,7 +3487,7 @@ def test_course_leg_vertical_drops_image_rate_feedback():
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.TRACK
     assert out.vertical_qualified
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-3)
+    assert out.thrust < SPAWN_SUPPORT - 0.01
 
 
 def test_course_leg_closure_excess_leaves_collective_alone():
@@ -3681,7 +3580,7 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
     current = controller.current
     current.y_axis.p = 0.30  # F96's low-sitting gate at the plane
     current.raw_y = 0.30
-    current.y_axis.v = 0.0
+    current.y_axis.v = 0.03  # expansion * y: dilation only
     current.scale_axis.p = -1.67  # filtered hypothesis LAGS...
     current.scale_axis.v = 0.10
     current.outer_log_scale = -0.9  # ...while raw proximity is at the plane
@@ -3705,7 +3604,7 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
     far_current = far.current
     far_current.y_axis.p = 0.30
     far_current.raw_y = 0.30
-    far_current.y_axis.v = 0.0
+    far_current.y_axis.v = 0.03  # expansion * y: dilation only
     far_current.scale_axis.p = -2.5
     far_current.scale_axis.v = 0.10
     far_current.outer_log_scale = -2.5  # beyond the ramp start: full 0.5 cap
@@ -3847,7 +3746,7 @@ def test_far_qualified_low_gate_request_damps_inherited_climb():
         current.raw_x = 0.0
         current.y_axis.p = 0.03  # gate AT/slightly BELOW center: no climb intent
         current.raw_y = 0.03
-        current.y_axis.v = 0.0
+        current.y_axis.v = 0.003  # expansion * y: dilation only
         current.scale_axis.p = -1.6
         current.scale_axis.v = 0.10  # settled closure
         now = 100.10
@@ -3877,7 +3776,7 @@ def test_far_vertical_owner_combines_compensated_position_and_imu_rate():
         current.raw_x = 0.0
         current.y_axis.p = ey
         current.raw_y = ey
-        current.y_axis.v = 0.0
+        current.y_axis.v = 0.10 * ey  # expansion * y: dilation only
         current.scale_axis.p = -1.6
         current.scale_axis.v = 0.10  # settled closure (brake quiet)
         now = 100.10

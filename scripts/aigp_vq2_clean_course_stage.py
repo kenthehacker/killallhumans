@@ -1691,17 +1691,20 @@ class CleanCourseController:
                 commit_ey = self._compensated_ey(
                     self.current.y, pitch_rad
                 )
+                commit_vertical_reference = self._passage_vertical_error(
+                    self.current, commit_ey
+                )
                 commit_vz_des = self._course_vz_setpoint(
                     self.current,
-                    vertical_error=commit_ey,
+                    vertical_error=commit_vertical_reference,
                     vertical_qualified=commit_vertical_qualified,
                 )
                 # F147: F146 reached Gate-0 credit already sinking -0.55 m/s
                 # and 1.32 m below the launch estimate.  The F144 range fade
-                # had removed the only physical rate damping exactly as the
-                # qualified compensated image still asked for climb.  Restore
-                # F127's single full IMU rate error in both TRACK and COMMIT;
-                # no vertical mode, margin, or second owner is introduced.
+                # had removed the only physical rate damping.  Keep F127's
+                # single full IMU rate error in both TRACK and COMMIT; F160's
+                # corrected image motion only projects the outer position
+                # reference and never replaces this inner physical damping.
                 commit_hold = support + cfg.course_vz_track_gain * (
                     commit_vz_des - self._vz_est_m_s
                 )
@@ -2022,11 +2025,16 @@ class CleanCourseController:
         self._pre_cross_brake_active = pre_cross_brake
         # F147: retain F146's improved lateral handoff, but restore F127's one
         # qualified physical-rate error after F146's range-faded controller
-        # carried a real -0.55 m/s Gate-0 sink through credit.  Image rate is
-        # still absent; TRACK, COMMIT, and blind holds share one collective.
+        # carried a real -0.55 m/s Gate-0 sink through credit.  F160 uses only
+        # closure-corrected image motion to project the outer position
+        # reference; TRACK, COMMIT, and blind holds keep the same full IMU
+        # damping and one collective owner.
+        vertical_reference = self._passage_vertical_error(
+            current, ey_vertical
+        )
         vz_des = self._course_vz_setpoint(
             current,
-            vertical_error=ey_vertical - vertical_setpoint_offset,
+            vertical_error=vertical_reference - vertical_setpoint_offset,
             vertical_qualified=vertical_qualified,
         )
         collective = support + cfg.course_vz_track_gain * (
@@ -2719,8 +2727,6 @@ class CleanCourseController:
 
         alpha = _clamp01(dt / max(1e-6, cfg.turn_reference_tau_s + dt))
         aperture_target = 0.0
-        passage_error = float(current_error)
-        passage_constraint = 0.0
         if current.aperture_half_x is not None and current.aperture_half_x > 0.0:
             aperture_budget = (
                 cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
@@ -2732,37 +2738,6 @@ class CleanCourseController:
             if aperture_budget > 1e-9:
                 aperture_target = _clamp01(
                     1.0 - projected_current_error / aperture_budget
-                )
-                # F159: current-gate x is a passage constraint, not a second
-                # heading request.  F158's left successor was known nearly
-                # two seconds before credit, yet a small right Gate-0 error
-                # countermanded it for 0.61 s even while passage remained
-                # inside, or only marginally outside, the existing projected
-                # aperture budget.  Only the continuous hinge violation may
-                # oppose the successor; unused aperture asks for no yaw.
-                # Without usable aperture geometry, retain the conservative
-                # current-error fallback.  This changes no state, threshold,
-                # evidence authority, reference filter, or command owner.
-                passage_violation = max(
-                    0.0,
-                    abs(
-                        float(current_error)
-                        + current.vx * cfg.successor_preview_projection_s
-                    )
-                    - aperture_budget,
-                )
-                passage_constraint = _clamp01(
-                    passage_violation / aperture_budget
-                )
-                projected_passage_x = (
-                    float(current_error)
-                    + current.vx * cfg.successor_preview_projection_s
-                )
-                passage_error = (
-                    math.copysign(passage_violation, projected_passage_x)
-                    if passage_violation > 0.0
-                    and abs(projected_passage_x) > 1e-9
-                    else 0.0
                 )
         if self._last_engulfing_anchor_s is not None:
             # F145: both existing passage observations feed the same filtered
@@ -2778,11 +2753,6 @@ class CleanCourseController:
                 1.0 - anchor_age_s / ENGULFING_ANCHOR_MAX_AGE_S
             )
             aperture_target = max(aperture_target, anchor_passage)
-            # A fresh same-id engulfing anchor supersedes a stale retained
-            # aperture extent continuously (F145); it releases both the
-            # violation correction and its successor attenuation together.
-            passage_error *= 1.0 - anchor_passage
-            passage_constraint *= 1.0 - anchor_passage
         self._turn_aperture_reserve += alpha * (
             aperture_target - self._turn_aperture_reserve
         )
@@ -2842,11 +2812,7 @@ class CleanCourseController:
             # still absolute, so a weak fragment cannot become full authority.
             # Both claims feed the one derotated yaw-and-bank reference.
             passage_release = 1.0 - current_claim
-            desired_authority = (
-                (1.0 - passage_constraint)
-                * passage_release
-                * successor_weight
-            )
+            desired_authority = passage_release * successor_weight
         self._turn_successor_authority += alpha * (
             desired_authority - self._turn_successor_authority
         )
@@ -2867,7 +2833,7 @@ class CleanCourseController:
             # granting the opposing current error invented authority.
             current_weight = min(current_claim, 1.0 - authority)
             desired = (
-                current_weight * passage_error
+                current_weight * float(current_error)
                 + authority * successor.x
             )
 
@@ -2905,6 +2871,32 @@ class CleanCourseController:
             cfg.max_target_roll_rad,
         )
         return target_roll, yaw_rate
+
+    def _passage_vertical_error(
+        self,
+        current: _Hypothesis,
+        vertical_error: float,
+    ) -> float:
+        """Project physical image-y motion without closure dilation.
+
+        F160: F150/F155/F159 all centered Gate 1 laterally, then lost it
+        through the frame bottom.  The instantaneous compensated bearing
+        stayed climb-positive until roughly 0.2 s before censorship because
+        perspective closure dilates a fixed physical offset in image space.
+        ``current.vy`` is already pitch-derotated, while
+        ``current.expansion_rate * vertical_error`` is that dilation.  Remove
+        it before projecting over the existing crossing-blackout horizon.
+        The result remains the sole position input to the existing physical
+        vz cascade; full IMU damping, support, collective carry, and safety
+        bounds are unchanged.
+        """
+
+        physical_error_rate = (
+            current.vy - current.expansion_rate * float(vertical_error)
+        )
+        return float(vertical_error) + (
+            physical_error_rate * self.config.commit_blackout_s
+        )
 
     def _course_vz_setpoint(
         self,
