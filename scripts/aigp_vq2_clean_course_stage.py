@@ -2252,24 +2252,8 @@ class CleanCourseController:
             if commit_regime
             else cfg.brake_relax_ey_norm
         )
-        # F129: custody is a camera-motion constraint, so fresh downward
-        # image motion belongs here rather than in the world-vertical-rate
-        # owner.  F127's compensated center stayed inside the static bound
-        # until only ~0.19 s before bottom censorship; the full brake then
-        # could not pitch the camera back down in time.  Project the fresher
-        # of the filtered/raw compensated bearings over the already-bounded
-        # crossing blackout.  This continuously relaxes only the existing
-        # brake request; it neither adds collective authority nor revives the
-        # F96 image-rate D term.  Stale/unqualified geometry keeps the F94
-        # derotated-hypothesis floor unchanged.
-        custody_ey = ey_vertical
-        if vertical_qualified:
-            custody_ey = max(
-                custody_ey,
-                self._compensated_ey(current.raw_y, pitch_rad),
-            ) + max(0.0, current.vy) * cfg.commit_blackout_s
         custody_floor = cfg.spawn_pitch_rad - (
-            (relax_bound - custody_ey) / cfg.vertical_pitch_comp_norm_per_rad
+            (relax_bound - ey_vertical) / cfg.vertical_pitch_comp_norm_per_rad
         )
         custody_floor = min(
             custody_floor,
@@ -2826,18 +2810,20 @@ class CleanCourseController:
                 / max(1e-6, cfg.successor_min_log_scale_gap)
             )
             # Successor selection already owns persistence, so track age is
-            # deliberately absent here.  F125/F126 showed that feeding this
-            # product directly into the reference still let covariance loss
-            # followed by a fresh tracker id create a 0.126 rad/s yaw jump.
-            # Carry the evidence product continuously; weak evidence changes
-            # authority instead of resetting it, while the one reference below
-            # remains the only state that can command yaw and bank.
+            # deliberately absent here.  F130 also stops multiplying three
+            # correlated views of the same observation quality.  In F127 the
+            # stable, correctly-left IMU-derotated bearing became older and
+            # more uncertain exactly while Gate 0's aperture reserve opened;
+            # confidence * uncertainty * freshness created an artificial
+            # authority valley until a fresh tracker id appeared.  The weakest
+            # quality remains fully authoritative and continuous without
+            # counting the same missed frames two more times.  The carried
+            # authority and reference below still own command smoothing.
+            evidence_quality = min(confidence, uncertainty, freshness)
             desired_authority = (
                 closure
                 * self._turn_aperture_reserve
-                * confidence
-                * uncertainty
-                * freshness
+                * evidence_quality
                 * range_order
             )
         self._turn_successor_authority += alpha * (
