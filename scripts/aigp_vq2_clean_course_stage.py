@@ -137,11 +137,6 @@ GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
 COURSE_VZ_DES_PER_NORM = 1.0  # m/s desired climb per norm of compensated ey
 COURSE_VZ_DES_MAX_M_S = 0.5
 COURSE_VZ_TRACK_GAIN = 0.12  # collective per m/s of vz tracking error
-# F142 restores one bounded visual derivative as the qualified rate feedback.
-# The hypothesis rate is already pitch-derotated in _predict(); this is the
-# original live-proved camera-rate envelope, used here INSTEAD OF the drifting
-# IMU vertical integrator rather than stacked with it.
-VERTICAL_MAX_ABS_RATE_NORM_S = 5.0 / 3.0
 # F97 (20260730T160909Z-visual-course-a4bfb6d3): F96 flew smoothly but the
 # tracker's vz_des saturated at -0.5 pulling a low-sitting gate to center,
 # holding vz -0.46 into the plane — COMMIT's |vz| <= 0.25 entry budget
@@ -928,7 +923,6 @@ class CleanCourseConfig:
     course_vz_des_per_norm: float = COURSE_VZ_DES_PER_NORM
     course_vz_des_max_m_s: float = COURSE_VZ_DES_MAX_M_S
     course_vz_track_gain: float = COURSE_VZ_TRACK_GAIN
-    vertical_max_abs_rate_norm_s: float = VERTICAL_MAX_ABS_RATE_NORM_S
     course_vz_des_commit_m_s: float = COURSE_VZ_DES_COMMIT_M_S
     course_vz_des_ramp_start_log_scale: float = COURSE_VZ_DES_RAMP_START_LOG_SCALE
     course_vz_des_ground_m_s: float = COURSE_VZ_DES_GROUND_M_S
@@ -1734,21 +1728,18 @@ class CleanCourseController:
                     vertical_error=commit_ey,
                     vertical_qualified=commit_vertical_qualified,
                 )
-                # F142: qualified vision owns both terms of one continuous
-                # reference: compensated position supplies desired motion,
-                # and the already pitch-derotated visual rate damps it.  The
-                # drifting IMU integral is not stacked with fresh vision; it
-                # remains the zero-rate hold when y is unobservable and the
-                # independent COMMIT-entry safety veto.
+                # F144: keep the one F127 vertical-rate owner, but fade its
+                # IMU term continuously over the existing course range ramp.
+                # Near the plane compensated vision can therefore command a
+                # correction without a drifting vz estimate vetoing it.  An
+                # unqualified hold still damps the full IMU rate.
                 if commit_vertical_qualified:
-                    commit_rate_feedback = _clamp(
-                        self.current.y_axis.v,
-                        -cfg.vertical_max_abs_rate_norm_s,
-                        cfg.vertical_max_abs_rate_norm_s,
+                    commit_rate_feedback = self._vz_est_m_s * (
+                        1.0 - self._course_range_ramp(self.current)
                     )
-                    commit_rate_error = commit_vz_des - commit_rate_feedback
                 else:
-                    commit_rate_error = 0.0 - self._vz_est_m_s
+                    commit_rate_feedback = self._vz_est_m_s
+                commit_rate_error = commit_vz_des - commit_rate_feedback
                 commit_hold = (
                     support + cfg.course_vz_track_gain * commit_rate_error
                 )
@@ -2085,27 +2076,24 @@ class CleanCourseController:
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
         self._pre_cross_brake_active = pre_cross_brake
-        # F142: F141's raw-position/no-rate discriminator mistook the braking
-        # attitude for a low gate, then drove an undamped -1.15 m/s sink into
-        # Gate 0.  Return to the F127 compensated geometry, but replace the
-        # contradictory qualified IMU integrator with the tracker's already
-        # pitch-derotated image rate.  It is the sole qualified derivative,
-        # not an overlay; the same owner and carried collective span TRACK,
-        # COMMIT, and visual loss.
+        # F144: F143 proved that normalized image motion is not a physical
+        # vertical-rate measurement: perspective/closure dilation drove a
+        # full collective oscillation into Gate 1.  Restore the single F127
+        # IMU rate term far out, then fade it continuously with the existing
+        # range ramp so it cannot veto compensated visual position near the
+        # plane.  This remains one carried collective owner across states.
         vz_des = self._course_vz_setpoint(
             current,
             vertical_error=ey_vertical - vertical_setpoint_offset,
             vertical_qualified=vertical_qualified,
         )
         if vertical_qualified:
-            visual_rate = _clamp(
-                current.y_axis.v,
-                -cfg.vertical_max_abs_rate_norm_s,
-                cfg.vertical_max_abs_rate_norm_s,
+            rate_feedback = self._vz_est_m_s * (
+                1.0 - self._course_range_ramp(current)
             )
-            vertical_rate_error = vz_des - visual_rate
         else:
-            vertical_rate_error = 0.0 - self._vz_est_m_s
+            rate_feedback = self._vz_est_m_s
+        vertical_rate_error = vz_des - rate_feedback
         collective = support + cfg.course_vz_track_gain * vertical_rate_error
         if not vertical_qualified:
             # A stale visual rate is never reused.  The same vertical owner
@@ -2848,20 +2836,35 @@ class CleanCourseController:
                 (current.outer_log_scale - successor.outer_log_scale)
                 / max(1e-6, cfg.successor_min_log_scale_gap)
             )
-            # F141 returns the handoff law to F127, the best evidence-backed
-            # baseline.  Successor selection already owns persistence, so
-            # track age is deliberately absent here.  Carry the evidence
-            # product continuously; weak evidence changes authority instead
-            # of resetting it, while the one reference remains the only yaw
-            # and bank command owner.
-            desired_authority = (
+            successor_weight = (
                 closure
-                * self._turn_aperture_reserve
                 * confidence
                 * uncertainty
                 * freshness
                 * range_order
             )
+            current_confidence = _clamp01(current.confidence)
+            current_uncertainty = _clamp01(
+                1.0 - current.x_axis.std / cfg.search_covariance_std_norm
+            )
+            current_freshness = _clamp01(
+                1.0
+                - max(0.0, now_s - current.last_x_measurement_s)
+                / cfg.x_steer_max_age_s
+            )
+            current_claim = (
+                (1.0 - self._turn_aperture_reserve)
+                * current_confidence
+                * current_uncertainty
+                * current_freshness
+            )
+            # F144 restores F138's live-proved passage custody on top of the
+            # corrected vertical estimator.  Aperture or weakening current-x
+            # evidence releases custody continuously; successor evidence is
+            # still absolute, so a weak fragment cannot become full authority.
+            # Both claims feed the one derotated yaw-and-bank reference.
+            passage_release = 1.0 - current_claim
+            desired_authority = passage_release * successor_weight
         self._turn_successor_authority += alpha * (
             desired_authority - self._turn_successor_authority
         )
@@ -2940,13 +2943,7 @@ class CleanCourseController:
             -cfg.vertical_max_abs_error_norm,
             cfg.vertical_max_abs_error_norm,
         )
-        ramp = _clamp01(
-            (current.outer_log_scale - cfg.course_vz_des_ramp_start_log_scale)
-            / (
-                cfg.commit_min_log_scale
-                - cfg.course_vz_des_ramp_start_log_scale
-            )
-        )
+        ramp = self._course_range_ramp(current)
         vz_des_max = cfg.course_vz_des_max_m_s - (
             cfg.course_vz_des_max_m_s - cfg.course_vz_des_commit_m_s
         ) * ramp
@@ -2957,6 +2954,18 @@ class CleanCourseController:
             -cfg.course_vz_des_per_norm * bounded_error,
             -vz_des_sink_max,
             vz_des_max,
+        )
+
+    def _course_range_ramp(self, current: _Hypothesis) -> float:
+        """Continuous far-to-crossing authority transfer already used by vz."""
+
+        cfg = self.config
+        return _clamp01(
+            (current.outer_log_scale - cfg.course_vz_des_ramp_start_log_scale)
+            / (
+                cfg.commit_min_log_scale
+                - cfg.course_vz_des_ramp_start_log_scale
+            )
         )
 
     def _continuous_collective(self, target: float, dt: float) -> float:
