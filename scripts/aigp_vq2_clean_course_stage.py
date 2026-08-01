@@ -594,14 +594,14 @@ UNMEASURED_X_FORCE_SEARCH_S = 0.75
 # (no job left once crossings are slow — and its hard nose-up episodes
 # were themselves VRS generators).
 CLOSURE_TARGET_RATE_S = 0.35  # log-scale rate the governor holds (TTC ~3 s)
-# F106 (20260801T052822Z-visual-course-88a27a09): F105 reached the full
-# bounded brake, but only after the approach had already crossed the 0.35/s
-# COMMIT expansion budget.  A 0.60/s full-brake threshold asks the airframe
-# to dissipate budget-invalid energy late; use a narrow 0.01/s response band
-# above the unchanged entry limit instead.  The range-ramped target remains
-# lower when far, so this also moves full braking into the early visible
-# window without adding a timer, mode, or Gate-0 exception.
-CLOSURE_FULL_BRAKE_RATE_S = 0.36
+# F108 (20260801T054550Z-visual-course-8b530eed): F106's 0.36/s threshold
+# put Gate 0 on the fast brake response far from the plane.  F107 then
+# accumulated a vertical sink before the near-plane hold (vz -0.11 m/s,
+# altitude -0.09 m at span 0.55), pitched to the custody limit, and struck
+# the structure without credit.  Restore F104's live-proven 0.60/s response
+# ceiling: the range-ramped governor still blends brake continuously, while
+# the explicit near-plane budget-false hold still demands full braking.
+CLOSURE_FULL_BRAKE_RATE_S = 0.60
 # F101 (20260730T173407Z-visual-course-7a862549): a range-flat 0.35
 # target permits 3+ m/s at leg start (0.35 log/s at 8-10 m), more than
 # custody-compatible attitude braking (~0.4-0.7 m/s^2, capped by the F94
@@ -2582,9 +2582,9 @@ class CleanCourseController:
         # to -0.30 from spawn at gate_index >= 1.  F104 applies that same
         # bounded brake to Gate 0 only when the near-plane COMMIT budget is
         # false.  F106 showed that applying it throughout Gate 0 pitched the
-        # gate below the frame before credit; the earlier F106 closure-demand
-        # threshold remains, but the far Gate-0 brake returns to the proved
-        # -0.15 attitude.  Same single blend and custody floor throughout.
+        # gate below the frame before credit; F108 also restores the proved
+        # far-range governor response.  Same single blend and custody floor
+        # throughout.
         brake_pitch_offset = (
             cfg.course_pre_cross_brake_pitch_rad
             if self.gate_index >= 1 or near_plane_hold

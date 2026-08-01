@@ -1300,15 +1300,15 @@ def test_closure_governor_is_a_continuous_blend():
     # Mid-band closure: the pitch target blends partway from the advance
     # law (spawn base) toward the spawn-0.15 Gate-0 brake attitude,
     # without latching the fast-slew brake flag.
-    # F101: at log -1.40 the range-ramped target is 0.25 (halfway down
-    # the -2.0 -> -0.8 ramp), so 0.325/s sits mid-band below F106's 0.36
-    # full-brake threshold.  (The commit
+    # F101: at log -1.40 the range-ramped target is 0.30, so 0.375/s sits
+    # inside the continuous response band below the 0.60 full-brake rate.
+    # (The commit
     # regime itself levels a centered gate via the F94 custody floor —
     # no blend is observable there.)
     controller = _tracked_controller(
         _track("A", 0.0, 0.0, scale=math.exp(-1.40))
     )
-    controller.current.scale_axis.v = 0.325
+    controller.current.scale_axis.v = 0.375
     now = 100.10
     out = None
     for _ in range(25):  # generic slew converges to the blended target
@@ -2478,11 +2478,11 @@ def test_commit_entry_arms_on_gate_zero():
     assert climbing._pre_cross_brake_active
 
 
-def test_gate_zero_budget_invalid_closure_gets_early_weak_brake_while_far():
-    # F107 keeps F106's narrow response band: at a still-far outer log scale
-    # of -1.9, expansion just above COMMIT's 0.35/s entry budget demands the
-    # fast brake path.  F106 showed that the -0.30 course attitude here hides
-    # Gate 0 before credit, so the far approach uses the proved -0.15 offset.
+def test_gate_zero_far_closure_avoids_early_fast_brake_dive():
+    # F108: F107's 0.36/s threshold latched the fast intercept response far
+    # from Gate 0, accumulated sink before the near-plane hold, and struck
+    # structure without credit.  At outer log -1.9, a 0.36/s observation
+    # gets a continuous weak-brake blend but does not latch the fast path.
     controller = _commit_controller_gate_zero()
     current = controller.current
     current.x_axis.p = 0.0
@@ -2503,11 +2503,12 @@ def test_gate_zero_budget_invalid_closure_gets_early_weak_brake_while_far():
         out = _command(controller, now, pitch=SPAWN_PITCH)
 
     assert controller.state is CleanCourseState.TRACK
-    assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad == pytest.approx(
+    assert not controller._pre_cross_brake_active
+    assert (
         controller.config.spawn_pitch_rad
-        + controller.config.pre_cross_brake_pitch_rad,
-        abs=1e-9,
+        + controller.config.pre_cross_brake_pitch_rad
+        < out.target_pitch_rad
+        < controller.config.spawn_pitch_rad
     )
 
 
