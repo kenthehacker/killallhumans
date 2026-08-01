@@ -158,7 +158,7 @@ def test_support_tilt_compensation_is_spawn_relative():
     # (F90/F91/F93/F94) and F94's gate slid out the bottom of the frame
     # into a ground collision (id 1002).  Compensation must be relative
     # to the level attitude; at level both formulas agree (0.2594).
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller = _tracked_controller(_track("A", 0.0, 0.427))
     brake_attitude = SPAWN_PITCH - 0.267
     now = 100.10
     out = None
@@ -168,7 +168,8 @@ def test_support_tilt_compensation_is_spawn_relative():
         controller.current.last_x_measurement_s = now
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=brake_attitude)
-    # Raw ey is centered, so the emitted collective IS the tilt-compensated
+    # Compensated ey = 0.427 - 0.267*1.6 ~= 0: a world-centered gate at the
+    # brake attitude, so the emitted collective IS the tilt-compensated
     # support.  True hover at 0.267 rad from level is
     # (0.247/cos(0.31))/cos(0.267) ~= 0.269; the absolute-rpy formula
     # emits >= 0.29.
@@ -211,7 +212,7 @@ def test_identical_global_vertical_sign_at_every_gate():
             controller.current.last_y_measurement_s = now
             controller.current.last_measurement_s = now
             controller._alt_est_m = 2.0  # honest altitude (floor quiet)
-        output = _command(controller, now + 0.02, pitch=SPAWN_PITCH)
+        output = _command(controller, now + 0.02)
         assert output.vertical_qualified
         assert output.gate_index == gate
         thrusts.append(output.thrust)
@@ -245,39 +246,41 @@ def test_vertical_sign_is_the_gate0_minus_form_by_default():
     )
 
 
-def test_vertical_owner_uses_raw_image_y_during_pitch_brake():
-    # F122: Gate 1 was visibly below center at credit (raw y +0.089), but
-    # the fixed pitch correction changed it to -0.150 and commanded climb
-    # until raw y reached +0.383.  Pitch geometry may still use the corrected
-    # bearing; the sole collective owner preserves raw image-aperture custody.
+def test_vertical_error_is_pitch_attitude_compensated():
+    # F50 (flight 20260729T222920Z-visual-course-3a8ed087): the vertical
+    # servo read image-y with NO attitude compensation, so the F49 nose-up
+    # brake (0.15 rad up from spawn) tilted the camera up and the world
+    # read ~0.24 norm LOW — the servo "centered" a gate that was really
+    # ~1.5-2 m below and held ceiling height into a truss.  (F32/F34/F36
+    # saw the same contamination with the opposite sign: nose-down dives
+    # read gates HIGH.)  Compensation is zero at the spawn attitude.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    assert controller._compensated_ey(0.0, SPAWN_PITCH) == pytest.approx(0.0)
+    # Nose-up 0.15 rad REDUCES the effective ey by 1.6 * 0.15 = 0.24.
+    assert controller._compensated_ey(
+        0.0, SPAWN_PITCH - 0.15
+    ) == pytest.approx(-0.24)
+    # Nose-down 0.15 rad raises it (the F32/F34/F36 "gate HIGH" sign).
+    assert controller._compensated_ey(
+        0.0, SPAWN_PITCH + 0.15
+    ) == pytest.approx(0.24)
+    # End to end: a gate reading 0.24 low while braked 0.15 rad nose-up is
+    # a LEVEL gate — the PD asks for the bare tilt-compensated support
+    # (F95: compensated relative to the LEVEL attitude, not absolute rpy)...
     braked = _tracked_controller(_track("A", 0.0, 0.24))
-    braked._alt_est_m = 2.0
     out = _command(braked, 100.10, pitch=SPAWN_PITCH - 0.15)
     assert out.thrust == pytest.approx(
-        SPAWN_SUPPORT / math.cos(0.15) - 0.12 * 0.24,
-        abs=1e-9,
+        SPAWN_SUPPORT / math.cos(0.15), abs=1e-9
     )
-
-    # At the spawn attitude the same raw evidence asks for the same desired
-    # vertical rate; only ordinary tilt support differs.
+    # ...while the same reading at the spawn attitude really is low.
+    # (F100: vz_des = -0.24 tracked at 0.12/m/s, vz_est 0; honest altitude
+    # keeps the F103 near-ground descent taper out of this law check.)
     level = _tracked_controller(_track("A", 0.0, 0.24))
     level._alt_est_m = 2.0
     out = _command(level, 100.10, pitch=SPAWN_PITCH)
     assert out.thrust == pytest.approx(
         SPAWN_SUPPORT - 0.12 * 0.24, abs=1e-9
     )
-
-    # Reproduce the F122 credit geometry.  With an inherited -0.097 m/s sink,
-    # raw y +0.089 asks for nearly zero rate error, not a climb step.
-    credit = _tracked_controller(_track("A", 0.0, 0.089))
-    credit._alt_est_m = 2.0
-    credit._vz_est_m_s = -0.097
-    out = _command(credit, 100.10, pitch=-0.460)
-    support = SPAWN_SUPPORT / math.cos(-0.460 - SPAWN_PITCH)
-    assert out.thrust == pytest.approx(
-        support + 0.12 * (-0.089 - -0.097), abs=1e-9
-    )
-    assert out.thrust < support + 0.002
 
 
 def test_gate0_takeoff_boost_is_feedforward_only():
@@ -2024,7 +2027,7 @@ def test_turn_reference_survives_track_predict_commit_credit_and_promotion():
 
 
 def test_turn_reference_eligibility_variation_never_reverses_left_handoff():
-    """F119 regression: qualification flicker cannot alternate yaw direction."""
+    """F119/F124: qualification flicker cannot reverse the shared turn."""
 
     controller = _turn_reference_controller(current_x=0.04)
     now = 100.10
@@ -2083,7 +2086,25 @@ def test_turn_reference_eligibility_variation_never_reverses_left_handoff():
     assert max(yaw_steps) < MAX_COURSE_YAW_RATE_RAD_S
 
 
-def test_weak_successor_evidence_decays_turn_authority_smoothly():
+def test_fresh_reassociated_successor_has_no_second_turn_age_gate():
+    # F122: the persistent left Gate-1 track changed id at the Gate-0 plane.
+    # Successor selection had already admitted the fresh, measured hypothesis,
+    # but a second age factor reset its turn authority to exactly zero.
+    controller = _turn_reference_controller(current_x=0.0)
+    now = 100.10
+    controller.successor.track_id = "B-reassociated"
+    controller._track_first_seen_s[controller.successor.track_id] = now
+    controller.successor.last_measurement_s = now
+    controller.successor.last_x_measurement_s = now
+
+    out = _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
+
+    assert out.successor_blend > 0.0
+    assert out.yaw_rate_rad_s < 0.0
+    assert out.target_roll_rad < 0.0
+
+
+def test_weak_successor_evidence_decays_turn_reference_smoothly():
     controller = _turn_reference_controller(current_x=0.04)
     now = 100.10
     for _ in range(14):
@@ -2098,8 +2119,9 @@ def test_weak_successor_evidence_decays_turn_authority_smoothly():
     assert authority_before > 0.0
     assert out.yaw_rate_rad_s < 0.0
 
-    # All evidence factors weaken together.  The first command must retain
-    # some authority/reference instead of reproducing F119's off-full switch.
+    # All evidence factors weaken together.  Raw evidence weight can vanish,
+    # but the only command-bearing state is the derotated reference, which
+    # must decay continuously instead of reproducing F119's off-full switch.
     controller.successor.x_axis.pp = 2.0
     controller.successor.y_axis.pp = 2.0
     controller.successor.last_measurement_s = now - 2.0
@@ -2108,41 +2130,55 @@ def test_weak_successor_evidence_decays_turn_authority_smoothly():
     controller.current.aperture_half_y = None
     controller._last_engulfing_anchor_s = None
     authorities = []
+    references = []
     yaws = []
     for _ in range(6):
         now += 0.04
         out = _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
         authorities.append(out.successor_blend)
+        references.append(controller._turn_reference_x)
         yaws.append(out.yaw_rate_rad_s)
 
     assert 0.0 < authorities[0] < authority_before
-    assert all(right < left for left, right in zip(authorities, authorities[1:]))
-    assert all(yaw <= 0.0 for yaw in yaws)
+    assert all(
+        right < left for left, right in zip(authorities, authorities[1:])
+    )
+    assert all(reference < 0.0 for reference in references)
+    assert all(
+        right > left for left, right in zip(references, references[1:])
+    )
+    assert all(yaw < 0.0 for yaw in yaws)
 
 
-def test_tiny_opposite_successor_authority_cannot_erase_current_gate_turn():
+def test_weak_opposite_successor_cannot_erase_current_gate_turn():
     # F120 live regression: Gate 1 was still x=-0.309 when a right-side Gate
     # 2 candidate reached only 2.1e-7 authority.  Binary sign arbitration
     # nevertheless snapped the left request to zero for ~1.4 s.
     controller = _turn_reference_controller(successor_x=0.20, current_x=-0.30)
-    controller.current.aperture_half_x = 0.05
-    controller.current.aperture_half_y = 0.05
+    controller.current.aperture_half_x = 0.50
+    controller.current.aperture_half_y = 0.50
     controller.current.raw_x = -0.30
-    controller._turn_aperture_reserve = 1e-6
-    controller._turn_successor_authority = 2.1e-7
-    controller._turn_reference_x = -0.276
-
-    outputs = []
+    controller.successor.x_axis.pp = 2.0
+    controller.successor.y_axis.pp = 2.0
+    controller._turn_aperture_reserve = 0.95
+    controller._turn_reference_x = None
     now = 100.10
-    for _ in range(12):
-        now += 0.04
-        controller.successor.last_measurement_s = now
-        controller.successor.last_x_measurement_s = now
-        outputs.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
+    heading, authority = controller._turn_reference(
+        controller.current,
+        controller.successor,
+        current_error=-0.30,
+        now_s=now,
+        yaw_rad=0.0,
+        dt=0.04,
+    )
+    target_roll, yaw_rate = controller._coordinated_turn_request(
+        heading, steer_gain=1.0, yaw_rad=0.0
+    )
 
-    assert all(output.yaw_rate_rad_s < -0.02 for output in outputs)
-    assert all(output.target_roll_rad < 0.0 for output in outputs)
-    assert max(output.successor_blend for output in outputs) < 1e-5
+    assert authority == pytest.approx(0.0)
+    assert heading == pytest.approx(-0.30)
+    assert yaw_rate < -0.02
+    assert target_roll < 0.0
 
 
 def test_authoritative_promotion_retains_stale_measured_successor_for_prediction():

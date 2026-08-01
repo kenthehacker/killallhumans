@@ -591,7 +591,7 @@ ALT_EST_MIN_M = -2.0  # biased-integrator clamp on the altitude estimate
 FH_UNTRUSTED_TRIGGER_MPS2 = 5.0  # biased regime above this horizontal force
 FH_TRUSTED_RELEASE_MPS2 = 2.0  # hysteresis release below this
 FH_UNTRUSTED_SUSTAIN_S = 0.3  # transients shorter than this never latch
-# F50 pitch-attitude compensation for pitch/crossing geometry (flight
+# F50 pitch-attitude compensation of the vertical error (flight
 # 20260729T222920Z-visual-course-3a8ed087): the vertical servo read the
 # aim's image-y with NO attitude compensation, so the F49 nose-up brake
 # (rpy_p -0.46, ~0.15 rad up from the -0.31 spawn attitude) tilted the
@@ -602,9 +602,7 @@ FH_UNTRUSTED_SUSTAIN_S = 0.3  # transients shorter than this never latch
 # ey -0.5..-0.7.)  With image-down-positive ey, a nose-up attitude (rpy_p
 # below spawn_pitch_rad) shifts the world DOWN in frame, so the effective
 # error is ey_true = ey_measured - (spawn_pitch_rad - rpy_p) * this gain;
-# it is zero at the spawn attitude.  F123 removes this reinterpretation from
-# collective control after it reversed fresh low-gate evidence during F122;
-# raw image y now owns aperture-preserving vertical translation.
+# it is zero at the spawn attitude.
 VERTICAL_PITCH_COMP_NORM_PER_RAD = 1.6  # image-norm vertical shift per rad
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 # F76 (20260730T074122Z-visual-course-3a505ef5): after the one-zero send
@@ -648,7 +646,9 @@ SEARCH_SWEEP_GAIN = 2.0  # heading-error gain to the bounded yaw rate
 # yaw.  One filtered reference now blends passage alignment and the retained
 # successor hypothesis.  The hypothesis is IMU-derotated in _predict(); its
 # confidence, covariance, measurement age, range ordering, closure, and the
-# filtered current-aperture reserve all reduce authority continuously.
+# filtered current-aperture reserve all reduce authority continuously.  F124
+# removes the second age-gated authority filter: successor selection already
+# owns persistence, while this sole derotated reference owns command smoothing.
 TURN_REFERENCE_TAU_S = 0.15
 BLEND_FAR_LOG_SCALE = -1.6  # below this the successor gets no blend
 BLEND_NEAR_LOG_SCALE = -0.9  # at this closure passage progress reaches one
@@ -660,7 +660,8 @@ SUCCESSOR_TURN_MAX_STD_NORM = 0.60  # zero turn authority at this uncertainty
 # out-confidenced the real gate-1 halves (0.62-0.71 vs 0.42-0.54) and was
 # adopted at promotion.  PERSISTENCE can: debris is newborn every frame
 # while the real gate halves stayed associated for seconds.  Successor
-# ranking, continuous turn authority, and re-acquisition all prefer track age.
+# ranking and re-acquisition prefer track age; F124 removes the duplicate age
+# gate from turn authority after selection has already admitted a hypothesis.
 SUCCESSOR_MIN_AGE_S = 0.5
 REACQUIRE_MIN_AGE_S = 0.3  # persistence preferred at SEARCH re-acquisition
 # F49 newborn suspicious-geometry adoption gate (terminal F48 failure): the
@@ -1129,7 +1130,6 @@ class CleanCourseController:
         self._turn_reference_x: Optional[float] = None
         self._turn_reference_yaw_rad: Optional[float] = None
         self._turn_aperture_reserve = 0.0
-        self._turn_successor_authority = 0.0
         self._successor_heading_blend = 0.0
         self._successor_heading_error_norm: Optional[float] = None
         # Course-heading anchor (F31): yaw at the leg start (lazily
@@ -1162,7 +1162,6 @@ class CleanCourseController:
         self._turn_reference_x = None
         self._turn_reference_yaw_rad = None
         self._turn_aperture_reserve = 0.0
-        self._turn_successor_authority = 0.0
         identity = _frame_identity(update)
         if identity is not None:
             self._last_frame_identity = identity
@@ -1440,7 +1439,6 @@ class CleanCourseController:
         # promoted current hypothesis is the same derotated bearing that fed
         # the pre-credit reference, so no control overlay changes sign here.
         self._turn_aperture_reserve = 0.0
-        self._turn_successor_authority = 0.0
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             self._exit_coast()
         # An authoritative increment settles the pending-credit hold.
@@ -1726,13 +1724,9 @@ class CleanCourseController:
                     and self.current.y_axis.std
                     <= cfg.search_covariance_std_norm
                 )
-                # F123: image-y aperture custody owns vertical translation.
-                # The fixed spawn-relative pitch correction reversed fresh
-                # low-gate evidence throughout F122's brake, commanding climb
-                # until the gate was already at the frame bottom.  Keep pitch
-                # compensation only for attitude/crossing geometry; the one
-                # vertical-rate owner consumes the fresh raw bearing.
-                commit_ey = self.current.y
+                commit_ey = self._compensated_ey(
+                    self.current.y, pitch_rad
+                )
                 commit_vz_des = self._course_vz_setpoint(
                     self.current,
                     vertical_error=commit_ey,
@@ -1899,12 +1893,14 @@ class CleanCourseController:
         ex = current.x
         heading_ex = ex
         ey = current.y
-        # F123 separates image-aperture custody from attitude geometry.  The
-        # sole vertical-rate owner consumes raw image y so a visible gate
-        # moving down cannot be reinterpreted as climb evidence by the brake
-        # attitude.  Pitch compensation remains only in the pitch/crossing
-        # geometry below; it no longer changes collective direction.
-        ey_geometry = self._compensated_ey(ey, pitch_rad)
+        # F50: the VERTICAL channel servos on the pitch-attitude-compensated
+        # error (nose-up brake attitude reads the world LOW in frame; see
+        # the VERTICAL_PITCH_COMP_NORM_PER_RAD block).  F117 uses that same
+        # physical error for the forward misalignment brake.  F116 showed the
+        # old RAW-ey coupling was positive feedback: braking pitched the
+        # camera up, moved Gate 0 down in-frame, and the camera artifact asked
+        # for still more brake until the vehicle met the top structure.
+        ey_vertical = self._compensated_ey(ey, pitch_rad)
         # F40 (20260729T193134Z-visual-course-63ed6342): never steer on an
         # x-axis without a fresh accepted measurement — an unmeasured or
         # stale x (edge-clipped splinter, censored axis) is a garbage aim
@@ -1979,8 +1975,8 @@ class CleanCourseController:
             vertical_setpoint_offset = (
                 cfg.gate0_climb_vertical_offset_norm * closure
             )
-            if ey >= 0.0:
-                # Gate at/below center in the image: the
+            if ey_vertical >= 0.0:
+                # Gate at/below center (attitude-compensated, F50): the
                 # climb bias may not lift the aim above center (flight
                 # 9d430a40, see block comment).
                 vertical_setpoint_offset = min(vertical_setpoint_offset, 0.0)
@@ -1990,7 +1986,7 @@ class CleanCourseController:
             <= cfg.vertical_qualify_max_age_s
             and current.y_axis.std <= cfg.search_covariance_std_norm
         )
-        floor_gate_y = ey_geometry if vertical_qualified else None
+        floor_gate_y = ey_vertical if vertical_qualified else None
         # Vision closure-rate governor (F31, see the CLOSURE_* constant
         # block): the filtered log-scale rate is the only honest closure
         # signal — fh is a signless drag magnitude that conflates speed with
@@ -2067,14 +2063,14 @@ class CleanCourseController:
         # structure.  Speed with no alignment is pure risk: blend toward
         # the TRUE brake attitude with the same signal that suppresses
         # advance.
-        angular_error = math.hypot(ex, ey_geometry)
+        angular_error = math.hypot(ex, ey_vertical)
         align = _clamp01(1.0 - angular_error / cfg.angular_full_brake_norm)
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
         self._pre_cross_brake_active = pre_cross_brake
         vz_des = self._course_vz_setpoint(
             current,
-            vertical_error=ey - vertical_setpoint_offset,
+            vertical_error=ey_vertical - vertical_setpoint_offset,
             vertical_qualified=vertical_qualified,
         )
         collective = support + cfg.course_vz_track_gain * (
@@ -2253,13 +2249,13 @@ class CleanCourseController:
         # entry budget correctly refused COMMIT (expansion, |vz|) and it
         # hit the structure (id 1001).  The compensated ey separates the
         # attitude artifact from true geometry: raw ey at a candidate
-        # attitude is ey_geometry + (spawn - pitch) * comp_gain, so the
+        # attitude is ey_vertical + (spawn - pitch) * comp_gain, so the
         # floor attitude that places the gate exactly ON the relax bound
-        # is spawn - (bound - ey_geometry) / comp_gain.  The pitch target
+        # is spawn - (bound - ey_vertical) / comp_gain.  The pitch target
         # may never go nose-up past it — the drone always holds the
         # MAXIMUM custody-compatible brake — and the floor never rises
         # above level: a genuinely low gate is re-centered by the vertical
-        # channel, never by advancing.  ey_geometry is attitude-invariant
+        # channel, never by advancing.  ey_vertical is attitude-invariant
         # by construction, so the floor is stable without any hysteresis.
         commit_regime = current.log_scale >= cfg.commit_min_log_scale
         relax_bound = (
@@ -2270,7 +2266,7 @@ class CleanCourseController:
             else cfg.brake_relax_ey_norm
         )
         custody_floor = cfg.spawn_pitch_rad - (
-            (relax_bound - ey_geometry) / cfg.vertical_pitch_comp_norm_per_rad
+            (relax_bound - ey_vertical) / cfg.vertical_pitch_comp_norm_per_rad
         )
         custody_floor = min(
             custody_floor,
@@ -2385,7 +2381,7 @@ class CleanCourseController:
         return True
 
     def _compensated_ey(self, ey: float, pitch_rad: float) -> float:
-        """F50 pitch-attitude-compensated pitch/crossing geometry.
+        """F50 pitch-attitude-compensated vertical error (image-down +).
 
         A nose-up attitude (rpy_p below spawn_pitch_rad) tilts the camera
         up and shifts the world DOWN in frame, so the measured ey reads
@@ -2800,7 +2796,7 @@ class CleanCourseController:
         )
         self._turn_aperture_reserve = _clamp01(self._turn_aperture_reserve)
 
-        desired_authority = 0.0
+        evidence_weight = 0.0
         desired = float(current_error)
         if successor is not None:
             closure_span = cfg.blend_near_log_scale - cfg.blend_far_log_scale
@@ -2822,42 +2818,33 @@ class CleanCourseController:
                 - max(0.0, now_s - successor.last_x_measurement_s)
                 / PREDICT_STALL_FORCE_SEARCH_S
             )
-            persistence = _clamp01(
-                self._track_age_s(successor.track_id, now_s)
-                / max(1e-6, cfg.successor_min_age_s)
-            )
             range_order = _clamp01(
                 (current.outer_log_scale - successor.outer_log_scale)
                 / max(1e-6, cfg.successor_min_log_scale_gap)
             )
-            desired_authority = (
+            # Successor selection already owns track persistence.  Applying
+            # age again here made a freshly re-associated, high-confidence
+            # Gate 1 contribute exactly zero at the Gate-0 plane (F122), then
+            # the separately filtered authority and reference delayed the
+            # turn twice.  Evidence quality is continuous here; the one
+            # derotated reference below is the only command-smoothing state.
+            evidence_weight = (
                 closure
                 * self._turn_aperture_reserve
                 * confidence
                 * uncertainty
                 * freshness
-                * persistence
                 * range_order
             )
-        self._turn_successor_authority += alpha * (
-            desired_authority - self._turn_successor_authority
-        )
-        self._turn_successor_authority = _clamp01(
-            self._turn_successor_authority
-        )
-        authority = (
-            self._turn_successor_authority if successor is not None else 0.0
-        )
         if successor is not None:
-            # Passage alignment loses weight only as the proved aperture
-            # reserve grows; successor bearing gains its independently
-            # confidence/covariance/freshness-weighted authority.  This sum
-            # has no binary sign arbitration: infinitesimal evidence for a
-            # future gate cannot erase the current-gate correction, while a
-            # safe near-plane aperture naturally hands the reference over.
+            # A true convex blend has no low-authority dead zone: weak
+            # successor evidence leaves current-passage alignment in charge,
+            # while credible evidence transfers that same coordinated yaw
+            # and bank reference toward the successor.  The filtered
+            # aperture reserve is already one factor in ``evidence_weight``.
             desired = (
-                (1.0 - self._turn_aperture_reserve) * float(current_error)
-                + authority * successor.x
+                (1.0 - evidence_weight) * float(current_error)
+                + evidence_weight * successor.x
             )
 
         if self._turn_reference_x is None:
@@ -2868,6 +2855,17 @@ class CleanCourseController:
             )
         self._turn_reference_x = _clamp(self._turn_reference_x, -1.0, 1.0)
 
+        # Report the reference's effective mixture, not the instantaneous
+        # evidence product.  Thus weak/flickering evidence decays authority
+        # with the same single filter that actually owns yaw and bank.
+        authority = 0.0
+        if successor is not None:
+            blend_span = successor.x - float(current_error)
+            if abs(blend_span) > 1e-9:
+                authority = _clamp01(
+                    (self._turn_reference_x - float(current_error))
+                    / blend_span
+                )
         self._successor_heading_blend = authority
         self._successor_heading_error_norm = self._turn_reference_x
         return self._turn_reference_x, authority
