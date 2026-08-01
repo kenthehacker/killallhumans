@@ -1122,7 +1122,7 @@ def test_authoritative_promotion_does_not_switch_brake_reference():
 
 
 def test_closure_governor_does_not_brake_below_target_rate():
-    # Slow closure is free flight: below the 0.15/s target rate the
+    # Slow closure is free flight: below the 0.35/s target rate the
     # governor contributes nothing and the advance law still closes.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller.current.scale_axis.v = 0.1
@@ -1185,15 +1185,15 @@ def test_closure_governor_is_a_continuous_blend():
     # Mid-band closure: the pitch target blends partway from the advance
     # law (spawn base) toward the spawn-0.15 Gate-0 brake attitude,
     # without latching the fast-slew brake flag.
-    # F154: the target stays 0.15 at every trusted range, so 0.35/s sits
-    # inside the continuous response band to the 0.60 full brake.
+    # F101: at log -1.40 the range-ramped target is 0.30, so 0.375/s sits
+    # inside the continuous response band below the 0.60 full-brake rate.
     # (The commit
     # regime itself levels a centered gate via the F94 custody floor —
     # no blend is observable there.)
     controller = _tracked_controller(
         _track("A", 0.0, 0.0, scale=math.exp(-1.40))
     )
-    controller.current.scale_axis.v = 0.35
+    controller.current.scale_axis.v = 0.375
     now = 100.10
     out = None
     for _ in range(25):  # generic slew converges to the blended target
@@ -1205,21 +1205,6 @@ def test_closure_governor_is_a_continuous_blend():
         < out.target_pitch_rad
         < SPAWN_PITCH - 1e-9
     )
-
-
-def test_closure_governor_does_not_relax_energy_target_with_range():
-    # F154 removes F101's rise toward the 0.35 COMMIT ceiling.  The same
-    # 0.40/s approach must stay on the fast-brake side throughout the trusted
-    # visible approach; range cannot silently release braking authority.
-    for outer_log_scale in (-1.90, -1.60, -1.30):
-        controller = _tracked_controller(
-            _track("A", 0.0, 0.0, scale=math.exp(outer_log_scale))
-        )
-        controller.current.scale_axis.v = 0.40
-        controller.current.outer_expansion_rate = 0.40
-        controller.current.last_measurement_s = 100.10
-        _command(controller, 100.10, pitch=SPAWN_PITCH)
-        assert controller._pre_cross_brake_active
 
 
 def test_misalignment_brake_is_invariant_to_its_own_camera_pitch():
@@ -2183,7 +2168,7 @@ def test_successor_reassociation_cannot_recreate_precredit_s_turn():
     assert max(yaw_steps) < 0.08
 
 
-def test_weak_successor_evidence_decays_turn_reference_smoothly():
+def test_weak_successor_evidence_releases_into_carried_reference_smoothly():
     controller = _turn_reference_controller(current_x=0.04)
     now = 100.10
     for _ in range(14):
@@ -2198,9 +2183,9 @@ def test_weak_successor_evidence_decays_turn_reference_smoothly():
     assert authority_before > 0.0
     assert out.yaw_rate_rad_s < 0.0
 
-    # All evidence factors weaken together.  Raw evidence weight can vanish,
-    # but the only command-bearing state is the derotated reference, which
-    # must decay continuously instead of reproducing F119's off-full switch.
+    # All evidence factors weaken together.  Raw evidence authority can
+    # vanish, but unsupported mass remains on the derotated reference instead
+    # of creating F150's zero-biased dead zone or F119's off-full switch.
     controller.successor.x_axis.pp = 2.0
     controller.successor.y_axis.pp = 2.0
     controller.successor.last_measurement_s = now - 2.0
@@ -2224,7 +2209,11 @@ def test_weak_successor_evidence_decays_turn_reference_smoothly():
     )
     assert all(reference < 0.0 for reference in references)
     assert all(
-        right > left for left, right in zip(references, references[1:])
+        right < left for left, right in zip(references, references[1:])
+    )
+    assert (
+        max(abs(right - left) for left, right in zip(references, references[1:]))
+        < 0.02
     )
     assert all(yaw < 0.0 for yaw in yaws)
 
@@ -2525,6 +2514,76 @@ def test_weak_opposite_successor_cannot_erase_current_gate_turn():
     assert heading < -0.20
     assert yaw_rate < -0.02
     assert target_roll < 0.0
+
+
+def test_zero_authority_successor_cannot_dilute_carried_pursuit():
+    # F150: evidence mass unsupported by either hypothesis was treated as an
+    # implicit zero-bearing sample.  Merely seeing a far, zero-authority next
+    # gate could therefore dilute an established turn before either measured
+    # bearing requested it.  Unsupported mass must preserve the one already
+    # derotated reference while fresh current evidence updates it continuously.
+    controller = _turn_reference_controller(successor_x=0.34, current_x=-0.18)
+    controller.current.outer_log_scale = -2.0  # successor closure authority 0
+    controller.current.aperture_half_x = 0.25
+    controller.current.raw_x = -0.18
+    controller._turn_aperture_reserve = 0.0
+    controller._turn_successor_authority = 0.0
+    controller._turn_reference_x = -0.13
+    controller._turn_reference_yaw_rad = 0.0
+
+    now = 100.10
+    references = []
+    for _ in range(8):
+        now += 0.031
+        controller.current.last_x_measurement_s = now
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        reference, authority = controller._turn_reference(
+            controller.current,
+            controller.successor,
+            current_error=-0.18,
+            now_s=now,
+            yaw_rad=0.0,
+            dt=0.031,
+        )
+        references.append(reference)
+        assert authority == pytest.approx(0.0, abs=1e-12)
+
+    assert all(right < left for left, right in zip(references, references[1:]))
+    assert references[-1] < -0.15
+
+
+def test_promoted_fresh_current_can_reverse_carried_turn_reference():
+    # Carry is evidence continuity, not a directional ratchet.  Once race
+    # promotion makes the retained successor current, a fresh bearing that
+    # crosses to image-right must unwind and reverse the same reference.
+    controller = _turn_reference_controller(successor_x=-0.45, current_x=0.04)
+    controller._turn_reference_x = -0.20
+    controller._turn_reference_yaw_rad = 0.0
+    assert controller.note_race(
+        gate_index=1, race_boot_ms=2200, now_s=100.10
+    )
+    assert controller.successor is None
+
+    now = 100.10
+    references = []
+    for _ in range(14):
+        now += 0.04
+        controller.current.x_axis.p = 0.25
+        controller.current.raw_x = 0.25
+        controller.current.last_x_measurement_s = now
+        reference, _ = controller._turn_reference(
+            controller.current,
+            None,
+            current_error=0.25,
+            now_s=now,
+            yaw_rad=0.0,
+            dt=0.04,
+        )
+        references.append(reference)
+
+    assert all(right > left for left, right in zip(references, references[1:]))
+    assert references[-1] > 0.0
 
 
 def test_authoritative_promotion_retains_stale_measured_successor_for_prediction():
@@ -3668,10 +3727,10 @@ def test_closure_governor_demands_energy_reduction_early():
     # than custody-compatible attitude braking can kill inside the leg.
     # F100's gate-1 leg held pb=1 mid-leg and still ran away to ~1.2
     # log/s at the plane (COMMIT expansion veto, blind structure strike).
-    # F154 keeps F101's evidence-backed 0.15 far target at every range.  At
-    # the F100 mid-leg state (outer log -1.90, closure 0.43), the governor
-    # continuously demands a meaningful fraction of the one F125 brake
-    # reference rather than releasing it as the gate grows.
+    # The target now ramps down with range: at the F100 mid-leg state
+    # (outer log -1.90, closure 0.43) the ramped target is 0.17, the
+    # governor continuously demands a meaningful fraction of the one F125
+    # brake reference rather than leaving the attitude at spawn.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.15))
     controller._alt_est_m = 2.0
     _promote_to_gate_one(controller)
