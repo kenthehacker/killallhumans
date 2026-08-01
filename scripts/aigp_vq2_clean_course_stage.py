@@ -1668,9 +1668,7 @@ class CleanCourseController:
                 # prediction tracks the real bearing through the blackout,
                 # and the F62 half-gain derate under-corrected (crossed
                 # -0.22 norm left at the plane).
-                commit_steer_gain = 1.0
-                if self.current.log_scale >= cfg.commit_min_log_scale:
-                    commit_steer_gain = cfg.near_plane_steer_gain_mult
+                commit_steer_gain = self._course_steer_gain(self.current)
                 commit_heading_ex, commit_blend = self._turn_reference(
                     self.current,
                     self.successor,
@@ -1782,11 +1780,7 @@ class CleanCourseController:
                         yaw_rad=yaw_rad,
                         dt=dt,
                     )
-                    pending_steer_gain = (
-                        cfg.near_plane_steer_gain_mult
-                        if self.current.log_scale >= cfg.commit_min_log_scale
-                        else 1.0
-                    )
+                    pending_steer_gain = self._course_steer_gain(self.current)
                     pending_roll, pending_yaw = self._coordinated_turn_request(
                         pending_reference,
                         steer_gain=pending_steer_gain,
@@ -2082,13 +2076,11 @@ class CleanCourseController:
         # confirmation.  Clipping no longer saturates corrective steering
         # (codex, flights 4480d0a6/ab6252b2): the clip penalty halves yaw
         # exactly when the target is escaping at the frame edge.
-        # F57 near-plane steering boost (see the NEAR_PLANE_STEER_GAIN_MULT
-        # block): inside the COMMIT proximity regime the proved far-range
-        # gains limit-cycle against close-range parallax (ex stalled at
-        # -0.15..-0.18 for F56's whole approach).  Caps unchanged.
-        steer_gain = 1.0
-        if current.log_scale >= cfg.commit_min_log_scale:
-            steer_gain = cfg.near_plane_steer_gain_mult
+        # F150: the F57 off/full gain switch arrived too late to center Gate 1
+        # and defeated the continuous turn-reference filter with a command
+        # step.  TRACK, COMMIT, and the credit wait now read the same existing
+        # outer-range ramp.  No new state or authority owner is introduced.
+        steer_gain = self._course_steer_gain(current)
         target_roll, yaw_rate = self._coordinated_turn_request(
             heading_ex,
             steer_gain=steer_gain,
@@ -2919,6 +2911,14 @@ class CleanCourseController:
                 - cfg.course_vz_des_ramp_start_log_scale
             )
         )
+
+    def _course_steer_gain(self, current: _Hypothesis) -> float:
+        """One continuous far-to-crossing steering gain for every state."""
+
+        cfg = self.config
+        return 1.0 + (
+            cfg.near_plane_steer_gain_mult - 1.0
+        ) * self._course_range_ramp(current)
 
     def _continuous_collective(self, target: float, dt: float) -> float:
         """Carry one bounded collective request continuously across states."""

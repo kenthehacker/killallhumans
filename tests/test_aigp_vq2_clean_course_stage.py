@@ -2991,18 +2991,18 @@ def test_near_plane_steering_boost_scales_both_lateral_gains():
     assert out.yaw_rate_rad_s == pytest.approx(-0.144, abs=1e-9)  # 0.90*-0.16
 
 
-def test_commit_fresh_steering_carries_the_near_plane_boost():
+def test_commit_fresh_steering_uses_the_outer_range_schedule():
     boosted = _commit_controller()
-    boosted.current.scale_axis.p = math.log(0.35)  # log_scale -1.05 >= -1.2
+    boosted.current.scale_axis.p = math.log(0.35)
     out, _ = _drive_commit_window(boosted, 100.10)
     assert boosted.state is CleanCourseState.COMMIT
-    # Trim frozen by the helper: the gains act on ex=0.10 directly —
-    # 0.9*2.5*0.10 = 0.225, clamped to the 0.15 production yaw command cap.
+    # Physical outer range is near-plane, so 0.9*2.5*0.10 reaches the command
+    # cap regardless of the slower filtered inner scale estimate.
     assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
-    plain = _commit_controller()  # scale_axis log ~-3.0: far-range gains
+    plain = _commit_controller()  # filtered scale_axis log remains ~-3.0
     out, _ = _drive_commit_window(plain, 100.10)
     assert plain.state is CleanCourseState.COMMIT
-    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)  # 0.9*0.10
+    assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
 
 
 def _commit_controller(now_s=100.10):
@@ -3178,9 +3178,8 @@ def test_commit_entry_fires_sustained_aligned_near_plane():
     out, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
     assert out.state is CleanCourseState.COMMIT
-    # COMMIT steers while x is fresh (yaw 0.90 on ex=+0.10, trim frozen by
-    # the helper).
-    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
+    # COMMIT steers fresh ex=+0.10 with the same near-plane range authority.
+    assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
 
 
 def test_commit_entry_refuses_predicted_blackout_drift():
@@ -3963,13 +3962,11 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
         controller.current.last_x_measurement_s = now
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
-    # F56: while x is FRESH the commit steers with the TRACK P gains on
-    # the derotated hypothesis (yaw 0.90, roll 0.50) — the entry offset
-    # is finished, not frozen (F55 crossed beside the post).  2026-07-30:
-    # the gains act on the trim-corrected error (trim frozen at 0 by the
-    # helper, so ex=+0.10): yaw 0.09, roll 0.05.
-    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
-    assert out.target_roll_rad == pytest.approx(0.05, abs=1e-9)
+    # F150: while x is fresh, COMMIT consumes the same continuous outer-range
+    # gain as TRACK and pending credit.  At this near-plane fixture the
+    # ex=+0.10 request is yaw-capped and asks for 0.125 rad bank.
+    assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
+    assert out.target_roll_rad == pytest.approx(0.125, abs=1e-9)
     # F58: the real 0.15 rad advance drive, not the coast's 0.05 nudge.
     # F66: the F60 vertical-aim term is deleted — in commit the attitude is
     # the forward drive only; vertical translation is the servo's alone.
@@ -4020,12 +4017,11 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
         SPAWN_PITCH + 0.15, abs=1e-9
     )
     # F62/F63: once x goes STALE/censored the commit steers the PREDICTED
-    # hypothesis at FULL gain — heading-hold committed the residual drift
+    # hypothesis with the same range gain — heading-hold committed the residual drift
     # (F61 clipped the left post) and F62's half-gain derate
     # under-corrected (crossed -0.22 left); the prediction tracked the
-    # real bearing through the blackout.  ex=+0.10 (trim frozen at 0) ->
-    # yaw 0.90*0.10 = 0.09, roll 0.50*0.10 = 0.05 (boost off at this
-    # log scale).
+    # real bearing through the blackout.  F150 keeps the physical outer-range
+    # authority continuous across fresh and stale steering.
     controller.current.x_axis.p = 0.10
     for _ in range(18):
         now += 0.033
@@ -4038,8 +4034,13 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     # still come from exactly the same reference and approach the old P values.
     reference = controller._turn_reference_x
     assert reference == pytest.approx(0.10, abs=0.005)
-    assert out.yaw_rate_rad_s == pytest.approx(0.90 * reference, abs=1e-9)
-    assert out.target_roll_rad == pytest.approx(0.50 * reference, abs=1e-9)
+    gain = controller._course_steer_gain(controller.current)
+    assert out.yaw_rate_rad_s == pytest.approx(
+        min(0.15, 0.90 * gain * reference), abs=1e-9
+    )
+    assert out.target_roll_rad == pytest.approx(
+        0.50 * gain * reference, abs=1e-9
+    )
 
 
 def test_commit_qualified_vertical_keeps_full_physical_rate_reference():
@@ -4800,6 +4801,33 @@ def test_sustained_race_owned_error_is_not_integrated_out_of_turn_request():
         assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
         assert out.target_roll_rad > 0.0
     assert controller._turn_reference_x == pytest.approx(0.10, abs=1e-9)
+
+
+def test_steering_gain_is_one_continuous_outer_range_schedule():
+    # F150: F148 exposed a 0.097 rad/s one-tick yaw jump at the old
+    # off/full near-plane switch, while F149 still stalled at x=-0.119 before
+    # bottom censorship.  Every state now consumes this same continuous
+    # existing range ramp; crossing the old threshold cannot switch 1->2.5.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    current = controller.current
+    logs = [-2.10, -2.00, -1.80, -1.60, -1.40, -1.20, -1.10]
+    gains = []
+    yaws = []
+    for log_scale in logs:
+        current.outer_log_scale = log_scale
+        gain = controller._course_steer_gain(current)
+        gains.append(gain)
+        yaws.append(
+            controller._coordinated_turn_request(
+                -0.04, steer_gain=gain, yaw_rad=0.0
+            )[1]
+        )
+
+    assert gains[0] == pytest.approx(1.0)
+    assert gains[-1] == pytest.approx(2.5)
+    assert all(right >= left for left, right in zip(gains, gains[1:]))
+    assert all(right <= left < 0.0 for left, right in zip(yaws, yaws[1:]))
+    assert max(abs(right - left) for left, right in zip(yaws, yaws[1:])) < 0.02
 
 
 def test_commit_close_loss_latches_exact_zero_credit_wait():
