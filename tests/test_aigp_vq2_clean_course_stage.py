@@ -2287,6 +2287,9 @@ def test_turn_reference_survives_track_predict_commit_credit_and_promotion():
     outputs.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=-0.03))
     assert controller.gate_index == 0
 
+    # Association can assign a fresh id at the gate plane.  Race credit,
+    # not a second persistence gate, transfers the same measured bearing.
+    controller._track_first_seen_s["B"] = now
     promoted = controller.note_race(
         gate_index=1, race_boot_ms=2400, now_s=now + 0.01
     )
@@ -2298,8 +2301,12 @@ def test_turn_reference_survives_track_predict_commit_credit_and_promotion():
 
     active = [out for out in outputs if abs(out.yaw_rate_rad_s) > 1e-6]
     assert active
-    assert all(out.yaw_rate_rad_s < 0.0 for out in active)
-    assert all(out.target_roll_rad < 0.0 for out in active)
+    first_left = next(
+        index for index, out in enumerate(outputs) if out.yaw_rate_rad_s < 0.0
+    )
+    handoff = outputs[first_left:]
+    assert all(out.yaw_rate_rad_s < 0.0 for out in handoff)
+    assert all(out.target_roll_rad < 0.0 for out in handoff)
     assert controller.transitions == [(0, 1)]
 
 
@@ -2400,13 +2407,35 @@ def test_weak_successor_evidence_decays_turn_authority_smoothly():
     assert all(yaw <= 0.0 for yaw in yaws)
 
 
-def test_search_adopts_retained_successor_after_race_clears_old_ownership():
-    # F110 (20260801T055544Z-visual-course-195506c7): Gate-1 credit arrived
-    # while retained track B was marginal for direct promotion.  note_race
-    # correctly cleared the old current, but F107 still excluded B in SEARCH
-    # and the controller adopted a tiny unrelated track instead.  Once race
-    # authority advances and current ownership is None, B is the authorized
-    # current-gate candidate; adoption also clears its stale successor role.
+def test_tiny_opposite_successor_authority_cannot_erase_current_gate_turn():
+    # F120 live regression: Gate 1 was still x=-0.309 when a right-side Gate
+    # 2 candidate reached only 2.1e-7 authority.  Binary sign arbitration
+    # nevertheless snapped the left request to zero for ~1.4 s.
+    controller = _turn_reference_controller(successor_x=0.20, current_x=-0.30)
+    controller.current.aperture_half_x = 0.05
+    controller.current.aperture_half_y = 0.05
+    controller.current.raw_x = -0.30
+    controller._turn_aperture_reserve = 1e-6
+    controller._turn_successor_authority = 2.1e-7
+    controller._turn_reference_x = -0.276
+
+    outputs = []
+    now = 100.10
+    for _ in range(12):
+        now += 0.04
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        outputs.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
+
+    assert all(output.yaw_rate_rad_s < -0.02 for output in outputs)
+    assert all(output.target_roll_rad < 0.0 for output in outputs)
+    assert max(output.successor_blend for output in outputs) < 1e-5
+
+
+def test_authoritative_promotion_retains_stale_measured_successor_for_prediction():
+    # A measured bearing remains an IMU-derotated hypothesis after race
+    # credit.  Staleness selects PREDICT, rather than discarding the bearing
+    # into an unrelated SEARCH command; a fresh association resumes TRACK.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.observe(
         _update(
@@ -2424,10 +2453,10 @@ def test_search_adopts_retained_successor_after_race_clears_old_ownership():
         gate_index=1, race_boot_ms=2200, now_s=100.10
     )
     assert promoted
-    assert controller.state is CleanCourseState.SEARCH
-    assert controller.current is None
-    assert controller.successor is not None
-    assert controller.successor.track_id == "B"
+    assert controller.state is CleanCourseState.PREDICT
+    assert controller.current is not None
+    assert controller.current.track_id == "B"
+    assert controller.successor is None
 
     controller.observe(
         _update([_track("B", -0.43, 0.08)], frame_id=5), now_s=100.15
@@ -2615,14 +2644,14 @@ def test_pending_credit_hold_never_sweeps_before_delayed_credit():
         if out.yaw_rate_rad_s < 0.0:
             assert out.target_roll_rad < 0.0
         assert out.thrust > 0.0
-    # Delayed credit inside the window: the retained left-side successor
-    # is stale by construction (the crossing swallowed measurements) but
-    # is adopted immediately — never a blind sweep on the new leg.
+    # Delayed credit inside the window: the retained left-side successor is
+    # stale by construction, so it remains the current PREDICT hypothesis —
+    # never a blind sweep on the new leg.
     promoted = controller.note_race(
         gate_index=1, race_boot_ms=2400, now_s=t + 0.04
     )
     assert promoted
-    assert controller.state is CleanCourseState.TRACK
+    assert controller.state is CleanCourseState.PREDICT
     assert controller.current.track_id == "B"
     # A fresh post-credit frame of the adopted gate steers LEFT at once.
     controller.observe(
@@ -2755,19 +2784,17 @@ def test_authoritative_promotion_event_never_vetoed_by_vision():
         _update([_track("A", 0.10, 0.0), _track("B", 0.30, 0.05)], frame_id=3),
         now_s=100.08,
     )
-    # F42: promotion requires a persistent successor; seed the age.
-    controller._track_first_seen_s["B"] = 100.08 - 1.0
     promoted = controller.note_race(
         gate_index=1, race_boot_ms=2500, now_s=100.10
     )
     assert promoted
     assert controller.gate_index == 1
     assert controller.max_gate_index == 1
-    # Credible cached successor promoted; no visual proof required.
+    # The selected measured successor keeps its bearing through promotion.
     assert controller.state is CleanCourseState.TRACK
     assert controller.current.track_id == "B"
 
-    # Without a credible successor the controller enters SEARCH.
+    # Without any successor bearing the controller enters SEARCH.
     promoted = controller.note_race(
         gate_index=2, race_boot_ms=2750, now_s=100.12
     )
@@ -4225,40 +4252,24 @@ def test_successor_prefers_persistent_track_over_newborn_debris():
     assert controller.successor.track_id == "P"
 
 
-def test_promotion_requires_persistent_successor():
-    # F42: an otherwise credible but NEWBORN successor must not be adopted
-    # (debris is newborn every frame); the same successor is adopted once
-    # it has been associated past successor_min_age_s.
-    young = _tracked_controller(_track("A", 0.0, 0.0))
-    young.observe(
+def test_promotion_has_no_second_persistence_gate_for_measured_successor():
+    # The successor selector still prefers persistent tracks when alternatives
+    # exist, but authoritative race credit preserves the already-selected,
+    # measured bearing even if association assigned it a fresh id at crossing.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller.observe(
         _update(
             [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
             frame_id=3,
         ),
         now_s=100.08,
     )
-    promoted = young.note_race(gate_index=1, race_boot_ms=2500, now_s=100.10)
+    promoted = controller.note_race(
+        gate_index=1, race_boot_ms=2500, now_s=100.10
+    )
     assert promoted
-    assert young.state is CleanCourseState.SEARCH
-    assert young.current is None
-
-    aged = _tracked_controller(_track("A", 0.0, 0.0))
-    now = 100.10
-    frame = 10
-    for _ in range(20):  # ~0.66 s of association before the increment
-        now += 0.033
-        aged.observe(
-            _update(
-                [_track("A", 0.0, 0.0), _track("B", 0.30, 0.05, scale=0.05)],
-                frame_id=frame,
-            ),
-            now_s=now,
-        )
-        frame += 1
-    promoted = aged.note_race(gate_index=1, race_boot_ms=2500, now_s=now)
-    assert promoted
-    assert aged.state is CleanCourseState.TRACK
-    assert aged.current.track_id == "B"
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.current.track_id == "B"
 
 
 def test_unmeasurable_x_hypothesis_cannot_hold_track():

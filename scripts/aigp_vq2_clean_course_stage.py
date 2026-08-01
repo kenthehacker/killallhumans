@@ -846,20 +846,14 @@ BLEND_FAR_LOG_SCALE = -1.6  # below this the successor gets no blend
 BLEND_NEAR_LOG_SCALE = -0.9  # at this closure passage progress reaches one
 SUCCESSOR_MIN_LOG_SCALE_GAP = 0.25  # successor must remain visibly farther
 SUCCESSOR_PREVIEW_PROJECTION_S = 0.10
-PROMOTE_MAX_STD_NORM = 0.60  # cached-successor credibility at promotion
-# 0.30 -> 0.60 (F35, d25f23fe): promotion dropped the fresh gate-1 successor
-# (std 0.14-0.34, age 0) into SEARCH, and the reacquisition churn that
-# followed flapped TRACK/SEARCH 7 times before impact.  The successor is the
-# best evidence of the next gate at the one moment the course geometry is
-# known — adopt it unless it is truly stale.
-PROMOTE_MAX_AGE_S = 0.50  # cached-successor freshness at promotion
+SUCCESSOR_TURN_MAX_STD_NORM = 0.60  # zero turn authority at this uncertainty
 # F42 (20260729T201743Z-visual-course-1e24b6d2): confidence provably cannot
 # separate the real gate from detector debris — a bottom-left splinter
 # out-confidenced the real gate-1 halves (0.62-0.71 vs 0.42-0.54) and was
 # adopted at promotion.  PERSISTENCE can: debris is newborn every frame
 # while the real gate halves stayed associated for seconds.  Successor
-# ranking, promotion credibility, and re-acquisition all prefer track age.
-SUCCESSOR_MIN_AGE_S = 0.5  # persistence required of a promoted successor
+# ranking, continuous turn authority, and re-acquisition all prefer track age.
+SUCCESSOR_MIN_AGE_S = 0.5
 REACQUIRE_MIN_AGE_S = 0.3  # persistence preferred at SEARCH re-acquisition
 # F49 newborn suspicious-geometry adoption gate (terminal F48 failure): the
 # gate-1 promotion adopted a NEWBORN top-censored extreme-aspect ceiling
@@ -1221,8 +1215,7 @@ class CleanCourseConfig:
     blend_near_log_scale: float = BLEND_NEAR_LOG_SCALE
     successor_min_log_scale_gap: float = SUCCESSOR_MIN_LOG_SCALE_GAP
     successor_preview_projection_s: float = SUCCESSOR_PREVIEW_PROJECTION_S
-    promote_max_std_norm: float = PROMOTE_MAX_STD_NORM
-    promote_max_age_s: float = PROMOTE_MAX_AGE_S
+    successor_turn_max_std_norm: float = SUCCESSOR_TURN_MAX_STD_NORM
     successor_min_age_s: float = SUCCESSOR_MIN_AGE_S
     collective_decay_tau_s: float = COLLECTIVE_DECAY_TAU_S
     vertical_qualify_max_age_s: float = VERTICAL_QUALIFY_MAX_AGE_S
@@ -1666,51 +1659,27 @@ class CleanCourseController:
         self._turn_successor_authority = 0.0
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             self._exit_coast()
-        # F76: an authoritative increment settles the pending-credit hold.
-        pending_credit = self._pending_credit_until_s is not None
+        # An authoritative increment settles the pending-credit hold.
         self._pending_credit_until_s = None
 
         successor = self.successor
-        credible = (
+        if (
             successor is not None
-            and successor.position_std <= self.config.promote_max_std_norm
-            and now_s - successor.last_measurement_s
-            <= self.config.promote_max_age_s
-            # F40: the promoted successor must have a real measured x-axis —
-            # NEVER_MEASURED_S (-1e9) fails every horizon check, so an
-            # edge-clipped splinter with an unmeasured x can never be
-            # adopted as the aim point.
-            and now_s - successor.last_x_measurement_s
-            <= self.config.promote_max_age_s
-            # F42: the successor must also be PERSISTENT — debris is newborn
-            # every frame while the real gate stays associated; a
-            # never-seen id ages 0 and fails.
-            and self._track_age_s(successor.track_id, now_s)
-            >= self.config.successor_min_age_s
-        )
-        if credible:
-            self.current = successor
-            self.successor = None
-            self.state = CleanCourseState.TRACK
-            self._set_reliable_bearing(self.current.x, self.current.y)
-        elif (
-            pending_credit
-            and successor is not None
-            and now_s - successor.last_x_measurement_s
-            <= ENGULFING_ANCHOR_MAX_AGE_S + self.config.pending_credit_hold_s
-            and self._track_age_s(successor.track_id, now_s)
-            >= self.config.successor_min_age_s
+            # No image-x measurement means there is no bearing to derotate.
+            # Every measured successor, however uncertain or short-lived,
+            # remains the same probabilistic hypothesis after authoritative
+            # race promotion; normal prediction and association own its
+            # growing uncertainty instead of a second binary admission gate.
+            and successor.last_x_measurement_s > NEVER_MEASURED_S + 1.0
         ):
-            # F76: delayed credit after a pending-credit hold.  The coast
-            # crossing swallowed fresh measurements, so the retained
-            # successor is stale by construction — but it is the only real
-            # bearing evidence on the new leg, and the F75 sweep away from
-            # it blinded the leg within 0.4 s.  Re-acquire it directly
-            # (persistence still required: newborn debris never qualifies)
-            # and let the normal TRACK law re-center on it.
             self.current = successor
             self.successor = None
-            self.state = CleanCourseState.TRACK
+            self.state = (
+                CleanCourseState.TRACK
+                if now_s - self.current.last_measurement_s
+                <= self.config.predict_frame_gap_s
+                else CleanCourseState.PREDICT
+            )
             self._set_reliable_bearing(self.current.x, self.current.y)
         else:
             self.current = None
@@ -3305,7 +3274,8 @@ class CleanCourseController:
             )
             confidence = _clamp01(successor.confidence)
             uncertainty = _clamp01(
-                1.0 - successor.position_std / cfg.promote_max_std_norm
+                1.0
+                - successor.position_std / cfg.successor_turn_max_std_norm
             )
             freshness = _clamp01(
                 1.0
@@ -3339,16 +3309,16 @@ class CleanCourseController:
             self._turn_successor_authority if successor is not None else 0.0
         )
         if successor is not None:
+            # Passage alignment loses weight only as the proved aperture
+            # reserve grows; successor bearing gains its independently
+            # confidence/covariance/freshness-weighted authority.  This sum
+            # has no binary sign arbitration: infinitesimal evidence for a
+            # future gate cannot erase the current-gate correction, while a
+            # safe near-plane aperture naturally hands the reference over.
             desired = (
-                (1.0 - authority) * float(current_error)
+                (1.0 - self._turn_aperture_reserve) * float(current_error)
                 + authority * successor.x
             )
-            # Once credible successor evidence establishes turn direction,
-            # current-passage alignment may reduce that request to zero but
-            # may not reverse it.  A real successor bearing crossing the image
-            # center still changes direction normally on a later tick.
-            if authority > 0.0 and successor.x * desired < 0.0:
-                desired = 0.0
 
         if self._turn_reference_x is None:
             self._turn_reference_x = float(desired)
@@ -3357,12 +3327,6 @@ class CleanCourseController:
                 float(desired) - self._turn_reference_x
             )
         self._turn_reference_x = _clamp(self._turn_reference_x, -1.0, 1.0)
-        if (
-            successor is not None
-            and authority > 0.0
-            and successor.x * self._turn_reference_x < 0.0
-        ):
-            self._turn_reference_x = 0.0
 
         self._successor_heading_blend = authority
         self._successor_heading_error_norm = self._turn_reference_x
