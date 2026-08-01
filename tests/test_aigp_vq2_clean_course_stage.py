@@ -2192,7 +2192,7 @@ def _successor_preview_controller(
     return controller
 
 
-def test_aperture_reserved_successor_preview_changes_yaw_only_before_credit():
+def test_aperture_reserved_successor_preview_coordinates_yaw_and_prebank():
     # F115 retained a fresh/persistent Gate-1 bearing for >2 s before Gate-0
     # credit, yet emitted current-only yaw/roll until promotion.  The new
     # preview uses that evidence for heading while the current aperture has
@@ -2207,12 +2207,15 @@ def test_aperture_reserved_successor_preview_changes_yaw_only_before_credit():
     assert with_preview.gate_index == 0
     assert with_preview.current_track_id == "A"
     assert with_preview.successor_track_id == "B"
-    assert 0.0 < with_preview.successor_blend <= 0.35
+    assert 0.20 < with_preview.successor_blend <= 0.35
     assert with_preview.yaw_rate_rad_s < 0.0 < without_preview.yaw_rate_rad_s
-    # Roll/pitch/thrust still solve the current-gate intercept exactly.
-    assert with_preview.target_roll_rad == pytest.approx(
-        without_preview.target_roll_rad, abs=1e-12
-    )
+    # F118: yaw-only F117 barely changed the handoff.  A small same-direction
+    # prebank now coordinates the turn, while the current roll correction
+    # remains in the sum and the aperture lease caps/withdraws it.
+    assert with_preview.target_roll_rad < without_preview.target_roll_rad
+    assert abs(preview._successor_prebank_rad) <= 0.13 + 1e-12
+    assert preview._successor_prebank_rad < 0.0
+    # Pitch/thrust remain current-gate-only.
     assert with_preview.target_pitch_rad == pytest.approx(
         without_preview.target_pitch_rad, abs=1e-12
     )
@@ -2224,8 +2227,8 @@ def test_aperture_reserved_successor_preview_changes_yaw_only_before_credit():
 
 
 def test_successor_heading_preview_continues_through_safe_commit():
-    # A TRACK->COMMIT transition must not undo the preturn while fresh
-    # aperture reserve remains.  COMMIT roll remains current-gate-only.
+    # A TRACK->COMMIT transition must not undo the coordinated preturn while
+    # fresh aperture reserve remains.
     preview = _successor_preview_controller()
     current_only = _successor_preview_controller(successor_x=None)
     for controller in (preview, current_only):
@@ -2238,9 +2241,8 @@ def test_successor_heading_preview_continues_through_safe_commit():
     assert with_preview.state is CleanCourseState.COMMIT
     assert with_preview.successor_blend > 0.0
     assert with_preview.yaw_rate_rad_s < without_preview.yaw_rate_rad_s
-    assert with_preview.target_roll_rad == pytest.approx(
-        without_preview.target_roll_rad, abs=1e-12
-    )
+    assert with_preview.target_roll_rad < without_preview.target_roll_rad
+    assert preview._successor_prebank_rad < 0.0
     assert with_preview.target_pitch_rad == pytest.approx(
         without_preview.target_pitch_rad, abs=1e-12
     )
@@ -2268,6 +2270,7 @@ def test_successor_heading_preview_yields_when_current_aperture_is_consumed():
     for controller in (outside, no_aperture, stale, newborn, not_farther):
         out = _command(controller, 100.10, pitch=SPAWN_PITCH)
         assert out.successor_blend == 0.0
+        assert controller._successor_prebank_rad == 0.0
         steer_gain = (
             controller.config.near_plane_steer_gain_mult
             if controller.current.log_scale

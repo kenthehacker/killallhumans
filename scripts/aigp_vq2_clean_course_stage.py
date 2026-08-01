@@ -836,13 +836,26 @@ SEARCH_SWEEP_GAIN = 2.0  # heading-error gain to the bounded yaw rate
 # F116 successor heading preview: the clean rewrite's original 0.50 blend
 # shared one aim between yaw, roll, and vertical control.  A far successor
 # could therefore cancel the current-gate intercept (flight ab6252b2), and the
-# whole preview was removed.  The replacement is yaw-only and reserves the
-# current aperture for roll/intercept ownership.  The last pre-reset controller
-# bounded this independent heading authority at 0.35; retain that ceiling.
-SUCCESSOR_BLEND_MAX = 0.35  # aperture-reserved yaw-only lookahead ceiling
+# whole preview was removed.  The replacement reserves the current aperture,
+# keeps its roll correction, and separates bounded heading/prebank feed-forward
+# from the translational aim.  The last pre-reset controller bounded heading
+# authority at 0.35; retain that ceiling.
+SUCCESSOR_BLEND_MAX = 0.35  # aperture-reserved coordinated lookahead ceiling
 BLEND_FAR_LOG_SCALE = -1.6  # below this the successor gets no blend
 BLEND_NEAR_LOG_SCALE = -0.9  # at this closure the blend ceiling applies
 SUCCESSOR_MIN_LOG_SCALE_GAP = 0.25  # successor must remain visibly farther
+# F118 coordinated preview: F117 proved yaw-only preview was too weak
+# (command peaked ~0.03 rad/s; Gate 1 still handed off at x=-0.55).  Live
+# TRACK feedback closes every camera frame, so reserve projects over the
+# historical pre-pass 0.10 s horizon rather than COMMIT's 0.50 s blackout.
+# Once persistence/freshness/covariance/confidence admit an identity, strength
+# comes from range and aperture reserve instead of attenuating the bearing a
+# second time.  A separately capped 0.13-rad prebank is the last proved small
+# legacy tier; it shares the same reserve and can never survive its withdrawal.
+SUCCESSOR_PREVIEW_PROJECTION_S = 0.10
+SUCCESSOR_MIN_CONFIDENCE = 0.40
+SUCCESSOR_PREBANK_MAX_RAD = 0.13
+SUCCESSOR_PREBANK_FULL_BEARING_NORM = 0.40
 PROMOTE_MAX_STD_NORM = 0.60  # cached-successor credibility at promotion
 # 0.30 -> 0.60 (F35, d25f23fe): promotion dropped the fresh gate-1 successor
 # (std 0.14-0.34, age 0) into SEARCH, and the reacquisition churn that
@@ -1217,6 +1230,12 @@ class CleanCourseConfig:
     blend_far_log_scale: float = BLEND_FAR_LOG_SCALE
     blend_near_log_scale: float = BLEND_NEAR_LOG_SCALE
     successor_min_log_scale_gap: float = SUCCESSOR_MIN_LOG_SCALE_GAP
+    successor_preview_projection_s: float = SUCCESSOR_PREVIEW_PROJECTION_S
+    successor_min_confidence: float = SUCCESSOR_MIN_CONFIDENCE
+    successor_prebank_max_rad: float = SUCCESSOR_PREBANK_MAX_RAD
+    successor_prebank_full_bearing_norm: float = (
+        SUCCESSOR_PREBANK_FULL_BEARING_NORM
+    )
     promote_max_std_norm: float = PROMOTE_MAX_STD_NORM
     promote_max_age_s: float = PROMOTE_MAX_AGE_S
     successor_min_age_s: float = SUCCESSOR_MIN_AGE_S
@@ -1345,6 +1364,7 @@ class CleanCourseController:
         # recomputes them from fresh current/successor geometry.
         self._successor_heading_blend = 0.0
         self._successor_heading_error_norm: Optional[float] = None
+        self._successor_prebank_rad = 0.0
         # Course-heading anchor (F31): yaw at the leg start (lazily
         # captured on the first command tick with a live yaw measurement,
         # re-armed on every authoritative promotion).  Yaw commands that
@@ -1729,6 +1749,7 @@ class CleanCourseController:
         self._pre_cross_brake_active = False  # main path recomputes below
         self._successor_heading_blend = 0.0
         self._successor_heading_error_norm = None
+        self._successor_prebank_rad = 0.0
         if yaw_rad is not None and self._course_anchor_yaw_rad is None:
             self._course_anchor_yaw_rad = float(yaw_rad)
         if self._last_command_s is None:
@@ -1956,13 +1977,19 @@ class CleanCourseController:
                     now_s=now_s,
                 )
                 commit_heading_ex = commit_ex
+                commit_preview_roll = 0.0
                 if commit_blend > 0.0 and self.successor is not None:
                     commit_heading_ex = (
                         (1.0 - commit_blend) * commit_ex
                         + commit_blend * self.successor.x
                     )
+                    commit_preview_roll = self._successor_prebank(
+                        commit_blend,
+                        self.successor,
+                    )
                     self._successor_heading_blend = commit_blend
                     self._successor_heading_error_norm = commit_heading_ex
+                    self._successor_prebank_rad = commit_preview_roll
                 commit_yaw = _clamp(
                     cfg.yaw_error_sign
                     * cfg.yaw_error_gain
@@ -1976,7 +2003,8 @@ class CleanCourseController:
                     cfg.roll_error_sign
                     * cfg.roll_error_gain
                     * commit_steer_gain
-                    * commit_ex,
+                    * commit_ex
+                    + commit_preview_roll,
                     -cfg.max_target_roll_rad,
                     cfg.max_target_roll_rad,
                 )
@@ -2179,8 +2207,9 @@ class CleanCourseController:
             )
 
         # F116 separates HEADING from PHYSICAL INTERCEPT.  Successor preview
-        # never changes roll, pitch, thrust, passage, or race ownership; the
-        # current-gate ``ex``/``ey`` remain authoritative for all of them.
+        # never changes pitch, thrust, passage, or race ownership; current-gate
+        # ``ex``/``ey`` remain authoritative, with F118 adding only a small
+        # aperture-leased prebank to the current roll correction.
         # The aperture-reserved yaw channel is computed after the orbit trim.
         # Historical context (flight
         # ab6252b2): track 07 (gate 1) was centered and approached to span
@@ -2232,14 +2261,18 @@ class CleanCourseController:
         ex -= self._ex_trim
 
         # The successor is a heading preview, not a second aim point.  Its
-        # authority is computed from fresh successor trust and the CURRENT
-        # aperture reserve; it fades to zero as current error/drift consumes
-        # that reserve.  Roll below deliberately continues to use ``ex``.
+        # authority is computed from admitted successor evidence and the
+        # CURRENT aperture reserve; it fades to zero as current error/drift
+        # consumes that reserve.  Roll keeps its current-gate correction and
+        # receives only the separately capped coordinated prebank.
         blend = self._successor_blend(current, self.successor, now_s=now_s)
+        preview_roll = 0.0
         if blend > 0.0 and self.successor is not None:
             heading_ex = (1.0 - blend) * ex + blend * self.successor.x
+            preview_roll = self._successor_prebank(blend, self.successor)
             self._successor_heading_blend = blend
             self._successor_heading_error_norm = heading_ex
+            self._successor_prebank_rad = preview_roll
         else:
             heading_ex = ex
 
@@ -2623,7 +2656,8 @@ class CleanCourseController:
         )
         yaw_rate = self._anchor_clamped_yaw(yaw_rate, yaw_rad)
         target_roll = _clamp(
-            cfg.roll_error_sign * cfg.roll_error_gain * steer_gain * ex,
+            cfg.roll_error_sign * cfg.roll_error_gain * steer_gain * ex
+            + preview_roll,
             -cfg.max_target_roll_rad * steer_cap,
             cfg.max_target_roll_rad * steer_cap,
         )
@@ -3231,14 +3265,14 @@ class CleanCourseController:
         *,
         now_s: float,
     ) -> float:
-        """Return bounded yaw-only preview authority for a farther gate.
+        """Return bounded coordinated-preview authority for a farther gate.
 
-        The current gate keeps physical-intercept ownership: roll, pitch,
-        thrust, crossing admission, and race ownership never read this value.
-        Yaw may preview the retained successor only out of *spare* current-
+        The current gate keeps passage ownership: its roll correction, pitch,
+        thrust, crossing admission, and race index remain authoritative.  A
+        small successor yaw/prebank feed-forward may use only *spare* current-
         aperture margin.  As current error/drift consumes that margin the
-        preview falls continuously to zero, closing the ab6252b2 cancellation
-        family without returning to the post-credit-only turn architecture.
+        entire preview falls continuously to zero, closing the ab6252b2
+        cancellation family without returning to post-credit-only turning.
         """
 
         if successor is None or self.state not in (
@@ -3262,6 +3296,7 @@ class CleanCourseController:
             > cfg.outer_expansion_max_age_s
             or self._track_age_s(successor.track_id, now_s)
             < cfg.successor_min_age_s
+            or successor.confidence < cfg.successor_min_confidence
             or successor.position_std > cfg.search_covariance_std_norm
             or successor.outer_log_scale
             > current.outer_log_scale - cfg.successor_min_log_scale_gap
@@ -3275,7 +3310,7 @@ class CleanCourseController:
             return 0.0
         projected_current_error = (
             max(abs(current.x), abs(current.raw_x))
-            + abs(current.vx) * cfg.commit_blackout_s
+            + abs(current.vx) * cfg.successor_preview_projection_s
         )
         aperture_reserve = _clamp01(
             1.0 - projected_current_error / aperture_budget
@@ -3287,15 +3322,34 @@ class CleanCourseController:
             (current.outer_log_scale - cfg.blend_far_log_scale)
             / (cfg.blend_near_log_scale - cfg.blend_far_log_scale)
         )
-        covariance_trust = _clamp01(
-            1.0 - successor.position_std / cfg.promote_max_std_norm
+        return cfg.successor_blend_max * closure * aperture_reserve
+
+    def _successor_prebank(
+        self,
+        blend: float,
+        successor: Optional[_Hypothesis],
+    ) -> float:
+        """Small coordinated bank under the same aperture-reserve lease."""
+
+        cfg = self.config
+        if (
+            successor is None
+            or blend <= 0.0
+            or cfg.successor_blend_max <= 1e-9
+            or cfg.successor_prebank_full_bearing_norm <= 1e-9
+        ):
+            return 0.0
+        authority = _clamp01(blend / cfg.successor_blend_max)
+        bearing = _clamp(
+            successor.x / cfg.successor_prebank_full_bearing_norm,
+            -1.0,
+            1.0,
         )
-        trust = min(_clamp01(successor.confidence), covariance_trust)
         return (
-            cfg.successor_blend_max
-            * closure
-            * trust
-            * aperture_reserve
+            cfg.roll_error_sign
+            * cfg.successor_prebank_max_rad
+            * authority
+            * bearing
         )
 
     def _effective_untrusted_gate_y(
@@ -4018,6 +4072,7 @@ def _clean_course_tick_trace(
         "successor_heading_error_norm": (
             controller._successor_heading_error_norm
         ),
+        "successor_prebank_rad": controller._successor_prebank_rad,
         "vertical_censor_edge": (
             None if current is None else int(current.vertical_censor_edge)
         ),
