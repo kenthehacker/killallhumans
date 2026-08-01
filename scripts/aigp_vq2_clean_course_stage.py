@@ -2831,18 +2831,19 @@ class CleanCourseController:
                 / max(1e-6, cfg.successor_min_log_scale_gap)
             )
             # Successor selection already owns persistence, so track age is
-            # deliberately absent here.  F125/F126 showed that feeding this
-            # product directly into the reference still let covariance loss
-            # followed by a fresh tracker id create a 0.126 rad/s yaw jump.
-            # Carry the evidence product continuously; weak evidence changes
-            # authority instead of resetting it, while the one reference below
-            # remains the only state that can command yaw and bank.
+            # deliberately absent here.  F132 pairs F131's signed passage
+            # reserve with one continuous evidence quality.  Confidence,
+            # covariance, and freshness are correlated consequences of the
+            # same missed observation; multiplying them made the credible
+            # left successor lose authority three times while passage reserve
+            # was rising, reversing the shared reference until reassociation.
+            # The weakest evidence remains authoritative without restoring a
+            # binary qualification gate or a second command-bearing state.
+            evidence_quality = min(confidence, uncertainty, freshness)
             desired_authority = (
                 closure
                 * self._turn_aperture_reserve
-                * confidence
-                * uncertainty
-                * freshness
+                * evidence_quality
                 * range_order
             )
         self._turn_successor_authority += alpha * (

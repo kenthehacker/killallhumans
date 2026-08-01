@@ -2175,6 +2175,65 @@ def test_successor_reassociation_cannot_recreate_precredit_s_turn():
     assert max(yaw_steps) < 0.08
 
 
+def test_correlated_successor_quality_does_not_create_precredit_dead_zone():
+    # F131 fixed the passage reserve: it rose 0.35 -> 0.83 while the old
+    # Gate-1 hypothesis remained consistently left.  Yet covariance and age
+    # rose from the same missed frames, and their product (again multiplied by
+    # confidence) drove authority 0.10 -> 0.05 and reversed the reference
+    # until reassociation.  Use the weakest quality once so the bounded,
+    # derotated bearing keeps one left handoff through the fresh-id tick.
+    controller = _turn_reference_controller(current_x=0.02)
+    now = 100.10
+    controller.state = CleanCourseState.PREDICT
+    controller.current.outer_log_scale = -0.95
+    controller.current.aperture_half_x = None
+    controller.current.aperture_half_y = None
+    controller.successor.x_axis.p = -0.43
+    controller.successor.confidence = 0.64
+    controller.successor.outer_log_scale = -4.37
+    controller._turn_aperture_reserve = 0.438
+    controller._turn_successor_authority = 0.055
+    controller._turn_reference_x = 0.010
+    controller._turn_reference_yaw_rad = 0.0
+    controller._last_command_s = now
+
+    samples = []
+    variations = (
+        # The old-id uncertainty/age progression while Gate 0 engulfed.
+        (0.378, 0.375, None),
+        (0.460, 0.469, None),
+        (0.556, 0.578, None),
+        # Same physical left gate, now assigned the fresh fused-track id.
+        (0.141, 0.0, "B-reassociated"),
+        (0.014, 0.0, None),
+        (0.014, 0.0, None),
+    )
+    for std, age_s, replacement_id in variations:
+        now += 0.047
+        variance = (std / math.sqrt(2.0)) ** 2
+        controller.successor.x_axis.pp = variance
+        controller.successor.y_axis.pp = variance
+        controller.successor.last_measurement_s = now - age_s
+        controller.successor.last_x_measurement_s = now - age_s
+        if replacement_id is not None:
+            controller.successor.track_id = replacement_id
+            controller._track_first_seen_s[replacement_id] = now
+        controller._last_engulfing_anchor_s = now
+        samples.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
+
+    first_left = next(
+        index for index, sample in enumerate(samples) if sample.yaw_rate_rad_s < 0.0
+    )
+    assert first_left < 3  # useful turn starts before the fresh-id tick
+    assert all(sample.yaw_rate_rad_s < 0.0 for sample in samples[first_left:])
+    assert all(sample.target_roll_rad < 0.0 for sample in samples[first_left:])
+    yaw_steps = [
+        abs(right.yaw_rate_rad_s - left.yaw_rate_rad_s)
+        for left, right in zip(samples, samples[1:])
+    ]
+    assert max(yaw_steps) < 0.08
+
+
 def test_weak_successor_evidence_decays_turn_reference_smoothly():
     controller = _turn_reference_controller(current_x=0.04)
     now = 100.10
