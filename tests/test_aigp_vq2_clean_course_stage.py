@@ -158,7 +158,7 @@ def test_support_tilt_compensation_is_spawn_relative():
     # (F90/F91/F93/F94) and F94's gate slid out the bottom of the frame
     # into a ground collision (id 1002).  Compensation must be relative
     # to the level attitude; at level both formulas agree (0.2594).
-    controller = _tracked_controller(_track("A", 0.0, 0.427))
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
     brake_attitude = SPAWN_PITCH - 0.267
     now = 100.10
     out = None
@@ -168,8 +168,7 @@ def test_support_tilt_compensation_is_spawn_relative():
         controller.current.last_x_measurement_s = now
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=brake_attitude)
-    # Compensated ey = 0.427 - 0.267*1.6 ~= 0: a world-centered gate at the
-    # brake attitude, so the emitted collective IS the tilt-compensated
+    # Raw ey is centered, so the emitted collective IS the tilt-compensated
     # support.  True hover at 0.267 rad from level is
     # (0.247/cos(0.31))/cos(0.267) ~= 0.269; the absolute-rpy formula
     # emits >= 0.29.
@@ -212,7 +211,7 @@ def test_identical_global_vertical_sign_at_every_gate():
             controller.current.last_y_measurement_s = now
             controller.current.last_measurement_s = now
             controller._alt_est_m = 2.0  # honest altitude (floor quiet)
-        output = _command(controller, now + 0.02)
+        output = _command(controller, now + 0.02, pitch=SPAWN_PITCH)
         assert output.vertical_qualified
         assert output.gate_index == gate
         thrusts.append(output.thrust)
@@ -246,41 +245,39 @@ def test_vertical_sign_is_the_gate0_minus_form_by_default():
     )
 
 
-def test_vertical_error_is_pitch_attitude_compensated():
-    # F50 (flight 20260729T222920Z-visual-course-3a8ed087): the vertical
-    # servo read image-y with NO attitude compensation, so the F49 nose-up
-    # brake (0.15 rad up from spawn) tilted the camera up and the world
-    # read ~0.24 norm LOW — the servo "centered" a gate that was really
-    # ~1.5-2 m below and held ceiling height into a truss.  (F32/F34/F36
-    # saw the same contamination with the opposite sign: nose-down dives
-    # read gates HIGH.)  Compensation is zero at the spawn attitude.
-    controller = _tracked_controller(_track("A", 0.0, 0.0))
-    assert controller._compensated_ey(0.0, SPAWN_PITCH) == pytest.approx(0.0)
-    # Nose-up 0.15 rad REDUCES the effective ey by 1.6 * 0.15 = 0.24.
-    assert controller._compensated_ey(
-        0.0, SPAWN_PITCH - 0.15
-    ) == pytest.approx(-0.24)
-    # Nose-down 0.15 rad raises it (the F32/F34/F36 "gate HIGH" sign).
-    assert controller._compensated_ey(
-        0.0, SPAWN_PITCH + 0.15
-    ) == pytest.approx(0.24)
-    # End to end: a gate reading 0.24 low while braked 0.15 rad nose-up is
-    # a LEVEL gate — the PD asks for the bare tilt-compensated support
-    # (F95: compensated relative to the LEVEL attitude, not absolute rpy)...
+def test_vertical_owner_uses_raw_image_y_during_pitch_brake():
+    # F122: Gate 1 was visibly below center at credit (raw y +0.089), but
+    # the fixed pitch correction changed it to -0.150 and commanded climb
+    # until raw y reached +0.383.  Pitch geometry may still use the corrected
+    # bearing; the sole collective owner preserves raw image-aperture custody.
     braked = _tracked_controller(_track("A", 0.0, 0.24))
+    braked._alt_est_m = 2.0
     out = _command(braked, 100.10, pitch=SPAWN_PITCH - 0.15)
     assert out.thrust == pytest.approx(
-        SPAWN_SUPPORT / math.cos(0.15), abs=1e-9
+        SPAWN_SUPPORT / math.cos(0.15) - 0.12 * 0.24,
+        abs=1e-9,
     )
-    # ...while the same reading at the spawn attitude really is low.
-    # (F100: vz_des = -0.24 tracked at 0.12/m/s, vz_est 0; honest altitude
-    # keeps the F103 near-ground descent taper out of this law check.)
+
+    # At the spawn attitude the same raw evidence asks for the same desired
+    # vertical rate; only ordinary tilt support differs.
     level = _tracked_controller(_track("A", 0.0, 0.24))
     level._alt_est_m = 2.0
     out = _command(level, 100.10, pitch=SPAWN_PITCH)
     assert out.thrust == pytest.approx(
         SPAWN_SUPPORT - 0.12 * 0.24, abs=1e-9
     )
+
+    # Reproduce the F122 credit geometry.  With an inherited -0.097 m/s sink,
+    # raw y +0.089 asks for nearly zero rate error, not a climb step.
+    credit = _tracked_controller(_track("A", 0.0, 0.089))
+    credit._alt_est_m = 2.0
+    credit._vz_est_m_s = -0.097
+    out = _command(credit, 100.10, pitch=-0.460)
+    support = SPAWN_SUPPORT / math.cos(-0.460 - SPAWN_PITCH)
+    assert out.thrust == pytest.approx(
+        support + 0.12 * (-0.089 - -0.097), abs=1e-9
+    )
+    assert out.thrust < support + 0.002
 
 
 def test_gate0_takeoff_boost_is_feedforward_only():
