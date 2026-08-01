@@ -643,8 +643,7 @@ SEARCH_SWEEP_GAIN = 2.0  # heading-error gain to the bounded yaw rate
 # removes the second age-gated authority filter: successor selection already
 # owns persistence, while this sole derotated reference owns command smoothing.
 TURN_REFERENCE_TAU_S = 0.15
-BLEND_FAR_LOG_SCALE = -1.6  # below this the successor gets no blend
-BLEND_NEAR_LOG_SCALE = -0.9  # at this closure passage progress reaches one
+BLEND_NEAR_LOG_SCALE = -0.9  # at this apparent scale closure reaches one
 SUCCESSOR_MIN_LOG_SCALE_GAP = 0.25  # successor must remain visibly farther
 SUCCESSOR_PREVIEW_PROJECTION_S = 0.10
 SUCCESSOR_TURN_MAX_STD_NORM = 0.60  # zero turn authority at this uncertainty
@@ -997,7 +996,6 @@ class CleanCourseConfig:
     search_sweep_gain: float = SEARCH_SWEEP_GAIN
     pending_credit_hold_s: float = PENDING_CREDIT_HOLD_S
     turn_reference_tau_s: float = TURN_REFERENCE_TAU_S
-    blend_far_log_scale: float = BLEND_FAR_LOG_SCALE
     blend_near_log_scale: float = BLEND_NEAR_LOG_SCALE
     successor_min_log_scale_gap: float = SUCCESSOR_MIN_LOG_SCALE_GAP
     successor_preview_projection_s: float = SUCCESSOR_PREVIEW_PROJECTION_S
@@ -2782,14 +2780,13 @@ class CleanCourseController:
         evidence_weight = 0.0
         desired = float(current_error)
         if successor is not None:
-            closure_span = cfg.blend_near_log_scale - cfg.blend_far_log_scale
-            closure = (
-                _clamp01(
-                    (current.outer_log_scale - cfg.blend_far_log_scale)
-                    / closure_span
-                )
-                if abs(closure_span) > 1e-9
-                else 0.0
+            # F126 removes the far-closure cutoff that held a visible left
+            # successor at exactly zero authority for the first ~1.25 s of
+            # F125.  Apparent scale relative to the near-plane scale is a
+            # continuous passage-progress signal: positive at every finite
+            # range, asymptotically small when far, and one at/after near.
+            closure = math.exp(
+                min(0.0, current.outer_log_scale - cfg.blend_near_log_scale)
             )
             confidence = _clamp01(successor.confidence)
             uncertainty = _clamp01(

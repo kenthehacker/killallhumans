@@ -1868,17 +1868,21 @@ def _turn_reference_controller(
     *,
     successor_x=-0.45,
     current_x=0.02,
+    current_scale=0.45,
+    successor_scale=0.10,
     now_s=100.10,
 ):
     """Fresh Gate-0 geometry with optional persistent farther Gate 1."""
 
     controller = _tracked_controller(
-        _track("A", current_x, 0.0, scale=0.45),
+        _track("A", current_x, 0.0, scale=current_scale),
         config=_config(ex_trim_gain=0.0),
     )
-    tracks = [_track("A", current_x, 0.0, scale=0.45)]
+    tracks = [_track("A", current_x, 0.0, scale=current_scale)]
     if successor_x is not None:
-        tracks.append(_track("B", successor_x, 0.05, scale=0.10))
+        tracks.append(
+            _track("B", successor_x, 0.05, scale=successor_scale)
+        )
     controller.observe(_update(tracks, frame_id=3), now_s=now_s - 0.02)
     if successor_x is not None:
         controller._track_first_seen_s["B"] = now_s - 1.0
@@ -2087,6 +2091,44 @@ def test_fresh_reassociated_successor_has_no_second_turn_age_gate():
     assert out.successor_blend > 0.0
     assert out.yaw_rate_rad_s < 0.0
     assert out.target_roll_rad < 0.0
+
+
+def test_visible_left_successor_has_continuous_closure_authority_from_far():
+    # F125: Gate 1 was visible from launch, but the far-closure threshold held
+    # its weight at exactly zero and let current-gate steering reverse right
+    # just before credit.  Scale-relative closure must build the same left
+    # reference continuously across a representative approach time series.
+    controller = _turn_reference_controller(
+        current_x=0.0,
+        current_scale=0.12,
+        successor_scale=0.025,
+    )
+    now = 100.10
+    outputs = []
+    approach = (
+        (-2.10, 0.00),
+        (-1.90, 0.01),
+        (-1.70, 0.02),
+        (-1.50, 0.03),
+        (-1.30, 0.04),
+        (-1.10, 0.04),
+        (-0.90, 0.02),
+    )
+    for outer_log_scale, current_x in approach:
+        for _ in range(4):
+            now += 0.04
+            controller.current.outer_log_scale = outer_log_scale
+            controller.current.x_axis.p = current_x
+            controller.current.raw_x = current_x
+            controller.successor.last_measurement_s = now
+            controller.successor.last_x_measurement_s = now
+            outputs.append(
+                _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
+            )
+
+    assert all(output.successor_blend > 0.0 for output in outputs)
+    assert all(output.yaw_rate_rad_s < 0.0 for output in outputs)
+    assert all(output.target_roll_rad < 0.0 for output in outputs)
 
 
 def test_weak_successor_evidence_decays_turn_reference_smoothly():
