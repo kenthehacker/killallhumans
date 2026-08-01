@@ -30,11 +30,8 @@ Authority model:
 
 Control-law constant sources:
 
-- ``SUPPORT_COLLECTIVE`` / ``VERTICAL_ERROR_GAIN`` / ``VERTICAL_RATE_GAIN`` /
-  error and rate bounds: the live-proved Gate-0 collective law
-  (``_gate0_proved_vertical_collective`` in the retired stage).
-- ``VERTICAL_FEEDBACK_SIGN``: empirically confirmed by the 2026-07-29
-  crossing-geometry analysis; see the comment at its definition.
+- ``SUPPORT_COLLECTIVE`` / ``COURSE_VZ_*``: one bounded world-vertical-rate
+  reference and one continuously carried collective request in every state.
 - ``YAW_ERROR_SIGN`` / ``ROLL_ERROR_SIGN``: the 2026-07-29 crossing-geometry
   analysis (Q5) falsified the retired controller's lateral direction
   post-credit; see the comments at their definitions.  Magnitudes are the
@@ -44,12 +41,7 @@ Control-law constant sources:
   to and produces unrecoverable overshoot; see the comment at its
   definition.  The closure-scaling machinery remains tested for possible
   post-credit reuse.
-- ``VZ_CLIMB_CAP_M_S`` / ``VZ_GOVERNOR_GAIN`` / ``VZ_LEAK_TAU_S``: the
-  IMU-based world-vertical-rate climb governor added after the fourth
-  top-bar collision showed bearing pursuit builds unbounded vz; see the
-  comment at its definition.  It supersedes the removed flight-2
-  D-direction limiter as the honest rate-limit mechanism.  A symmetric
-  proportional descent floor extends it; see the constant blocks.
+- ``VZ_LEAK_TAU_S``: bias guard for the IMU world-vertical-rate estimate.
 - ``CLOSURE_TARGET_RATE_S`` / ``CLOSURE_FULL_BRAKE_RATE_S``: the vision
   closure-rate governor (F31).  The filtered log-scale expansion rate is
   the only honest closure signal — fh is a signless drag magnitude that
@@ -64,12 +56,8 @@ Control-law constant sources:
   out of contract).
 - ``FH_UNTRUSTED_*``: the F14 inflow-regime gate.  vz_est is invalidated
   by REGIME (a smooth fh-proportional thrust deficit), not attitude or
-  vibration, so sustained fh > 5.0 freezes the vz/alt integrators,
-  suppresses every vz-based governor floor/cap, and
-  falls back to the camera-qualified vertical PD (support + margin when
-  unqualified); the latch releases below fh 2.0.  (Trigger raised 3.0 ->
-  5.0 in F50: the F49 hard brake reads fh 3.0-3.4 and tripped its own
-  distrust alarm; the F14 biased regime measured 6.5-7.5.)
+  vibration, so sustained fh > 5.0 freezes the vz/alt integrators without
+  selecting a different collective law; the latch releases below fh 2.0.
 - Thrust envelope ``[MIN_COURSE_THRUST, MAX_COURSE_THRUST]`` and yaw cap: the
   accepted v3 yaw profile and the visual-course thrust envelope from the
   July-18 safety contract (max raised 0.32 -> 0.34 under the 0.35 hard
@@ -115,24 +103,11 @@ from scripts.aigp_vq2_yaw_profile import (
 # Control-law constants (see module docstring for sources).
 # ---------------------------------------------------------------------------
 
-# Global sign of the stable vertical feedback with the image-down vertical
-# error.  EMPIRICALLY CONFIRMED by the 2026-07-29 crossing-geometry analysis
-# (`docs/aigp/2026-07-29-vq2-crossing-geometry-analysis.md`, Q2): in the clean
-# pre-credit identification condition, more collective climbs (corr +0.913
-# with world-up acceleration) and the target moves DOWN in frame (residual
-# corr +0.130 after pitch-derotation), so `BASE - K*e` is the stabilizing
-# sign at every gate.  One global sign; gate-0 takeoff boost is feedforward
-# only and does not change it.
-VERTICAL_FEEDBACK_SIGN = -1.0
-
 # F49 (20260730 flight-48 measurement): the true hover support in the clean
 # pre-credit condition is 0.247, not the 0.275 carried from gate-0 proving —
 # at 0.275 every "level" hold climbed ~+0.3 m/s into the top-bar geometry.
 SUPPORT_COLLECTIVE = 0.247  # F48-measured hover support collective
-VERTICAL_ERROR_GAIN = 0.080  # GATE0_PROVED_COLLECTIVE_ERROR_GAIN
-VERTICAL_RATE_GAIN = 0.126  # GATE0_PROVED_COLLECTIVE_RATE_GAIN
 VERTICAL_MAX_ABS_ERROR_NORM = 0.50  # GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR
-VERTICAL_MAX_ABS_RATE_NORM_S = 5.0 / 3.0  # GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE
 
 MIN_COURSE_THRUST = 0.21  # MIN_VISUAL_THRUST (active visual-course envelope)
 # Raised 0.32 -> 0.34 (flights 20260729T114842Z-visual-course-039186c8 and
@@ -144,50 +119,8 @@ MIN_COURSE_THRUST = 0.21  # MIN_VISUAL_THRUST (active visual-course envelope)
 # target 0.33 was clipped by the old 0.32 clamp.
 MAX_COURSE_THRUST = 0.34  # MAX_VISUAL_THRUST, below the 0.35 hard abort
 
-# IMU-based world-vertical-rate governor (climb only).  Four consecutive
-# gate-0 top-bar collisions (flights 20260729T085719Z-visual-course-4455fd61,
-# 20260729T094736Z-visual-course-9d430a40, 95644bf5, and 4dbe4b8c) showed
-# bearing-pursuit vertical control necessarily builds UNBOUNDED vz: every
-# flight peaked at 2.8-3.35 m/s within 1.3 s against a required ~2 m climb
-# over ~2.2 s (~0.9 m/s average) and arrived at the gate plane with vz
-# +0.6..+1.0 m/s.  Measured plant (199 airborne samples, all four flights):
-# a_up = 66.7*thrust - 18.44 (residual sigma 0.59; hover at 0.277 ~=
-# support 0.275), so 0.01 collective ~= 0.67 m/s^2 and 2 m/s over the cap
-# costs -0.06 collective ~= -4 m/s^2, inside the 0.21 floor's authority.
-# The governor is IMU-based precisely so it stays alive when vision is
-# censored or stalled.
-VZ_CLIMB_CAP_M_S = 1.0  # generous bound vs the ~0.9 m/s average requirement
-VZ_GOVERNOR_GAIN = 0.03  # collective per m/s over the cap (see block above)
-# F68 (20260730T052644Z-visual-course-0d49884b): the 1.0 m/s cap is a gate-0
-# climb-out bound, but gate-1+ legs inherit it — the gate-1 approach climbed
-# at vz +1.0 through the final 1.5 s and overshot ~0.4 m ABOVE the gate, the
-# aperture died at the frame bottom before the geometry could recover, and
-# the blind SEARCH drifted into the structure.  Inter-gate vertical
-# corrections are ~0.2-0.3 m/s, so course legs get a 0.5 m/s cap with real
-# teeth (0.10/m/s, SUBTRACTIVE from the PD demand — a min()-against-support
-# cap would bang-bang the demand the way the F64 descent step did).  The
-# vertical FEEDBACK law stays one global PD at every gate; this is a safety
-# envelope, and envelopes already differ by leg.
-VZ_CLIMB_CAP_COURSE_M_S = 0.5  # gate-1+ leg climb-rate bound
-VZ_GOVERNOR_COURSE_GAIN = 0.10  # continuous subtraction per m/s over it
 VZ_LEAK_TAU_S = 2.5  # leaky-integrator time constant (bias/noise guard)
 GRAVITY_M_S2 = 9.80665  # ImuAttitudeConfig.gravity_mps2
-# Symmetric descent floor (flight 20260729T111003Z-visual-course-d52adcd4):
-# a 6.1 s frozen-camera stall blinded the loop while a_up ~= -1.9 m/s^2 sank
-# it into a ground graze.  The hover regime shifts ~0.275 -> ~0.30 support
-# in fast/descending flight.  F63 (20260730T015429Z-visual-course-5e550551)
-# proved the original floor too weak AND too late: an established -0.5..-1.5
-# sink ran ~5 s unarrested at thrust 0.30-0.33 (fast-regime hover ~=0.32)
-# and the drone passed UNDER gate 1 into the floor.  F67: the F64 law
-# (0.10/m/s plus a +0.04 step feedforward) bang-banged at the plane — F65's
-# last 0.5 s alternated 0.31 <-> 0.22 tick-to-tick as vz_est straddled the
-# floor, each high tick re-climbing toward the top panel — so the step is
-# DELETED and the gain raised 0.10 -> 0.21, which reproduces the F64
-# authority at vz -0.7 (support + 0.0735 ~= the proved 0.075) while staying
-# continuous at the boundary.  Engage at -0.35 m/s (before momentum builds);
-# the command saturates at the 0.34 envelope top by vz ~= -0.8.
-VZ_DESCENT_FLOOR_M_S = -0.35  # sink-rate bound, mirroring the climb cap
-VZ_DESCENT_GOVERNOR_GAIN = 0.21  # collective per m/s below the floor
 # F100: the F78/F91/F93 vertical arrival arrest is DELETED.  Its last
 # scope (gate 0 near the plane, F96) was a second vz term stacked on
 # the same path the unified vz-tracking law now owns — the F95
@@ -198,39 +131,11 @@ VZ_DESCENT_GOVERNOR_GAIN = 0.21  # collective per m/s below the floor
 # (20260730T134602Z-...-6e302725) centered-gate balloon, F99
 # (20260730T170522Z-...-50b0c982) gate-0 sink into the lower structure.
 
-# F96 unified course-leg vertical law (flight
-# 20260730T153947Z-visual-course-a2741311).  F95 removed the support
-# inflation and the one-sided balloon with it, but exposed the limit
-# cycle underneath: on the gate-1+ qualified TRACK path vz feedback was
-# stacked four-deep and incoherent — the camera D term (0.126*vy, a
-# lagged image copy of vz), the two-sided arrest (0.15*excess over a
-# deadband), the vz-center trim integral, and the course governor
-# (climb cap 0.10 + descent floor 0.21).  Each was tuned as if it were
-# the only vz term; in phase they summed ~0.13 collective (~2.5 m/s^2)
-# for a 0.4 m/s vz error, so the leg oscillated clamp-to-clamp
-# (thrust 0.21 <-> 0.34, vz +/-0.4..0.5), |vz| never met COMMIT's
-# <= 0.25 entry budget at the plane, the gate engulfed the frame with
-# no crossing path, and the blind search flew into the ground (id
-# 1002).  The replacement is ONE vz-tracking law on qualified
-# fh-trusted TRACK: the desired climb rate is proportional to the
-# compensated error (the arrest's per-norm allowance as a SETPOINT, no
-# deadband — it goes to zero as ey approaches center), and a single
-# coherent gain tracks it.  The F14 fh-untrusted path keeps the camera
-# PD (a frozen vz_est cannot be tracked); blind paths keep their
-# support floors and the governor.
-# F100 (20260730T170522Z-visual-course-50b0c982): the law is now GLOBAL
-# — gate 0's "proved PD envelope" special case is deleted.  That PD had
-# no signal mid-approach (ey ~0 by perspective geometry), so collective
-# sat at support+trim while the fh fast-regime thrust deficit sank the
-# drone at vz -0.31..-0.37; the only counter was the vz-center trim
-# integrator winding at ~0.015/s.  Every gate-0 approach F95-F99 flew
-# at/below pad altitude; F99 arrived at the plane sinking, the
-# post-coast ballistic dip carried it to -0.42 m, and it struck the
-# gate-0 lower structure (id 1001) before credit.  Gate-0-specific
-# behavior stays feedforward-only (launch boost), per the standing
-# one-global-vertical-law contract.
+# One global vertical law: qualified geometry selects a bounded desired
+# world-vertical rate; unqualified geometry selects zero.  The same gain and
+# continuously carried collective request apply in every navigation state.
 COURSE_VZ_DES_PER_NORM = 1.0  # m/s desired climb per norm of compensated ey
-COURSE_VZ_DES_MAX_M_S = 0.5  # matches the VZ_CLIMB_CAP_COURSE_M_S envelope
+COURSE_VZ_DES_MAX_M_S = 0.5
 COURSE_VZ_TRACK_GAIN = 0.12  # collective per m/s of vz tracking error
 # F97 (20260730T160909Z-visual-course-a4bfb6d3): F96 flew smoothly but the
 # tracker's vz_des saturated at -0.5 pulling a low-sitting gate to center,
@@ -242,13 +147,6 @@ COURSE_VZ_TRACK_GAIN = 0.12  # collective per m/s of vz tracking error
 # correction happens earlier in the approach, not at the plane.
 COURSE_VZ_DES_COMMIT_M_S = 0.20  # vz_des cap at/inside commit_min_log_scale
 COURSE_VZ_DES_RAMP_START_LOG_SCALE = -2.0  # far end of the cap ramp
-# F97: the same flight's mid-leg overshoot (alt +0.19 with ey ~0) was
-# propped by the vz-center trim, wound to its cap during the blind
-# post-crossing window (F90 blind anti-sink, working as designed) and
-# leaking back at only 0.02/s — it fought the tracker for the whole leg.
-# A wound positive trim while the tracker wants LESS climb than the
-# measured vz is suspect by construction: bleed it fast.
-COURSE_VZ_TRIM_FAST_LEAK_S = 0.10  # collective/s when trim fights the tracker
 # F103 (20260730T182343Z-visual-course-334c208e): a commanded -0.5 m/s sink
 # at ~1 m altitude enters VRS and the collective CANNOT arrest it — F102
 # parked short of gate 1 with the gate genuinely low (raw ey +0.88 at a
@@ -453,7 +351,6 @@ CROSSING_MIN_LOG_SCALE = -0.80  # retired stage crossing_arm_min_log_scale
 # steering hold.
 COMMIT_MIN_LOG_SCALE = -1.2  # entry proximity bound (span ~0.3)
 COMMIT_SUSTAIN_S = 0.10  # near-plane regime must persist this long to arm
-COMMIT_MEAS_MAX_AGE_S = 0.30  # fresh uncensored both-axis window at entry
 # F58 (20260730T004618Z-visual-course-cae7b894): the pre-cross brake bled
 # the approach to ~0 speed at entry and the coast-sized 0.05 rad advance
 # only rebuilds ~1 m/s in the window — the commit never reached the plane
@@ -515,47 +412,6 @@ PITCH_TARGET_MIN_RAD = math.radians(-33.0)
 EX_TRIM_GAIN = 0.30  # trim norm/s per norm of sustained ex
 EX_TRIM_MAX_NORM = 0.15  # anti-windup bound (~2x the measured equilibrium)
 EX_TRIM_ACTIVE_EX_NORM = 0.25  # integrate only inside the near regime
-# 2026-07-30 TRACK-phase vertical centering trim (the vertical EX_TRIM):
-# the ey PD around center is far too weak to hold altitude (error gain
-# 0.080/norm: the measured -0.03 droop yields +0.002 collective), so a
-# slightly-underestimated support settles ON the -0.35 m/s descent-floor
-# boundary as a STABLE equilibrium — continuous by F65 design, so the
-# floor adds exactly zero there — or, under a larger brake-attitude
-# deficit, droops BELOW it.  F87 (20260730T125108Z-visual-course-
-# 95059527) rode vz ~-0.35 with ey ~0 through the whole gate-0 final
-# approach, arrived ~0.3-0.4 m low, and the credible-loss zero coast
-# dropped it onto the lower lip (id 1001, no credit); F86 sank the
-# gate-1 leg alt -0.4 -> -2.0 the same way (ey ~0 is degenerate:
-# approach + descent keeps the gate centered).  While TRACK holds the
-# gate at/above center with a qualified vertical channel, integrate a
-# bounded upward trim against the residual sink until vz ~0; hold it on
-# demanded descents (ey > active bound, where the P law owns the
-# descent) and leak it on real climbs.  One-sided by design: the F78
-# arrest already owns climb overshoot.  F88 (20260730T131916Z-visual-
-# course-9bde29e4): gate 0 CREDITED with dead vertical energy (vz +0.08,
-# alt +0.11 at the coast) after the trim arrested the mid-approach sink
-# — then the gate-1 leg sank at vz -0.55 with ey +0.03 (a far-left gate
-# under misalignment braking) and hit the ground (id 1002) with the
-# trim gated out by the original 0.02 ey bound.  The P law's descent
-# demand at |ey| 0.10 is 0.008 collective — negligible — so the active
-# band widens to 0.10: a genuine low gate (ey > 0.10) still holds the
-# trim, anything nearer center learns.  F89 (20260730T132758Z-visual-
-# course-ef525c4c): gate 0 credited again, but the gate-1 leg's sink
-# (vz -0.47 sustained) developed while the vertical channel was
-# UNQUALIFIED (stale y-axis) — the trim lived inside the qualified
-# branch and could not engage — and the following blind SEARCH held
-# bare support+margin for 5+ s of vz -0.45..-0.48 into the ground
-# (id 1002).  F90: the integrator is a shared helper; the blind paths
-# (SEARCH, pending-credit hold, unqualified TRACK/PREDICT) add the
-# trim to their support holds and wind it with NO ey gate — a blind
-# path holds altitude by definition, so any IMU-trusted sink is
-# unwanted.  COAST (exact-zero contract) and COMMIT (its own bounded
-# crossing servo) never wind or consume it.
-VZ_CENTER_TRIM_GAIN = 0.08  # collective per (m/s of sink) per second
-VZ_CENTER_TRIM_MAX = 0.06  # anti-windup bound (~2x the measured deficit)
-VZ_CENTER_TRIM_ACTIVE_EY_NORM = 0.10  # integrate only near center (TRACK)
-VZ_CENTER_TRIM_SINK_M_S = -0.10  # deadband above estimator noise
-VZ_CENTER_TRIM_LEAK_S = 0.02  # collective/s release on real climbs
 
 PREDICT_FRAME_GAP_S = 0.25  # ~8 camera frames; 0.06 (~2) flapped TRACK/SEARCH
 # 7 times in the 4.2 s F35 gate-1 leg, each flap dumping the pursuit fix.
@@ -728,57 +584,13 @@ NEAR_BRAKE_RELAX_COURSE_EY_NORM = 0.18  # course-leg custody bound
 # 1.33 for 2.4 s until a soft gate-1 graze).  1.5 still blocks F31's 2.63
 # rad wander with margin.
 COURSE_HEADING_ANCHOR_CAP_RAD = 1.5
-# F92: the pre-gate-1 altitude-floor latch (ALT_FLOOR_*) is DELETED — see
-# the removal note in command().  alt_est stays for the vz-center trim's
-# blind anti-sink, still clamped below at ALT_EST_MIN_M (F13).
+# The IMU altitude estimate bounds the low-altitude desired-sink taper.
 ALT_EST_MIN_M = -2.0  # biased-integrator clamp on the altitude estimate
-# F14 inflow-regime gate (agent-10, verified with the actuator/estimator
-# tick fields): identical delivered rotor output 0.34 gives accz -13.0 in
-# the slow regime (real climb, t=2.59) and -8.0 in the fast regime (t=8.5)
-# — vz_est is invalidated by REGIME, a smooth fh-proportional DC deficit
-# (~0.9*fh - 0.5), NOT vibration (accz std 0.19, the cleanest of the
-# flight) and NOT attitude (kp=0, gyro drift <= 0.2 rad).  Trusted fh <
-# ~2.0, biased fh 6.5-7.5; F49's hard brake reads 3.0-3.4 and must NOT
-# trip the gate, so the trigger sits at 5.0 (see below).  While untrusted
-# the stage freezes vz_est (the
-# leak relaxes it toward 0; the biased a_up is never integrated), holds
-# alt_est, falls back to the camera-qualified vertical PD (support +
-# margin when unqualified — bare support historically sinks for real at
-# -0.8...-1.9), and suppresses every vz-based governor floor/cap so the
-# descent feedforward cannot fire from the frozen estimate.  This breaks
-# the F14 self-locking loop: governor pinned 0.34 on the phantom sink, the
-# floor flew biased-"level".
-# F50 (flight 20260729T222920Z-visual-course-3a8ed087): the F49 TRUE brake
-# reads fh 3.0-3.4 — a hard nose-up brake IS horizontal specific force — so
-# the 3.0 trigger tripped on the brake itself, latched _fh_untrusted, and
-# floored the collective at support + 0.05 for the whole gate-1 leg (pinned
-# ~0.31, ceiling height, truss graze).  The F14 pathological regime measured
-# 6.5-7.5; 5.0 separates braking from the biased regime with margin on both
-# sides.
+# The fh regime gate protects only IMU integration.  It never selects a
+# different collective law or adds a thrust margin.
 FH_UNTRUSTED_TRIGGER_MPS2 = 5.0  # biased regime above this horizontal force
 FH_TRUSTED_RELEASE_MPS2 = 2.0  # hysteresis release below this
 FH_UNTRUSTED_SUSTAIN_S = 0.3  # transients shorter than this never latch
-# 0.02 -> 0.05 (flight 20260729T151236Z-visual-course-99e093fa): the fh gate
-# froze vz/alt at t=2.83 post-credit and the unqualified hold at support+0.02
-# sank for real ~1 m in 1.5 s into gentle terrain contacts — F14 measured the
-# biased-regime deficit at ~0.05 collective, so the margin must cover all of
-# it, not part of it.
-FH_UNTRUSTED_VERTICAL_MARGIN = 0.05  # unqualified hold: support + margin
-# High-gate climb bias (post-credit pursuit redesign, agent-10 F26/F27/L13/
-# L18 trace analysis): gate 1 is handed off HIGH (ey ~ -0.69, 20% already
-# top-clipped at credit), and a censored/unqualified y-axis decays the
-# collective to support + margin — a real sink in the biased regime — so the
-# gate migrates UP, clips harder, and the track dies ~1.5 s post-credit in
-# every flight.  When the tracked gate is high, the unqualified hold must
-# CLIMB toward it, not hover: support + 0.065 ~= the 0.34 thrust clamp.
-# 0.065 -> 0.12 (F35, d25f23fe): the +0.065 "climb" margin only matched
-# fast-regime hover (~0.32) — alt pinned at 1.59 m for the whole gate-1 leg
-# while the gate sat at ey -0.9, and the drone flew LEVEL into the gate's
-# lower structure.  A top-clipped gate is a one-sided measurement: the ONLY
-# safe direction is up.  support + 0.12 ~= 0.40 is a real climb that also
-# un-clips the y-axis so the qualified PD can take over.
-HIGH_GATE_Y_NORM = -0.30  # hypothesis y below this counts as "gate is high"
-HIGH_GATE_CLIMB_MARGIN = 0.12  # unqualified hold margin while the gate is high
 # F50 pitch-attitude compensation of the vertical error (flight
 # 20260729T222920Z-visual-course-3a8ed087): the vertical servo read the
 # aim's image-y with NO attitude compensation, so the F49 nose-up brake
@@ -792,12 +604,6 @@ HIGH_GATE_CLIMB_MARGIN = 0.12  # unqualified hold margin while the gate is high
 # error is ey_true = ey_measured - (spawn_pitch_rad - rpy_p) * this gain;
 # it is zero at the spawn attitude.
 VERTICAL_PITCH_COMP_NORM_PER_RAD = 1.6  # image-norm vertical shift per rad
-# SEARCH vertical band: bounds the COMMIT/TRACK ey collective servo.  The
-# F50 SEARCH memory-descent that shared this band is REMOVED (F75): it
-# turned F74's gate-1 miss into a blind sink to the alt-est floor — a
-# no-track SEARCH now latches altitude support and lets the sweep do the
-# re-acquisition.
-SEARCH_VERTICAL_MEMORY_BAND = 0.05  # collective band around support
 SEARCH_COVARIANCE_STD_NORM = 0.35  # position std that forces SEARCH
 # F76 (20260730T074122Z-visual-course-3a505ef5): after the one-zero send
 # the pending-credit SEARCH ran the generic yaw sweep — +0.15 (right)
@@ -1115,18 +921,13 @@ class NavigationOutput:
 class CleanCourseConfig:
     """Tunable bounds for :class:`CleanCourseController` (test-friendly)."""
 
-    vertical_feedback_sign: float = VERTICAL_FEEDBACK_SIGN
     support_collective: float = SUPPORT_COLLECTIVE
-    vertical_error_gain: float = VERTICAL_ERROR_GAIN
-    vertical_rate_gain: float = VERTICAL_RATE_GAIN
     vertical_max_abs_error_norm: float = VERTICAL_MAX_ABS_ERROR_NORM
-    vertical_max_abs_rate_norm_s: float = VERTICAL_MAX_ABS_RATE_NORM_S
     course_vz_des_per_norm: float = COURSE_VZ_DES_PER_NORM
     course_vz_des_max_m_s: float = COURSE_VZ_DES_MAX_M_S
     course_vz_track_gain: float = COURSE_VZ_TRACK_GAIN
     course_vz_des_commit_m_s: float = COURSE_VZ_DES_COMMIT_M_S
     course_vz_des_ramp_start_log_scale: float = COURSE_VZ_DES_RAMP_START_LOG_SCALE
-    course_vz_trim_fast_leak_s: float = COURSE_VZ_TRIM_FAST_LEAK_S
     course_vz_des_ground_m_s: float = COURSE_VZ_DES_GROUND_M_S
     course_vz_des_ground_alt_m: float = COURSE_VZ_DES_GROUND_ALT_M
     min_thrust: float = MIN_COURSE_THRUST
@@ -1155,7 +956,6 @@ class CleanCourseConfig:
     near_brake_log_scale: float = NEAR_BRAKE_LOG_SCALE
     crossing_min_log_scale: float = CROSSING_MIN_LOG_SCALE
     commit_sustain_s: float = COMMIT_SUSTAIN_S
-    commit_meas_max_age_s: float = COMMIT_MEAS_MAX_AGE_S
     commit_timeout_s: float = COMMIT_TIMEOUT_S
     commit_min_log_scale: float = COMMIT_MIN_LOG_SCALE
     commit_advance_pitch_rad: float = COMMIT_ADVANCE_PITCH_RAD
@@ -1168,11 +968,6 @@ class CleanCourseConfig:
     ex_trim_gain: float = EX_TRIM_GAIN
     ex_trim_max_norm: float = EX_TRIM_MAX_NORM
     ex_trim_active_ex_norm: float = EX_TRIM_ACTIVE_EX_NORM
-    vz_center_trim_gain: float = VZ_CENTER_TRIM_GAIN
-    vz_center_trim_max: float = VZ_CENTER_TRIM_MAX
-    vz_center_trim_active_ey_norm: float = VZ_CENTER_TRIM_ACTIVE_EY_NORM
-    vz_center_trim_sink_m_s: float = VZ_CENTER_TRIM_SINK_M_S
-    vz_center_trim_leak_s: float = VZ_CENTER_TRIM_LEAK_S
     near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
@@ -1198,11 +993,7 @@ class CleanCourseConfig:
     fh_untrusted_trigger_mps2: float = FH_UNTRUSTED_TRIGGER_MPS2
     fh_trusted_release_mps2: float = FH_TRUSTED_RELEASE_MPS2
     fh_untrusted_sustain_s: float = FH_UNTRUSTED_SUSTAIN_S
-    fh_untrusted_vertical_margin: float = FH_UNTRUSTED_VERTICAL_MARGIN
-    high_gate_y_norm: float = HIGH_GATE_Y_NORM
-    high_gate_climb_margin: float = HIGH_GATE_CLIMB_MARGIN
     vertical_pitch_comp_norm_per_rad: float = VERTICAL_PITCH_COMP_NORM_PER_RAD
-    search_vertical_memory_band: float = SEARCH_VERTICAL_MEMORY_BAND
     search_covariance_std_norm: float = SEARCH_COVARIANCE_STD_NORM
     search_yaw_rate_rad_s: float = SEARCH_YAW_RATE_RAD_S
     search_sweep_period_s: float = SEARCH_SWEEP_PERIOD_S
@@ -1303,11 +1094,6 @@ class CleanCourseController:
         # small bounded integral on raw ex that nulls the off-axis pursuit
         # orbit equilibrium before entry; reset on target/promotion change.
         self._ex_trim: float = 0.0
-        # Vertical centering trim (see the VZ_CENTER_TRIM_* block): a
-        # bounded one-sided integral that learns the support correction
-        # needed to stop a centered-gate sink.  A vehicle/regime property,
-        # so it survives target/promotion changes; reset on start only.
-        self._vz_center_trim: float = 0.0
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
@@ -1322,11 +1108,8 @@ class CleanCourseController:
         # keep refreshing it, or the anchor never expires and SEARCH is
         # suppressed for the whole blind descent.
         self._last_engulfing_anchor_identity: Optional[Tuple[Any, Any]] = None
-        # IMU altitude estimate (m) integrated from the governor's vz_est,
-        # seeded 0 at course start (takeoff pad reference) and clamped below
-        # at alt_est_min_m (F13).  F92: the pre-gate-1 altitude-floor latch
-        # it used to guard is deleted (see command()); the estimate stays
-        # for the trace and the vz-center trim's blind anti-sink.
+        # IMU altitude estimate (m), seeded at the takeoff pad and used only
+        # to taper commanded descent near/below spawn altitude.
         self._alt_est_m = 0.0
         # Pre-crossing expansion brake latch for the tick trace; recomputed
         # every main-path tick (see the PRE_CROSS_BRAKE_* constant block).
@@ -1374,7 +1157,6 @@ class CleanCourseController:
         self.max_gate_index = int(gate_index)
         self._course_start_s = float(now_s)
         self._ex_trim = 0.0
-        self._vz_center_trim = 0.0
         self._turn_reference_x = None
         self._turn_reference_yaw_rad = None
         self._turn_aperture_reserve = 0.0
@@ -1692,9 +1474,6 @@ class CleanCourseController:
             elif cached is not None:
                 self._set_reliable_bearing(cached[0], cached[1])
             self._enter_search(now_s)
-        # Re-seed the collective tracker so a retained saturated sub-support
-        # command can never survive into the next gate.
-        self._collective = None
         # Re-arm the course-heading anchor for the new leg (F31).
         self._course_anchor_yaw_rad = None
         return True
@@ -1822,10 +1601,7 @@ class CleanCourseController:
         # an open-loop +0.9 m/s^2 climb bias — the chronic gate-1 balloon
         # (F90/F91/F93/F94 all ballooned vz +0.4..+0.5 at the brake
         # attitude) that the vertical arrest kept chasing downstream.  At
-        # level both formulas agree (0.2594), so every level-tuned path
-        # (the F14/F21 margins, the F83 floor, gate 0's envelope) is
-        # unchanged; F83 already proved the same inflation wrong in the
-        # fh-untrusted floor and bounded it there.
+        # level both formulas agree (0.2594).
         level_hover = cfg.support_collective / math.cos(cfg.spawn_pitch_rad)
         support = _clamp(
             level_hover
@@ -1837,15 +1613,6 @@ class CleanCourseController:
             cfg.min_thrust,
             cfg.max_thrust,
         )
-
-        # F92 (20260730T135630Z-visual-course-2aa541ba): the pre-gate-1
-        # altitude-floor latch is DELETED.  Its max() pinned support+0.05
-        # over the governor and arrest for four ballooned gate-1 legs
-        # (F78/F78b/F79, then F91 armed blind at alt -0.09 and held the pin
-        # for the whole leg into a gate-1 structure hit); both yield
-        # patches (F79, F86) failed in flight.  Blind anti-sink is owned by
-        # the vz-center trim (F88/F89/F90) and the continuous vz descent
-        # floor, which arrested F90's blind -0.5 sink in ~0.5 s.
 
         # F53 near-plane COMMIT (see the COMMIT_* constant block): the
         # misalignment brake self-locks short of the plane, so a sustained,
@@ -1951,36 +1718,27 @@ class CleanCourseController:
                     steer_gain=commit_steer_gain,
                     yaw_rad=yaw_rad,
                 )
-                commit_correction = _clamp(
-                    cfg.vertical_feedback_sign
-                    * cfg.vertical_error_gain
-                    * self._compensated_ey(self.current.y, pitch_rad),
-                    -cfg.search_vertical_memory_band,
-                    cfg.search_vertical_memory_band,
-                )
-                if (
-                    now_s - self.current.last_y_measurement_s
-                    > cfg.commit_meas_max_age_s
-                ):
-                    # F58: y is stale/censored — never CLIMB on a frozen
-                    # bearing (F57's frozen servo pinned support+0.05 for
-                    # the whole commit and drifted up over the opening).
-                    # The descend side stays live; the vz governor bounds
-                    # the sink.
-                    commit_correction = min(commit_correction, 0.0)
-                commit_hold = support + commit_correction
-                self._collective = commit_hold
                 commit_vertical_qualified = (
                     now_s - self.current.last_y_measurement_s
                     <= cfg.vertical_qualify_max_age_s
                     and self.current.y_axis.std
                     <= cfg.search_covariance_std_norm
                 )
-                commit_floor_gate_y = self._effective_untrusted_gate_y(
+                commit_ey = self._compensated_ey(
+                    self.current.y, pitch_rad
+                )
+                commit_vz_des = self._course_vz_setpoint(
                     self.current,
-                    now_s=now_s,
-                    pitch_rad=pitch_rad,
+                    vertical_error=commit_ey,
                     vertical_qualified=commit_vertical_qualified,
+                )
+                commit_hold = support + cfg.course_vz_track_gain * (
+                    commit_vz_des - self._vz_est_m_s
+                )
+                commit_target = self._governed_collective(
+                    commit_hold,
+                    support,
+                    gate_y=(commit_ey if commit_vertical_qualified else None),
                 )
                 # F66: the F60 vertical-aim pitch term is DELETED.  In
                 # commit the attitude is the forward drive, not a second
@@ -1990,8 +1748,8 @@ class CleanCourseController:
                 # its pre-dive velocity vector.  F63 dove UNDER gate 1;
                 # F65 (11b13f53) slammed the top panel 0.47 s after entry
                 # with the opening 0.45 norm below the aim.  Vertical
-                # translation now lives ONLY in the bounded ey servo above
-                # (plus the vz descent floor).
+                # translation now lives only in the shared vertical-rate
+                # owner above.
                 return NavigationOutput(
                     target_roll_rad=self._slew_roll(commit_roll, dt),
                     # F55: the advance attitude must actually be reached —
@@ -2007,11 +1765,7 @@ class CleanCourseController:
                         slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
                     ),
                     yaw_rate_rad_s=commit_yaw,
-                    thrust=self._governed_collective(
-                        commit_hold,
-                        support,
-                        gate_y=commit_floor_gate_y,
-                    ),
+                    thrust=self._continuous_collective(commit_target, dt),
                     state=self.state,
                     gate_index=self.gate_index,
                     successor_blend=commit_blend,
@@ -2020,13 +1774,10 @@ class CleanCourseController:
                 )
 
         if self.state is CleanCourseState.SEARCH:
-            # Flight 25361816: the unqualified hold margin must apply here
-            # too — SEARCH at bare support in the fh-untrusted regime sank
-            # ~1 m/s for real into terrain (the margin only covered the
-            # TRACK path).
-            margin = (
-                cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
+            search_hold = support + cfg.course_vz_track_gain * (
+                0.0 - self._vz_est_m_s
             )
+            search_target = self._governed_collective(search_hold, support)
             if (
                 self._pending_credit_until_s is not None
                 and now_s < self._pending_credit_until_s
@@ -2047,12 +1798,6 @@ class CleanCourseController:
                 # gain and cap as the TRACK law, no roll, no advance, no
                 # promotion — authoritative ownership is unchanged);
                 # absent or ambiguous evidence keeps the neutral hold.
-                # F90: blind paths hold altitude by definition, so any
-                # IMU-trusted sink is unwanted — wind the support trim
-                # with no ey gate (see _wind_vz_center_trim).
-                self._wind_vz_center_trim(dt)
-                hold = support + margin + self._vz_center_trim
-                self._collective = hold
                 pending_roll = 0.0
                 pending_yaw = 0.0
                 pending_blend = 0.0
@@ -2081,7 +1826,7 @@ class CleanCourseController:
                         cfg.spawn_pitch_rad + cfg.brake_pitch_rad, dt
                     ),
                     yaw_rate_rad_s=pending_yaw,
-                    thrust=self._governed_collective(hold, support),
+                    thrust=self._continuous_collective(search_target, dt),
                     state=self.state,
                     gate_index=self.gate_index,
                     successor_blend=pending_blend,
@@ -2093,27 +1838,6 @@ class CleanCourseController:
             # centered sweep re-centered the scan on the course heading
             # instead of where the target was last seen.
             sweep_yaw = self._search_yaw_heading(dt, yaw_rad)
-            # F75: altitude support is LATCHED in no-track SEARCH.  The F50
-            # memory-descent servo turned F74's gate-1 miss into a blind
-            # 4.8 s sink to the alt-est floor (-2.0) while fh grew 1.3 ->
-            # 4.3 — a searching drone that descends on a frozen bearing
-            # converts a recoverable miss into a floor/structure crash.
-            # SEARCH holds altitude at support; re-acquisition is the
-            # sweep's job.  (The TRACK/COMMIT ey servo is untouched.)
-            # F90: the support trim winds here too — a blind SEARCH at
-            # bare support sank F89's gate-1 leg vz -0.47 for 5+ s into
-            # the ground while the sweep ran.
-            self._wind_vz_center_trim(dt)
-            search_hold = support + margin + self._vz_center_trim
-            # F98: while fh is TRUSTED the SEARCH hold also tracks vz -> 0
-            # (see the TRACK/PREDICT blind-hold block).  F95/F96/F97 all
-            # ended in a blind SEARCH porpoising vz +/-0.4 on the passive
-            # support hold into the ground (id 1002).
-            if not self._fh_untrusted:
-                search_hold += cfg.course_vz_track_gain * (
-                    0.0 - self._vz_est_m_s
-                )
-            self._collective = search_hold
             target_roll = self._slew_roll(0.0, dt)
             # F49: SEARCH always holds the LEVEL (spawn-attitude) pitch.
             # The F31/F40 blind-at-speed brake was built on absolute pitch
@@ -2128,9 +1852,7 @@ class CleanCourseController:
                 target_roll_rad=target_roll,
                 target_pitch_rad=target_pitch,
                 yaw_rate_rad_s=sweep_yaw,
-                # The IMU climb governor applies here too: vision loss must
-                # never disable it.
-                thrust=self._governed_collective(search_hold, support),
+                thrust=self._continuous_collective(search_target, dt),
                 state=self.state,
                 gate_index=self.gate_index,
                 current_track_id=self._current_track_id(),
@@ -2142,15 +1864,15 @@ class CleanCourseController:
             # Defensive: no hypothesis outside SEARCH should be impossible,
             # but never emit an unbounded command if it happens.
             self._enter_search(now_s)
-            fallback_hold = support + (
-                cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
+            fallback_hold = support + cfg.course_vz_track_gain * (
+                0.0 - self._vz_est_m_s
             )
-            self._collective = fallback_hold
+            fallback_target = self._governed_collective(fallback_hold, support)
             return NavigationOutput(
                 target_roll_rad=0.0,
                 target_pitch_rad=cfg.spawn_pitch_rad + cfg.brake_pitch_rad,
                 yaw_rate_rad_s=0.0,
-                thrust=self._governed_collective(fallback_hold, support),
+                thrust=self._continuous_collective(fallback_target, dt),
                 state=self.state,
                 gate_index=self.gate_index,
             )
@@ -2264,12 +1986,7 @@ class CleanCourseController:
             <= cfg.vertical_qualify_max_age_s
             and current.y_axis.std <= cfg.search_covariance_std_norm
         )
-        floor_gate_y = self._effective_untrusted_gate_y(
-            current,
-            now_s=now_s,
-            pitch_rad=pitch_rad,
-            vertical_qualified=vertical_qualified,
-        )
+        floor_gate_y = ey_vertical if vertical_qualified else None
         # Vision closure-rate governor (F31, see the CLOSURE_* constant
         # block): the filtered log-scale rate is the only honest closure
         # signal — fh is a signless drag magnitude that conflates speed with
@@ -2351,185 +2068,18 @@ class CleanCourseController:
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
         self._pre_cross_brake_active = pre_cross_brake
-        vz_tracked = False  # qualified fh-trusted branch sets this (F96)
-        if vertical_qualified:
-            bounded_error = _clamp(
-                ey_vertical - vertical_setpoint_offset,
-                -cfg.vertical_max_abs_error_norm,
-                cfg.vertical_max_abs_error_norm,
-            )
-            bounded_rate = _clamp(
-                current.vy,
-                -cfg.vertical_max_abs_rate_norm_s,
-                cfg.vertical_max_abs_rate_norm_s,
-            )
-            # Full D authority.  The flight-2 direction limiter (clip D to
-            # |P| on disagreement) was REMOVED after flight
-            # 20260729T094736Z-...-4dbe4b8c: with ey hovering near zero it
-            # zeroed the only vz feedback and pinned collective at exactly
-            # tilt-compensated support through the decisive t=1.31-1.72
-            # window at vz 2.7 m/s.  Honest climb-rate limiting now lives in
-            # the IMU vz governor below, which cannot go blind with vision.
-            # One GLOBAL vertical law at every gate (the F67 gate-dependent
-            # D-removal was reverted): a high equilibrium is now refused at
-            # the COMMIT entry budget instead of tuned out per-gate.
-            # VZ_CENTER_TRIM (see the constant block): the PD is too weak
-            # around center to hold altitude, so an underestimated support
-            # settles ON the descent-floor boundary (or droops below it)
-            # and the approach sinks with ey ~0.  Learn the support
-            # correction while TRACK holds the gate near center with a
-            # qualified, IMU-trusted vertical channel; hold on demanded
-            # descents (ey > active bound), leak on real climbs, and never
-            # wind into a saturated collective.  The trim is added AFTER
-            # the PD so every governor and floor below sees the corrected
-            # demand.  F90: the same integrator also covers the blind
-            # paths via _wind_vz_center_trim call sites below.
-            if (
-                self.state is CleanCourseState.TRACK
-                and ey_vertical <= cfg.vz_center_trim_active_ey_norm
-            ):
-                self._wind_vz_center_trim(dt)
-            if not self._fh_untrusted:
-                # F96/F100 unified course-leg vertical law (see the
-                # COURSE_VZ_* constant block): ONE vz-tracking term on
-                # EVERY fh-trusted qualified TRACK path, gate-agnostic.
-                # The desired climb rate is proportional to the
-                # compensated error — it goes to zero as ey approaches
-                # center, so vertical energy is arrested BEFORE the
-                # center crossing by construction.  The F14 fh-untrusted
-                # path cannot track a frozen vz_est and keeps the camera
-                # PD (below).
-                # F97: reconcile the setpoint with the COMMIT |vz| <= 0.25
-                # entry budget (see the COURSE_VZ_DES_COMMIT_M_S block):
-                # the cap ramps 0.5 -> 0.20 across the approach so the
-                # tracker cannot carry a budget-vetoing vertical rate
-                # into the plane.
-                # F98: the ramp reads outer_log_scale — the raw per-frame
-                # outer-bbox proximity that COMMIT's own entry check uses.
-                # F97 keyed on the FILTERED hypothesis log_scale, which
-                # read -1.67 while the gate already engulfed the frame
-                # (outer span 0.87x0.75): the 0.20 cap never engaged and
-                # vz_des was still ~-0.43 at the plane (F97 flight).
-                ramp = _clamp01(
-                    (
-                        current.outer_log_scale
-                        - cfg.course_vz_des_ramp_start_log_scale
-                    )
-                    / (
-                        cfg.commit_min_log_scale
-                        - cfg.course_vz_des_ramp_start_log_scale
-                    )
-                )
-                vz_des_max = cfg.course_vz_des_max_m_s - (
-                    cfg.course_vz_des_max_m_s - cfg.course_vz_des_commit_m_s
-                ) * ramp
-                # F103 (see the COURSE_VZ_DES_GROUND_* block): a fast
-                # commanded sink at ~1 m altitude enters VRS and the
-                # collective cannot arrest it (F101/F102 both died at
-                # thrust saturation, id 1002).  Descent authority tapers
-                # to the VRS-safe cap as alt_est approaches spawn level;
-                # the climb side is untouched.
-                vz_des_sink_max = cfg.course_vz_des_ground_m_s + (
-                    vz_des_max - cfg.course_vz_des_ground_m_s
-                ) * _clamp01(self._alt_est_m / cfg.course_vz_des_ground_alt_m)
-                vz_des = _clamp(
-                    -cfg.course_vz_des_per_norm * bounded_error,
-                    -vz_des_sink_max,
-                    vz_des_max,
-                )
-                # F97: a wound positive trim while the tracker wants LESS
-                # climb than the measured vz is suspect by construction
-                # (it fought the tracker for F96's whole leg); bleed it
-                # fast, then emit with the bled value.
-                if (
-                    self._vz_center_trim > 0.0
-                    and self._vz_est_m_s > vz_des + 0.05
-                ):
-                    self._vz_center_trim = max(
-                        0.0,
-                        self._vz_center_trim
-                        - cfg.course_vz_trim_fast_leak_s * dt,
-                    )
-                collective = (
-                    support
-                    + self._vz_center_trim
-                    + cfg.course_vz_track_gain * (vz_des - self._vz_est_m_s)
-                )
-                vz_tracked = True
-            else:
-                collective = (
-                    support
-                    + self._vz_center_trim
-                    + cfg.vertical_feedback_sign
-                    * (
-                        cfg.vertical_error_gain * bounded_error
-                        + cfg.vertical_rate_gain * bounded_rate
-                    )
-                )
-            self._collective = collective
-        else:
-            # F14: while fh-untrusted the camera is the only honest vertical
-            # channel; when it is unqualified, hold support + margin instead
-            # of bare support, which historically sinks for real (-0.8...
-            # -1.9 m/s against the biased-regime thrust deficit).
-            # High-gate climb bias (see the HIGH_GATE_* block): a censored
-            # y-axis must not sink the drone below a gate that sits HIGH —
-            # the hypothesis y is still the best evidence of that.
-            margin = (
-                cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
-            )
-            # F116: bottom censorship is fresh one-sided evidence, not total
-            # vertical ignorance.  Apply the same non-increasing course-floor
-            # release to the unqualified HOLD demand itself; changing only the
-            # final governor floor would still leave this upstream +0.05 in
-            # command (the exact F115 0.259 -> 0.309 jump).
-            if (
-                self._fh_untrusted
-                and self.gate_index >= 1
-                and floor_gate_y is not None
-                and cfg.near_brake_relax_course_ey_norm > 1e-9
-            ):
-                margin *= _clamp01(
-                    -floor_gate_y / cfg.near_brake_relax_course_ey_norm
-                )
-            # Gate-high classification uses the compensated error too (F50):
-            # a nose-up brake attitude must not read a level gate as LOW,
-            # and the historical nose-down dives must not read it as HIGH.
-            effective_high_gate_y = (
-                ey_vertical if floor_gate_y is None else floor_gate_y
-            )
-            if effective_high_gate_y < cfg.high_gate_y_norm:
-                margin = max(margin, cfg.high_gate_climb_margin)
-            # F90: the unqualified hold is blind — wind the support trim
-            # against any IMU-trusted sink (no ey gate; a stale y-axis was
-            # what made the path blind in the first place).
-            self._wind_vz_center_trim(dt)
-            hold = support + margin + self._vz_center_trim
-            # F98 (20260730T162145Z-visual-course-e7628b9c): while fh is
-            # TRUSTED the blind hold gets the same vz-tracking law with a
-            # zero setpoint.  F97's leg-start plateau ran on THIS path —
-            # the new track's y-axis stayed unqualified ~1.2 s while the
-            # hold sat at support + wound trim (~0.29) and HELD vz +0.36,
-            # ballooning the drone ~0.5 m above the gate line; the gate
-            # then sat low in frame, the custody floor levelled the brake
-            # pitch, and the leg arrived at the plane with ~1.67 log/s
-            # closure (COMMIT's first veto) and a late dive.  A passive
-            # hold cannot arrest that; track vz -> 0.  fh-untrusted keeps
-            # the support+margin floor: a frozen vz_est cannot be tracked
-            # (F14/F21).
-            if not self._fh_untrusted:
-                hold += cfg.course_vz_track_gain * (0.0 - self._vz_est_m_s)
-            if self._collective is None:
-                self._collective = hold
-            # Flight bc8c6003: a phantom vy (+0.38 norm/s, seeded as the gate
-            # sank through the frame) random-walked unmeasured for 5.4 s and
-            # commanded an unrecoverable descent.  A stale rate is never
-            # reused: zero it while vertical is unqualified; the next real
-            # measurement reseeds it through the filter coupling.
+        vz_des = self._course_vz_setpoint(
+            current,
+            vertical_error=ey_vertical - vertical_setpoint_offset,
+            vertical_qualified=vertical_qualified,
+        )
+        collective = support + cfg.course_vz_track_gain * (
+            vz_des - self._vz_est_m_s
+        )
+        if not vertical_qualified:
+            # A stale visual rate is never reused.  The same vertical owner
+            # simply tracks zero world-vertical rate until vision returns.
             current.y_axis.v = 0.0
-            alpha = min(1.0, dt / cfg.collective_decay_tau_s)
-            self._collective += (hold - self._collective) * alpha
-            collective = self._collective
 
         # F96: the F77 closure-excess collective brake is DELETED.  It
         # only fired on the gate-1+ qualified TRACK path — exactly the
@@ -2555,26 +2105,12 @@ class CleanCourseController:
             and now_s - self._course_start_s < cfg.launch_boost_duration_s
         ):
             collective = cfg.launch_boost_thrust
-        # IMU world-vertical-rate governor, after the PD law and the
-        # feedforward boost, before the final clamp.  It caps what bearing
-        # pursuit cannot (see the VZ_CLIMB_CAP_M_S constant block) and stays
-        # alive through TRACK, PREDICT, and SEARCH alike.  The brake-ceiling
-        # band inside classifies gate-high on the F50 compensated error.
-        # F92: the latched pre-gate-1 altitude floor and its F79/F86 yield
-        # kwarg are deleted (four ballooned gate-1 legs: F78/F78b/F79/F91);
-        # blind anti-sink is owned by the vz-center trim and the continuous
-        # vz descent floor.
-        collective = self._governed_collective(
+        collective_target = self._governed_collective(
             collective,
             support,
-            # Numeric taper authority remains fresh-camera-only.  F116 adds
-            # one directional exception: a fresh same-id BOTTOM censorship
-            # may keep the extra margin released because it proves the gate
-            # is low; arbitrary stale prediction still regains the full floor.
             gate_y=floor_gate_y,
-            vz_tracked=vz_tracked,
         )
-        thrust = _clamp(collective, cfg.min_thrust, cfg.max_thrust)
+        thrust = self._continuous_collective(collective_target, dt)
 
         # Lateral: per the 2026-07-29 crossing-geometry analysis, positive
         # image-x error requires POSITIVE yaw (negative yaw rotates the
@@ -3355,185 +2891,75 @@ class CleanCourseController:
         )
         return target_roll, yaw_rate
 
-    def _effective_untrusted_gate_y(
+    def _course_vz_setpoint(
         self,
-        current: _Hypothesis,
+        current: Optional[_Hypothesis],
         *,
-        now_s: float,
-        pitch_rad: float,
+        vertical_error: float,
         vertical_qualified: bool,
-    ) -> Optional[float]:
-        """Preserve one-sided low-gate evidence across bottom censorship.
+    ) -> float:
+        """One bounded course-relative vertical-rate reference.
 
-        A numeric y measurement still owns the normal floor taper.  If that
-        same track then exits through the frame bottom, the measurement is no
-        longer two-sided but its direction is unambiguous: the gate is low.
-        For the bounded prediction horizon, return center/low evidence so the
-        fh-untrusted fallback cannot re-add its +0.05 climb margin.  Bare level
-        support remains the hard floor in ``_governed_collective``.  Top/both-
-        edge censorship and expired/no-track memory remain conservative.
+        TRACK, PREDICT, COMMIT, and SEARCH all use this same owner.  Loss of
+        visual qualification smoothly changes the desired rate to zero; the
+        fh trust latch only protects IMU integration and never selects a
+        different thrust law.
         """
 
-        if vertical_qualified:
-            return self._compensated_ey(current.y, pitch_rad)
-        edge = current.vertical_censor_edge
-        bottom_only = bool(edge & FrameEdge.BOTTOM) and not bool(
-            edge & FrameEdge.TOP
-        )
-        if (
-            bottom_only
-            and now_s - current.last_measurement_s
-            <= self.config.predict_max_gap_s
-        ):
+        if current is None or not vertical_qualified:
             return 0.0
-        return None
-
-    def _wind_vz_center_trim(self, dt: float) -> None:
-        """One-sided support-trim integrator (see the VZ_CENTER_TRIM block).
-
-        The caller decides WHEN to run it: qualified TRACK gates on the ey
-        active bound (a demanded descent is not a sink to fight); blind
-        paths (SEARCH, unqualified TRACK/PREDICT) hold altitude by
-        definition, so any sink is unwanted and there is no ey gate (F90).
-        A sink winds the trim up (bounded, anti-windup at saturation); a
-        real climb leaks it back down.  Never runs while fh-untrusted — a
-        biased-regime vz is not evidence — and COAST/COMMIT never call it,
-        so the exact-zero wait and the crossing law keep their semantics.
-        """
-        if self._fh_untrusted or dt <= 0.0:
-            return
         cfg = self.config
-        saturated = (
-            self._collective is not None
-            and self._collective >= cfg.max_thrust - 0.005
+        bounded_error = _clamp(
+            vertical_error,
+            -cfg.vertical_max_abs_error_norm,
+            cfg.vertical_max_abs_error_norm,
         )
-        if self._vz_est_m_s < cfg.vz_center_trim_sink_m_s and not saturated:
-            self._vz_center_trim = _clamp(
-                self._vz_center_trim
-                + cfg.vz_center_trim_gain * (-self._vz_est_m_s) * dt,
-                0.0,
-                cfg.vz_center_trim_max,
+        ramp = _clamp01(
+            (current.outer_log_scale - cfg.course_vz_des_ramp_start_log_scale)
+            / (
+                cfg.commit_min_log_scale
+                - cfg.course_vz_des_ramp_start_log_scale
             )
-        elif self._vz_est_m_s > -cfg.vz_center_trim_sink_m_s:
-            self._vz_center_trim = max(
-                0.0, self._vz_center_trim - cfg.vz_center_trim_leak_s * dt
+        )
+        vz_des_max = cfg.course_vz_des_max_m_s - (
+            cfg.course_vz_des_max_m_s - cfg.course_vz_des_commit_m_s
+        ) * ramp
+        vz_des_sink_max = cfg.course_vz_des_ground_m_s + (
+            vz_des_max - cfg.course_vz_des_ground_m_s
+        ) * _clamp01(self._alt_est_m / cfg.course_vz_des_ground_alt_m)
+        return _clamp(
+            -cfg.course_vz_des_per_norm * bounded_error,
+            -vz_des_sink_max,
+            vz_des_max,
+        )
+
+    def _continuous_collective(self, target: float, dt: float) -> float:
+        """Carry one bounded collective request continuously across states."""
+
+        target = _clamp(target, self.config.min_thrust, self.config.max_thrust)
+        if self._collective is None:
+            self._collective = target
+        else:
+            alpha = _clamp01(
+                dt / max(1e-6, self.config.collective_decay_tau_s + dt)
             )
+            self._collective += alpha * (target - self._collective)
+        self._collective = _clamp(
+            self._collective, self.config.min_thrust, self.config.max_thrust
+        )
+        return self._collective
 
     def _governed_collective(
         self,
         collective: float,
         support: float,
         gate_y: Optional[float] = None,
-        vz_tracked: bool = False,
     ) -> float:
-        """IMU climb/descent-rate governor: bound collective by estimated vz.
+        """Apply the remaining crossing envelope to one collective target."""
 
-        Applied wherever a nonzero collective is emitted (TRACK, PREDICT,
-        SEARCH, and the defensive fallback) so vision loss never disables
-        it; the COAST exact-zero wait and the abort/cleanup zeros bypass it
-        by construction.
-        Symmetric: caps collective above the climb cap and floors it below
-        the descent floor (flight d52adcd4 sank ~-1.9 m/s^2 into a ground
-        graze while the frozen frame suppressed SEARCH).  F67: the floor is
-        purely proportional (0.21/m/s) — the F64 +0.04 step feedforward
-        bang-banged against the ey servo at the plane (F65: thrust
-        0.31 <-> 0.22 tick-to-tick as vz_est straddled the floor).
-        """
-
-        if self._fh_untrusted:
-            # F14: vz_est is frozen and regime-biased, so NO vz-based
-            # adjustment may fire — not the climb cap, and above all not
-            # the descent floor/feedforward, which pinned F14's thrust at
-            # the clamp on a phantom -4.36 m/s sink.  Camera-qualified PD
-            # output only, hard-clamped to the envelope.
-            # F21 (9828d64c) floor: an invisible "missed" track kept
-            # refreshing vertical_qualified from its frozen ghost position,
-            # so the qualified-PD path sagged collective 0.318 -> 0.254 over
-            # 1.5 s at fh 6.5-7.5 — below real hover in the fast regime — and
-            # the drone sank ~2 m into terrain.  While vz/alt are known lies,
-            # NOTHING may command below the governed support floor (the
-            # F14-measured deficit margin is tapered only by fresh low-gate
-            # geometry on course legs); honest qualified PD may still command
-            # above it.  This closes the blind-sink family in one
-            # place (F19 SEARCH hold, F20 coast gate, F21 qualified-PD sag)
-            # instead of per-path patches.
-            # F83 (20260730T113315Z-visual-course-57671d35): the floor's
-            # support term is tilt-INFLATED by attitude — at the -0.55
-            # pre-cross brake attitude support rose 0.2594 -> 0.2906 and
-            # the +0.05 floor pinned MAX thrust (0.34) for the whole 1.3 s
-            # latch while the same latch disabled the vz climb governor:
-            # an open-loop +2.4 m/s^2 balloon carried the drone OVER gate
-            # 1 (no credit; ground collision after the fall).  The F14/F21
-            # deficit was measured at ~level attitude, so the floor's
-            # support term is bounded at the spawn-level tilt compensation;
-            # qualified PD may still command above the floor.
-            level_support = self.config.support_collective / max(
-                0.85, math.cos(self.config.spawn_pitch_rad)
-            )
-            floor_margin = self.config.fh_untrusted_vertical_margin
-            # F112 (20260801T060914Z-visual-course-39579943): the full
-            # support+0.05 regime floor remained pinned after the correctly
-            # tracked Gate 1 moved BELOW the vehicle (compensated ey +0.44).
-            # F113 (20260801T062148Z-visual-course-0732ea2d): tapering only
-            # over [center, +custody_bound] released the floor one response
-            # window too late.  At the first usable entry scale ey was
-            # already +0.32, so the entry budget correctly refused COMMIT
-            # and the gate left the frame bottom.  On course legs only,
-            # taper that extra deficit margin while fresh compensated
-            # geometry APPROACHES center from one custody bound high.  Full
-            # margin remains for a gate at/above -bound; it reaches zero at
-            # center and stays zero for a low gate.  Bare level support is
-            # still a hard floor: untrusted IMU state can never command the
-            # historical sub-support blind sink.
-            if (
-                self.gate_index >= 1
-                and gate_y is not None
-                and self.config.near_brake_relax_course_ey_norm > 1e-9
-            ):
-                floor_margin *= _clamp01(
-                    -gate_y / self.config.near_brake_relax_course_ey_norm
-                )
-            floor = min(support, level_support) + floor_margin
-            governed = _clamp(
-                max(collective, floor),
-                self.config.min_thrust,
-                self.config.max_thrust,
-            )
-        else:
-            # F68: gate-0 keeps the proved 1.0/0.03 climb-out envelope;
-            # gate-1+ legs get the 0.5/0.10 course envelope, SUBTRACTIVE
-            # from the PD demand so the arrest is continuous (no cap
-            # chatter against the demand).
-            # F96/F100: when the unified vz-tracking law computed the
-            # collective (ANY qualified fh-trusted TRACK) the climb cap is
-            # skipped — it would be a second incoherent vz term on top of
-            # the tracker (the F95 limit cycle).  The descent floor stays:
-            # it is a one-sided hard lower bound, not feedback.
-            if not vz_tracked:
-                if self.gate_index == 0:
-                    excess = self._vz_est_m_s - VZ_CLIMB_CAP_M_S
-                    if excess > 0.0:
-                        collective = min(
-                            collective, support - VZ_GOVERNOR_GAIN * excess
-                        )
-                else:
-                    course_excess = self._vz_est_m_s - VZ_CLIMB_CAP_COURSE_M_S
-                    if course_excess > 0.0:
-                        collective -= VZ_GOVERNOR_COURSE_GAIN * course_excess
-            descent_excess = VZ_DESCENT_FLOOR_M_S - self._vz_est_m_s
-            if descent_excess > 0.0:
-                collective = max(
-                    collective,
-                    support + VZ_DESCENT_GOVERNOR_GAIN * descent_excess,
-                )
-            # Hard clamp here, not only at the main-path call site: the SEARCH
-            # and defensive-fallback returns emit the governed value directly,
-            # and an unclamped deep-sink floor boost (support + gain*excess +
-            # feedforward) exceeded the runner's 0.35 envelope abort in flight
-            # 20260729T115619Z-visual-course-039186c8.
-            governed = _clamp(
-                collective, self.config.min_thrust, self.config.max_thrust
-            )
+        governed = _clamp(
+            collective, self.config.min_thrust, self.config.max_thrust
+        )
         # F33/F34 brake ceiling band: while the closure governor brakes,
         # the collective is confined to support +/- brake_ceiling_band.
         # F34's hard pin AT support removed all centering authority and the
@@ -3587,9 +3013,6 @@ class CleanCourseController:
                         support + self.config.brake_ceiling_band,
                     ),
                 )
-        # F92: the pre-gate-1 altitude-floor max() that used to apply here
-        # is deleted (F78/F78b/F79/F91 balloons); blind anti-sink is the
-        # vz-center trim plus the vz descent floor above.
         return governed
 
     def _anchor_clamped_yaw(
@@ -4091,7 +3514,6 @@ def _clean_course_tick_trace(
         "pre_cross_brake": controller._pre_cross_brake_active,
         "course_anchor_yaw_rad": controller._course_anchor_yaw_rad,
         "alt_est_m": controller._alt_est_m,
-        "vz_center_trim": controller._vz_center_trim,
         "fh_mps2": controller._fh_mps2,
         "fh_trusted": not controller._fh_untrusted,
     }
