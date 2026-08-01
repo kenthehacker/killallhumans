@@ -710,17 +710,14 @@ CLIPPED_INFLATE_VAR_NORM = 0.004  # clipping uncertainty inflation
 INITIAL_POS_VAR_NORM = 0.01  # fresh measured hypothesis position variance
 INITIAL_RATE_VAR = 0.25
 SYNTHETIC_POS_VAR_NORM = 0.16  # StartContext-only fallback hypothesis
-# F140: normalized x and y cannot share one focal value on the verified
-# 640x360 stream.  The existing measured vertical gain is 1.6 norm/rad;
-# because normalization divides pixels by the respective half-dimension,
-# the same physical focal length is 1.6 * (180/320) = 0.9 in normalized x.
-# F138/F139 then supply the live discriminator: using 1.6 in x repeatedly
-# over-derotated a fresh left Gate 1, leaving the carried reference 32-43%
-# weaker than its fused bearing and producing the -0.13 centering
-# equilibrium.  Keep the vertical calibration unchanged and correct only
-# the inconsistent coordinate conversion.
-ROTATION_COMP_X_FOCAL_NORM = 0.9
-ROTATION_COMP_Y_FOCAL_NORM = 1.6
+# F57 (20260730T003044Z-visual-course-74abd688): the de-rotation focal was
+# inconsistent with the SAME camera's measured geometry already in this
+# file (VERTICAL_PITCH_COMP_NORM_PER_RAD = 1.6) -- at 1.0 every predicted
+# bearing under-rotated by 37.5%, which is why the frozen hypothesis
+# lagged the true gate bearing in F52 (frozen ex -0.156 vs true -0.48) and
+# why stale-bearing steering under-corrects.  F140's x=0.9 discriminator
+# regressed the live handoff, so F141 returns to the F127 baseline here.
+ROTATION_COMP_FOCAL_NORM = 1.6  # normalized focal length for de-rotation
 ROTATION_COMP_UNCERTAINTY = 0.25  # fraction of comp drift added as variance
 # Timestamp sentinel for "this axis has never had an accepted measurement"
 # (censored creation detection); any horizon check against it fails.
@@ -1723,21 +1720,33 @@ class CleanCourseController:
                     and self.current.y_axis.std
                     <= cfg.search_covariance_std_norm
                 )
-                commit_ey = self._compensated_ey(
+                commit_geometry_ey = self._compensated_ey(
                     self.current.y, pitch_rad
                 )
                 commit_vz_des = self._course_vz_setpoint(
                     self.current,
-                    vertical_error=commit_ey,
+                    vertical_error=self.current.y,
                     vertical_qualified=commit_vertical_qualified,
                 )
-                commit_hold = support + cfg.course_vz_track_gain * (
-                    commit_vz_des - self._vz_est_m_s
+                # F141: a fresh image-y measurement owns the qualified
+                # vertical correction directly.  The leaky IMU estimate
+                # remains the zero-rate arrest only when image-y is not
+                # observable, and remains authoritative in the COMMIT entry
+                # safety budget; it cannot veto fresh vision here.
+                commit_rate_error = commit_vz_des
+                if not commit_vertical_qualified:
+                    commit_rate_error -= self._vz_est_m_s
+                commit_hold = (
+                    support + cfg.course_vz_track_gain * commit_rate_error
                 )
                 commit_target = self._governed_collective(
                     commit_hold,
                     support,
-                    gate_y=(commit_ey if commit_vertical_qualified else None),
+                    gate_y=(
+                        commit_geometry_ey
+                        if commit_vertical_qualified
+                        else None
+                    ),
                 )
                 # F66: the F60 vertical-aim pitch term is DELETED.  In
                 # commit the attitude is the forward drive, not a second
@@ -2067,14 +2076,24 @@ class CleanCourseController:
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
         self._pre_cross_brake_active = pre_cross_brake
+        # F141 discriminating experiment: F140 reached x=-0.109 while the
+        # raw Gate-1 y was near center, but pitch compensation still read
+        # strongly high and the negative leaky vz estimate kept collective
+        # above support until bottom censorship.  Qualified raw image-y owns
+        # the one bounded vertical reference directly.  Compensated y stays
+        # the physical geometry used by braking and crossing safety; loss of
+        # image-y qualification falls back within this same owner to the
+        # existing IMU zero-rate arrest.  No mode, latch, or additive margin
+        # is introduced.
         vz_des = self._course_vz_setpoint(
             current,
-            vertical_error=ey_vertical - vertical_setpoint_offset,
+            vertical_error=ey - vertical_setpoint_offset,
             vertical_qualified=vertical_qualified,
         )
-        collective = support + cfg.course_vz_track_gain * (
-            vz_des - self._vz_est_m_s
-        )
+        vertical_rate_error = vz_des
+        if not vertical_qualified:
+            vertical_rate_error -= self._vz_est_m_s
+        collective = support + cfg.course_vz_track_gain * vertical_rate_error
         if not vertical_qualified:
             # A stale visual rate is never reused.  The same vertical owner
             # simply tracks zero world-vertical rate until vision returns.
@@ -2466,8 +2485,8 @@ class CleanCourseController:
         # sweeps them downward in the effective Rx(pi) image.
         pitch_rate = float(body_rates[1])
         yaw_rate = float(body_rates[2])
-        drift_x = -yaw_rate * ROTATION_COMP_X_FOCAL_NORM * dt
-        drift_y = pitch_rate * ROTATION_COMP_Y_FOCAL_NORM * dt
+        drift_x = -yaw_rate * ROTATION_COMP_FOCAL_NORM * dt
+        drift_y = pitch_rate * ROTATION_COMP_FOCAL_NORM * dt
         hypothesis.x_axis.predict(dt, drift=drift_x)
         hypothesis.y_axis.predict(dt, drift=drift_y)
         hypothesis.scale_axis.predict(dt)
@@ -2754,7 +2773,7 @@ class CleanCourseController:
                     math.cos(yaw - self._turn_reference_yaw_rad),
                 )
                 self._turn_reference_x -= (
-                    delta_yaw * ROTATION_COMP_X_FOCAL_NORM
+                    delta_yaw * ROTATION_COMP_FOCAL_NORM
                 )
             self._turn_reference_yaw_rad = yaw
 
@@ -2812,39 +2831,20 @@ class CleanCourseController:
                 (current.outer_log_scale - successor.outer_log_scale)
                 / max(1e-6, cfg.successor_min_log_scale_gap)
             )
-            successor_weight = (
+            # F141 returns the handoff law to F127, the best evidence-backed
+            # baseline.  Successor selection already owns persistence, so
+            # track age is deliberately absent here.  Carry the evidence
+            # product continuously; weak evidence changes authority instead
+            # of resetting it, while the one reference remains the only yaw
+            # and bank command owner.
+            desired_authority = (
                 closure
+                * self._turn_aperture_reserve
                 * confidence
                 * uncertainty
                 * freshness
                 * range_order
             )
-            current_confidence = _clamp01(current.confidence)
-            current_uncertainty = _clamp01(
-                1.0 - current.x_axis.std / cfg.search_covariance_std_norm
-            )
-            current_freshness = _clamp01(
-                1.0
-                - max(0.0, now_s - current.last_x_measurement_s)
-                / cfg.x_steer_max_age_s
-            )
-            current_claim = (
-                (1.0 - self._turn_aperture_reserve)
-                * current_confidence
-                * current_uncertainty
-                * current_freshness
-            )
-            # F138: F137's normalized ratio granted full authority to any
-            # nonzero successor when the current claim vanished, then reused
-            # that authority across a fragment reassociation.  It also used
-            # joint x/y covariance, so bottom-y censorship erased a still-
-            # fresh lateral claim.  Keep successor evidence absolute and use
-            # only x-axis quality for current passage custody.  Safe aperture
-            # or aging/uncertain current x releases the successor smoothly;
-            # weak successor evidence remains weak.  Both bearings stay in
-            # the camera/IMU-derotated frame and feed the one carried filter.
-            passage_release = 1.0 - current_claim
-            desired_authority = passage_release * successor_weight
         self._turn_successor_authority += alpha * (
             desired_authority - self._turn_successor_authority
         )
