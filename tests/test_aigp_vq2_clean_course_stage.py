@@ -507,9 +507,10 @@ def test_vertical_rate_owner_applies_in_predict_and_search():
     )
 
 
-def test_near_plane_compensated_gate_y_cannot_be_vetoed_by_vz_estimate():
-    # At the crossing end of the existing range ramp, compensated geometry
-    # owns the correction and the drifting IMU integral has zero authority.
+def test_near_plane_compensated_gate_y_keeps_physical_sink_damping():
+    # F147: compensated geometry still sets the desired rate at the crossing,
+    # but it must not erase measured vertical energy.  F146 reached Gate-0
+    # credit sinking -0.55 m/s after the range fade removed this damping.
     brake_pitch = -0.46
     controller = _tracked_controller(_track("A", 0.0, 0.10))
     controller.current.outer_log_scale = controller.config.commit_min_log_scale
@@ -518,14 +519,16 @@ def test_near_plane_compensated_gate_y_cannot_be_vetoed_by_vz_estimate():
     support = SPAWN_SUPPORT / math.cos(brake_pitch - SPAWN_PITCH)
     compensated = controller._compensated_ey(0.10, brake_pitch)
     assert compensated < 0.0
-    assert out.thrust == pytest.approx(support - 0.12 * compensated, abs=1e-9)
+    assert out.thrust == pytest.approx(
+        support + 0.12 * (-compensated - controller._vz_est_m_s), abs=1e-9
+    )
     assert out.thrust > support
 
 
-def test_qualified_imu_rate_authority_fades_continuously_with_range():
-    # F144 uses the already-established -2.0 -> -1.2 course ramp, rather than
-    # adding a mode or threshold.  A fixed phantom sink must lose authority
-    # smoothly as compensated position approaches the crossing plane.
+def test_qualified_imu_rate_authority_does_not_fade_with_range():
+    # F147 keeps the one physical-rate owner continuous through the existing
+    # proximity ramp.  Range can cap the desired rate, but cannot silently
+    # remove damping of an already-established physical sink.
     thrusts = []
     for outer_log_scale in (-2.0, -1.8, -1.6, -1.4, -1.2):
         controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
@@ -534,11 +537,8 @@ def test_qualified_imu_rate_authority_fades_continuously_with_range():
         controller._vz_est_m_s = -0.40
         thrusts.append(_command(controller, 100.10, pitch=SPAWN_PITCH).thrust)
 
-    assert all(b < a for a, b in zip(thrusts, thrusts[1:]))
-    assert thrusts[0] == pytest.approx(SPAWN_SUPPORT + 0.12 * 0.40)
-    assert thrusts[-1] == pytest.approx(SPAWN_SUPPORT)
-    assert thrusts[2] == pytest.approx(
-        (thrusts[0] + thrusts[-1]) / 2.0, abs=1e-9
+    assert thrusts == pytest.approx(
+        [SPAWN_SUPPORT + 0.12 * 0.40] * len(thrusts), abs=1e-9
     )
 
 
@@ -3583,9 +3583,9 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
         current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.TRACK
-    # At/inside commit range, IMU rate authority has faded to zero: the
-    # -0.20 setpoint alone requests 0.024 below support.
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.024, abs=1e-3)
+    # At/inside commit range the setpoint is capped at -0.20, while the same
+    # full physical-rate error also damps the measured +0.10 m/s climb.
+    assert out.thrust == pytest.approx(SPAWN_SUPPORT - 0.036, abs=1e-3)
     # Far away the full -0.30 setpoint and +0.10 IMU climb both apply.
     far = _tracked_controller(_track("A", 0.0, 0.30, scale=0.20))
     _promote_to_gate_one(far)
@@ -3790,7 +3790,7 @@ def test_far_vertical_owner_combines_compensated_position_and_imu_rate():
     assert very_low.thrust == pytest.approx(SPAWN_SUPPORT + 0.12 * 0.10)
 
 
-def test_gate0_qualified_imu_damping_fades_only_near_plane():
+def test_gate0_qualified_imu_damping_continues_through_near_plane():
     # F85 (20260730T123020Z-visual-course-34c8dd71): gate 0 arrived at
     # censorship climbing +0.45 m/s; the aperture fit had died to clipping,
     # so COMMIT could not arm (the F83 entry cap never ran), and the
@@ -3822,11 +3822,10 @@ def test_gate0_qualified_imu_damping_fades_only_near_plane():
         assert controller.state is CleanCourseState.TRACK
         return out
 
-    # Near plane, compensated position is no longer vetoed by IMU climb.
+    # Near plane and far away, the same one rate owner arrests vertical energy.
     climbing = _gate0_thrust(0.45, -0.70)
     settled = _gate0_thrust(0.0, -0.70)
-    assert climbing.thrust == pytest.approx(settled.thrust, abs=1e-9)
-    # Far range retains the same single damping term used by every leg.
+    assert climbing.thrust < settled.thrust - 0.03
     far_climbing = _gate0_thrust(0.45, -2.20)
     far_settled = _gate0_thrust(0.0, -2.20)
     assert far_climbing.thrust < far_settled.thrust - 0.03
@@ -4050,14 +4049,14 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     assert out.target_roll_rad == pytest.approx(0.50 * reference, abs=1e-9)
 
 
-def test_commit_qualified_vertical_uses_near_plane_position_reference():
+def test_commit_qualified_vertical_keeps_full_physical_rate_reference():
     controller = _commit_controller()
     _, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
 
-    # COMMIT is at the crossing end of the same range ramp.  Neither a
-    # phantom IMU sink nor normalized image motion may veto a centered
-    # compensated-position request.
+    # COMMIT carries the same full physical-rate reference through the plane.
+    # Normalized image motion remains irrelevant, but an established sink is
+    # actively arrested instead of being discarded by proximity.
     controller._vz_est_m_s = -0.80
     controller.current.y_axis.p = 0.0
     controller.current.raw_y = 0.0
@@ -4071,7 +4070,8 @@ def test_commit_qualified_vertical_uses_near_plane_position_reference():
         out = _command(controller, now, pitch=SPAWN_PITCH)
 
     assert controller.state is CleanCourseState.COMMIT
-    assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-3)
+    assert out.thrust > SPAWN_SUPPORT + 0.06
+    assert out.thrust <= controller.config.max_thrust
 
 
 def test_commit_stale_y_relaxes_continuously_to_zero_vz_reference():

@@ -1728,20 +1728,14 @@ class CleanCourseController:
                     vertical_error=commit_ey,
                     vertical_qualified=commit_vertical_qualified,
                 )
-                # F144: keep the one F127 vertical-rate owner, but fade its
-                # IMU term continuously over the existing course range ramp.
-                # Near the plane compensated vision can therefore command a
-                # correction without a drifting vz estimate vetoing it.  An
-                # unqualified hold still damps the full IMU rate.
-                if commit_vertical_qualified:
-                    commit_rate_feedback = self._vz_est_m_s * (
-                        1.0 - self._course_range_ramp(self.current)
-                    )
-                else:
-                    commit_rate_feedback = self._vz_est_m_s
-                commit_rate_error = commit_vz_des - commit_rate_feedback
-                commit_hold = (
-                    support + cfg.course_vz_track_gain * commit_rate_error
+                # F147: F146 reached Gate-0 credit already sinking -0.55 m/s
+                # and 1.32 m below the launch estimate.  The F144 range fade
+                # had removed the only physical rate damping exactly as the
+                # qualified compensated image still asked for climb.  Restore
+                # F127's single full IMU rate error in both TRACK and COMMIT;
+                # no vertical mode, margin, or second owner is introduced.
+                commit_hold = support + cfg.course_vz_track_gain * (
+                    commit_vz_des - self._vz_est_m_s
                 )
                 commit_target = self._governed_collective(
                     commit_hold,
@@ -2076,25 +2070,18 @@ class CleanCourseController:
         brake_demand = max(closure_brake, 1.0 - align)
         pre_cross_brake = brake_demand > 0.5
         self._pre_cross_brake_active = pre_cross_brake
-        # F144: F143 proved that normalized image motion is not a physical
-        # vertical-rate measurement: perspective/closure dilation drove a
-        # full collective oscillation into Gate 1.  Restore the single F127
-        # IMU rate term far out, then fade it continuously with the existing
-        # range ramp so it cannot veto compensated visual position near the
-        # plane.  This remains one carried collective owner across states.
+        # F147: retain F146's improved lateral handoff, but restore F127's one
+        # qualified physical-rate error after F146's range-faded controller
+        # carried a real -0.55 m/s Gate-0 sink through credit.  Image rate is
+        # still absent; TRACK, COMMIT, and blind holds share one collective.
         vz_des = self._course_vz_setpoint(
             current,
             vertical_error=ey_vertical - vertical_setpoint_offset,
             vertical_qualified=vertical_qualified,
         )
-        if vertical_qualified:
-            rate_feedback = self._vz_est_m_s * (
-                1.0 - self._course_range_ramp(current)
-            )
-        else:
-            rate_feedback = self._vz_est_m_s
-        vertical_rate_error = vz_des - rate_feedback
-        collective = support + cfg.course_vz_track_gain * vertical_rate_error
+        collective = support + cfg.course_vz_track_gain * (
+            vz_des - self._vz_est_m_s
+        )
         if not vertical_qualified:
             # A stale visual rate is never reused.  The same vertical owner
             # simply tracks zero world-vertical rate until vision returns.
