@@ -2677,7 +2677,7 @@ def test_near_plane_stale_x_keeps_derotated_steering():
     assert out.target_roll_rad == 0.0
 
 
-def test_derotation_focal_matches_f127_baseline():
+def test_derotation_focal_and_sign_match_fixed_world_geometry():
     # F140's split x focal was falsified live: it delayed the useful
     # successor turn, doubled pre-credit reversals, and regressed the Gate-1
     # credit setup.  F141 deliberately restores the F127 derotation baseline.
@@ -2686,9 +2686,9 @@ def test_derotation_focal_matches_f127_baseline():
     hypothesis = controller.current
     start_x, start_y = hypothesis.x, hypothesis.y
     controller._predict(hypothesis, 0.033, (0.0, -0.20, 0.40))
-    # drift_x = -yaw_rate * focal * dt; drift_y = pitch_rate * focal * dt.
+    # Both fixed-world flows oppose their corresponding positive body rate.
     assert hypothesis.x - start_x == pytest.approx(-0.40 * 1.6 * 0.033)
-    assert hypothesis.y - start_y == pytest.approx(-0.20 * 1.6 * 0.033)
+    assert hypothesis.y - start_y == pytest.approx(+0.20 * 1.6 * 0.033)
 
     turn = _turn_reference_controller(successor_x=None, current_x=0.0)
     turn._turn_reference_x = -0.20
@@ -2702,6 +2702,26 @@ def test_derotation_focal_matches_f127_baseline():
         dt=0.0,
     )
     assert reference == pytest.approx(-0.20 + 0.10 * 1.6)
+
+
+def test_vertical_derotation_keeps_stationary_world_geometry_stationary():
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    hypothesis = controller.current
+    pitch = SPAWN_PITCH
+
+    # A stationary gate's raw image y changes only with attitude.  Applying
+    # the known pitch flow must leave compensated position and translational
+    # visual rate at zero throughout a reversing pitch sequence.
+    for pitch_rate in (-0.20, -0.10, 0.15, 0.05):
+        dt = 0.033
+        controller._predict(hypothesis, dt, (0.0, pitch_rate, 0.0))
+        pitch += pitch_rate * dt
+        expected_raw_y = (SPAWN_PITCH - pitch) * 1.6
+        assert hypothesis.y == pytest.approx(expected_raw_y, abs=1e-12)
+        assert controller._compensated_ey(hypothesis.y, pitch) == pytest.approx(
+            0.0, abs=1e-12
+        )
+        assert hypothesis.y_axis.v == pytest.approx(0.0, abs=1e-12)
 
 
 def test_near_plane_steering_boost_scales_both_lateral_gains():

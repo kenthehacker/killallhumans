@@ -2494,12 +2494,16 @@ class CleanCourseController:
         """
 
         # FRD body rates: (roll, pitch, yaw).  A positive yaw rate sweeps
-        # fixed image features toward image-left; a positive pitch rate
-        # sweeps them downward in the effective Rx(pi) image.
+        # fixed image features toward image-left.  F143 corrects the vertical
+        # sign to match the controller's own compensated coordinate:
+        # raw_y = world_y + (spawn_pitch - pitch) * focal, hence fixed-world
+        # flow is -pitch_rate * focal.  F142 used the opposite prediction,
+        # manufactured a positive y-rate during the nose-up brake, and kept
+        # thrust sub-support into a -1.07 m/s Gate-0 sink.
         pitch_rate = float(body_rates[1])
         yaw_rate = float(body_rates[2])
         drift_x = -yaw_rate * ROTATION_COMP_FOCAL_NORM * dt
-        drift_y = pitch_rate * ROTATION_COMP_FOCAL_NORM * dt
+        drift_y = -pitch_rate * ROTATION_COMP_FOCAL_NORM * dt
         hypothesis.x_axis.predict(dt, drift=drift_x)
         hypothesis.y_axis.predict(dt, drift=drift_y)
         hypothesis.scale_axis.predict(dt)
