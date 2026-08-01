@@ -401,18 +401,6 @@ COMMIT_ENTRY_MAX_VZ_M_S = 0.25
 # straight into it ("pitch limit exceeded (-35.0deg)") after a credited
 # gate-0 crossing.  -33 deg keeps 2 deg of settling margin.
 PITCH_TARGET_MIN_RAD = math.radians(-33.0)
-# TRACK-phase lateral trim (2026-07-30): the gate-1 off-axis pursuit is a
-# P-loop orbiting the gate — it equilibrates at ex ~-0.08 EVERY flight
-# (yaw holds the bearing constant against translation parallax; the F57
-# gain boost only moved the equilibrium).  A small bounded integral on the
-# raw ex, active only near the linear regime and while x is fresh, learns
-# the feedforward that nulls the orbit so entries arrive centered.  This
-# replaces the COMMIT-only F62 0.08 bias, which compensated the entry
-# offset only during the blind finish.
-EX_TRIM_GAIN = 0.30  # trim norm/s per norm of sustained ex
-EX_TRIM_MAX_NORM = 0.15  # anti-windup bound (~2x the measured equilibrium)
-EX_TRIM_ACTIVE_EX_NORM = 0.25  # integrate only inside the near regime
-
 PREDICT_FRAME_GAP_S = 0.25  # ~8 camera frames; 0.06 (~2) flapped TRACK/SEARCH
 # 7 times in the 4.2 s F35 gate-1 leg, each flap dumping the pursuit fix.
 PREDICT_MAX_GAP_S = 0.50  # short-gap bound before SEARCH
@@ -962,9 +950,6 @@ class CleanCourseConfig:
     commit_entry_max_expansion_rate_s: float = COMMIT_ENTRY_MAX_EXPANSION_RATE_S
     commit_entry_max_vz_m_s: float = COMMIT_ENTRY_MAX_VZ_M_S
     pitch_target_min_rad: float = PITCH_TARGET_MIN_RAD
-    ex_trim_gain: float = EX_TRIM_GAIN
-    ex_trim_max_norm: float = EX_TRIM_MAX_NORM
-    ex_trim_active_ex_norm: float = EX_TRIM_ACTIVE_EX_NORM
     near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
     predict_max_gap_s: float = PREDICT_MAX_GAP_S
@@ -1086,10 +1071,6 @@ class CleanCourseController:
         # COMMIT_* constant block).
         self._near_plane_since_s: Optional[float] = None
         self._commit_entry_s: Optional[float] = None
-        # 2026-07-30 TRACK-phase lateral trim (see the EX_TRIM_* block): a
-        # small bounded integral on raw ex that nulls the off-axis pursuit
-        # orbit equilibrium before entry; reset on target/promotion change.
-        self._ex_trim: float = 0.0
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
@@ -1152,7 +1133,6 @@ class CleanCourseController:
         self.gate_index = int(gate_index)
         self.max_gate_index = int(gate_index)
         self._course_start_s = float(now_s)
-        self._ex_trim = 0.0
         self._turn_reference_x = None
         self._turn_reference_yaw_rad = None
         self._turn_aperture_reserve = 0.0
@@ -1340,8 +1320,6 @@ class CleanCourseController:
                 ):
                     self.successor = None
                 self.state = CleanCourseState.TRACK
-                # New target, new geometry: relearn the orbit trim.
-                self._ex_trim = 0.0
         else:
             gap = now_s - self.current.last_measurement_s
             # F102: the gate-0 credible-close-loss coast is DELETED — every
@@ -1427,8 +1405,6 @@ class CleanCourseController:
         self.gate_index = int(gate_index)
         self.max_gate_index = max(self.max_gate_index, self.gate_index)
         self.transitions.append((previous, self.gate_index))
-        # Promotion: the next gate's pursuit gets a fresh orbit trim.
-        self._ex_trim = 0.0
         # Preserve the filtered bearing through promotion, but start the new
         # gate's future-successor aperture calculation from zero.  The newly
         # promoted current hypothesis is the same derotated bearing that fed
@@ -1695,16 +1671,10 @@ class CleanCourseController:
                 commit_steer_gain = 1.0
                 if self.current.log_scale >= cfg.commit_min_log_scale:
                     commit_steer_gain = cfg.near_plane_steer_gain_mult
-                # 2026-07-30: the aim carries the TRACK-learned orbit trim
-                # (EX_TRIM_* block) instead of the F63 fixed 0.08 bias — the
-                # trim nulls the repeatable lateral P-loop equilibrium at
-                # its source, so the entry arrives centered about the true
-                # crossing point rather than compensating it blind.
-                commit_ex = self.current.x - self._ex_trim
                 commit_heading_ex, commit_blend = self._turn_reference(
                     self.current,
                     self.successor,
-                    current_error=commit_ex,
+                    current_error=self.current.x,
                     now_s=now_s,
                     yaw_rad=yaw_rad,
                     dt=dt,
@@ -1807,7 +1777,7 @@ class CleanCourseController:
                     pending_reference, pending_blend = self._turn_reference(
                         self.current,
                         self.successor,
-                        current_error=self.current.x - self._ex_trim,
+                        current_error=self.current.x,
                         now_s=now_s,
                         yaw_rad=yaw_rad,
                         dt=dt,
@@ -1883,7 +1853,6 @@ class CleanCourseController:
         # never changes pitch, thrust, passage, or race ownership; current-gate
         # ``ex``/``ey`` remain authoritative, with F118 adding only a small
         # aperture-leased prebank to the current roll correction.
-        # The aperture-reserved yaw channel is computed after the orbit trim.
         # Historical context (flight
         # ab6252b2): track 07 (gate 1) was centered and approached to span
         # 0.34/conf 0.87, then slid left to x=-0.95 while the yaw command
@@ -1913,25 +1882,12 @@ class CleanCourseController:
         x_qualified = (
             now_s - current.last_x_measurement_s <= cfg.x_steer_max_age_s
         )
-        # 2026-07-30 TRACK-phase lateral trim (EX_TRIM_* block): the off-axis
-        # pursuit is a P-loop that equilibrates at ex ~-0.08 every flight
-        # (yaw holds the bearing constant against translation parallax).
-        # Integrate the raw ex while fresh and near the linear regime; the
-        # bounded trim learns the feedforward that nulls the orbit BEFORE
-        # entry, replacing the F62 COMMIT-only 0.08 bias.  Steady state of
-        # trim += ki*ex is ex -> 0, not ex -> trim.
-        if (
-            self.state is CleanCourseState.TRACK
-            and self.gate_index >= 1
-            and x_qualified
-            and abs(current.x) <= cfg.ex_trim_active_ex_norm
-        ):
-            self._ex_trim = _clamp(
-                self._ex_trim + cfg.ex_trim_gain * current.x * dt,
-                -cfg.ex_trim_max_norm,
-                cfg.ex_trim_max_norm,
-            )
-        ex -= self._ex_trim
+        # F149: F148 reached x=-0.134, then the retired TRACK trim had
+        # integrated -0.050 and reduced the race-owned error to -0.084.  Its
+        # own contract deliberately drove a sustained nonzero image error to
+        # zero yaw, opposing the only coordinated turn reference.  Current x
+        # now enters that reference directly; no lateral integrator, bias, or
+        # second command owner remains.
 
         # F120: one lateral reference owns yaw and bank before, through, and
         # after the crossing.  Passage alignment and the IMU-derotated
@@ -2867,25 +2823,18 @@ class CleanCourseController:
             self._turn_successor_authority if successor is not None else 0.0
         )
         if successor is not None:
-            # F148: F147 exposed the remaining dead zone in F146's neutral
-            # mass.  Merely detecting far-right Gate 2 weakened race-owned
-            # Gate-1 pursuit while successor authority was exactly zero:
-            # reference -0.129 -> -0.082 and x stalled near -0.153.  Assign
-            # unsupported mass to the already IMU-derotated carried reference,
-            # so evidence strength controls how fast it updates rather than
-            # biasing it toward zero.  The current and successor claims, race
-            # ownership, and the single yaw/bank owner are unchanged.
+            # F146: F145 computed an evidence-backed current claim, then the
+            # final blend discarded it and implicitly restored current error
+            # to (1 - successor authority).  That recreated the rightward
+            # counterturn whenever the old left bearing grew uncertain.  Use
+            # the two claims actually supported by evidence; unclaimed weight
+            # is neutral, and the existing derotated reference filter supplies
+            # continuity.  Weak evidence now decays toward zero rather than
+            # granting the opposing current error invented authority.
             current_weight = min(current_claim, 1.0 - authority)
-            carried_weight = max(0.0, 1.0 - current_weight - authority)
-            carried_reference = (
-                self._turn_reference_x
-                if self._turn_reference_x is not None
-                else float(current_error)
-            )
             desired = (
                 current_weight * float(current_error)
                 + authority * successor.x
-                + carried_weight * carried_reference
             )
 
         if self._turn_reference_x is None:

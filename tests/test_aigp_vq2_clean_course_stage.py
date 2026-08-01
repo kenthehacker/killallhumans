@@ -1902,7 +1902,6 @@ def _turn_reference_controller(
 
     controller = _tracked_controller(
         _track("A", current_x, 0.0, scale=0.45),
-        config=_config(ex_trim_gain=0.0),
     )
     tracks = [_track("A", current_x, 0.0, scale=0.45)]
     if successor_x is not None:
@@ -2169,7 +2168,7 @@ def test_successor_reassociation_cannot_recreate_precredit_s_turn():
     assert max(yaw_steps) < 0.08
 
 
-def test_weak_successor_evidence_releases_into_carried_reference_smoothly():
+def test_weak_successor_evidence_decays_turn_reference_smoothly():
     controller = _turn_reference_controller(current_x=0.04)
     now = 100.10
     for _ in range(14):
@@ -2184,9 +2183,9 @@ def test_weak_successor_evidence_releases_into_carried_reference_smoothly():
     assert authority_before > 0.0
     assert out.yaw_rate_rad_s < 0.0
 
-    # All evidence factors weaken together.  Raw evidence authority can
-    # vanish, but unsupported mass remains on the derotated reference instead
-    # of creating F146's zero-biased dead zone or F119's off-full switch.
+    # All evidence factors weaken together.  Raw evidence weight can vanish,
+    # but the only command-bearing state is the derotated reference, which
+    # must decay continuously instead of reproducing F119's off-full switch.
     controller.successor.x_axis.pp = 2.0
     controller.successor.y_axis.pp = 2.0
     controller.successor.last_measurement_s = now - 2.0
@@ -2209,14 +2208,8 @@ def test_weak_successor_evidence_releases_into_carried_reference_smoothly():
         right < left for left, right in zip(authorities, authorities[1:])
     )
     assert all(reference < 0.0 for reference in references)
-    # Residual left evidence can still update the carried reference while its
-    # authority fades, but every update remains small and same-sign.
     assert all(
-        right < left for left, right in zip(references, references[1:])
-    )
-    assert (
-        max(abs(right - left) for left, right in zip(references, references[1:]))
-        < 0.02
+        right > left for left, right in zip(references, references[1:])
     )
     assert all(yaw < 0.0 for yaw in yaws)
 
@@ -2517,44 +2510,6 @@ def test_weak_opposite_successor_cannot_erase_current_gate_turn():
     assert heading < -0.20
     assert yaw_rate < -0.02
     assert target_roll < 0.0
-
-
-def test_f147_zero_authority_successor_cannot_dilute_current_pursuit():
-    # F147: Gate 1 was still x=-0.178 when far-right Gate 2 first appeared.
-    # Its successor authority remained exactly zero, yet merely entering the
-    # successor branch assigned uncertain current mass to neutral and decayed
-    # the carried reference -0.129 -> -0.082.  Unsupported mass must preserve
-    # the already derotated reference; fresh current evidence can then move it
-    # toward Gate 1 without a zero-biased dead zone.
-    controller = _turn_reference_controller(successor_x=0.34, current_x=-0.18)
-    controller.current.outer_log_scale = -2.0  # successor closure authority 0
-    controller.current.aperture_half_x = 0.25
-    controller.current.raw_x = -0.18
-    controller._turn_aperture_reserve = 0.0
-    controller._turn_successor_authority = 0.0
-    controller._turn_reference_x = -0.13
-    controller._turn_reference_yaw_rad = 0.0
-
-    now = 100.10
-    references = []
-    for _ in range(8):
-        now += 0.031
-        controller.current.last_x_measurement_s = now
-        controller.successor.last_measurement_s = now
-        controller.successor.last_x_measurement_s = now
-        reference, authority = controller._turn_reference(
-            controller.current,
-            controller.successor,
-            current_error=-0.18,
-            now_s=now,
-            yaw_rad=0.0,
-            dt=0.031,
-        )
-        references.append(reference)
-        assert authority == pytest.approx(0.0, abs=1e-12)
-
-    assert all(right < left for left, right in zip(references, references[1:]))
-    assert references[-1] < -0.15
 
 
 def test_authoritative_promotion_retains_stale_measured_successor_for_prediction():
@@ -3055,13 +3010,9 @@ def _commit_controller(now_s=100.10):
     near plane (outer log scale -0.50 >= -1.2), fresh uncensored
     measurements on both axes, and the 2026-07-30 entry budget satisfied —
     a usable inner aperture whose 60% margin admits error+blackout drift
-    (0.10 + 0 <= 0.6*0.25 on x; 0.05 + 0 <= 0.6*0.25 on y).  The lateral
-    trim integrator is frozen (gain 0) so steering-law assertions stay
-    exact; the dedicated trim test exercises the integrator itself."""
+    (0.10 + 0 <= 0.6*0.25 on x; 0.05 + 0 <= 0.6*0.25 on y)."""
 
-    controller = _tracked_controller(
-        _track("A", 0.0, 0.0), config=_config(ex_trim_gain=0.0)
-    )
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
     _promote_to_gate_one(controller, now_s=now_s)
     controller._alt_est_m = 2.0  # honest altitude (floor quiet)
     current = controller.current
@@ -3116,9 +3067,7 @@ def _commit_controller_gate_zero(now_s=100.10):
     promotion) — the unified crossing policy must arm COMMIT at gate 0
     exactly as it does at gate 1+."""
 
-    controller = _tracked_controller(
-        _track("A", 0.0, 0.0), config=_config(ex_trim_gain=0.0)
-    )
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
     controller._alt_est_m = 2.0  # honest altitude (floor quiet)
     current = controller.current
     current.x_axis.p = 0.10
@@ -4828,55 +4777,29 @@ def test_commit_entry_refuses_excessive_closure():
     assert closing.state is CleanCourseState.TRACK
 
 
-def test_track_lateral_trim_integrates_bounded_and_nulls_the_orbit():
-    # The off-axis pursuit is a P-loop that equilibrates at ex ~-0.08 every
-    # flight (yaw holds the bearing against translation parallax).  The
-    # TRACK-phase trim integrates the sustained error on gate-1+ legs and
-    # nulls the orbit BEFORE entry, bounded at +/-0.15 — replacing the
-    # F63 COMMIT-only fixed bias.
+def test_sustained_race_owned_error_is_not_integrated_out_of_turn_request():
+    # F149: F148 stalled at x=-0.134 while the old trim integrated -0.050
+    # and reduced the current-gate request to -0.084.  A persistent measured
+    # bearing is a physical pursuit error, not a bias to ratchet toward zero.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     _promote_to_gate_one(controller)
     controller._alt_est_m = 2.0
-    current = controller.current  # B: far scale, no commit arming, no boost
+    controller.successor = None
+    controller._turn_reference_x = None
+    current = controller.current
     current.x_axis.p = 0.10
+    current.raw_x = 0.10
+    current.outer_log_scale = -2.5  # far-range gain remains 1.0
     now = 100.10
-    first_yaw = None
-    out = None
     for _ in range(60):  # ~2 s of sustained ex=+0.10
         now += 0.033
         current.last_measurement_s = now
         current.last_x_measurement_s = now
         current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
-        if first_yaw is None:
-            first_yaw = out.yaw_rate_rad_s
-    assert first_yaw == pytest.approx(0.09, abs=2e-3)  # 0.9 * 0.10 pre-trim
-    assert 0.04 < controller._ex_trim <= 0.15
-    assert out.yaw_rate_rad_s < first_yaw  # the trim eats the orbit error
-    # Anti-windup: an arbitrarily long sustained error cannot wind the trim
-    # past its bound.
-    for _ in range(400):
-        now += 0.033
-        current.last_measurement_s = now
-        current.last_x_measurement_s = now
-        current.last_y_measurement_s = now
-        out = _command(controller, now, pitch=SPAWN_PITCH)
-    assert controller._ex_trim <= 0.15 + 1e-12
-    # With the trim converged onto the orbit error, the steering law sees a
-    # nulled error and commands zero yaw.
-    frozen = _tracked_controller(
-        _track("A", 0.0, 0.0), config=_config(ex_trim_gain=0.0)
-    )
-    _promote_to_gate_one(frozen)
-    frozen._alt_est_m = 2.0
-    frozen.current.x_axis.p = 0.10
-    frozen._ex_trim = 0.10
-    now = 100.133
-    frozen.current.last_measurement_s = now
-    frozen.current.last_x_measurement_s = now
-    frozen.current.last_y_measurement_s = now
-    out = _command(frozen, now, pitch=SPAWN_PITCH)
-    assert out.yaw_rate_rad_s == pytest.approx(0.0, abs=1e-9)
+        assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
+        assert out.target_roll_rad > 0.0
+    assert controller._turn_reference_x == pytest.approx(0.10, abs=1e-9)
 
 
 def test_commit_close_loss_latches_exact_zero_credit_wait():
