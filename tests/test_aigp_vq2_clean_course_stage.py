@@ -1206,7 +1206,7 @@ def test_fh_untrusted_floor_not_inflated_by_brake_attitude():
 def test_closure_governor_full_brake_at_high_expansion_rate():
     # F31: the vision log-scale expansion rate is the only honest closure
     # signal (fh is a signless drag magnitude).  At/above the full-brake
-    # rate the governor commands the gentle brake attitude exactly, at the
+    # rate the governor commands the full bounded brake attitude, at the
     # fast slew, with lateral pursuit and the vz governor alive.
     controller = _tracked_controller(_track("A", 0.20, 0.0, scale=0.10))
     controller.current.scale_axis.v = 0.7  # above CLOSURE_FULL_BRAKE_RATE_S
@@ -1221,12 +1221,8 @@ def test_closure_governor_full_brake_at_high_expansion_rate():
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
     assert out.target_pitch_rad == pytest.approx(
-            # F49: spawn-relative — the -0.15 offset from the -0.31 spawn
-            # attitude gives the effective -0.46 TRUE brake.
-            controller.config.spawn_pitch_rad
-            + controller.config.pre_cross_brake_pitch_rad,
-            abs=1e-9,
-        )
+        controller.config.pitch_target_min_rad, abs=1e-9
+    )
     assert now - 100.10 <= 0.5  # fast slew, not the generic 0.30 rad/s
     assert out.yaw_rate_rad_s > 0.0  # x=+0.20 pursuit stays alive
     assert out.thrust > 0.0  # the vz governor keeps the collective alive
@@ -1238,9 +1234,9 @@ def test_course_leg_brake_doubles_authority():
     # saturated) and still closed log-scale -1.6 -> -0.57 in 2.4 s — the
     # ~5 m/s inherited from the gate-0 crossing outran ~1.5 m/s^2 of brake,
     # and the drone passed ~2 m right of the aperture with yaw at the cap.
-    # Course legs (gate_index >= 1) get twice the brake offset (-0.30 from
-    # spawn, effective -0.61); gate 0 keeps the proved -0.15 (asserted by
-    # the governor tests above).
+    # The full bounded brake offset is -0.30 from spawn (effective -0.61)
+    # on every leg; F105 removed Gate 0's weaker exception after F104's
+    # near-plane-only application engaged too late to arrest closure.
     # F84 (20260730T121408Z-visual-course-533d563c): -0.61 rad sat 0.001 rad
     # inside the runner's -35 deg pitch watchdog and the sustained brake
     # slewed into the abort.  Every pitch target is now clamped at
@@ -1300,7 +1296,7 @@ def test_closure_governor_distrusts_tiny_track_expansion():
 
 def test_closure_governor_is_a_continuous_blend():
     # Mid-band closure: the pitch target blends partway from the advance
-    # law (spawn base) toward the spawn-0.15 pre-cross brake attitude,
+    # law (spawn base) toward the full pre-cross brake attitude,
     # without latching the fast-slew brake flag.
     # F101: at log -1.40 the range-ramped target is 0.25 (halfway down
     # the -2.0 -> -0.8 ramp), so 0.375/s sits mid-band.  (The commit
@@ -1317,7 +1313,7 @@ def test_closure_governor_is_a_continuous_blend():
         out = _command(controller, now)
     assert not controller._pre_cross_brake_active
     assert (
-        SPAWN_PITCH - 0.15 + 1e-9
+        controller.config.pitch_target_min_rad + 1e-9
         < out.target_pitch_rad
         < SPAWN_PITCH - 1e-9
     )
@@ -1344,12 +1340,8 @@ def test_misaligned_far_gate_brakes_and_climbs():
         out = _command(controller, now)
     assert controller._pre_cross_brake_active
     assert out.target_pitch_rad == pytest.approx(
-            # F49: spawn-relative — the -0.15 offset from the -0.31 spawn
-            # attitude gives the effective -0.46 TRUE brake.
-            controller.config.spawn_pitch_rad
-            + controller.config.pre_cross_brake_pitch_rad,
-            abs=1e-9,
-        )
+        controller.config.pitch_target_min_rad, abs=1e-9
+    )
     # Top-clipped gate: y censored -> unqualified -> one-sided climb hold.
     assert not out.vertical_qualified
     # support + 0.12 exceeds the old +0.065 hover-equivalent margin even
@@ -1381,12 +1373,8 @@ def test_closure_governor_brakes_in_predict():
     assert controller.state is CleanCourseState.PREDICT
     assert controller._pre_cross_brake_active
     assert out.target_pitch_rad == pytest.approx(
-            # F49: spawn-relative — the -0.15 offset from the -0.31 spawn
-            # attitude gives the effective -0.46 TRUE brake.
-            controller.config.spawn_pitch_rad
-            + controller.config.pre_cross_brake_pitch_rad,
-            abs=1e-9,
-        )
+        controller.config.pitch_target_min_rad, abs=1e-9
+    )
 
 
 def test_pitch_offsets_follow_the_configured_spawn_attitude():
@@ -1404,8 +1392,8 @@ def test_pitch_offsets_follow_the_configured_spawn_attitude():
         controller.current.last_x_measurement_s = now
         out = _command(controller, now, pitch=config.spawn_pitch_rad)
     assert controller._pre_cross_brake_active
-    # -0.20 spawn + (-0.15) pre-cross offset = -0.35 effective brake.
-    assert out.target_pitch_rad == pytest.approx(-0.35, abs=1e-9)
+    # -0.20 spawn + the global -0.30 pre-cross offset = -0.50.
+    assert out.target_pitch_rad == pytest.approx(-0.50, abs=1e-9)
 
 
 def test_heading_anchor_clamps_outward_yaw_only():
@@ -1669,9 +1657,11 @@ def test_pre_cross_brake_custody_floor_scales_with_compensated_ey():
     assert drive().target_pitch_rad == pytest.approx(
         SPAWN_PITCH - (0.55 - 0.40) / 1.6, abs=1e-9
     )
-    # Centered: the floor sits below the gate-0 brake attitude — full brake.
+    # Centered: the floor sits below the global bounded brake — full brake.
     controller.current.y_axis.p = 0.0
-    assert drive().target_pitch_rad == pytest.approx(SPAWN_PITCH - 0.15, abs=1e-9)
+    assert drive().target_pitch_rad == pytest.approx(
+        controller.config.pitch_target_min_rad, abs=1e-9
+    )
 
 
 def test_near_plane_custody_floor_runs_on_the_stale_hypothesis():
@@ -2447,23 +2437,22 @@ def test_commit_entry_arms_on_gate_zero():
     assert climbing._pre_cross_brake_active
 
 
-def test_gate_zero_budget_false_hold_uses_full_course_brake():
-    # F104: F102/F103 received authoritative Gate-0 credit from PREDICT,
-    # never COMMIT.  Raw expansion remained above the 0.35/s entry budget
-    # through censorship while the Gate-0 hold used only the -0.15 offset.
-    # Preserve the far approach, but once Gate 0 is near-plane with a false
-    # entry budget, use the already-bounded course brake.  The existing
-    # custody floor remains the final authority and keeps the gate visible.
+def test_gate_zero_early_brake_uses_full_course_authority():
+    # F105: F104 used the full Gate-0 brake only inside the near-plane hold,
+    # but live expansion exceeded the 0.35/s entry budget roughly two seconds
+    # before credit and still crossed from PREDICT.  Use the same bounded
+    # course brake as soon as the existing pre-cross demand fires, while the
+    # outer scale is still outside the near-plane COMMIT regime.
     controller = _commit_controller_gate_zero()
     current = controller.current
     current.x_axis.p = 0.0
     current.raw_x = 0.0
     current.y_axis.p = 0.15
     current.raw_y = 0.15
-    current.scale_axis.p = -1.0
+    current.scale_axis.p = -1.4
     current.scale_axis.v = 0.0
-    current.outer_log_scale = -1.0
-    current.outer_expansion_rate = 1.5
+    current.outer_log_scale = -1.4
+    current.outer_expansion_rate = 0.65
     weak_brake_attitude = (
         controller.config.spawn_pitch_rad
         + controller.config.pre_cross_brake_pitch_rad
@@ -2480,15 +2469,9 @@ def test_gate_zero_budget_false_hold_uses_full_course_brake():
     assert controller.state is CleanCourseState.TRACK
     assert controller._pre_cross_brake_active
     assert out.target_pitch_rad < weak_brake_attitude - 0.05
-    compensated_ey = 0.15 - 0.15 * controller.config.vertical_pitch_comp_norm_per_rad
-    custody_floor = controller.config.spawn_pitch_rad - (
-        (
-            controller.config.near_brake_relax_ey_norm
-            - compensated_ey
-        )
-        / controller.config.vertical_pitch_comp_norm_per_rad
+    assert out.target_pitch_rad == pytest.approx(
+        controller.config.pitch_target_min_rad, abs=1e-9
     )
-    assert out.target_pitch_rad == pytest.approx(custody_floor, abs=1e-9)
 
 
 def test_commit_entry_fires_sustained_aligned_near_plane():
@@ -2602,7 +2585,8 @@ def test_near_plane_track_holds_closure_while_commit_budget_false():
     assert stalled.state is CleanCourseState.TRACK
     assert stalled._pre_cross_brake_active
     assert out.target_pitch_rad <= SPAWN_PITCH + 1e-9
-    # Gate 0 is untouched: the same geometry keeps its proved advance law.
+    # A budget-satisfying first Gate-0 tick still follows the ordinary
+    # continuous law; F105 changes brake strength, not its demand threshold.
     gate0 = _tracked_controller(_track("A", 0.10, 0.05, scale=0.50))
     gate0.current.outer_log_scale = -0.50
     gate0.current.last_x_measurement_s = 100.0 - 0.40

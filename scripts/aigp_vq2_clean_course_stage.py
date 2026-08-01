@@ -2570,19 +2570,16 @@ class CleanCourseController:
             law_pitch = min(
                 law_pitch, cfg.spawn_pitch_rad + cfg.fragment_creep_pitch_rad
             )
-        # F80 (see the COURSE_PRE_CROSS_BRAKE_PITCH_RAD block): course legs
-        # inherit the previous crossing's energy, so the TRUE brake doubles
-        # to -0.30 from spawn at gate_index >= 1.  F104 applies that same
-        # bounded brake to Gate 0 only when the near-plane COMMIT budget is
-        # false: F102/F103 crossed from PREDICT with raw expansion still
-        # above the entry budget, so the weaker Gate-0 hold did not arrest
-        # the handoff energy.  Far Gate-0 alignment keeps the proved -0.15
-        # brake.  Same single blend and relax/custody machinery throughout.
-        brake_pitch_offset = (
-            cfg.course_pre_cross_brake_pitch_rad
-            if self.gate_index >= 1 or near_plane_hold
-            else cfg.pre_cross_brake_pitch_rad
-        )
+        # F80 (see the COURSE_PRE_CROSS_BRAKE_PITCH_RAD block): the TRUE
+        # brake is -0.30 from spawn.  F104 first applied it to Gate 0 only
+        # inside the near-plane hold, but live raw expansion was already
+        # above the COMMIT budget about two seconds before credit and the
+        # stronger hold engaged too late; Gate 0 still crossed from PREDICT.
+        # F105 removes the weaker Gate-0 exception: the same bounded brake
+        # now follows the existing continuous brake demand on every leg.
+        # No threshold or state is added, and the custody floor below remains
+        # the final visibility authority.
+        brake_pitch_offset = cfg.course_pre_cross_brake_pitch_rad
         target_pitch = law_pitch + brake_demand * (
             (cfg.spawn_pitch_rad + brake_pitch_offset) - law_pitch
         )
