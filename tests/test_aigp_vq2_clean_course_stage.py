@@ -2163,7 +2163,7 @@ def test_search_never_promotes_retained_successor_without_race_credit():
     assert controller.successor.track_id == "B"
 
 
-def _successor_preview_controller(
+def _turn_reference_controller(
     *,
     successor_x=-0.45,
     current_x=0.02,
@@ -2192,57 +2192,63 @@ def _successor_preview_controller(
     return controller
 
 
-def test_aperture_reserved_successor_preview_coordinates_yaw_and_prebank():
-    # F115 retained a fresh/persistent Gate-1 bearing for >2 s before Gate-0
-    # credit, yet emitted current-only yaw/roll until promotion.  The new
-    # preview uses that evidence for heading while the current aperture has
-    # reserve.  Physical intercept and authority remain Gate 0's.
-    preview = _successor_preview_controller()
-    current_only = _successor_preview_controller(successor_x=None)
+def test_continuous_turn_reference_coordinates_yaw_and_bank_only():
+    turn = _turn_reference_controller()
+    current_only = _turn_reference_controller(successor_x=None)
+    with_turn = None
+    without_turn = None
+    for tick in range(12):
+        now = 100.10 + 0.04 * tick
+        turn.successor.last_measurement_s = now
+        turn.successor.last_x_measurement_s = now
+        with_turn = _command(turn, now, pitch=SPAWN_PITCH, yaw=0.0)
+        without_turn = _command(current_only, now, pitch=SPAWN_PITCH, yaw=0.0)
 
-    with_preview = _command(preview, 100.10, pitch=SPAWN_PITCH)
-    without_preview = _command(current_only, 100.10, pitch=SPAWN_PITCH)
-
-    assert with_preview.state is CleanCourseState.TRACK
-    assert with_preview.gate_index == 0
-    assert with_preview.current_track_id == "A"
-    assert with_preview.successor_track_id == "B"
-    assert 0.20 < with_preview.successor_blend <= 0.35
-    assert with_preview.yaw_rate_rad_s < 0.0 < without_preview.yaw_rate_rad_s
-    # F118: yaw-only F117 barely changed the handoff.  A small same-direction
-    # prebank now coordinates the turn, while the current roll correction
-    # remains in the sum and the aperture lease caps/withdraws it.
-    assert with_preview.target_roll_rad < without_preview.target_roll_rad
-    assert abs(preview._successor_prebank_rad) <= 0.13 + 1e-12
-    assert preview._successor_prebank_rad < 0.0
-    # Pitch/thrust remain current-gate-only.
-    assert with_preview.target_pitch_rad == pytest.approx(
-        without_preview.target_pitch_rad, abs=1e-12
+    assert with_turn.state is CleanCourseState.TRACK
+    assert with_turn.gate_index == 0
+    assert with_turn.current_track_id == "A"
+    assert with_turn.successor_track_id == "B"
+    assert with_turn.successor_blend > 0.0
+    assert with_turn.yaw_rate_rad_s < 0.0
+    assert with_turn.target_roll_rad < 0.0
+    assert without_turn.yaw_rate_rad_s > 0.0
+    assert without_turn.target_roll_rad > 0.0
+    # The successor changes only the shared lateral reference.
+    assert with_turn.target_pitch_rad == pytest.approx(
+        without_turn.target_pitch_rad, abs=1e-12
     )
-    assert with_preview.thrust == pytest.approx(
-        without_preview.thrust, abs=1e-12
+    assert with_turn.thrust == pytest.approx(
+        without_turn.thrust, abs=1e-12
     )
-    assert preview.gate_index == 0
-    assert preview.current.track_id == "A"
+    assert turn.gate_index == 0
+    assert turn.current.track_id == "A"
 
 
-def test_successor_heading_preview_continues_through_safe_commit():
+def test_continuous_turn_reference_continues_through_safe_commit():
     # A TRACK->COMMIT transition must not undo the coordinated preturn while
     # fresh aperture reserve remains.
-    preview = _successor_preview_controller()
-    current_only = _successor_preview_controller(successor_x=None)
+    preview = _turn_reference_controller()
+    current_only = _turn_reference_controller(successor_x=None)
+    for tick in range(10):
+        now = 100.10 + 0.04 * tick
+        preview.successor.last_measurement_s = now
+        preview.successor.last_x_measurement_s = now
+        _command(preview, now, pitch=SPAWN_PITCH, yaw=0.0)
+        _command(current_only, now, pitch=SPAWN_PITCH, yaw=0.0)
     for controller in (preview, current_only):
         controller.state = CleanCourseState.COMMIT
-        controller._commit_entry_s = 100.09
+        controller._commit_entry_s = now
 
-    with_preview = _command(preview, 100.10, pitch=SPAWN_PITCH)
-    without_preview = _command(current_only, 100.10, pitch=SPAWN_PITCH)
+    with_preview = _command(preview, now + 0.04, pitch=SPAWN_PITCH, yaw=0.0)
+    without_preview = _command(
+        current_only, now + 0.04, pitch=SPAWN_PITCH, yaw=0.0
+    )
 
     assert with_preview.state is CleanCourseState.COMMIT
     assert with_preview.successor_blend > 0.0
     assert with_preview.yaw_rate_rad_s < without_preview.yaw_rate_rad_s
     assert with_preview.target_roll_rad < without_preview.target_roll_rad
-    assert preview._successor_prebank_rad < 0.0
+    assert with_preview.yaw_rate_rad_s * with_preview.target_roll_rad > 0.0
     assert with_preview.target_pitch_rad == pytest.approx(
         without_preview.target_pitch_rad, abs=1e-12
     )
@@ -2251,92 +2257,147 @@ def test_successor_heading_preview_continues_through_safe_commit():
     )
 
 
-def test_admitted_successor_preturn_is_held_through_fresh_engulfing_anchor():
-    # F118 preturned on approach, then aperture loss disabled the preview and
-    # PREDICT yaw unwound it for ~0.6 s before credit; Gate 1 entered worse at
-    # x=-0.61.  Once the successor earned the live aperture lease, a fresh
-    # same-current engulfing anchor preserves the bounded heading/prebank
-    # through that short crossing window without claiming credit.
-    controller = _successor_preview_controller()
-    approach = _command(controller, 100.10, pitch=SPAWN_PITCH)
-    assert approach.successor_blend > 0.0  # arms the continuation lease
+def test_turn_reference_survives_track_predict_commit_credit_and_promotion():
+    controller = _turn_reference_controller()
+    outputs = []
+    now = 100.10
+    for tick in range(10):
+        now += 0.04
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        outputs.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
 
     controller.state = CleanCourseState.PREDICT
-    controller._last_engulfing_anchor_s = 100.11
     controller.current.aperture_half_x = None
     controller.current.aperture_half_y = None
-    controller.successor = None  # crossing swallowed the live next track
-    crossing = _command(controller, 100.12, pitch=SPAWN_PITCH)
+    controller._last_engulfing_anchor_s = now
+    now += 0.04
+    outputs.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=-0.01))
 
-    assert controller._successor_preview_crossing_hold
-    assert crossing.successor_blend == pytest.approx(0.35, abs=1e-12)
-    assert crossing.yaw_rate_rad_s < 0.0
-    assert controller._successor_prebank_rad < 0.0
-    assert crossing.gate_index == 0
-    assert controller.current.track_id == "A"
-    assert controller.transitions == []
+    controller.state = CleanCourseState.COMMIT
+    controller._commit_entry_s = now
+    now += 0.04
+    outputs.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=-0.02))
 
+    # The bounded credit wait is still race-owned, but uses the same turn
+    # reference instead of a yaw-only overlay.
+    controller.state = CleanCourseState.SEARCH
+    controller._pending_credit_until_s = now + 1.0
+    now += 0.04
+    outputs.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=-0.03))
+    assert controller.gate_index == 0
 
-def test_crossing_preturn_withdraws_on_aperture_error_or_anchor_expiry():
-    displaced = _successor_preview_controller()
-    _command(displaced, 100.10, pitch=SPAWN_PITCH)  # admit/arm
-    displaced.state = CleanCourseState.PREDICT
-    displaced._last_engulfing_anchor_s = 100.11
-    displaced.successor = None
-    displaced.current.x_axis.p = 0.30
-    displaced.current.raw_x = 0.30
-    displaced.current.last_x_measurement_s = 100.11
-    displaced_out = _command(displaced, 100.12, pitch=SPAWN_PITCH)
-    assert displaced_out.successor_blend == 0.0
-    assert displaced._successor_prebank_rad == 0.0
-
-    expired = _successor_preview_controller()
-    _command(expired, 100.10, pitch=SPAWN_PITCH)  # admit/arm
-    expired.state = CleanCourseState.PREDICT
-    expired._last_engulfing_anchor_s = 100.12 - 1.0
-    expired.successor = None
-    expired_out = _command(expired, 100.12, pitch=SPAWN_PITCH)
-    assert expired_out.successor_blend == 0.0
-    assert not expired._successor_preview_crossing_hold
-    assert expired._successor_prebank_rad == 0.0
-
-
-def test_successor_heading_preview_yields_when_current_aperture_is_consumed():
-    # Regression for ab6252b2: an opposite-side successor can never cancel a
-    # displaced current-gate correction.  Preview also needs current aperture,
-    # a persistent/fresh successor, and clear farther-gate ordering.
-    outside = _successor_preview_controller(successor_x=0.60, current_x=-0.30)
-    no_aperture = _successor_preview_controller()
-    no_aperture.current.aperture_half_x = None
-    stale = _successor_preview_controller()
-    stale.successor.last_x_measurement_s = 99.0
-    newborn = _successor_preview_controller()
-    newborn._track_first_seen_s["B"] = 100.10 - 0.10
-    not_farther = _successor_preview_controller()
-    not_farther.successor.outer_log_scale = (
-        not_farther.current.outer_log_scale - 0.10
+    promoted = controller.note_race(
+        gate_index=1, race_boot_ms=2400, now_s=now + 0.01
     )
+    assert promoted
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.current.track_id == "B"
+    now += 0.04
+    outputs.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=-0.04))
 
-    for controller in (outside, no_aperture, stale, newborn, not_farther):
-        out = _command(controller, 100.10, pitch=SPAWN_PITCH)
-        assert out.successor_blend == 0.0
-        assert controller._successor_prebank_rad == 0.0
-        steer_gain = (
-            controller.config.near_plane_steer_gain_mult
-            if controller.current.log_scale
-            >= controller.config.commit_min_log_scale
-            else 1.0
+    active = [out for out in outputs if abs(out.yaw_rate_rad_s) > 1e-6]
+    assert active
+    assert all(out.yaw_rate_rad_s < 0.0 for out in active)
+    assert all(out.target_roll_rad < 0.0 for out in active)
+    assert controller.transitions == [(0, 1)]
+
+
+def test_turn_reference_eligibility_variation_never_reverses_left_handoff():
+    """F119 regression: qualification flicker cannot alternate yaw direction."""
+
+    controller = _turn_reference_controller(current_x=0.04)
+    now = 100.10
+    # Establish a credible left reference before the crossing variations.
+    for _ in range(14):
+        now += 0.04
+        variance = (0.02 / math.sqrt(2.0)) ** 2
+        controller.successor.x_axis.pp = variance
+        controller.successor.y_axis.pp = variance
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
+    assert out.yaw_rate_rad_s < 0.0
+    assert out.target_roll_rad < 0.0
+
+    samples = []
+    variations = (
+        # good evidence
+        (0.02, 0.0, 0.25, None),
+        # weak covariance
+        (0.55, 0.0, 0.25, None),
+        # old measurement, still inside the bounded prediction horizon
+        (0.25, 0.90, 0.25, None),
+        # aperture loss at a fresh same-current engulfing observation
+        (0.35, 0.30, None, 0.0),
+        # bad fragment geometry consumes aperture margin
+        (0.20, 0.10, 0.08, None),
+        # fresh evidence returns
+        (0.02, 0.0, 0.25, None),
+    )
+    for index, (std, age, aperture, anchor_age) in enumerate(variations):
+        now += 0.04
+        controller.state = (
+            CleanCourseState.PREDICT if index in (2, 3) else CleanCourseState.TRACK
         )
-        expected = max(
-            -MAX_COURSE_YAW_RATE_RAD_S,
-            min(
-                MAX_COURSE_YAW_RATE_RAD_S,
-                controller.config.yaw_error_gain
-                * steer_gain
-                * (controller.current.x - controller._ex_trim),
-            ),
+        variance = (std / math.sqrt(2.0)) ** 2
+        controller.successor.x_axis.pp = variance
+        controller.successor.y_axis.pp = variance
+        controller.successor.last_measurement_s = now - age
+        controller.successor.last_x_measurement_s = now - age
+        controller.current.aperture_half_x = aperture
+        controller.current.aperture_half_y = aperture
+        controller.current.raw_x = 0.30 if index == 4 else 0.04
+        controller._last_engulfing_anchor_s = (
+            None if anchor_age is None else now - anchor_age
         )
-        assert out.yaw_rate_rad_s == pytest.approx(expected, abs=1e-12)
+        samples.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
+
+    assert all(sample.yaw_rate_rad_s <= 1e-9 for sample in samples)
+    assert all(sample.target_roll_rad <= 1e-9 for sample in samples)
+    assert any(sample.yaw_rate_rad_s < -0.02 for sample in samples)
+    yaw_steps = [
+        abs(right.yaw_rate_rad_s - left.yaw_rate_rad_s)
+        for left, right in zip(samples, samples[1:])
+    ]
+    assert max(yaw_steps) < MAX_COURSE_YAW_RATE_RAD_S
+
+
+def test_weak_successor_evidence_decays_turn_authority_smoothly():
+    controller = _turn_reference_controller(current_x=0.04)
+    now = 100.10
+    for _ in range(14):
+        now += 0.04
+        variance = (0.02 / math.sqrt(2.0)) ** 2
+        controller.successor.x_axis.pp = variance
+        controller.successor.y_axis.pp = variance
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        out = _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
+    authority_before = out.successor_blend
+    assert authority_before > 0.0
+    assert out.yaw_rate_rad_s < 0.0
+
+    # All evidence factors weaken together.  The first command must retain
+    # some authority/reference instead of reproducing F119's off-full switch.
+    controller.successor.x_axis.pp = 2.0
+    controller.successor.y_axis.pp = 2.0
+    controller.successor.last_measurement_s = now - 2.0
+    controller.successor.last_x_measurement_s = now - 2.0
+    controller.current.aperture_half_x = None
+    controller.current.aperture_half_y = None
+    controller._last_engulfing_anchor_s = None
+    authorities = []
+    yaws = []
+    for _ in range(6):
+        now += 0.04
+        out = _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
+        authorities.append(out.successor_blend)
+        yaws.append(out.yaw_rate_rad_s)
+
+    assert 0.0 < authorities[0] < authority_before
+    assert all(right < left for left, right in zip(authorities, authorities[1:]))
+    assert all(yaw <= 0.0 for yaw in yaws)
 
 
 def test_search_adopts_retained_successor_after_race_clears_old_ownership():
@@ -2519,13 +2580,25 @@ def test_pending_credit_hold_never_sweeps_before_delayed_credit():
     )
     controller._track_first_seen_s["B"] = 100.08 - 1.0  # persistent (F42)
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.current.aperture_half_x = 0.25
+    controller.current.aperture_half_y = 0.25
+    now = 100.10
+    # Establish the shared turn reference on approach.  The credit wait
+    # continues it; the wait no longer invents a separate yaw posture.
+    for _ in range(8):
+        now += 0.03
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
     # F102: the gate-0 hot-coast trigger is deleted — COAST arms only from
     # an armed COMMIT; enter through the COMMIT latch.
     controller.state = CleanCourseState.COMMIT
-    controller._commit_entry_s = 100.12
-    controller.observe(_update([], frame_id=5), now_s=100.12)
+    controller._commit_entry_s = now
+    now += 0.02
+    controller.observe(_update([], frame_id=5), now_s=now)
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
-    out = _command(controller, 100.14)  # the single wire-zero send (F72)
+    now += 0.02
+    out = _command(controller, now, yaw=0.0)  # the single wire-zero send (F72)
     assert out.thrust == 0.0
     # Pending-credit window (~0.33 s << PENDING_CREDIT_HOLD_S): heading
     # held level, zero roll, governed altitude support — no sweep.  F78:
@@ -2534,23 +2607,28 @@ def test_pending_credit_hold_never_sweeps_before_delayed_credit():
     # successor), so the invariant here is only the F76 one: never yaw
     # AWAY (positive) from the retained left-side successor.
     for tick in range(10):
-        out = _command(controller, 100.18 + 0.033 * tick)
+        t = now + 0.04 + 0.033 * tick
+        out = _command(controller, t, yaw=0.0)
         assert controller.state is CleanCourseState.SEARCH
         assert out.yaw_rate_rad_s <= 0.0
-        assert out.target_roll_rad == 0.0
+        assert out.target_roll_rad <= 0.0
+        if out.yaw_rate_rad_s < 0.0:
+            assert out.target_roll_rad < 0.0
         assert out.thrust > 0.0
     # Delayed credit inside the window: the retained left-side successor
     # is stale by construction (the crossing swallowed measurements) but
     # is adopted immediately — never a blind sweep on the new leg.
-    promoted = controller.note_race(gate_index=1, race_boot_ms=2400, now_s=100.55)
+    promoted = controller.note_race(
+        gate_index=1, race_boot_ms=2400, now_s=t + 0.04
+    )
     assert promoted
     assert controller.state is CleanCourseState.TRACK
     assert controller.current.track_id == "B"
     # A fresh post-credit frame of the adopted gate steers LEFT at once.
     controller.observe(
-        _update([_track("B", -0.43, 0.05)], frame_id=6), now_s=100.57
+        _update([_track("B", -0.43, 0.05)], frame_id=6), now_s=t + 0.06
     )
-    out = _command(controller, 100.60)
+    out = _command(controller, t + 0.09, yaw=0.0)
     assert out.yaw_rate_rad_s < 0.0  # steers LEFT toward the successor
     # Bounded: with no credit the window expires and the sweep resumes.
     expiring = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
@@ -2585,28 +2663,39 @@ def test_pending_credit_recenters_toward_credible_successor():
     )
     controller._track_first_seen_s["B"] = 100.08 - 1.0  # persistent (F42)
     controller.note_race(gate_index=0, race_boot_ms=2000, now_s=100.10)
+    controller.current.aperture_half_x = 0.25
+    controller.current.aperture_half_y = 0.25
+    now = 100.10
+    for _ in range(8):
+        now += 0.03
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
     # F102: the gate-0 hot-coast trigger is deleted — COAST arms only from
     # an armed COMMIT; enter through the COMMIT latch.
     controller.state = CleanCourseState.COMMIT
-    controller._commit_entry_s = 100.12
-    controller.observe(_update([], frame_id=5), now_s=100.12)
+    controller._commit_entry_s = now
+    now += 0.02
+    controller.observe(_update([], frame_id=5), now_s=now)
     assert controller.state is CleanCourseState.COAST_FOR_CREDIT
-    out = _command(controller, 100.14)  # the single wire-zero send (F72)
+    now += 0.02
+    out = _command(controller, now, yaw=0.0)  # the single wire-zero send (F72)
     assert out.thrust == 0.0
     level_pitch = controller.config.spawn_pitch_rad + controller.config.brake_pitch_rad
     for tick in range(6):
-        t = 100.18 + 0.05 * tick
+        t = now + 0.04 + 0.05 * tick
         # Fresh successor frames keep B credible through the window.
         controller.observe(
             _update([_track("B", -0.51, 0.05)], frame_id=6 + tick), now_s=t
         )
-        out = _command(controller, t + 0.02)
+        out = _command(controller, t + 0.02, yaw=0.0)
         assert controller.state is CleanCourseState.SEARCH
         assert controller.gate_index == 0  # authoritative ownership intact
         assert -MAX_COURSE_YAW_RATE_RAD_S <= out.yaw_rate_rad_s < 0.0
-        assert out.target_roll_rad == 0.0
-        # No forward advance before credit: the level/brake posture holds.
-        assert out.target_pitch_rad >= level_pitch - 1e-6
+        assert out.target_roll_rad < 0.0
+        # No forward advance before credit: the crossing brake may still be
+        # slewing back toward level, but must never cross into nose-down drive.
+        assert out.target_pitch_rad <= level_pitch + 1e-6
         assert out.thrust > 0.0
 
 
@@ -3986,8 +4075,13 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.COMMIT
-    assert out.yaw_rate_rad_s == pytest.approx(0.09, abs=1e-9)
-    assert out.target_roll_rad == pytest.approx(0.05, abs=1e-9)
+    # F120 filters the one shared yaw/bank reference, so the large +0.80 to
+    # +0.10 bearing change converges without a command step.  Both channels
+    # still come from exactly the same reference and approach the old P values.
+    reference = controller._turn_reference_x
+    assert reference == pytest.approx(0.10, abs=0.005)
+    assert out.yaw_rate_rad_s == pytest.approx(0.90 * reference, abs=1e-9)
+    assert out.target_roll_rad == pytest.approx(0.50 * reference, abs=1e-9)
 
 
 def test_commit_stale_y_never_climbs_on_a_frozen_bearing():

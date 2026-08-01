@@ -833,29 +833,19 @@ SEARCH_MAX_EXCURSION_RAD = 0.80  # bounded sweep excursion before reversal
 SEARCH_SWEEP_RATE_RAD_S = 0.5  # absolute-heading sweep rate around the anchor
 SEARCH_SWEEP_GAIN = 2.0  # heading-error gain to the bounded yaw rate
 
-# F116 successor heading preview: the clean rewrite's original 0.50 blend
-# shared one aim between yaw, roll, and vertical control.  A far successor
-# could therefore cancel the current-gate intercept (flight ab6252b2), and the
-# whole preview was removed.  The replacement reserves the current aperture,
-# keeps its roll correction, and separates bounded heading/prebank feed-forward
-# from the translational aim.  The last pre-reset controller bounded heading
-# authority at 0.35; retain that ceiling.
-SUCCESSOR_BLEND_MAX = 0.35  # aperture-reserved coordinated lookahead ceiling
+# F120 continuous turn reference.  F116-F119 split lateral guidance into a
+# current-gate correction, a binary/off-full successor preview, a separate
+# prebank, and a pending-credit yaw overlay.  F119 alternated +/-0.15 rad/s
+# through the crossing and reached Gate-0 credit with essentially zero net
+# yaw.  One filtered reference now blends passage alignment and the retained
+# successor hypothesis.  The hypothesis is IMU-derotated in _predict(); its
+# confidence, covariance, measurement age, range ordering, closure, and the
+# filtered current-aperture reserve all reduce authority continuously.
+TURN_REFERENCE_TAU_S = 0.15
 BLEND_FAR_LOG_SCALE = -1.6  # below this the successor gets no blend
-BLEND_NEAR_LOG_SCALE = -0.9  # at this closure the blend ceiling applies
+BLEND_NEAR_LOG_SCALE = -0.9  # at this closure passage progress reaches one
 SUCCESSOR_MIN_LOG_SCALE_GAP = 0.25  # successor must remain visibly farther
-# F118 coordinated preview: F117 proved yaw-only preview was too weak
-# (command peaked ~0.03 rad/s; Gate 1 still handed off at x=-0.55).  Live
-# TRACK feedback closes every camera frame, so reserve projects over the
-# historical pre-pass 0.10 s horizon rather than COMMIT's 0.50 s blackout.
-# Once persistence/freshness/covariance/confidence admit an identity, strength
-# comes from range and aperture reserve instead of attenuating the bearing a
-# second time.  A separately capped 0.13-rad prebank is the last proved small
-# legacy tier; it shares the same reserve and can never survive its withdrawal.
 SUCCESSOR_PREVIEW_PROJECTION_S = 0.10
-SUCCESSOR_MIN_CONFIDENCE = 0.40
-SUCCESSOR_PREBANK_MAX_RAD = 0.13
-SUCCESSOR_PREBANK_FULL_BEARING_NORM = 0.40
 PROMOTE_MAX_STD_NORM = 0.60  # cached-successor credibility at promotion
 # 0.30 -> 0.60 (F35, d25f23fe): promotion dropped the fresh gate-1 successor
 # (std 0.14-0.34, age 0) into SEARCH, and the reacquisition churn that
@@ -1226,16 +1216,11 @@ class CleanCourseConfig:
     search_sweep_rate_rad_s: float = SEARCH_SWEEP_RATE_RAD_S
     search_sweep_gain: float = SEARCH_SWEEP_GAIN
     pending_credit_hold_s: float = PENDING_CREDIT_HOLD_S
-    successor_blend_max: float = SUCCESSOR_BLEND_MAX
+    turn_reference_tau_s: float = TURN_REFERENCE_TAU_S
     blend_far_log_scale: float = BLEND_FAR_LOG_SCALE
     blend_near_log_scale: float = BLEND_NEAR_LOG_SCALE
     successor_min_log_scale_gap: float = SUCCESSOR_MIN_LOG_SCALE_GAP
     successor_preview_projection_s: float = SUCCESSOR_PREVIEW_PROJECTION_S
-    successor_min_confidence: float = SUCCESSOR_MIN_CONFIDENCE
-    successor_prebank_max_rad: float = SUCCESSOR_PREBANK_MAX_RAD
-    successor_prebank_full_bearing_norm: float = (
-        SUCCESSOR_PREBANK_FULL_BEARING_NORM
-    )
     promote_max_std_norm: float = PROMOTE_MAX_STD_NORM
     promote_max_age_s: float = PROMOTE_MAX_AGE_S
     successor_min_age_s: float = SUCCESSOR_MIN_AGE_S
@@ -1359,22 +1344,16 @@ class CleanCourseController:
         self._fh_mps2 = 0.0
         self._fh_untrusted = False
         self._fh_above_since_s: Optional[float] = None
-        # Per-command diagnostics for the independent successor-heading
-        # channel.  These do not carry authority across ticks; every command
-        # recomputes them from fresh current/successor geometry.
+        # F120 continuous lateral reference.  The reference itself carries
+        # through crossing and authoritative promotion; it is derotated by
+        # measured yaw between command ticks, then filtered toward the latest
+        # current/successor evidence.  No raw image bearing is latched.
+        self._turn_reference_x: Optional[float] = None
+        self._turn_reference_yaw_rad: Optional[float] = None
+        self._turn_aperture_reserve = 0.0
+        self._turn_successor_authority = 0.0
         self._successor_heading_blend = 0.0
         self._successor_heading_error_norm: Optional[float] = None
-        self._successor_prebank_rad = 0.0
-        # Crossing continuation lease (F119): once fresh aperture geometry
-        # admits the successor, retain its bearing through a short, fresh
-        # engulfing-anchor window instead of unwinding the preturn while the
-        # authoritative race packet is in flight.  The stored aperture budget
-        # and current-track identity remain the withdrawal authority.
-        self._crossing_preview_current_track_id: Optional[str] = None
-        self._crossing_preview_bearing_x: Optional[float] = None
-        self._crossing_preview_admitted_s: Optional[float] = None
-        self._crossing_preview_aperture_budget = 0.0
-        self._successor_preview_crossing_hold = False
         # Course-heading anchor (F31): yaw at the leg start (lazily
         # captured on the first command tick with a live yaw measurement,
         # re-armed on every authoritative promotion).  Yaw commands that
@@ -1403,10 +1382,10 @@ class CleanCourseController:
         self._course_start_s = float(now_s)
         self._ex_trim = 0.0
         self._vz_center_trim = 0.0
-        self._crossing_preview_current_track_id = None
-        self._crossing_preview_bearing_x = None
-        self._crossing_preview_admitted_s = None
-        self._crossing_preview_aperture_budget = 0.0
+        self._turn_reference_x = None
+        self._turn_reference_yaw_rad = None
+        self._turn_aperture_reserve = 0.0
+        self._turn_successor_authority = 0.0
         identity = _frame_identity(update)
         if identity is not None:
             self._last_frame_identity = identity
@@ -1679,10 +1658,12 @@ class CleanCourseController:
         self.transitions.append((previous, self.gate_index))
         # Promotion: the next gate's pursuit gets a fresh orbit trim.
         self._ex_trim = 0.0
-        self._crossing_preview_current_track_id = None
-        self._crossing_preview_bearing_x = None
-        self._crossing_preview_admitted_s = None
-        self._crossing_preview_aperture_budget = 0.0
+        # Preserve the filtered bearing through promotion, but start the new
+        # gate's future-successor aperture calculation from zero.  The newly
+        # promoted current hypothesis is the same derotated bearing that fed
+        # the pre-credit reference, so no control overlay changes sign here.
+        self._turn_aperture_reserve = 0.0
+        self._turn_successor_authority = 0.0
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             self._exit_coast()
         # F76: an authoritative increment settles the pending-credit hold.
@@ -1767,8 +1748,6 @@ class CleanCourseController:
         self._pre_cross_brake_active = False  # main path recomputes below
         self._successor_heading_blend = 0.0
         self._successor_heading_error_norm = None
-        self._successor_prebank_rad = 0.0
-        self._successor_preview_crossing_hold = False
         if yaw_rad is not None and self._course_anchor_yaw_rad is None:
             self._course_anchor_yaw_rad = float(yaw_rad)
         if self._last_command_s is None:
@@ -1990,41 +1969,18 @@ class CleanCourseController:
                 # its source, so the entry arrives centered about the true
                 # crossing point rather than compensating it blind.
                 commit_ex = self.current.x - self._ex_trim
-                commit_blend, commit_preview_bearing_x = self._successor_preview(
+                commit_heading_ex, commit_blend = self._turn_reference(
                     self.current,
+                    self.successor,
+                    current_error=commit_ex,
                     now_s=now_s,
+                    yaw_rad=yaw_rad,
+                    dt=dt,
                 )
-                commit_heading_ex = commit_ex
-                commit_preview_roll = 0.0
-                if commit_blend > 0.0 and commit_preview_bearing_x is not None:
-                    commit_heading_ex = (
-                        (1.0 - commit_blend) * commit_ex
-                        + commit_blend * commit_preview_bearing_x
-                    )
-                    commit_preview_roll = self._successor_prebank(
-                        commit_blend,
-                        commit_preview_bearing_x,
-                    )
-                    self._successor_heading_blend = commit_blend
-                    self._successor_heading_error_norm = commit_heading_ex
-                    self._successor_prebank_rad = commit_preview_roll
-                commit_yaw = _clamp(
-                    cfg.yaw_error_sign
-                    * cfg.yaw_error_gain
-                    * commit_steer_gain
-                    * commit_heading_ex,
-                    -cfg.max_yaw_rate_rad_s,
-                    cfg.max_yaw_rate_rad_s,
-                )
-                commit_yaw = self._anchor_clamped_yaw(commit_yaw, yaw_rad)
-                commit_roll = _clamp(
-                    cfg.roll_error_sign
-                    * cfg.roll_error_gain
-                    * commit_steer_gain
-                    * commit_ex
-                    + commit_preview_roll,
-                    -cfg.max_target_roll_rad,
-                    cfg.max_target_roll_rad,
+                commit_roll, commit_yaw = self._coordinated_turn_request(
+                    commit_heading_ex,
+                    steer_gain=commit_steer_gain,
+                    yaw_rad=yaw_rad,
                 )
                 commit_correction = _clamp(
                     cfg.vertical_feedback_sign
@@ -2128,32 +2084,38 @@ class CleanCourseController:
                 self._wind_vz_center_trim(dt)
                 hold = support + margin + self._vz_center_trim
                 self._collective = hold
-                recenter_yaw = 0.0
-                successor = self.successor
-                if (
-                    successor is not None
-                    and successor.position_std <= cfg.promote_max_std_norm
-                    and now_s - successor.last_measurement_s
-                    <= cfg.promote_max_age_s
-                    and now_s - successor.last_x_measurement_s
-                    <= cfg.promote_max_age_s
-                    and self._track_age_s(successor.track_id, now_s)
-                    >= cfg.successor_min_age_s
-                ):
-                    recenter_yaw = _clamp(
-                        cfg.yaw_error_sign * cfg.yaw_error_gain * successor.x,
-                        -cfg.max_yaw_rate_rad_s,
-                        cfg.max_yaw_rate_rad_s,
+                pending_roll = 0.0
+                pending_yaw = 0.0
+                pending_blend = 0.0
+                if self.current is not None:
+                    pending_reference, pending_blend = self._turn_reference(
+                        self.current,
+                        self.successor,
+                        current_error=self.current.x - self._ex_trim,
+                        now_s=now_s,
+                        yaw_rad=yaw_rad,
+                        dt=dt,
+                    )
+                    pending_steer_gain = (
+                        cfg.near_plane_steer_gain_mult
+                        if self.current.log_scale >= cfg.commit_min_log_scale
+                        else 1.0
+                    )
+                    pending_roll, pending_yaw = self._coordinated_turn_request(
+                        pending_reference,
+                        steer_gain=pending_steer_gain,
+                        yaw_rad=yaw_rad,
                     )
                 return NavigationOutput(
-                    target_roll_rad=self._slew_roll(0.0, dt),
+                    target_roll_rad=self._slew_roll(pending_roll, dt),
                     target_pitch_rad=self._slew_pitch(
                         cfg.spawn_pitch_rad + cfg.brake_pitch_rad, dt
                     ),
-                    yaw_rate_rad_s=recenter_yaw,
+                    yaw_rate_rad_s=pending_yaw,
                     thrust=self._governed_collective(hold, support),
                     state=self.state,
                     gate_index=self.gate_index,
+                    successor_blend=pending_blend,
                     current_track_id=self._current_track_id(),
                     successor_track_id=self._successor_track_id(),
                 )
@@ -2278,24 +2240,18 @@ class CleanCourseController:
             )
         ex -= self._ex_trim
 
-        # The successor is a heading preview, not a second aim point.  Its
-        # authority is computed from admitted successor evidence and the
-        # CURRENT aperture reserve; it fades to zero as current error/drift
-        # consumes that reserve.  Roll keeps its current-gate correction and
-        # receives only the separately capped coordinated prebank.
-        blend, preview_bearing_x = self._successor_preview(
+        # F120: one lateral reference owns yaw and bank before, through, and
+        # after the crossing.  Passage alignment and the IMU-derotated
+        # successor bearing are blended continuously; no preturn overlay can
+        # countermand the current controller or be countermanded by it.
+        heading_ex, blend = self._turn_reference(
             current,
+            self.successor,
+            current_error=ex,
             now_s=now_s,
+            yaw_rad=yaw_rad,
+            dt=dt,
         )
-        preview_roll = 0.0
-        if blend > 0.0 and preview_bearing_x is not None:
-            heading_ex = (1.0 - blend) * ex + blend * preview_bearing_x
-            preview_roll = self._successor_prebank(blend, preview_bearing_x)
-            self._successor_heading_blend = blend
-            self._successor_heading_error_norm = heading_ex
-            self._successor_prebank_rad = preview_roll
-        else:
-            heading_ex = ex
 
         # Vertical: ONE GLOBAL SIGN at every gate (empirically confirmed by
         # the 2026-07-29 crossing-geometry analysis).  The gate-0 phase adds
@@ -2659,7 +2615,6 @@ class CleanCourseController:
         # confirmation.  Clipping no longer saturates corrective steering
         # (codex, flights 4480d0a6/ab6252b2): the clip penalty halves yaw
         # exactly when the target is escaping at the frame edge.
-        steer_cap = 1.0
         # F57 near-plane steering boost (see the NEAR_PLANE_STEER_GAIN_MULT
         # block): inside the COMMIT proximity regime the proved far-range
         # gains limit-cycle against close-range parallax (ex stalled at
@@ -2667,22 +2622,16 @@ class CleanCourseController:
         steer_gain = 1.0
         if current.log_scale >= cfg.commit_min_log_scale:
             steer_gain = cfg.near_plane_steer_gain_mult
-        yaw_rate = _clamp(
-            cfg.yaw_error_sign
-            * cfg.yaw_error_gain
-            * steer_gain
-            * heading_ex,
-            -cfg.max_yaw_rate_rad_s * steer_cap,
-            cfg.max_yaw_rate_rad_s * steer_cap,
+        target_roll, yaw_rate = self._coordinated_turn_request(
+            heading_ex,
+            steer_gain=steer_gain,
+            yaw_rad=yaw_rad,
         )
-        yaw_rate = self._anchor_clamped_yaw(yaw_rate, yaw_rad)
-        target_roll = _clamp(
-            cfg.roll_error_sign * cfg.roll_error_gain * steer_gain * ex
-            + preview_roll,
-            -cfg.max_target_roll_rad * steer_cap,
-            cfg.max_target_roll_rad * steer_cap,
-        )
-        if not x_qualified and current.log_scale < cfg.near_brake_log_scale:
+        if (
+            not x_qualified
+            and blend <= 0.0
+            and current.log_scale < cfg.near_brake_log_scale
+        ):
             # F40: no fresh x measurement -> no yaw/roll authority; hold
             # heading and wings level (slewing toward 0) instead of chasing
             # a phantom bearing off the frame.  F52 near-plane exception
@@ -2827,7 +2776,7 @@ class CleanCourseController:
                 dt,
                 slew_rad_s=(
                     cfg.roll_pursuit_slew_rad_s
-                    if abs(ex) > cfg.roll_pursuit_fast_ex_norm
+                    if abs(heading_ex) > cfg.roll_pursuit_fast_ex_norm
                     else None
                 ),
             ),
@@ -3279,160 +3228,168 @@ class CleanCourseController:
             ),
         )
 
-    def _successor_blend(
+    def _turn_reference(
         self,
         current: _Hypothesis,
         successor: Optional[_Hypothesis],
         *,
+        current_error: float,
         now_s: float,
-    ) -> float:
-        """Return bounded coordinated-preview authority for a farther gate.
+        yaw_rad: Optional[float],
+        dt: float,
+    ) -> Tuple[float, float]:
+        """One continuous current-passage/successor lateral reference.
 
-        The current gate keeps passage ownership: its roll correction, pitch,
-        thrust, crossing admission, and race index remain authoritative.  A
-        small successor yaw/prebank feed-forward may use only *spare* current-
-        aperture margin.  As current error/drift consumes that margin the
-        entire preview falls continuously to zero, closing the ab6252b2
-        cancellation family without returning to post-credit-only turning.
+        Both hypotheses are already IMU-derotated by ``_predict``.  Between
+        command ticks the carried reference is derotated by measured yaw, then
+        filtered toward a confidence/covariance/freshness-weighted blend.  No
+        raw successor image coordinate is cached, and no state transition can
+        inject an independent yaw or bank request.
         """
 
-        if successor is None or self.state not in (
-            CleanCourseState.TRACK,
-            CleanCourseState.COMMIT,
-        ):
-            return 0.0
         cfg = self.config
-        if (
-            current.aperture_half_x is None
-            or current.aperture_half_x <= 0.0
-            or now_s - current.last_measurement_s
-            > cfg.commit_entry_meas_max_age_s
-            or now_s - current.last_x_measurement_s
-            > cfg.commit_entry_meas_max_age_s
-            or now_s - current.last_y_measurement_s
-            > cfg.commit_entry_meas_max_age_s
-            or now_s - successor.last_measurement_s
-            > cfg.outer_expansion_max_age_s
-            or now_s - successor.last_x_measurement_s
-            > cfg.outer_expansion_max_age_s
-            or self._track_age_s(successor.track_id, now_s)
-            < cfg.successor_min_age_s
-            or successor.confidence < cfg.successor_min_confidence
-            or successor.position_std > cfg.search_covariance_std_norm
-            or successor.outer_log_scale
-            > current.outer_log_scale - cfg.successor_min_log_scale_gap
-        ):
-            return 0.0
+        if yaw_rad is not None:
+            yaw = float(yaw_rad)
+            if (
+                self._turn_reference_x is not None
+                and self._turn_reference_yaw_rad is not None
+            ):
+                delta_yaw = math.atan2(
+                    math.sin(yaw - self._turn_reference_yaw_rad),
+                    math.cos(yaw - self._turn_reference_yaw_rad),
+                )
+                self._turn_reference_x -= (
+                    delta_yaw * ROTATION_COMP_FOCAL_NORM
+                )
+            self._turn_reference_yaw_rad = yaw
 
-        aperture_budget = (
-            cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
-        )
-        if aperture_budget <= 1e-9:
-            return 0.0
-        projected_current_error = (
-            max(abs(current.x), abs(current.raw_x))
-            + abs(current.vx) * cfg.successor_preview_projection_s
-        )
-        aperture_reserve = _clamp01(
-            1.0 - projected_current_error / aperture_budget
-        )
-        if aperture_reserve <= 0.0:
-            return 0.0
-
-        closure = _clamp01(
-            (current.outer_log_scale - cfg.blend_far_log_scale)
-            / (cfg.blend_near_log_scale - cfg.blend_far_log_scale)
-        )
-        return cfg.successor_blend_max * closure * aperture_reserve
-
-    def _successor_preview(
-        self,
-        current: _Hypothesis,
-        *,
-        now_s: float,
-    ) -> Tuple[float, Optional[float]]:
-        """Resolve live approach preview or its bounded crossing continuation."""
-
-        blend = self._successor_blend(current, self.successor, now_s=now_s)
-        if blend > 0.0 and self.successor is not None:
-            self._crossing_preview_current_track_id = current.track_id
-            self._crossing_preview_bearing_x = self.successor.x
-            self._crossing_preview_admitted_s = float(now_s)
-            assert current.aperture_half_x is not None
-            self._crossing_preview_aperture_budget = (
-                self.config.commit_entry_aperture_margin_frac
-                * current.aperture_half_x
+        alpha = _clamp01(dt / max(1e-6, cfg.turn_reference_tau_s + dt))
+        aperture_target = 0.0
+        if current.aperture_half_x is not None and current.aperture_half_x > 0.0:
+            aperture_budget = (
+                cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
             )
-            return blend, self.successor.x
-
-        cfg = self.config
-        anchor_fresh = (
-            self._last_engulfing_anchor_s is not None
-            and now_s - self._last_engulfing_anchor_s
-            <= ENGULFING_ANCHOR_MAX_AGE_S
-        )
-        admission_fresh = (
-            self._crossing_preview_admitted_s is not None
-            and now_s - self._crossing_preview_admitted_s
-            <= PREDICT_STALL_FORCE_SEARCH_S
-        )
-        if (
-            self.state
-            not in (
-                CleanCourseState.TRACK,
-                CleanCourseState.PREDICT,
-                CleanCourseState.COMMIT,
-            )
-            or not anchor_fresh
-            or not admission_fresh
-            or current.track_id != self._crossing_preview_current_track_id
-            or self._crossing_preview_bearing_x is None
-            or self._crossing_preview_aperture_budget <= 0.0
-        ):
-            return 0.0, None
-
-        # A fresh horizontal correction still outranks the preview.  With x
-        # censored/stale, the fresh same-id engulfing anchor is the bounded
-        # center evidence; it expires after 0.50 s and cannot sustain a blind
-        # turn into ordinary SEARCH.
-        if now_s - current.last_x_measurement_s <= cfg.x_steer_max_age_s:
             projected_current_error = (
                 max(abs(current.x), abs(current.raw_x))
                 + abs(current.vx) * cfg.successor_preview_projection_s
             )
-            if projected_current_error > self._crossing_preview_aperture_budget:
-                return 0.0, None
+            if aperture_budget > 1e-9:
+                aperture_target = _clamp01(
+                    1.0 - projected_current_error / aperture_budget
+                )
+        elif (
+            self._last_engulfing_anchor_s is not None
+            and now_s - self._last_engulfing_anchor_s
+            <= ENGULFING_ANCHOR_MAX_AGE_S
+        ):
+            # The fresh same-id engulfing observation is passage evidence, not
+            # a successor bearing.  It smoothly raises the saved aperture
+            # reserve while the successor hypothesis continues to derotate.
+            aperture_target = 1.0
+        self._turn_aperture_reserve += alpha * (
+            aperture_target - self._turn_aperture_reserve
+        )
+        self._turn_aperture_reserve = _clamp01(self._turn_aperture_reserve)
 
-        self._successor_preview_crossing_hold = True
-        return cfg.successor_blend_max, self._crossing_preview_bearing_x
+        desired_authority = 0.0
+        desired = float(current_error)
+        if successor is not None:
+            closure_span = cfg.blend_near_log_scale - cfg.blend_far_log_scale
+            closure = (
+                _clamp01(
+                    (current.outer_log_scale - cfg.blend_far_log_scale)
+                    / closure_span
+                )
+                if abs(closure_span) > 1e-9
+                else 0.0
+            )
+            confidence = _clamp01(successor.confidence)
+            uncertainty = _clamp01(
+                1.0 - successor.position_std / cfg.promote_max_std_norm
+            )
+            freshness = _clamp01(
+                1.0
+                - max(0.0, now_s - successor.last_x_measurement_s)
+                / PREDICT_STALL_FORCE_SEARCH_S
+            )
+            persistence = _clamp01(
+                self._track_age_s(successor.track_id, now_s)
+                / max(1e-6, cfg.successor_min_age_s)
+            )
+            range_order = _clamp01(
+                (current.outer_log_scale - successor.outer_log_scale)
+                / max(1e-6, cfg.successor_min_log_scale_gap)
+            )
+            desired_authority = (
+                closure
+                * self._turn_aperture_reserve
+                * confidence
+                * uncertainty
+                * freshness
+                * persistence
+                * range_order
+            )
+        self._turn_successor_authority += alpha * (
+            desired_authority - self._turn_successor_authority
+        )
+        self._turn_successor_authority = _clamp01(
+            self._turn_successor_authority
+        )
+        authority = (
+            self._turn_successor_authority if successor is not None else 0.0
+        )
+        if successor is not None:
+            desired = (
+                (1.0 - authority) * float(current_error)
+                + authority * successor.x
+            )
+            # Once credible successor evidence establishes turn direction,
+            # current-passage alignment may reduce that request to zero but
+            # may not reverse it.  A real successor bearing crossing the image
+            # center still changes direction normally on a later tick.
+            if authority > 0.0 and successor.x * desired < 0.0:
+                desired = 0.0
 
-    def _successor_prebank(
+        if self._turn_reference_x is None:
+            self._turn_reference_x = float(desired)
+        else:
+            self._turn_reference_x += alpha * (
+                float(desired) - self._turn_reference_x
+            )
+        self._turn_reference_x = _clamp(self._turn_reference_x, -1.0, 1.0)
+        if (
+            successor is not None
+            and authority > 0.0
+            and successor.x * self._turn_reference_x < 0.0
+        ):
+            self._turn_reference_x = 0.0
+
+        self._successor_heading_blend = authority
+        self._successor_heading_error_norm = self._turn_reference_x
+        return self._turn_reference_x, authority
+
+    def _coordinated_turn_request(
         self,
-        blend: float,
-        bearing_x: Optional[float],
-    ) -> float:
-        """Small coordinated bank under the same aperture-reserve lease."""
+        reference_x: float,
+        *,
+        steer_gain: float,
+        yaw_rad: Optional[float],
+    ) -> Tuple[float, float]:
+        """Map one lateral reference into same-direction bounded yaw and bank."""
 
         cfg = self.config
-        if (
-            bearing_x is None
-            or blend <= 0.0
-            or cfg.successor_blend_max <= 1e-9
-            or cfg.successor_prebank_full_bearing_norm <= 1e-9
-        ):
-            return 0.0
-        authority = _clamp01(blend / cfg.successor_blend_max)
-        bearing = _clamp(
-            bearing_x / cfg.successor_prebank_full_bearing_norm,
-            -1.0,
-            1.0,
+        yaw_rate = _clamp(
+            cfg.yaw_error_sign * cfg.yaw_error_gain * steer_gain * reference_x,
+            -cfg.max_yaw_rate_rad_s,
+            cfg.max_yaw_rate_rad_s,
         )
-        return (
-            cfg.roll_error_sign
-            * cfg.successor_prebank_max_rad
-            * authority
-            * bearing
+        yaw_rate = self._anchor_clamped_yaw(yaw_rate, yaw_rad)
+        target_roll = _clamp(
+            cfg.roll_error_sign * cfg.roll_error_gain * steer_gain * reference_x,
+            -cfg.max_target_roll_rad,
+            cfg.max_target_roll_rad,
         )
+        return target_roll, yaw_rate
 
     def _effective_untrusted_gate_y(
         self,
@@ -4150,14 +4107,9 @@ def _clean_course_tick_trace(
         "token": token_trace,
         "tracks": tracks,
         "successor": successor_trace,
-        "successor_heading_blend": controller._successor_heading_blend,
-        "successor_heading_error_norm": (
-            controller._successor_heading_error_norm
-        ),
-        "successor_prebank_rad": controller._successor_prebank_rad,
-        "successor_preview_crossing_hold": (
-            controller._successor_preview_crossing_hold
-        ),
+        "turn_successor_authority": controller._successor_heading_blend,
+        "turn_reference_x": controller._successor_heading_error_norm,
+        "turn_aperture_reserve": controller._turn_aperture_reserve,
         "vertical_censor_edge": (
             None if current is None else int(current.vertical_censor_edge)
         ),
