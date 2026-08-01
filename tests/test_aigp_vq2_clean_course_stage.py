@@ -1076,7 +1076,7 @@ def test_closure_governor_full_brake_at_high_expansion_rate():
     # rate the governor commands the Gate-0 brake attitude exactly, at the
     # fast slew, with lateral pursuit and the vz governor alive.
     controller = _tracked_controller(_track("A", 0.20, 0.0, scale=0.10))
-    controller.current.outer_expansion_rate = 0.7
+    controller.current.scale_axis.v = 0.7  # above CLOSURE_FULL_BRAKE_RATE_S
     now = 100.10
     out = None
     for _ in range(15):  # ~0.5 s: the fast slew attains the attitude
@@ -1084,7 +1084,6 @@ def test_closure_governor_full_brake_at_high_expansion_rate():
         # Fresh x measurements keep arriving (the F40 x-freshness gate
         # otherwise zeroes steering after 0.5 s without one).
         controller.current.last_x_measurement_s = now
-        controller.current.outer_expansion_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller._pre_cross_brake_active
     assert out.state is CleanCourseState.TRACK
@@ -1123,11 +1122,10 @@ def test_authoritative_promotion_does_not_switch_brake_reference():
 
 
 def test_closure_governor_does_not_brake_below_target_rate():
-    # Slow closure is free flight: below the far-range 0.15/s target rate
-    # the governor contributes nothing and the advance law still closes.
+    # Slow closure is free flight: below the 0.35/s target rate the
+    # governor contributes nothing and the advance law still closes.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
-    controller.current.outer_expansion_rate = 0.1
-    controller.current.outer_expansion_s = 100.10
+    controller.current.scale_axis.v = 0.1
     out = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert not controller._pre_cross_brake_active
     # Advance law still closes: above the level (spawn) brake base.
@@ -1141,68 +1139,65 @@ def test_closure_governor_distrusts_tiny_track_expansion():
     # drone into gate 0's structure.  Below CLOSURE_MIN_LOG_SCALE the
     # governor stays out no matter how large the reported expansion is.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.05))
-    controller.current.outer_expansion_rate = 0.9  # noise-level expansion
-    controller.current.outer_expansion_s = 100.10
+    controller.current.scale_axis.v = 0.9  # noise-level expansion
     out = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert not controller._pre_cross_brake_active
     # Advance law still closes: above the level (spawn) brake base.
     assert out.target_pitch_rad > SPAWN_PITCH
 
 
-def test_height_only_fragment_growth_cannot_create_closure_brake():
-    # F154 began on a short Gate-0 fragment whose height snapped .161 -> .231
-    # in one frame while width stayed .125.  Geometric apparent-scale called
-    # that 5.8/s closure and commanded the fatal launch brake.  The sole
-    # horizontal-span signal must remain calm even if the geometric Kalman
-    # rate is poisoned by the same association correction.
-    width = 0.125
-    first_height = 0.161
-    full_height = 0.231
-    first = _track(
-        "A", 0.0, 0.0, scale=math.sqrt(width * first_height)
+def test_gate_zero_launch_uses_raw_closure_while_scale_filter_warms():
+    # F114 (20260801T063210Z-visual-course-9260728c): the only failed run
+    # among F110-F113 pulsed the full brake during t=0.047...0.110 even
+    # though the raw Gate-0 box was stationary.  During the bounded launch
+    # boost, a newborn filtered-scale spike cannot own the brake; honest raw
+    # expansion and misalignment remain active, and the normal max signal
+    # resumes immediately afterward.
+    controller = _tracked_controller(
+        _track("A", 0.0, 0.0, scale=math.exp(-1.79)),
+        config=_config(launch_boost_duration_s=0.40),
     )
-    first.bbox_norm = (
-        -width / 2,
-        -first_height / 2,
-        width / 2,
-        first_height / 2,
-    )
-    controller = _tracked_controller(first)
-    full = _track("A", 0.0, 0.0, scale=math.sqrt(width * full_height))
-    full.bbox_norm = (
-        -width / 2,
-        -full_height / 2,
-        width / 2,
-        full_height / 2,
-    )
-    controller.observe(_update([full], frame_id=3), now_s=100.064)
-    controller.current.scale_axis.v = 2.0
-
-    out = _command(controller, 100.064, pitch=SPAWN_PITCH)
-
-    assert abs(controller.current.outer_expansion_rate) < 0.01
+    controller.current.scale_axis.v = 2.0  # newborn filtered-rate spike
+    controller.current.outer_expansion_rate = 0.0  # stationary raw box
+    controller.current.last_measurement_s = 100.10
+    out = _command(controller, 100.10, pitch=SPAWN_PITCH)
     assert not controller._pre_cross_brake_active
     assert out.target_pitch_rad > SPAWN_PITCH
+
+    # A real fast outer-box approach still brakes inside the launch window.
+    raw = _tracked_controller(
+        _track("A", 0.0, 0.0, scale=math.exp(-1.79)),
+        config=_config(launch_boost_duration_s=0.40),
+    )
+    raw.current.scale_axis.v = 0.0
+    raw.current.outer_expansion_rate = 0.80
+    raw.current.last_measurement_s = 100.10
+    _command(raw, 100.10, pitch=SPAWN_PITCH)
+    assert raw._pre_cross_brake_active
+
+    # The filtered rate regains authority at the boost boundary.
+    controller.current.last_measurement_s = 100.41
+    _command(controller, 100.41, pitch=SPAWN_PITCH)
+    assert controller._pre_cross_brake_active
 
 
 def test_closure_governor_is_a_continuous_blend():
     # Mid-band closure: the pitch target blends partway from the advance
     # law (spawn base) toward the spawn-0.15 Gate-0 brake attitude,
     # without latching the fast-slew brake flag.
-    # F157 keeps F150's range target: at log -1.40 it is 0.30, so 0.375/s
-    # is a mid-band response below the unchanged 0.60 full-brake rate.
+    # F101: at log -1.40 the range-ramped target is 0.30, so 0.375/s sits
+    # inside the continuous response band below the 0.60 full-brake rate.
     # (The commit
     # regime itself levels a centered gate via the F94 custody floor —
     # no blend is observable there.)
     controller = _tracked_controller(
         _track("A", 0.0, 0.0, scale=math.exp(-1.40))
     )
-    controller.current.outer_expansion_rate = 0.375
+    controller.current.scale_axis.v = 0.375
     now = 100.10
     out = None
     for _ in range(25):  # generic slew converges to the blended target
         now += 0.033
-        controller.current.outer_expansion_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert not controller._pre_cross_brake_active
     assert (
@@ -1210,26 +1205,6 @@ def test_closure_governor_is_a_continuous_blend():
         < out.target_pitch_rad
         < SPAWN_PITCH - 1e-9
     )
-
-
-def test_closure_governor_retains_the_f150_range_schedule():
-    # F157 changes evidence continuity, not F150's policy: the same 0.40/s
-    # closure receives more brake authority far away than near the entry
-    # regime, where the target rises toward the unchanged 0.35/s budget.
-    outputs = []
-    for outer_log_scale in (-1.90, -1.30):
-        controller = _tracked_controller(
-            _track("A", 0.0, 0.0, scale=math.exp(outer_log_scale)),
-            config=_config(
-                target_slew_rad_s=100.0,
-                pre_cross_brake_slew_rad_s=100.0,
-            ),
-        )
-        controller.current.outer_log_scale = outer_log_scale
-        controller.current.outer_expansion_rate = 0.40
-        controller.current.outer_expansion_s = 100.10
-        outputs.append(_command(controller, 100.10, pitch=SPAWN_PITCH))
-    assert outputs[0].target_pitch_rad < outputs[1].target_pitch_rad
 
 
 def test_misalignment_brake_is_invariant_to_its_own_camera_pitch():
@@ -1305,36 +1280,31 @@ def test_misaligned_far_gate_brakes_without_vertical_overlay():
     assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
 
 
-def test_predict_decays_closure_reference_without_reversing_pitch_direction():
-    # F156 hard-reset a 1.37/s Gate-0 approach to zero before PREDICT could
-    # even begin, then reversed pitch toward advance.  The last horizontal
-    # span rate is retained with continuously falling authority through the
-    # existing bounded PREDICT window; it never becomes a second owner.
+def test_closure_governor_brakes_in_predict():
+    # The governor applies in PREDICT too (the scale rate is filter state,
+    # live even while the camera is briefly blind).
     controller = _tracked_controller(_track("A", 0.20, 0.0, scale=0.10))
     now = 100.10
     now += 0.033
     controller.observe(
         _update([_track("A", 0.20, 0.0, scale=0.10)], frame_id=39), now_s=now
     )  # fresh measurement so the dropout starts from TRACK
-    controller.current.outer_expansion_rate = 1.37
-    controller.current.outer_expansion_s = now
-    pitch_targets = []
-    for frame in range(19):  # ~0.63 s: F156's last span through Gate-0 credit
+    controller.current.scale_axis.v = 0.7
+    for frame in range(9):  # ~0.3 s without a measurement -> PREDICT
         now += 0.033
-        # The live engulfing anchor kept the bounded credit wait in PREDICT
-        # beyond the ordinary 0.5 s loss bound without becoming a measurement.
-        controller._last_engulfing_anchor_s = now
         controller.observe(_update([], frame_id=40 + frame), now_s=now)
         out = _command(controller, now, pitch=SPAWN_PITCH)
-        pitch_targets.append(out.target_pitch_rad)
     assert controller.state is CleanCourseState.PREDICT
-    assert controller._closure_rate(controller.current, now) > 0.6
+    for _ in range(4):  # converge the fast brake slew inside the 0.5 s bound
+        now += 0.033
+        out = _command(controller, now, pitch=SPAWN_PITCH)
+    assert controller.state is CleanCourseState.PREDICT
     assert controller._pre_cross_brake_active
-    assert all(
-        later <= earlier + 1e-12
-        for earlier, later in zip(pitch_targets, pitch_targets[1:])
+    assert out.target_pitch_rad == pytest.approx(
+        controller.config.spawn_pitch_rad
+        + controller.config.pre_cross_brake_pitch_rad,
+        abs=1e-9,
     )
-    assert out.target_pitch_rad < controller.config.spawn_pitch_rad
 
 
 def test_pitch_offsets_follow_the_configured_spawn_attitude():
@@ -1344,13 +1314,12 @@ def test_pitch_offsets_follow_the_configured_spawn_attitude():
     controller = _tracked_controller(
         _track("A", 0.20, 0.0, scale=0.10), config=config
     )
-    controller.current.outer_expansion_rate = 0.7  # full closure brake
+    controller.current.scale_axis.v = 0.7  # full closure brake
     now = 100.10
     out = None
     for _ in range(15):  # fast slew attains the brake attitude
         now += 0.033
         controller.current.last_x_measurement_s = now
-        controller.current.outer_expansion_s = now
         out = _command(controller, now, pitch=config.spawn_pitch_rad)
     assert controller._pre_cross_brake_active
     # -0.20 spawn + the Gate-0 -0.15 pre-cross offset = -0.35.
@@ -1581,7 +1550,7 @@ def test_pre_cross_brake_custody_floor_scales_with_compensated_ey():
     # full brake when centered.  No hysteresis — the compensated ey is
     # attitude-invariant, so the floor cannot chatter.
     controller = _tracked_controller(_track("A", 0.0, 0.60, scale=0.10))
-    controller.current.outer_expansion_rate = 0.7  # full closure brake demand
+    controller.current.scale_axis.v = 0.7  # rapid expansion: full brake demand
     now = 100.10
 
     def drive(ticks=15):
@@ -1592,7 +1561,6 @@ def test_pre_cross_brake_custody_floor_scales_with_compensated_ey():
             controller.current.last_measurement_s = now
             controller.current.last_x_measurement_s = now
             controller.current.last_y_measurement_s = now
-            controller.current.outer_expansion_s = now
             out = _command(controller, now, pitch=SPAWN_PITCH)
         return out
 
@@ -1628,7 +1596,7 @@ def test_near_plane_custody_floor_runs_on_the_stale_hypothesis():
     # hypothesis (no freshness gate): past the 0.30 bound it surrenders to
     # level, below it the brake is preserved proportionally.
     controller = _tracked_controller(_track("A", 0.30, 0.43, scale=0.50))
-    # The lateral error supplies the brake demand; image closure is stale too.
+    controller.current.scale_axis.v = 0.7  # rapid expansion: full brake demand
     now = 100.10
     out = None
     for _ in range(20):
@@ -1688,6 +1656,7 @@ def test_course_leg_custody_floor_relaxes_the_single_brake():
     # Gate 0 keeps the wider 0.30 bound: the same ey 0.22 leaves MORE
     # brake authority, not less.
     gate0 = _tracked_controller(_track("A", 0.30, 0.22, scale=0.50))
+    gate0.current.scale_axis.v = 0.7
     now0 = 100.10
     for _ in range(20):
         now0 += 0.033
@@ -1731,6 +1700,54 @@ def test_clipping_increases_uncertainty_but_does_not_abort():
     # Clipping saturates corrective steering rather than aborting.
     # (F36 yaw gain 0.9: the clipped ex=0.10 pursuit commands 0.09.)
     assert abs(output.yaw_rate_rad_s) <= 0.10 * 0.9 + 1e-9
+
+
+def test_known_edge_center_censorship_is_axis_local():
+    # The production tracker marks any edge-clipped bbox center_censored,
+    # while retaining the orthogonal coordinate as a real measurement.
+    # TOP therefore censors only y, RIGHT only x; a censored center with no
+    # known edge is genuinely ambiguous and must censor both axes.
+    clean = _tracked_controller(_track("A", 0.10, 0.20))
+    top = _tracked_controller(
+        _track(
+            "A",
+            0.10,
+            0.20,
+            clipping=FrameEdge.TOP,
+            center_censored=True,
+        )
+    )
+    right = _tracked_controller(
+        _track(
+            "A",
+            0.10,
+            0.20,
+            clipping=FrameEdge.RIGHT,
+            center_censored=True,
+        )
+    )
+    unknown = _tracked_controller(
+        _track("A", 0.10, 0.20, center_censored=True)
+    )
+
+    assert top.current.last_x_measurement_s > NEVER_MEASURED_S + 1.0
+    assert top.current.last_y_measurement_s == NEVER_MEASURED_S
+    assert top.current.x_axis.pp == pytest.approx(
+        clean.current.x_axis.pp, abs=1e-12
+    )
+    assert top.current.y_axis.pp > clean.current.y_axis.pp
+
+    assert right.current.last_x_measurement_s == NEVER_MEASURED_S
+    assert right.current.last_y_measurement_s > NEVER_MEASURED_S + 1.0
+    assert right.current.x_axis.pp > clean.current.x_axis.pp
+    assert right.current.y_axis.pp == pytest.approx(
+        clean.current.y_axis.pp, abs=1e-12
+    )
+
+    assert unknown.current.last_x_measurement_s == NEVER_MEASURED_S
+    assert unknown.current.last_y_measurement_s == NEVER_MEASURED_S
+    assert unknown.current.x_axis.pp > clean.current.x_axis.pp
+    assert unknown.current.y_axis.pp > clean.current.y_axis.pp
 
 
 # ---------------------------------------------------------------------------
@@ -2310,6 +2327,83 @@ def test_bottom_y_covariance_cannot_release_fresh_lateral_custody():
             lateral.append((reference, authority, roll, yaw_rate))
 
         assert lateral[1] == pytest.approx(lateral[0], abs=1e-12)
+
+
+def test_bottom_censorship_keeps_observed_x_and_left_custody_over_time():
+    # F157: Gate 1 remained visibly left after its bbox touched BOTTOM, but
+    # blanket center censorship aged its still-observed x.  That released
+    # lateral custody to a right-side successor and reversed reference/yaw.
+    # Exercise the production tracker contract (center_censored=True on the
+    # known BOTTOM edge) across longer than the x-freshness horizon.
+    nominal = _turn_reference_controller(successor_x=0.55, current_x=-0.12)
+    bottom = _turn_reference_controller(successor_x=0.55, current_x=-0.12)
+    for controller in (nominal, bottom):
+        controller.gate_index = 1
+        controller.current.aperture_half_x = None
+        controller.current.aperture_half_y = None
+        controller._turn_aperture_reserve = 0.0
+        controller._turn_successor_authority = 0.0
+        controller._turn_reference_x = -0.12
+        controller._turn_reference_yaw_rad = 0.0
+
+    now = 100.10
+    for frame in range(18):
+        now += 0.04
+        nominal.observe(
+            _update(
+                [
+                    _track("A", -0.12, 0.25, scale=0.45),
+                    _track("B", 0.55, 0.05, scale=0.10),
+                ],
+                frame_id=20 + frame,
+            ),
+            now_s=now,
+        )
+        bottom.observe(
+            _update(
+                [
+                    _track(
+                        "A",
+                        -0.12,
+                        0.25,
+                        scale=0.45,
+                        clipping=FrameEdge.BOTTOM,
+                        center_censored=True,
+                    ),
+                    _track("B", 0.55, 0.05, scale=0.10),
+                ],
+                frame_id=20 + frame,
+            ),
+            now_s=now,
+        )
+
+        nominal_output = _command(
+            nominal, now, pitch=SPAWN_PITCH, yaw=0.0
+        )
+        bottom_output = _command(
+            bottom, now, pitch=SPAWN_PITCH, yaw=0.0
+        )
+
+        assert bottom.current.last_x_measurement_s == pytest.approx(now)
+        assert bottom.current.x_axis.pp == pytest.approx(
+            nominal.current.x_axis.pp, abs=1e-12
+        )
+        assert bottom.current.y_axis.pp > nominal.current.y_axis.pp
+        assert bottom._turn_reference_x == pytest.approx(
+            nominal._turn_reference_x, abs=1e-12
+        )
+        assert bottom_output.successor_blend == pytest.approx(
+            nominal_output.successor_blend, abs=1e-12
+        )
+        assert bottom_output.yaw_rate_rad_s == pytest.approx(
+            nominal_output.yaw_rate_rad_s, abs=1e-12
+        )
+        assert bottom_output.target_roll_rad == pytest.approx(
+            nominal_output.target_roll_rad, abs=1e-12
+        )
+        assert bottom._turn_reference_x < 0.0
+        assert bottom_output.yaw_rate_rad_s < 0.0
+        assert bottom_output.target_roll_rad < 0.0
 
 
 def test_arbitrarily_weak_successor_remains_weak_after_current_claim_ages():
@@ -3068,7 +3162,6 @@ def _drive_commit_window(controller, now, ticks=12):
         controller.current.last_measurement_s = now
         controller.current.last_x_measurement_s = now
         controller.current.last_y_measurement_s = now
-        controller.current.outer_expansion_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     return out, now
 
@@ -3155,7 +3248,6 @@ def test_gate_zero_far_closure_avoids_early_fast_brake_dive():
         current.last_measurement_s = now
         current.last_x_measurement_s = now
         current.last_y_measurement_s = now
-        current.outer_expansion_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
 
     assert controller.state is CleanCourseState.TRACK
@@ -3194,7 +3286,6 @@ def test_gate_zero_budget_false_near_plane_hold_keeps_gentle_brake():
         current.last_measurement_s = now
         current.last_x_measurement_s = now
         current.last_y_measurement_s = now
-        current.outer_expansion_s = now
         out = _command(controller, now, pitch=weak_brake_attitude)
 
     assert controller.state is CleanCourseState.TRACK
@@ -3338,7 +3429,7 @@ def test_near_plane_hold_brakes_without_self_blinding():
     current.raw_x = -0.12
     current.raw_y = 0.31
     current.scale_axis.p = -1.00
-    current.outer_expansion_rate = 0.85
+    current.scale_axis.v = 0.85
     current.outer_log_scale = -1.00
     current.aperture_half_x = 0.20
     current.aperture_half_y = 0.20
@@ -3376,7 +3467,7 @@ def test_hot_closure_keeps_the_single_brake_through_attitude_artifact():
     current.raw_x = -0.10
     current.raw_y = 0.24
     current.scale_axis.p = -0.50  # commit regime reads the inner scale
-    current.outer_expansion_rate = 1.0  # ~1.0 log/s closure: budget false
+    current.scale_axis.v = 1.0  # ~1.0 log/s closure: budget false
     current.aperture_half_x = 0.20
     current.aperture_half_y = 0.20
     brake_attitude = SPAWN_PITCH - 0.267  # the held F93 brake attitude
@@ -3387,7 +3478,6 @@ def test_hot_closure_keeps_the_single_brake_through_attitude_artifact():
         current.last_measurement_s = now
         current.last_x_measurement_s = now
         current.last_y_measurement_s = now
-        current.outer_expansion_s = now
         out = _command(controller, now, pitch=brake_attitude)
     assert controller.state is CleanCourseState.TRACK  # COMMIT never arms
     assert controller._pre_cross_brake_active
@@ -3414,7 +3504,7 @@ def test_no_track_search_latches_altitude_support():
 
 
 def _converged_gate_one_vertical(vz_m_s):
-    """Gate-1 TRACK controller with the closure governor quiet."""
+    """Gate-1 TRACK controller, gate just above center, settled closure."""
 
     controller = _tracked_controller(_track("A", 0.0, -0.10, scale=0.20))
     _promote_to_gate_one(controller)
@@ -3426,6 +3516,7 @@ def _converged_gate_one_vertical(vz_m_s):
     current.raw_y = -0.10
     current.y_axis.v = 0.0
     current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10  # settled closure (closure governor quiet)
     now = 100.10
     out = None
     for _ in range(15):  # converge the slews/governors
@@ -3459,6 +3550,7 @@ def test_far_vertical_arrival_damping_uses_one_imu_rate_term():
         current.y_axis.v = 0.0
         current.scale_axis.p = -1.6
         current.outer_log_scale = -2.20
+        current.scale_axis.v = 0.10
         now = 100.10
         out = None
         for _ in range(15):
@@ -3489,6 +3581,7 @@ def test_course_leg_vertical_drops_image_rate_feedback():
     current.raw_y = 0.0
     current.y_axis.v = 0.30  # gate sliding down the frame (image rate)
     current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10
     now = 100.10
     out = None
     for _ in range(15):
@@ -3518,7 +3611,7 @@ def test_course_leg_closure_excess_leaves_collective_alone():
     current.raw_y = 0.0
     current.y_axis.v = 0.0
     current.scale_axis.p = -1.6  # span ~0.20, outside the near-plane zone
-    current.outer_expansion_rate = 0.58  # hot closure (target 0.15)
+    current.scale_axis.v = 0.58  # hot closure (target 0.35)
     now = 100.10
     out = None
     for _ in range(15):
@@ -3527,7 +3620,6 @@ def test_course_leg_closure_excess_leaves_collective_alone():
         current.last_measurement_s = now
         current.last_x_measurement_s = now
         current.last_y_measurement_s = now
-        current.outer_expansion_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.TRACK
     assert out.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-3)
@@ -3561,6 +3653,7 @@ def test_course_leg_vz_des_sink_is_capped_near_the_ground():
     current.raw_y = 0.30
     current.y_axis.v = 0.0
     current.scale_axis.p = -2.5
+    current.scale_axis.v = 0.10
     current.outer_log_scale = -2.5  # far: the F97 commit ramp is not the cap
     now = 100.10
     out = None
@@ -3595,6 +3688,7 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
     current.raw_y = 0.30
     current.y_axis.v = 0.0
     current.scale_axis.p = -1.67  # filtered hypothesis LAGS...
+    current.scale_axis.v = 0.10
     current.outer_log_scale = -0.9  # ...while raw proximity is at the plane
     now = 100.10
     out = None
@@ -3618,6 +3712,7 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
     far_current.raw_y = 0.30
     far_current.y_axis.v = 0.0
     far_current.scale_axis.p = -2.5
+    far_current.scale_axis.v = 0.10
     far_current.outer_log_scale = -2.5  # beyond the ramp start: full 0.5 cap
     far_now = 100.10
     far_out = None
@@ -3632,9 +3727,12 @@ def test_course_leg_vz_des_respects_commit_budget_near_plane():
 
 
 def test_raw_closure_brakes_when_the_filtered_rate_lags():
-    # F99's fast raw response is preserved after F156 removes the lagging
-    # geometric Kalman rate: coherent horizontal expansion alone sees a hot
-    # approach within a few frames and owns the brake.
+    # F99 (20260730T164633Z-visual-course-cb4e1b9e): the closure governor
+    # read only the Kalman scale_axis.v, which lags ~1 s on a growing
+    # track — F98 braked only incidentally (misalignment) and arrived at
+    # +1.7..+3.5 log/s.  The raw outer-bbox rate (EMA, tau 0.2 s) sees a
+    # hot approach within a few frames and the governor brakes on the
+    # faster of the two signals.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.08))
     now = 100.10
     out = None
@@ -3651,7 +3749,8 @@ def test_raw_closure_brakes_when_the_filtered_rate_lags():
     assert controller.state is CleanCourseState.TRACK
     # The raw signal converged to the true hot closure...
     assert controller.current.outer_expansion_rate > 0.5
-    # ...and the governor is braking on that one signal.
+    # ...and the governor is braking on it (the parent's lagging filtered
+    # rate leaves the brake off here and fails both assertions).
     assert controller._pre_cross_brake_active
     assert out.target_pitch_rad < SPAWN_PITCH - 0.10
 
@@ -3679,10 +3778,10 @@ def test_closure_governor_demands_energy_reduction_early():
     # than custody-compatible attitude braking can kill inside the leg.
     # F100's gate-1 leg held pb=1 mid-leg and still ran away to ~1.2
     # log/s at the plane (COMMIT expansion veto, blind structure strike).
-    # F157 retains F150's evidence-backed range schedule.  At the F100
-    # mid-leg state (outer log -1.90, target ~0.175, closure 0.43), the
+    # The target now ramps down with range: at the F100 mid-leg state
+    # (outer log -1.90, closure 0.43) the ramped target is 0.17, the
     # governor continuously demands a meaningful fraction of the one F125
-    # brake reference.
+    # brake reference rather than leaving the attitude at spawn.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.15))
     controller._alt_est_m = 2.0
     _promote_to_gate_one(controller)
@@ -3697,7 +3796,7 @@ def test_closure_governor_demands_energy_reduction_early():
         current = controller.current
         current.scale_axis.v = 0.0  # settled filtered rate
         current.outer_expansion_rate = 0.43  # F100 mid-leg closure
-        current.outer_expansion_s = now
+        current.last_measurement_s = now  # raw signal fresh
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller._pre_cross_brake_active
     assert out.target_pitch_rad < SPAWN_PITCH - 0.05
@@ -3713,6 +3812,7 @@ def test_blind_hold_tracks_zero_vz_when_fh_trusted():
     current.y_axis.p = 0.0
     current.raw_y = 0.0
     current.scale_axis.p = -1.6
+    current.scale_axis.v = 0.10
     now = 100.10
     out = None
     for _ in range(30):  # ~1 s of the F97 leg-start plateau geometry
@@ -3754,6 +3854,7 @@ def test_far_qualified_low_gate_request_damps_inherited_climb():
         current.raw_y = 0.03
         current.y_axis.v = 0.0
         current.scale_axis.p = -1.6
+        current.scale_axis.v = 0.10  # settled closure
         now = 100.10
         out = None
         for _ in range(15):  # converge the slews/governors
@@ -3783,6 +3884,7 @@ def test_far_vertical_owner_combines_compensated_position_and_imu_rate():
         current.raw_y = ey
         current.y_axis.v = 0.0
         current.scale_axis.p = -1.6
+        current.scale_axis.v = 0.10  # settled closure (brake quiet)
         now = 100.10
         out = None
         for _ in range(ticks):
@@ -3824,6 +3926,7 @@ def test_gate0_qualified_imu_damping_continues_through_near_plane():
         current.y_axis.v = 0.0
         current.scale_axis.p = log_scale
         current.outer_log_scale = log_scale
+        current.scale_axis.v = 0.10  # settled closure
         now = 100.10
         out = None
         for _ in range(15):  # converge the slews/governors
@@ -4790,12 +4893,12 @@ def test_yaw_command_output_never_exceeds_the_0p15_production_cap():
 
 def test_commit_entry_refuses_excessive_closure():
     # Arrival energy is the uncontrolled budget: an approach still closing
-    # faster than the entry budget (expansion rate 0.50/s > 0.35) is
+    # faster than the governor target (expansion rate 0.50/s > 0.35) is
     # refused even with a usable aperture and a centered, settled bearing —
     # TRACK keeps controlling energy outside the censorship blackout
     # instead of committing a hot crossing.
     closing = _commit_controller()
-    closing.current.outer_expansion_rate = 0.50
+    closing.current.scale_axis.v = 0.50
     _drive_commit_window(closing, 100.10)
     assert closing.state is CleanCourseState.TRACK
 

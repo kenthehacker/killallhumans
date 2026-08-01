@@ -43,11 +43,10 @@ Control-law constant sources:
   post-credit reuse.
 - ``VZ_LEAK_TAU_S``: bias guard for the IMU world-vertical-rate estimate.
 - ``CLOSURE_TARGET_RATE_S`` / ``CLOSURE_FULL_BRAKE_RATE_S``: the vision
-  closure-rate governor (F31/F157).  One uncensored horizontal log-span
-  reference supplies closure; fh is a signless drag magnitude that
-  conflates speed with braking.  Its authority decays continuously during
-  bounded blindness, and speed is capped at every range as pitch blends
-  from the advance law toward the gentle
+  closure-rate governor (F31).  The filtered log-scale expansion rate is
+  the only honest closure signal — fh is a signless drag magnitude that
+  conflates speed with braking — so speed is capped CONTINUOUSLY at every
+  range: the pitch target blends from the advance law toward the gentle
   ``PRE_CROSS_BRAKE_PITCH_RAD`` attitude as the expansion rate rises past
   the target.  This replaces the retired fh closure governor (wrong
   signal), the near-field log_scale/TTC triggers (late), and the
@@ -431,26 +430,31 @@ UNMEASURED_X_FORCE_SEARCH_S = 0.75
 # same way — terrain at the gate-1 threshold in the high-drag regime with
 # frozen estimates): vision expansion rate is the ONLY honest closure
 # signal (fh is a signless drag magnitude that conflates speed with
-# braking).  Speed is now capped CONTINUOUSLY at every range: as the fresh
-# horizontal bbox log-span rate rises past the target, the pitch target
-# blends from the advance law toward the gentle brake attitude, reaching it
-# at the full-brake rate.  This replaces the fh closure governor (wrong signal),
+# braking).  Speed is now capped CONTINUOUSLY at every range: as the
+# filtered log-scale rate rises past the target, the pitch target blends
+# from the advance law toward the gentle brake attitude, reaching it at the
+# full-brake rate.  This replaces the fh closure governor (wrong signal),
 # the near-field log_scale/TTC triggers (late), and the post-credit brake
 # (no job left once crossings are slow — and its hard nose-up episodes
 # were themselves VRS generators).
+CLOSURE_TARGET_RATE_S = 0.35  # log-scale rate the governor holds (TTC ~3 s)
 # F108 (20260801T054550Z-visual-course-8b530eed): F106's 0.36/s threshold
 # put Gate 0 on the fast brake response far from the plane.  F107 then
 # accumulated a vertical sink before the near-plane hold (vz -0.11 m/s,
 # altitude -0.09 m at span 0.55), pitched to the custody limit, and struck
 # the structure without credit.  Restore F104's live-proven 0.60/s response
-# ceiling: the governor still blends brake continuously, while
+# ceiling: the range-ramped governor still blends brake continuously, while
 # the explicit near-plane budget-false hold still demands full braking.
 CLOSURE_FULL_BRAKE_RATE_S = 0.60
-CLOSURE_TARGET_RATE_S = 0.35  # near-plane log-rate entry target
-# F157 returns to F150's evidence-backed range schedule after F156 showed
-# that retuning the target could not be interpreted through a discontinuous
-# closure handoff.  The policy is unchanged here; only the one closure
-# reference below changes.
+# F101 (20260730T173407Z-visual-course-7a862549): a range-flat 0.35
+# target permits 3+ m/s at leg start (0.35 log/s at 8-10 m), more than
+# custody-compatible attitude braking (~0.4-0.7 m/s^2, capped by the F94
+# floor near the plane) can dissipate inside the leg — F100's gate-1 leg
+# held pb=1 mid-leg and still ran away to ~1.2 log/s at the plane
+# (COMMIT veto, blind structure strike).  The target ramps from a low
+# far value (an implicit constant-speed cap while the full gate is
+# visible and custody is free) up to the unchanged 0.35 entry budget at
+# the commit regime.
 CLOSURE_FAR_TARGET_RATE_S = 0.15  # far-range closure target (~1.2 m/s at 8 m)
 CLOSURE_FAR_LOG_SCALE = -2.0  # ramp start; 0.35 target at commit_min_log_scale
 # F96: the F77 closure-excess collective brake (COURSE_CLOSURE_BRAKE_COLLECTIVE)
@@ -465,12 +469,19 @@ CLOSURE_FAR_LOG_SCALE = -2.0  # ramp start; 0.35 target at commit_min_log_scale
 # (far-field real closure at our speeds never exceeds the target anyway:
 # 4 m/s at 10 m is 0.4/s with scale already >= ~0.08).
 CLOSURE_MIN_LOG_SCALE = -2.6
-# F157 keeps F156's shape-robust response but removes its 0.15 s hard expiry.
-# The sole closure signal is an EMA of uncensored horizontal bbox log-span
-# growth: it responds within a few frames while rejecting F154's height-only
-# fragment snap.  Through a bounded blind interval it loses authority
-# continuously, reaching zero only at the existing forced-SEARCH bound.
-OUTER_EXPANSION_TAU_S = 0.20  # horizontal log-span EMA time constant
+# F99 (20260730T164633Z-visual-course-cb4e1b9e): the closure governor's
+# signal is the Kalman scale_axis.v, which lags ~1 s on a fresh/adopted
+# track — F98 braked only incidentally (misalignment), the governor never
+# saw the true closure, and the leg arrived at expansion +1.7..+3.5 log/s
+# through every centered fresh frame (COMMIT's 0.35 entry limit vetoed
+# first; gate 0's hot 2.5-3.5 m/s crossings are the same lag).  The raw
+# outer-bbox log-scale rate (EMA over uncensored frames) is fast enough;
+# the governor takes the FASTER of the two, so braking never goes below
+# today's.  Physics: holding the 0.35 log/s cap over a 15 m leg from
+# 3 m/s needs ~0.3 m/s^2 — inside the measured 0.4-0.7 brake authority,
+# so the signal, not the airframe, was the bottleneck.
+OUTER_EXPANSION_TAU_S = 0.20  # EMA time constant for the raw closure rate
+OUTER_EXPANSION_MAX_AGE_S = 0.15  # freshness bound on the raw signal
 # Fragment advance gate (F43, 20260729T202844Z-visual-course-ee8fd1e5): the
 # gate-1 leg advanced at full +0.08 on a LONE span-(0.04,0.10) fragment
 # (log_scale ~-3.7), built fh 3-4 mps2, and parallax outran yaw authority
@@ -787,7 +798,7 @@ class _Hypothesis:
         "scale_axis",
         "confidence",
         "outer_log_scale",
-        "outer_expansion_s",
+        "outer_log_scale_s",
         "outer_expansion_rate",
         "outer_half_span_x",
         "clipped",
@@ -819,7 +830,7 @@ class _Hypothesis:
         self.scale_axis = _AxisFilter(log_scale, 0.0, pos_var, INITIAL_RATE_VAR)
         self.confidence = _clamp01(confidence)
         self.outer_log_scale = float(log_scale)
-        self.outer_expansion_s = float(now_s)
+        self.outer_log_scale_s = float(now_s)
         self.outer_expansion_rate = 0.0
         # F56: outer bbox x half-width in norm — the COMMIT corridor bound
         # is measured in gate units.  Square-box proxy from the area scale
@@ -864,6 +875,10 @@ class _Hypothesis:
     @property
     def log_scale(self) -> float:
         return self.scale_axis.p
+
+    @property
+    def expansion_rate(self) -> float:
+        return self.scale_axis.v
 
     @property
     def position_std(self) -> float:
@@ -945,6 +960,7 @@ class CleanCourseConfig:
     closure_far_log_scale: float = CLOSURE_FAR_LOG_SCALE
     closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
     outer_expansion_tau_s: float = OUTER_EXPANSION_TAU_S
+    outer_expansion_max_age_s: float = OUTER_EXPANSION_MAX_AGE_S
     fragment_advance_min_log_scale: float = FRAGMENT_ADVANCE_MIN_LOG_SCALE
     fragment_creep_pitch_rad: float = FRAGMENT_CREEP_PITCH_RAD
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
@@ -1923,16 +1939,64 @@ class CleanCourseController:
             and current.y_axis.std <= cfg.search_covariance_std_norm
         )
         floor_gate_y = ey_vertical if vertical_qualified else None
-        # Vision closure-rate governor (F157, see the CLOSURE_* block): one
-        # shape-robust signal owns governor, advance, and entry-budget
-        # decisions.  It is the EMA of uncensored horizontal bbox
-        # growth, so a fragment gaining only vertical support cannot be
-        # interpreted as physical approach.  The target blends continuously
-        # toward the gentle brake at every trusted range; tiny far tracks and
-        # uncertainty during PREDICT reduces authority smoothly instead of
-        # resetting a still-hot approach to zero.  The lagging geometric
-        # Kalman rate and launch-only selector remain deleted.
-        closure_rate = self._closure_rate(current, now_s)
+        # Vision closure-rate governor (F31, see the CLOSURE_* constant
+        # block): the filtered log-scale rate is the only honest closure
+        # signal — fh is a signless drag magnitude that conflates speed with
+        # braking.  Speed is capped CONTINUOUSLY at every range: the pitch
+        # target below blends from the advance law toward the gentle brake
+        # attitude as the expansion rate rises past the target.  Applies in
+        # TRACK and PREDICT alike (the SEARCH path returned above).
+        # F33 trust gate: expansion from tiny far tracks is sub-pixel noise,
+        # so the governor only runs above CLOSURE_MIN_LOG_SCALE.
+        # F99: the Kalman rate lags ~1 s on a fresh/adopted track (see the
+        # OUTER_EXPANSION_* block) — the governor only braked incidentally
+        # and every leg arrived hot.  Take the FASTER of the filtered rate
+        # and the raw outer-bbox rate (fresh only): braking never goes
+        # below what the filtered signal alone would command.
+        raw_closure = (
+            current.outer_expansion_rate
+            if now_s - current.last_measurement_s
+            <= cfg.outer_expansion_max_age_s
+            else 0.0
+        )
+        closure_rate = 0.0
+        if current.outer_log_scale >= cfg.closure_min_log_scale:
+            # F114 (20260801T063210Z-visual-course-9260728c): only the
+            # failed Gate-0 run produced a full-brake pulse at t=0.047...
+            # 0.110 s while its raw outer box was exactly stationary
+            # (outer EMA 0.0).  The fresh hypothesis's lagging scale rate
+            # invoked the high-authority brake loop during launch, moved
+            # pitch -0.31 -> -0.33, and the approach stayed above the
+            # aperture into the top structure.  During the bounded Gate-0
+            # launch boost, use the fast raw outer-box signal alone; real
+            # raw closure and the independent misalignment brake remain
+            # fully authoritative.  After the boost, resume the normal
+            # faster-of-two governor.
+            launch_scale_warmup = (
+                self.gate_index == 0
+                and self._course_start_s is not None
+                and now_s - self._course_start_s
+                < cfg.launch_boost_duration_s
+            )
+            closure_rate = (
+                raw_closure
+                if launch_scale_warmup
+                else max(current.expansion_rate, raw_closure)
+            )
+        # F101 approach-energy profile (20260730T173407Z-...-7a862549):
+        # F100's gate-1 leg braked mid-leg (pb=1, pitch to -0.57) yet the
+        # closure held 0.43 log/s and then RAN AWAY to ~1.2 log/s at the
+        # plane once the F94 custody floor capped the brake attitude —
+        # attitude braking authority (~0.4-0.7 m/s^2, custody-limited to
+        # less near the plane) cannot kill 2.5-3.5 m/s inside the leg
+        # remainder, so the COMMIT expansion budget vetoed and the blind
+        # drone hit the gate-1 structure.  A constant 0.35 log/s target
+        # only bounds speed NEAR the plane; far out it permits 3+ m/s.
+        # The target now RAMPS with range: a low far target
+        # (constant-speed cap in log terms) bleeding energy while the
+        # full gate is visible and custody is free, rising to the
+        # unchanged 0.35 entry budget at the commit regime.  Same law on
+        # every leg — gate-0 entry energy is what the next leg inherits.
         target_frac = _clamp01(
             (current.outer_log_scale - cfg.closure_far_log_scale)
             / (cfg.commit_min_log_scale - cfg.closure_far_log_scale)
@@ -2051,7 +2115,7 @@ class CleanCourseController:
         )
         expansion = _clamp01(
             1.0
-            - max(0.0, closure_rate - cfg.expansion_brake_free_s)
+            - max(0.0, current.expansion_rate - cfg.expansion_brake_free_s)
             / cfg.expansion_brake_span_s
         )
         near_plane = _clamp01(
@@ -2200,16 +2264,6 @@ class CleanCourseController:
         self.last_reliable_bearing = (float(x), float(y))
         self._bearing_memory_valid = True
 
-    def _closure_rate(self, current: _Hypothesis, now_s: float) -> float:
-        """Return one bounded, uncertainty-decayed approach reference."""
-
-        cfg = self.config
-        if current.outer_log_scale < cfg.closure_min_log_scale:
-            return 0.0
-        age_s = max(0.0, float(now_s) - current.outer_expansion_s)
-        authority = _clamp01(1.0 - age_s / PREDICT_STALL_FORCE_SEARCH_S)
-        return authority * current.outer_expansion_rate
-
     def _commit_entry_budget_ok(
         self, now_s: float, pitch_rad: float, cfg: "CleanCourseConfig"
     ) -> bool:
@@ -2236,12 +2290,19 @@ class CleanCourseController:
             return False
         if current.aperture_half_x is None or current.aperture_half_y is None:
             return False
-        # F157: entry reads the same uncertainty-decayed horizontal-span
-        # rate as the pitch law.  A second geometric/filter closure owner
-        # cannot veto or admit a crossing on contradictory detector-shape
-        # evidence.
-        if self._closure_rate(current, now_s) > (
-            cfg.commit_entry_max_expansion_rate_s
+        # F102 (Codex checkpoint): veto on the FASTER of the lagging Kalman
+        # rate and the fresh raw outer-bbox rate — the same signal the F99
+        # closure governor brakes on.  The filtered rate alone lags ~1 s on
+        # a fresh/adopted track and would arm a still-hot crossing.
+        raw_closure = (
+            current.outer_expansion_rate
+            if now_s - current.last_measurement_s
+            <= cfg.outer_expansion_max_age_s
+            else 0.0
+        )
+        if (
+            max(current.expansion_rate, raw_closure)
+            > cfg.commit_entry_max_expansion_rate_s
         ):
             return False
         # F82: the blackout-displacement budget includes IMU vz, not just
@@ -2319,9 +2380,17 @@ class CleanCourseController:
         if type(clipping) is not FrameEdge:
             clipping = FrameEdge.NONE
         center_censored = bool(getattr(track, "center_censored", False))
+        unknown_center_censorship = (
+            center_censored and clipping == FrameEdge.NONE
+        )
         hypothesis.clipped = clipping is not FrameEdge.NONE
         x_censored = (
-            center_censored or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
+            unknown_center_censorship
+            or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
+        )
+        y_censored = (
+            unknown_center_censorship
+            or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM))
         )
         if x_censored:
             hypothesis.last_x_measurement_s = NEVER_MEASURED_S
@@ -2333,7 +2402,7 @@ class CleanCourseController:
                 hypothesis.outer_half_span_x = 0.5 * (
                     float(bbox[2]) - float(bbox[0])
                 )
-        if center_censored or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)):
+        if y_censored:
             hypothesis.last_y_measurement_s = NEVER_MEASURED_S
             hypothesis.vertical_censor_edge = clipping & (
                 FrameEdge.TOP | FrameEdge.BOTTOM
@@ -2386,11 +2455,16 @@ class CleanCourseController:
         if type(clipping) is not FrameEdge:
             clipping = FrameEdge.NONE
         center_censored = bool(getattr(track, "center_censored", False))
+        unknown_center_censorship = (
+            center_censored and clipping == FrameEdge.NONE
+        )
         x_censored = (
-            center_censored or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
+            unknown_center_censorship
+            or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
         )
         y_censored = (
-            center_censored or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM))
+            unknown_center_censorship
+            or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM))
         )
         hypothesis.vertical_censor_edge = (
             clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
@@ -2426,40 +2500,39 @@ class CleanCourseController:
             hypothesis.scale_axis.update(z_log_scale, r_scale)
         hypothesis.confidence = _clamp01(float(track.confidence))
         hypothesis.clipped = clipping is not FrameEdge.NONE
-        if hypothesis.clipped:
-            # Clipping increases uncertainty; it is not an abort condition.
+        # Edge support increases uncertainty only on the axis it censors.
+        # The orthogonal center remains a real measurement (tracker contract,
+        # mirrored by x_censored/y_censored above).
+        if bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)):
             hypothesis.x_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
+        if bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)):
             hypothesis.y_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
         hypothesis.last_measurement_s = float(now_s)
         new_outer_log_scale = math.log(max(1e-6, float(track.apparent_scale)))
+        # F99: fast raw closure signal (see the OUTER_EXPANSION_* block) —
+        # EMA of the per-frame outer log-scale rate, so the closure
+        # governor does not wait ~1 s for the Kalman scale_axis.v to
+        # tighten on a fresh/adopted track.
+        dt_outer = float(now_s) - hypothesis.outer_log_scale_s
+        if dt_outer > 1e-6:
+            raw_rate = (
+                new_outer_log_scale - hypothesis.outer_log_scale
+            ) / dt_outer
+            alpha = dt_outer / (self.config.outer_expansion_tau_s + dt_outer)
+            hypothesis.outer_expansion_rate += alpha * (
+                raw_rate - hypothesis.outer_expansion_rate
+            )
         hypothesis.outer_log_scale = new_outer_log_scale
+        hypothesis.outer_log_scale_s = float(now_s)
         if not x_censored:
-            # F157: horizontal bbox growth is the sole closure measurement.
-            # F154's fatal launch pulse changed only height; using apparent
-            # area made that association/shape correction look like 5.8/s
-            # physical approach.  The x span is co-timed with accepted x and
-            # is held (and naturally ages stale) while horizontally censored.
+            # F56: the corridor bound needs the gate's true half-width; a
+            # censored-x bbox underreports it, so only uncensored frames
+            # refresh the span.
             bbox = getattr(track, "bbox_norm", None)
             if bbox is not None and len(bbox) >= 4:
-                new_span_x = max(
-                    1e-6, float(bbox[2]) - float(bbox[0])
+                hypothesis.outer_half_span_x = 0.5 * (
+                    float(bbox[2]) - float(bbox[0])
                 )
-                previous_span_x = max(
-                    1e-6, 2.0 * hypothesis.outer_half_span_x
-                )
-                dt_outer = float(now_s) - hypothesis.outer_expansion_s
-                if dt_outer > 1e-6:
-                    raw_rate = (
-                        math.log(new_span_x) - math.log(previous_span_x)
-                    ) / dt_outer
-                    alpha = dt_outer / (
-                        self.config.outer_expansion_tau_s + dt_outer
-                    )
-                    hypothesis.outer_expansion_rate += alpha * (
-                        raw_rate - hypothesis.outer_expansion_rate
-                    )
-                hypothesis.outer_half_span_x = 0.5 * new_span_x
-                hypothesis.outer_expansion_s = float(now_s)
         # 2026-07-30 entry budget: the CURRENT frame's usable inner aperture
         # (passage_usable) is recorded as half-extents; a missing/unusable
         # fit clears them, so a close-range aperture loss is itself visible
@@ -2499,16 +2572,20 @@ class CleanCourseController:
             ):
                 self.successor = None
             return
-        # F40: prefer a successor whose x-axis is observable — a
-        # center-censored or LEFT/RIGHT-clipped track is the splinter-
-        # fragment geometry that promoted onto a never-measured x-axis.
+        # F158: prefer a successor whose x-axis is observable.  The tracker
+        # marks every known edge clip center_censored, but TOP/BOTTOM leaves
+        # horizontal center observable; only unknown censorship or a
+        # LEFT/RIGHT edge makes x unusable.
         eligible = []
         for track in others:
             clipping = getattr(track, "clipping", FrameEdge.NONE)
             if type(clipping) is not FrameEdge:
                 clipping = FrameEdge.NONE
             center_censored = bool(getattr(track, "center_censored", False))
-            if not center_censored and not bool(
+            unknown_center_censorship = (
+                center_censored and clipping == FrameEdge.NONE
+            )
+            if not unknown_center_censorship and not bool(
                 clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
             ):
                 eligible.append(track)
