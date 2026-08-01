@@ -1237,6 +1237,82 @@ def test_fh_untrusted_course_taper_requires_fresh_vertical_geometry():
     assert out.thrust == pytest.approx(SPAWN_SUPPORT + 0.05, abs=1e-9)
 
 
+def test_bottom_censorship_cannot_reassert_untrusted_climb_margin():
+    # F115 responded correctly while the low Gate 1 still had numeric y
+    # (thrust 0.309 -> 0.259), then restored 0.309 the instant that same
+    # low gate became bottom-censored.  Bottom censorship is one-sided fresh
+    # evidence: keep the extra margin released while the same id remains fresh.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(controller, now_s=100.50)
+    controller._fh_untrusted = True
+    controller._alt_est_m = 2.0
+    controller._collective = SPAWN_SUPPORT
+    now = 100.50
+    controller.current.y_axis.p = 0.50
+    controller.current.raw_y = 0.50
+    controller.current.last_measurement_s = now
+    controller.current.last_y_measurement_s = now
+    fresh_low = _command(controller, now, pitch=SPAWN_PITCH, fh=6.0)
+    assert fresh_low.vertical_qualified
+    assert fresh_low.thrust == pytest.approx(SPAWN_SUPPORT, abs=1e-9)
+
+    out = None
+    for frame in range(20, 32):
+        now += 0.033
+        controller.observe(
+            _update(
+                [
+                    _track(
+                        "B",
+                        0.0,
+                        0.95,
+                        clipping=FrameEdge.BOTTOM,
+                    )
+                ],
+                frame_id=frame,
+            ),
+            now_s=now,
+        )
+        out = _command(controller, now, pitch=SPAWN_PITCH, fh=6.0)
+
+    assert controller.current.vertical_censor_edge == FrameEdge.BOTTOM
+    assert not out.vertical_qualified
+    assert SPAWN_SUPPORT <= out.thrust <= fresh_low.thrust + 1e-9
+
+
+def test_top_or_expired_censorship_keeps_conservative_untrusted_margin():
+    # Only fresh, bottom-only same-id geometry can release the extra margin.
+    # A top-censored gate may need climb, and directional memory expires with
+    # the bounded prediction horizon.
+    top = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(top, now_s=100.50)
+    top._fh_untrusted = True
+    top._collective = SPAWN_SUPPORT
+    top.current.y_axis.p = -0.50
+    top.current.raw_y = -0.50
+    top.current.last_y_measurement_s = 99.0
+    top.current.last_measurement_s = 100.50
+    top.current.vertical_censor_edge = FrameEdge.TOP
+    top_out = _command(top, 100.50, pitch=SPAWN_PITCH, fh=6.0)
+    assert top_out.thrust >= SPAWN_SUPPORT + 0.05
+
+    expired = _tracked_controller(_track("A", 0.0, 0.0))
+    _promote_to_gate_one(expired, now_s=100.50)
+    expired._fh_untrusted = True
+    expired._collective = SPAWN_SUPPORT
+    expired.current.y_axis.p = 0.50
+    expired.current.raw_y = 0.50
+    expired.current.last_y_measurement_s = 99.0
+    expired.current.last_measurement_s = (
+        100.50 - expired.config.predict_max_gap_s - 0.01
+    )
+    expired.current.vertical_censor_edge = FrameEdge.BOTTOM
+    expired_out = _command(expired, 100.50, pitch=SPAWN_PITCH, fh=6.0)
+    assert expired_out.thrust == pytest.approx(
+        SPAWN_SUPPORT + 0.05, abs=1e-9
+    )
+
+
 def test_closure_governor_full_brake_at_high_expansion_rate():
     # F31: the vision log-scale expansion rate is the only honest closure
     # signal (fh is a signless drag magnitude).  At/above the full-brake
@@ -2044,6 +2120,129 @@ def test_search_never_promotes_retained_successor_without_race_credit():
     assert controller.current.track_id == "A"
     assert controller.successor is not None
     assert controller.successor.track_id == "B"
+
+
+def _successor_preview_controller(
+    *,
+    successor_x=-0.45,
+    current_x=0.02,
+    now_s=100.10,
+):
+    """Fresh Gate-0 geometry with optional persistent farther Gate 1."""
+
+    controller = _tracked_controller(
+        _track("A", current_x, 0.0, scale=0.45),
+        config=_config(ex_trim_gain=0.0),
+    )
+    tracks = [_track("A", current_x, 0.0, scale=0.45)]
+    if successor_x is not None:
+        tracks.append(_track("B", successor_x, 0.05, scale=0.10))
+    controller.observe(_update(tracks, frame_id=3), now_s=now_s - 0.02)
+    if successor_x is not None:
+        controller._track_first_seen_s["B"] = now_s - 1.0
+        assert controller.successor is not None
+        assert controller.successor.track_id == "B"
+    current = controller.current
+    current.x_axis.p = current_x
+    current.x_axis.v = 0.0
+    current.raw_x = current_x
+    current.aperture_half_x = 0.25
+    current.aperture_half_y = 0.25
+    return controller
+
+
+def test_aperture_reserved_successor_preview_changes_yaw_only_before_credit():
+    # F115 retained a fresh/persistent Gate-1 bearing for >2 s before Gate-0
+    # credit, yet emitted current-only yaw/roll until promotion.  The new
+    # preview uses that evidence for heading while the current aperture has
+    # reserve.  Physical intercept and authority remain Gate 0's.
+    preview = _successor_preview_controller()
+    current_only = _successor_preview_controller(successor_x=None)
+
+    with_preview = _command(preview, 100.10, pitch=SPAWN_PITCH)
+    without_preview = _command(current_only, 100.10, pitch=SPAWN_PITCH)
+
+    assert with_preview.state is CleanCourseState.TRACK
+    assert with_preview.gate_index == 0
+    assert with_preview.current_track_id == "A"
+    assert with_preview.successor_track_id == "B"
+    assert 0.0 < with_preview.successor_blend <= 0.35
+    assert with_preview.yaw_rate_rad_s < 0.0 < without_preview.yaw_rate_rad_s
+    # Roll/pitch/thrust still solve the current-gate intercept exactly.
+    assert with_preview.target_roll_rad == pytest.approx(
+        without_preview.target_roll_rad, abs=1e-12
+    )
+    assert with_preview.target_pitch_rad == pytest.approx(
+        without_preview.target_pitch_rad, abs=1e-12
+    )
+    assert with_preview.thrust == pytest.approx(
+        without_preview.thrust, abs=1e-12
+    )
+    assert preview.gate_index == 0
+    assert preview.current.track_id == "A"
+
+
+def test_successor_heading_preview_continues_through_safe_commit():
+    # A TRACK->COMMIT transition must not undo the preturn while fresh
+    # aperture reserve remains.  COMMIT roll remains current-gate-only.
+    preview = _successor_preview_controller()
+    current_only = _successor_preview_controller(successor_x=None)
+    for controller in (preview, current_only):
+        controller.state = CleanCourseState.COMMIT
+        controller._commit_entry_s = 100.09
+
+    with_preview = _command(preview, 100.10, pitch=SPAWN_PITCH)
+    without_preview = _command(current_only, 100.10, pitch=SPAWN_PITCH)
+
+    assert with_preview.state is CleanCourseState.COMMIT
+    assert with_preview.successor_blend > 0.0
+    assert with_preview.yaw_rate_rad_s < without_preview.yaw_rate_rad_s
+    assert with_preview.target_roll_rad == pytest.approx(
+        without_preview.target_roll_rad, abs=1e-12
+    )
+    assert with_preview.target_pitch_rad == pytest.approx(
+        without_preview.target_pitch_rad, abs=1e-12
+    )
+    assert with_preview.thrust == pytest.approx(
+        without_preview.thrust, abs=1e-12
+    )
+
+
+def test_successor_heading_preview_yields_when_current_aperture_is_consumed():
+    # Regression for ab6252b2: an opposite-side successor can never cancel a
+    # displaced current-gate correction.  Preview also needs current aperture,
+    # a persistent/fresh successor, and clear farther-gate ordering.
+    outside = _successor_preview_controller(successor_x=0.60, current_x=-0.30)
+    no_aperture = _successor_preview_controller()
+    no_aperture.current.aperture_half_x = None
+    stale = _successor_preview_controller()
+    stale.successor.last_x_measurement_s = 99.0
+    newborn = _successor_preview_controller()
+    newborn._track_first_seen_s["B"] = 100.10 - 0.10
+    not_farther = _successor_preview_controller()
+    not_farther.successor.outer_log_scale = (
+        not_farther.current.outer_log_scale - 0.10
+    )
+
+    for controller in (outside, no_aperture, stale, newborn, not_farther):
+        out = _command(controller, 100.10, pitch=SPAWN_PITCH)
+        assert out.successor_blend == 0.0
+        steer_gain = (
+            controller.config.near_plane_steer_gain_mult
+            if controller.current.log_scale
+            >= controller.config.commit_min_log_scale
+            else 1.0
+        )
+        expected = max(
+            -MAX_COURSE_YAW_RATE_RAD_S,
+            min(
+                MAX_COURSE_YAW_RATE_RAD_S,
+                controller.config.yaw_error_gain
+                * steer_gain
+                * (controller.current.x - controller._ex_trim),
+            ),
+        )
+        assert out.yaw_rate_rad_s == pytest.approx(expected, abs=1e-12)
 
 
 def test_search_adopts_retained_successor_after_race_clears_old_ownership():

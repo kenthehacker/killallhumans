@@ -833,9 +833,16 @@ SEARCH_MAX_EXCURSION_RAD = 0.80  # bounded sweep excursion before reversal
 SEARCH_SWEEP_RATE_RAD_S = 0.5  # absolute-heading sweep rate around the anchor
 SEARCH_SWEEP_GAIN = 2.0  # heading-error gain to the bounded yaw rate
 
-SUCCESSOR_BLEND_MAX = 0.50  # continuous lookahead ceiling
+# F116 successor heading preview: the clean rewrite's original 0.50 blend
+# shared one aim between yaw, roll, and vertical control.  A far successor
+# could therefore cancel the current-gate intercept (flight ab6252b2), and the
+# whole preview was removed.  The replacement is yaw-only and reserves the
+# current aperture for roll/intercept ownership.  The last pre-reset controller
+# bounded this independent heading authority at 0.35; retain that ceiling.
+SUCCESSOR_BLEND_MAX = 0.35  # aperture-reserved yaw-only lookahead ceiling
 BLEND_FAR_LOG_SCALE = -1.6  # below this the successor gets no blend
 BLEND_NEAR_LOG_SCALE = -0.9  # at this closure the blend ceiling applies
+SUCCESSOR_MIN_LOG_SCALE_GAP = 0.25  # successor must remain visibly farther
 PROMOTE_MAX_STD_NORM = 0.60  # cached-successor credibility at promotion
 # 0.30 -> 0.60 (F35, d25f23fe): promotion dropped the fresh gate-1 successor
 # (std 0.14-0.34, age 0) into SEARCH, and the reacquisition churn that
@@ -1007,6 +1014,7 @@ class _Hypothesis:
         "outer_expansion_rate",
         "outer_half_span_x",
         "clipped",
+        "vertical_censor_edge",
         "created_s",
         "last_measurement_s",
         "last_x_measurement_s",
@@ -1042,6 +1050,11 @@ class _Hypothesis:
         # x measurement (see _update_hypothesis).
         self.outer_half_span_x = 0.5 * math.exp(float(log_scale))
         self.clipped = False
+        # Directional censorship is still one-sided geometry.  In
+        # particular, a same-id gate leaving through the frame BOTTOM says
+        # the gate is low; losing the numeric y measurement must not turn
+        # that evidence into a renewed climb command (F115).
+        self.vertical_censor_edge = FrameEdge.NONE
         self.created_s = float(now_s)
         self.last_measurement_s = float(now_s)
         self.last_x_measurement_s = float(now_s)
@@ -1203,6 +1216,7 @@ class CleanCourseConfig:
     successor_blend_max: float = SUCCESSOR_BLEND_MAX
     blend_far_log_scale: float = BLEND_FAR_LOG_SCALE
     blend_near_log_scale: float = BLEND_NEAR_LOG_SCALE
+    successor_min_log_scale_gap: float = SUCCESSOR_MIN_LOG_SCALE_GAP
     promote_max_std_norm: float = PROMOTE_MAX_STD_NORM
     promote_max_age_s: float = PROMOTE_MAX_AGE_S
     successor_min_age_s: float = SUCCESSOR_MIN_AGE_S
@@ -1326,6 +1340,11 @@ class CleanCourseController:
         self._fh_mps2 = 0.0
         self._fh_untrusted = False
         self._fh_above_since_s: Optional[float] = None
+        # Per-command diagnostics for the independent successor-heading
+        # channel.  These do not carry authority across ticks; every command
+        # recomputes them from fresh current/successor geometry.
+        self._successor_heading_blend = 0.0
+        self._successor_heading_error_norm: Optional[float] = None
         # Course-heading anchor (F31): yaw at the leg start (lazily
         # captured on the first command tick with a live yaw measurement,
         # re-armed on every authoritative promotion).  Yaw commands that
@@ -1708,6 +1727,8 @@ class CleanCourseController:
 
         cfg = self.config
         self._pre_cross_brake_active = False  # main path recomputes below
+        self._successor_heading_blend = 0.0
+        self._successor_heading_error_norm = None
         if yaw_rad is not None and self._course_anchor_yaw_rad is None:
             self._course_anchor_yaw_rad = float(yaw_rad)
         if self._last_command_s is None:
@@ -1929,11 +1950,24 @@ class CleanCourseController:
                 # its source, so the entry arrives centered about the true
                 # crossing point rather than compensating it blind.
                 commit_ex = self.current.x - self._ex_trim
+                commit_blend = self._successor_blend(
+                    self.current,
+                    self.successor,
+                    now_s=now_s,
+                )
+                commit_heading_ex = commit_ex
+                if commit_blend > 0.0 and self.successor is not None:
+                    commit_heading_ex = (
+                        (1.0 - commit_blend) * commit_ex
+                        + commit_blend * self.successor.x
+                    )
+                    self._successor_heading_blend = commit_blend
+                    self._successor_heading_error_norm = commit_heading_ex
                 commit_yaw = _clamp(
                     cfg.yaw_error_sign
                     * cfg.yaw_error_gain
                     * commit_steer_gain
-                    * commit_ex,
+                    * commit_heading_ex,
                     -cfg.max_yaw_rate_rad_s,
                     cfg.max_yaw_rate_rad_s,
                 )
@@ -1965,6 +1999,18 @@ class CleanCourseController:
                     commit_correction = min(commit_correction, 0.0)
                 commit_hold = support + commit_correction
                 self._collective = commit_hold
+                commit_vertical_qualified = (
+                    now_s - self.current.last_y_measurement_s
+                    <= cfg.vertical_qualify_max_age_s
+                    and self.current.y_axis.std
+                    <= cfg.search_covariance_std_norm
+                )
+                commit_floor_gate_y = self._effective_untrusted_gate_y(
+                    self.current,
+                    now_s=now_s,
+                    pitch_rad=pitch_rad,
+                    vertical_qualified=commit_vertical_qualified,
+                )
                 # F66: the F60 vertical-aim pitch term is DELETED.  In
                 # commit the attitude is the forward drive, not a second
                 # vertical channel — the aim and the collective servo read
@@ -1990,9 +2036,14 @@ class CleanCourseController:
                         slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
                     ),
                     yaw_rate_rad_s=commit_yaw,
-                    thrust=self._governed_collective(commit_hold, support),
+                    thrust=self._governed_collective(
+                        commit_hold,
+                        support,
+                        gate_y=commit_floor_gate_y,
+                    ),
                     state=self.state,
                     gate_index=self.gate_index,
+                    successor_blend=commit_blend,
                     current_track_id=self._current_track_id(),
                     successor_track_id=self._successor_track_id(),
                 )
@@ -2127,16 +2178,20 @@ class CleanCourseController:
                 gate_index=self.gate_index,
             )
 
-        # Successor blending REMOVED from the lateral/vertical aim (flight
+        # F116 separates HEADING from PHYSICAL INTERCEPT.  Successor preview
+        # never changes roll, pitch, thrust, passage, or race ownership; the
+        # current-gate ``ex``/``ey`` remain authoritative for all of them.
+        # The aperture-reserved yaw channel is computed after the orbit trim.
+        # Historical context (flight
         # ab6252b2): track 07 (gate 1) was centered and approached to span
         # 0.34/conf 0.87, then slid left to x=-0.95 while the yaw command
         # sat at ~0 — the blend toward a far successor at x=+0.6 cancelled
-        # the pursuit error exactly when the close gate escaped (codex:
-        # "remove unproved successor blending").  The aim is always the
-        # current gate; the successor hypothesis machinery stays for
-        # promotion only.
+        # the pursuit error exactly when the close gate escaped.  F116 makes
+        # that displaced geometry ineligible and keeps successor influence
+        # out of every translational channel.
         blend = 0.0
         ex = current.x
+        heading_ex = ex
         ey = current.y
         # F50: the VERTICAL channel servos on the pitch-attitude-compensated
         # error (nose-up brake attitude reads the world LOW in frame; see
@@ -2174,6 +2229,18 @@ class CleanCourseController:
                 cfg.ex_trim_max_norm,
             )
         ex -= self._ex_trim
+
+        # The successor is a heading preview, not a second aim point.  Its
+        # authority is computed from fresh successor trust and the CURRENT
+        # aperture reserve; it fades to zero as current error/drift consumes
+        # that reserve.  Roll below deliberately continues to use ``ex``.
+        blend = self._successor_blend(current, self.successor, now_s=now_s)
+        if blend > 0.0 and self.successor is not None:
+            heading_ex = (1.0 - blend) * ex + blend * self.successor.x
+            self._successor_heading_blend = blend
+            self._successor_heading_error_norm = heading_ex
+        else:
+            heading_ex = ex
 
         # Vertical: ONE GLOBAL SIGN at every gate (empirically confirmed by
         # the 2026-07-29 crossing-geometry analysis).  The gate-0 phase adds
@@ -2216,6 +2283,12 @@ class CleanCourseController:
             and now_s - current.last_y_measurement_s
             <= cfg.vertical_qualify_max_age_s
             and current.y_axis.std <= cfg.search_covariance_std_norm
+        )
+        floor_gate_y = self._effective_untrusted_gate_y(
+            current,
+            now_s=now_s,
+            pitch_rad=pitch_rad,
+            vertical_qualified=vertical_qualified,
         )
         # Vision closure-rate governor (F31, see the CLOSURE_* constant
         # block): the filtered log-scale rate is the only honest closure
@@ -2425,10 +2498,27 @@ class CleanCourseController:
             margin = (
                 cfg.fh_untrusted_vertical_margin if self._fh_untrusted else 0.0
             )
+            # F116: bottom censorship is fresh one-sided evidence, not total
+            # vertical ignorance.  Apply the same non-increasing course-floor
+            # release to the unqualified HOLD demand itself; changing only the
+            # final governor floor would still leave this upstream +0.05 in
+            # command (the exact F115 0.259 -> 0.309 jump).
+            if (
+                self._fh_untrusted
+                and self.gate_index >= 1
+                and floor_gate_y is not None
+                and cfg.near_brake_relax_course_ey_norm > 1e-9
+            ):
+                margin *= _clamp01(
+                    -floor_gate_y / cfg.near_brake_relax_course_ey_norm
+                )
             # Gate-high classification uses the compensated error too (F50):
             # a nose-up brake attitude must not read a level gate as LOW,
             # and the historical nose-down dives must not read it as HIGH.
-            if ey_vertical < cfg.high_gate_y_norm:
+            effective_high_gate_y = (
+                ey_vertical if floor_gate_y is None else floor_gate_y
+            )
+            if effective_high_gate_y < cfg.high_gate_y_norm:
                 margin = max(margin, cfg.high_gate_climb_margin)
             # F90: the unqualified hold is blind — wind the support trim
             # against any IMU-trusted sink (no ey gate; a stale y-axis was
@@ -2497,10 +2587,11 @@ class CleanCourseController:
         collective = self._governed_collective(
             collective,
             support,
-            # F113's margin taper is camera-authoritative only while the
-            # y-axis is qualified.  A stale/predicted y immediately regains
-            # the full untrusted-IMU floor instead of controlling thrust.
-            gate_y=ey_vertical if vertical_qualified else None,
+            # Numeric taper authority remains fresh-camera-only.  F116 adds
+            # one directional exception: a fresh same-id BOTTOM censorship
+            # may keep the extra margin released because it proves the gate
+            # is low; arbitrary stale prediction still regains the full floor.
+            gate_y=floor_gate_y,
             vz_tracked=vz_tracked,
         )
         thrust = _clamp(collective, cfg.min_thrust, cfg.max_thrust)
@@ -2522,7 +2613,10 @@ class CleanCourseController:
         if current.log_scale >= cfg.commit_min_log_scale:
             steer_gain = cfg.near_plane_steer_gain_mult
         yaw_rate = _clamp(
-            cfg.yaw_error_sign * cfg.yaw_error_gain * steer_gain * ex,
+            cfg.yaw_error_sign
+            * cfg.yaw_error_gain
+            * steer_gain
+            * heading_ex,
             -cfg.max_yaw_rate_rad_s * steer_cap,
             cfg.max_yaw_rate_rad_s * steer_cap,
         )
@@ -2831,6 +2925,7 @@ class CleanCourseController:
         if type(clipping) is not FrameEdge:
             clipping = FrameEdge.NONE
         center_censored = bool(getattr(track, "center_censored", False))
+        hypothesis.clipped = clipping is not FrameEdge.NONE
         x_censored = (
             center_censored or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
         )
@@ -2846,6 +2941,9 @@ class CleanCourseController:
                 )
         if center_censored or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)):
             hypothesis.last_y_measurement_s = NEVER_MEASURED_S
+            hypothesis.vertical_censor_edge = clipping & (
+                FrameEdge.TOP | FrameEdge.BOTTOM
+            )
         return hypothesis
 
     def _predict(
@@ -2895,6 +2993,11 @@ class CleanCourseController:
         )
         y_censored = (
             center_censored or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM))
+        )
+        hypothesis.vertical_censor_edge = (
+            clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
+            if y_censored
+            else FrameEdge.NONE
         )
         confidence = max(
             MIN_MEAS_CONFIDENCE,
@@ -3124,18 +3227,108 @@ class CleanCourseController:
         self,
         current: _Hypothesis,
         successor: Optional[_Hypothesis],
+        *,
+        now_s: float,
     ) -> float:
-        if successor is None:
+        """Return bounded yaw-only preview authority for a farther gate.
+
+        The current gate keeps physical-intercept ownership: roll, pitch,
+        thrust, crossing admission, and race ownership never read this value.
+        Yaw may preview the retained successor only out of *spare* current-
+        aperture margin.  As current error/drift consumes that margin the
+        preview falls continuously to zero, closing the ab6252b2 cancellation
+        family without returning to the post-credit-only turn architecture.
+        """
+
+        if successor is None or self.state not in (
+            CleanCourseState.TRACK,
+            CleanCourseState.COMMIT,
+        ):
             return 0.0
         cfg = self.config
+        if (
+            current.aperture_half_x is None
+            or current.aperture_half_x <= 0.0
+            or now_s - current.last_measurement_s
+            > cfg.commit_entry_meas_max_age_s
+            or now_s - current.last_x_measurement_s
+            > cfg.commit_entry_meas_max_age_s
+            or now_s - current.last_y_measurement_s
+            > cfg.commit_entry_meas_max_age_s
+            or now_s - successor.last_measurement_s
+            > cfg.outer_expansion_max_age_s
+            or now_s - successor.last_x_measurement_s
+            > cfg.outer_expansion_max_age_s
+            or self._track_age_s(successor.track_id, now_s)
+            < cfg.successor_min_age_s
+            or successor.position_std > cfg.search_covariance_std_norm
+            or successor.outer_log_scale
+            > current.outer_log_scale - cfg.successor_min_log_scale_gap
+        ):
+            return 0.0
+
+        aperture_budget = (
+            cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
+        )
+        if aperture_budget <= 1e-9:
+            return 0.0
+        projected_current_error = (
+            max(abs(current.x), abs(current.raw_x))
+            + abs(current.vx) * cfg.commit_blackout_s
+        )
+        aperture_reserve = _clamp01(
+            1.0 - projected_current_error / aperture_budget
+        )
+        if aperture_reserve <= 0.0:
+            return 0.0
+
         closure = _clamp01(
-            (current.log_scale - cfg.blend_far_log_scale)
+            (current.outer_log_scale - cfg.blend_far_log_scale)
             / (cfg.blend_near_log_scale - cfg.blend_far_log_scale)
         )
-        trust = _clamp01(successor.confidence) * _clamp01(
-            1.0 - successor.position_std / cfg.search_covariance_std_norm
+        covariance_trust = _clamp01(
+            1.0 - successor.position_std / cfg.promote_max_std_norm
         )
-        return cfg.successor_blend_max * closure * trust
+        trust = min(_clamp01(successor.confidence), covariance_trust)
+        return (
+            cfg.successor_blend_max
+            * closure
+            * trust
+            * aperture_reserve
+        )
+
+    def _effective_untrusted_gate_y(
+        self,
+        current: _Hypothesis,
+        *,
+        now_s: float,
+        pitch_rad: float,
+        vertical_qualified: bool,
+    ) -> Optional[float]:
+        """Preserve one-sided low-gate evidence across bottom censorship.
+
+        A numeric y measurement still owns the normal floor taper.  If that
+        same track then exits through the frame bottom, the measurement is no
+        longer two-sided but its direction is unambiguous: the gate is low.
+        For the bounded prediction horizon, return center/low evidence so the
+        fh-untrusted fallback cannot re-add its +0.05 climb margin.  Bare level
+        support remains the hard floor in ``_governed_collective``.  Top/both-
+        edge censorship and expired/no-track memory remain conservative.
+        """
+
+        if vertical_qualified:
+            return self._compensated_ey(current.y, pitch_rad)
+        edge = current.vertical_censor_edge
+        bottom_only = bool(edge & FrameEdge.BOTTOM) and not bool(
+            edge & FrameEdge.TOP
+        )
+        if (
+            bottom_only
+            and now_s - current.last_measurement_s
+            <= self.config.predict_max_gap_s
+        ):
+            return 0.0
+        return None
 
     def _wind_vz_center_trim(self, dt: float) -> None:
         """One-sided support-trim integrator (see the VZ_CENTER_TRIM block).
@@ -3820,6 +4013,13 @@ def _clean_course_tick_trace(
         "token": token_trace,
         "tracks": tracks,
         "successor": successor_trace,
+        "successor_heading_blend": controller._successor_heading_blend,
+        "successor_heading_error_norm": (
+            controller._successor_heading_error_norm
+        ),
+        "vertical_censor_edge": (
+            None if current is None else int(current.vertical_censor_edge)
+        ),
         "vz_est_m_s": controller._vz_est_m_s,
         "thrust_clamp": [controller.config.min_thrust, controller.config.max_thrust],
         "anchor_age_s": (
