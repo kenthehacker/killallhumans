@@ -2274,6 +2274,117 @@ def test_weak_successor_evidence_decays_turn_reference_smoothly():
     assert all(yaw < 0.0 for yaw in yaws)
 
 
+def test_fresh_current_passage_keeps_custody_from_opposite_successor():
+    # F137 reached Gate 1 x=-0.103, then normalized a strong right Gate 2 to
+    # enough authority to reverse yaw/bank while fresh Gate 1 remained left.
+    # Continuous passage release must keep one left correction until aperture
+    # geometry or current-evidence aging transfers custody.
+    controller = _turn_reference_controller(successor_x=0.55, current_x=-0.12)
+    controller.current.aperture_half_x = 0.10
+    controller.current.aperture_half_y = 0.10
+    controller.current.raw_x = -0.12
+    controller._turn_aperture_reserve = 0.0
+    controller._turn_successor_authority = 0.0
+    controller._turn_reference_x = -0.12
+    controller._turn_reference_yaw_rad = 0.0
+    now = 100.10
+    outputs = []
+    authorities = []
+    for _ in range(50):
+        now += 0.04
+        controller.current.last_measurement_s = now
+        controller.current.last_x_measurement_s = now
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        outputs.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
+        authorities.append(controller._turn_successor_authority)
+
+    assert max(authorities) < 0.20
+    assert all(output.yaw_rate_rad_s < -0.02 for output in outputs)
+    assert all(output.target_roll_rad < 0.0 for output in outputs)
+    assert controller._turn_reference_x < 0.0
+
+
+def test_bottom_y_covariance_cannot_release_fresh_lateral_custody():
+    # F137 used joint x/y position uncertainty for the current-gate claim.
+    # Bottom censorship therefore erased a fresh lateral claim and let an
+    # opposite-side successor take over.  Vertical covariance must not alter
+    # the one lateral turn reference while current x evidence is unchanged.
+    nominal = _turn_reference_controller(successor_x=0.55, current_x=-0.12)
+    censored = _turn_reference_controller(successor_x=0.55, current_x=-0.12)
+    for controller in (nominal, censored):
+        controller.current.aperture_half_x = 0.10
+        controller.current.aperture_half_y = 0.10
+        controller.current.raw_x = -0.12
+        controller._turn_aperture_reserve = 0.0
+        controller._turn_successor_authority = 0.0
+        controller._turn_reference_x = -0.12
+        controller._turn_reference_yaw_rad = 0.0
+    censored.current.y_axis.pp = 4.0
+
+    now = 100.10
+    for _ in range(12):
+        now += 0.04
+        lateral = []
+        for controller in (nominal, censored):
+            controller.current.last_x_measurement_s = now
+            controller.successor.last_measurement_s = now
+            controller.successor.last_x_measurement_s = now
+            reference, authority = controller._turn_reference(
+                controller.current,
+                controller.successor,
+                current_error=-0.12,
+                now_s=now,
+                yaw_rad=0.0,
+                dt=0.04,
+            )
+            roll, yaw_rate = controller._coordinated_turn_request(
+                reference, steer_gain=1.0, yaw_rad=0.0
+            )
+            lateral.append((reference, authority, roll, yaw_rate))
+
+        assert lateral[1] == pytest.approx(lateral[0], abs=1e-12)
+
+
+def test_arbitrarily_weak_successor_remains_weak_after_current_claim_ages():
+    # F137 normalized successor evidence against the current claim.  Once
+    # current x aged out, any nonzero successor evidence became full desired
+    # authority.  Evidence transfer must stay absolute: aging the current
+    # claim releases custody, but cannot amplify a nearly-uncertain successor.
+    controller = _turn_reference_controller(successor_x=-0.45, current_x=0.0)
+    controller.current.aperture_half_x = None
+    controller.current.aperture_half_y = None
+    controller._last_engulfing_anchor_s = None
+    controller._turn_aperture_reserve = 0.0
+    controller._turn_successor_authority = 0.0
+    controller._turn_reference_x = 0.0
+    controller._turn_reference_yaw_rad = 0.0
+    weak_std = controller.config.successor_turn_max_std_norm * 0.98
+    weak_axis_variance = (weak_std / math.sqrt(2.0)) ** 2
+    controller.successor.x_axis.pp = weak_axis_variance
+    controller.successor.y_axis.pp = weak_axis_variance
+
+    now = 100.10
+    authorities = []
+    for _ in range(12):
+        now += 0.04
+        controller.current.last_x_measurement_s = now - 2.0
+        controller.successor.last_measurement_s = now
+        controller.successor.last_x_measurement_s = now
+        _, authority = controller._turn_reference(
+            controller.current,
+            controller.successor,
+            current_error=0.0,
+            now_s=now,
+            yaw_rad=0.0,
+            dt=0.04,
+        )
+        authorities.append(authority)
+
+    assert authorities[-1] > 0.0
+    assert max(authorities) < 0.03
+
+
 def test_weak_opposite_successor_cannot_erase_current_gate_turn():
     # F120 live regression: Gate 1 was still x=-0.309 when a right-side Gate
     # 2 candidate reached only 2.1e-7 authority.  Binary sign arbitration

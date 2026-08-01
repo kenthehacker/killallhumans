@@ -2818,34 +2818,30 @@ class CleanCourseController:
             )
             current_confidence = _clamp01(current.confidence)
             current_uncertainty = _clamp01(
-                1.0
-                - current.position_std / cfg.search_covariance_std_norm
+                1.0 - current.x_axis.std / cfg.search_covariance_std_norm
             )
             current_freshness = _clamp01(
                 1.0
                 - max(0.0, now_s - current.last_x_measurement_s)
                 / cfg.x_steer_max_age_s
             )
-            current_weight = (
+            current_claim = (
                 (1.0 - self._turn_aperture_reserve)
                 * current_confidence
                 * current_uncertainty
                 * current_freshness
             )
-            # F137: current passage and successor bearing are two continuous
-            # evidence claims, not a full-strength current command plus a
-            # successor product capped by aperture reserve.  F127/F136 kept
-            # steering right while current x aged through PREDICT and a fresh
-            # consistently-left successor remained visible; F134 showed that
-            # fixing passage in a leg frame merely hides completed lateral
-            # translation.  Normalize the two existing camera/IMU-derotated
-            # claims, then keep the one carried authority/reference filters.
-            # Weak current evidence now transfers authority smoothly instead
-            # of countermanding known successor geometry, with no latch,
-            # qualification mode, or second command owner.
-            evidence_sum = current_weight + successor_weight
-            if evidence_sum > 1e-9:
-                desired_authority = successor_weight / evidence_sum
+            # F138: F137's normalized ratio granted full authority to any
+            # nonzero successor when the current claim vanished, then reused
+            # that authority across a fragment reassociation.  It also used
+            # joint x/y covariance, so bottom-y censorship erased a still-
+            # fresh lateral claim.  Keep successor evidence absolute and use
+            # only x-axis quality for current passage custody.  Safe aperture
+            # or aging/uncertain current x releases the successor smoothly;
+            # weak successor evidence remains weak.  Both bearings stay in
+            # the camera/IMU-derotated frame and feed the one carried filter.
+            passage_release = 1.0 - current_claim
+            desired_authority = passage_release * successor_weight
         self._turn_successor_authority += alpha * (
             desired_authority - self._turn_successor_authority
         )
