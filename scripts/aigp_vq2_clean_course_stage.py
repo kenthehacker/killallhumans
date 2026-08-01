@@ -1728,8 +1728,11 @@ class CleanCourseController:
                     vertical_error=commit_ey,
                     vertical_qualified=commit_vertical_qualified,
                 )
-                commit_hold = support + cfg.course_vz_track_gain * (
-                    commit_vz_des - self._vz_est_m_s
+                commit_rate_error = commit_vz_des
+                if not commit_vertical_qualified:
+                    commit_rate_error -= self._vz_est_m_s
+                commit_hold = (
+                    support + cfg.course_vz_track_gain * commit_rate_error
                 )
                 commit_target = self._governed_collective(
                     commit_hold,
@@ -2069,9 +2072,18 @@ class CleanCourseController:
             vertical_error=ey_vertical - vertical_setpoint_offset,
             vertical_qualified=vertical_qualified,
         )
-        collective = support + cfg.course_vz_track_gain * (
-            vz_des - self._vz_est_m_s
-        )
+        # F136 discriminating experiment: in every F122-F135 Gate-1 loss,
+        # qualified compensated-y eventually demanded descent while a
+        # negative integrated vz estimate cancelled that request and kept
+        # thrust at/above support through bottom censorship.  Qualified
+        # vision owns the one bounded vertical reference directly; when that
+        # axis is unobservable, the same owner falls back to the existing IMU
+        # zero-rate hold.  The continuously filtered collective keeps both
+        # seams smooth, and vz_est remains authoritative for COMMIT safety.
+        vertical_rate_error = vz_des
+        if not vertical_qualified:
+            vertical_rate_error -= self._vz_est_m_s
+        collective = support + cfg.course_vz_track_gain * vertical_rate_error
         if not vertical_qualified:
             # A stale visual rate is never reused.  The same vertical owner
             # simply tracks zero world-vertical rate until vision returns.
@@ -2740,17 +2752,8 @@ class CleanCourseController:
         """
 
         cfg = self.config
-        yaw_offset = 0.0
         if yaw_rad is not None:
             yaw = float(yaw_rad)
-            if self._course_anchor_yaw_rad is not None:
-                yaw_offset = (
-                    math.remainder(
-                        yaw - self._course_anchor_yaw_rad,
-                        2.0 * math.pi,
-                    )
-                    * ROTATION_COMP_FOCAL_NORM
-                )
             if (
                 self._turn_reference_x is not None
                 and self._turn_reference_yaw_rad is not None
@@ -2759,20 +2762,8 @@ class CleanCourseController:
                     math.sin(yaw - self._turn_reference_yaw_rad),
                     math.cos(yaw - self._turn_reference_yaw_rad),
                 )
-                # F135: aperture reserve continuously interpolates current
-                # passage alignment from camera-relative (reserve=0) to
-                # leg-relative (reserve=1); the successor stays camera-frame.
-                # Derotate the exact complementary camera share of the old
-                # filtered mixture.  F134 treated passage as fully leg-fixed
-                # even with zero reserve, so yaw accumulated without a
-                # translation observation and drove Gate 1 across the frame.
-                camera_share = 1.0 - self._turn_aperture_reserve * (
-                    1.0 - self._turn_successor_authority
-                )
                 self._turn_reference_x -= (
-                    camera_share
-                    * delta_yaw
-                    * ROTATION_COMP_FOCAL_NORM
+                    delta_yaw * ROTATION_COMP_FOCAL_NORM
                 )
             self._turn_reference_yaw_rad = yaw
 
@@ -2804,11 +2795,8 @@ class CleanCourseController:
         )
         self._turn_aperture_reserve = _clamp01(self._turn_aperture_reserve)
 
-        passage_error = float(current_error) + (
-            self._turn_aperture_reserve * yaw_offset
-        )
         desired_authority = 0.0
-        desired = passage_error
+        desired = float(current_error)
         if successor is not None:
             closure_span = cfg.blend_near_log_scale - cfg.blend_far_log_scale
             closure = (
@@ -2858,12 +2846,13 @@ class CleanCourseController:
             self._turn_successor_authority if successor is not None else 0.0
         )
         if successor is not None:
-            # Passage frame ownership follows the same continuous aperture
-            # evidence above; the successor is a fresh or bounded
-            # IMU-propagated current-camera bearing.  The one reference
-            # remains the only command owner through every race transition.
+            # A true convex blend has no low-authority dead zone: weak
+            # successor evidence leaves current-passage alignment in charge,
+            # while credible evidence transfers that same coordinated yaw
+            # and bank reference toward the successor.  The filtered
+            # aperture reserve is already one factor in the carried authority.
             desired = (
-                (1.0 - authority) * passage_error
+                (1.0 - authority) * float(current_error)
                 + authority * successor.x
             )
 
