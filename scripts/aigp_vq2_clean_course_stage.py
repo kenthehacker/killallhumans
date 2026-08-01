@@ -594,7 +594,14 @@ UNMEASURED_X_FORCE_SEARCH_S = 0.75
 # (no job left once crossings are slow — and its hard nose-up episodes
 # were themselves VRS generators).
 CLOSURE_TARGET_RATE_S = 0.35  # log-scale rate the governor holds (TTC ~3 s)
-CLOSURE_FULL_BRAKE_RATE_S = 0.60  # rate at which the full brake pitch applies
+# F106 (20260801T052822Z-visual-course-88a27a09): F105 reached the full
+# bounded brake, but only after the approach had already crossed the 0.35/s
+# COMMIT expansion budget.  A 0.60/s full-brake threshold asks the airframe
+# to dissipate budget-invalid energy late; use a narrow 0.01/s response band
+# above the unchanged entry limit instead.  The range-ramped target remains
+# lower when far, so this also moves full braking into the early visible
+# window without adding a timer, mode, or Gate-0 exception.
+CLOSURE_FULL_BRAKE_RATE_S = 0.36
 # F101 (20260730T173407Z-visual-course-7a862549): a range-flat 0.35
 # target permits 3+ m/s at leg start (0.35 log/s at 8-10 m), more than
 # custody-compatible attitude braking (~0.4-0.7 m/s^2, capped by the F94

@@ -1299,13 +1299,14 @@ def test_closure_governor_is_a_continuous_blend():
     # law (spawn base) toward the full pre-cross brake attitude,
     # without latching the fast-slew brake flag.
     # F101: at log -1.40 the range-ramped target is 0.25 (halfway down
-    # the -2.0 -> -0.8 ramp), so 0.375/s sits mid-band.  (The commit
+    # the -2.0 -> -0.8 ramp), so 0.325/s sits mid-band below F106's 0.36
+    # full-brake threshold.  (The commit
     # regime itself levels a centered gate via the F94 custody floor —
     # no blend is observable there.)
     controller = _tracked_controller(
         _track("A", 0.0, 0.0, scale=math.exp(-1.40))
     )
-    controller.current.scale_axis.v = 0.375
+    controller.current.scale_axis.v = 0.325
     now = 100.10
     out = None
     for _ in range(25):  # generic slew converges to the blended target
@@ -2437,26 +2438,22 @@ def test_commit_entry_arms_on_gate_zero():
     assert climbing._pre_cross_brake_active
 
 
-def test_gate_zero_early_brake_uses_full_course_authority():
-    # F105: F104 used the full Gate-0 brake only inside the near-plane hold,
-    # but live expansion exceeded the 0.35/s entry budget roughly two seconds
-    # before credit and still crossed from PREDICT.  Use the same bounded
-    # course brake as soon as the existing pre-cross demand fires, while the
-    # outer scale is still outside the near-plane COMMIT regime.
+def test_gate_zero_budget_invalid_closure_gets_full_brake_while_far():
+    # F106: F105 used the full bounded brake once demand crossed 0.5, but the
+    # 0.60/s full-brake threshold remained far above COMMIT's 0.35/s entry
+    # budget.  At a still-far outer log scale of -1.9, expansion just above
+    # the budget must now demand the full brake.  The parent only blended a
+    # weak correction here and did not latch the fast brake path.
     controller = _commit_controller_gate_zero()
     current = controller.current
     current.x_axis.p = 0.0
     current.raw_x = 0.0
-    current.y_axis.p = 0.15
-    current.raw_y = 0.15
-    current.scale_axis.p = -1.4
+    current.y_axis.p = 0.0
+    current.raw_y = 0.0
+    current.scale_axis.p = -1.9
     current.scale_axis.v = 0.0
-    current.outer_log_scale = -1.4
-    current.outer_expansion_rate = 0.65
-    weak_brake_attitude = (
-        controller.config.spawn_pitch_rad
-        + controller.config.pre_cross_brake_pitch_rad
-    )
+    current.outer_log_scale = -1.9
+    current.outer_expansion_rate = 0.36
     now = 100.10
     out = None
     for _ in range(15):
@@ -2464,11 +2461,10 @@ def test_gate_zero_early_brake_uses_full_course_authority():
         current.last_measurement_s = now
         current.last_x_measurement_s = now
         current.last_y_measurement_s = now
-        out = _command(controller, now, pitch=weak_brake_attitude)
+        out = _command(controller, now, pitch=SPAWN_PITCH)
 
     assert controller.state is CleanCourseState.TRACK
     assert controller._pre_cross_brake_active
-    assert out.target_pitch_rad < weak_brake_attitude - 0.05
     assert out.target_pitch_rad == pytest.approx(
         controller.config.pitch_target_min_rad, abs=1e-9
     )
