@@ -2577,16 +2577,19 @@ class CleanCourseController:
             law_pitch = min(
                 law_pitch, cfg.spawn_pitch_rad + cfg.fragment_creep_pitch_rad
             )
-        # F80 (see the COURSE_PRE_CROSS_BRAKE_PITCH_RAD block): the TRUE
-        # brake is -0.30 from spawn.  F104 first applied it to Gate 0 only
-        # inside the near-plane hold, but live raw expansion was already
-        # above the COMMIT budget about two seconds before credit and the
-        # stronger hold engaged too late; Gate 0 still crossed from PREDICT.
-        # F105 removes the weaker Gate-0 exception: the same bounded brake
-        # now follows the existing continuous brake demand on every leg.
-        # No threshold or state is added, and the custody floor below remains
-        # the final visibility authority.
-        brake_pitch_offset = cfg.course_pre_cross_brake_pitch_rad
+        # F80 (see the COURSE_PRE_CROSS_BRAKE_PITCH_RAD block): course legs
+        # inherit the previous crossing's energy, so the TRUE brake doubles
+        # to -0.30 from spawn at gate_index >= 1.  F104 applies that same
+        # bounded brake to Gate 0 only when the near-plane COMMIT budget is
+        # false.  F106 showed that applying it throughout Gate 0 pitched the
+        # gate below the frame before credit; the earlier F106 closure-demand
+        # threshold remains, but the far Gate-0 brake returns to the proved
+        # -0.15 attitude.  Same single blend and custody floor throughout.
+        brake_pitch_offset = (
+            cfg.course_pre_cross_brake_pitch_rad
+            if self.gate_index >= 1 or near_plane_hold
+            else cfg.pre_cross_brake_pitch_rad
+        )
         target_pitch = law_pitch + brake_demand * (
             (cfg.spawn_pitch_rad + brake_pitch_offset) - law_pitch
         )
@@ -3013,13 +3016,22 @@ class CleanCourseController:
             same = self._find(tracks, self.current.track_id)
             if same is not None:
                 return same
+        # F107 (20260801T053629Z-visual-course-cb3892b6): after the stronger
+        # Gate-0 brake pushed the current gate below frame, generic SEARCH
+        # adopted the already-retained Gate-1 successor and drove toward it
+        # while authoritative race ownership remained Gate 0.  A retained
+        # successor is explicitly next-gate evidence; only note_race() may
+        # promote it.  SEARCH may re-adopt the same current id or another
+        # candidate, but never this known successor before credit.
+        successor_id = self._successor_track_id()
         # F49: newborn suspicious-geometry tracks (ceiling-truss slabs,
         # extreme aspects) are ineligible until they persist — the terminal
         # F48 re-acquisition adopted one over the persistent real gate.
         eligible = [
             track
             for track in tracks
-            if not (
+            if track.track_id != successor_id
+            and not (
                 _suspicious_adoption_geometry(track)
                 and self._track_age_s(track.track_id, now_s)
                 < REACQUIRE_MIN_AGE_S
