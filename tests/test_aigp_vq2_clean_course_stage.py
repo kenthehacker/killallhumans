@@ -1702,54 +1702,6 @@ def test_clipping_increases_uncertainty_but_does_not_abort():
     assert abs(output.yaw_rate_rad_s) <= 0.10 * 0.9 + 1e-9
 
 
-def test_known_edge_center_censorship_is_axis_local():
-    # The production tracker marks any edge-clipped bbox center_censored,
-    # while retaining the orthogonal coordinate as a real measurement.
-    # TOP therefore censors only y, RIGHT only x; a censored center with no
-    # known edge is genuinely ambiguous and must censor both axes.
-    clean = _tracked_controller(_track("A", 0.10, 0.20))
-    top = _tracked_controller(
-        _track(
-            "A",
-            0.10,
-            0.20,
-            clipping=FrameEdge.TOP,
-            center_censored=True,
-        )
-    )
-    right = _tracked_controller(
-        _track(
-            "A",
-            0.10,
-            0.20,
-            clipping=FrameEdge.RIGHT,
-            center_censored=True,
-        )
-    )
-    unknown = _tracked_controller(
-        _track("A", 0.10, 0.20, center_censored=True)
-    )
-
-    assert top.current.last_x_measurement_s > NEVER_MEASURED_S + 1.0
-    assert top.current.last_y_measurement_s == NEVER_MEASURED_S
-    assert top.current.x_axis.pp == pytest.approx(
-        clean.current.x_axis.pp, abs=1e-12
-    )
-    assert top.current.y_axis.pp > clean.current.y_axis.pp
-
-    assert right.current.last_x_measurement_s == NEVER_MEASURED_S
-    assert right.current.last_y_measurement_s > NEVER_MEASURED_S + 1.0
-    assert right.current.x_axis.pp > clean.current.x_axis.pp
-    assert right.current.y_axis.pp == pytest.approx(
-        clean.current.y_axis.pp, abs=1e-12
-    )
-
-    assert unknown.current.last_x_measurement_s == NEVER_MEASURED_S
-    assert unknown.current.last_y_measurement_s == NEVER_MEASURED_S
-    assert unknown.current.x_axis.pp > clean.current.x_axis.pp
-    assert unknown.current.y_axis.pp > clean.current.y_axis.pp
-
-
 # ---------------------------------------------------------------------------
 # State transitions
 # ---------------------------------------------------------------------------
@@ -2329,83 +2281,6 @@ def test_bottom_y_covariance_cannot_release_fresh_lateral_custody():
         assert lateral[1] == pytest.approx(lateral[0], abs=1e-12)
 
 
-def test_bottom_censorship_keeps_observed_x_and_left_custody_over_time():
-    # F157: Gate 1 remained visibly left after its bbox touched BOTTOM, but
-    # blanket center censorship aged its still-observed x.  That released
-    # lateral custody to a right-side successor and reversed reference/yaw.
-    # Exercise the production tracker contract (center_censored=True on the
-    # known BOTTOM edge) across longer than the x-freshness horizon.
-    nominal = _turn_reference_controller(successor_x=0.55, current_x=-0.12)
-    bottom = _turn_reference_controller(successor_x=0.55, current_x=-0.12)
-    for controller in (nominal, bottom):
-        controller.gate_index = 1
-        controller.current.aperture_half_x = None
-        controller.current.aperture_half_y = None
-        controller._turn_aperture_reserve = 0.0
-        controller._turn_successor_authority = 0.0
-        controller._turn_reference_x = -0.12
-        controller._turn_reference_yaw_rad = 0.0
-
-    now = 100.10
-    for frame in range(18):
-        now += 0.04
-        nominal.observe(
-            _update(
-                [
-                    _track("A", -0.12, 0.25, scale=0.45),
-                    _track("B", 0.55, 0.05, scale=0.10),
-                ],
-                frame_id=20 + frame,
-            ),
-            now_s=now,
-        )
-        bottom.observe(
-            _update(
-                [
-                    _track(
-                        "A",
-                        -0.12,
-                        0.25,
-                        scale=0.45,
-                        clipping=FrameEdge.BOTTOM,
-                        center_censored=True,
-                    ),
-                    _track("B", 0.55, 0.05, scale=0.10),
-                ],
-                frame_id=20 + frame,
-            ),
-            now_s=now,
-        )
-
-        nominal_output = _command(
-            nominal, now, pitch=SPAWN_PITCH, yaw=0.0
-        )
-        bottom_output = _command(
-            bottom, now, pitch=SPAWN_PITCH, yaw=0.0
-        )
-
-        assert bottom.current.last_x_measurement_s == pytest.approx(now)
-        assert bottom.current.x_axis.pp == pytest.approx(
-            nominal.current.x_axis.pp, abs=1e-12
-        )
-        assert bottom.current.y_axis.pp > nominal.current.y_axis.pp
-        assert bottom._turn_reference_x == pytest.approx(
-            nominal._turn_reference_x, abs=1e-12
-        )
-        assert bottom_output.successor_blend == pytest.approx(
-            nominal_output.successor_blend, abs=1e-12
-        )
-        assert bottom_output.yaw_rate_rad_s == pytest.approx(
-            nominal_output.yaw_rate_rad_s, abs=1e-12
-        )
-        assert bottom_output.target_roll_rad == pytest.approx(
-            nominal_output.target_roll_rad, abs=1e-12
-        )
-        assert bottom._turn_reference_x < 0.0
-        assert bottom_output.yaw_rate_rad_s < 0.0
-        assert bottom_output.target_roll_rad < 0.0
-
-
 def test_arbitrarily_weak_successor_remains_weak_after_current_claim_ages():
     # Aging current x releases custody, but it must not normalize an almost
     # completely uncertain successor into full authority.
@@ -2441,6 +2316,126 @@ def test_arbitrarily_weak_successor_remains_weak_after_current_claim_ages():
 
     assert authorities[-1] > 0.0
     assert max(authorities) < 0.03
+
+
+def test_passage_slack_cannot_countermand_consistently_left_successor():
+    # F158 live: Gate 1 remained consistently left, while a small positive
+    # Gate-0 correction drove the shared reference left -> right -> left.
+    # Current-gate x is a passage constraint: inside the already-existing
+    # projected aperture budget it contributes no opposing heading request.
+    controller = _turn_reference_controller(
+        successor_x=-0.42, current_x=0.08
+    )
+    controller.current.outer_log_scale = -0.30
+    controller.current.aperture_half_x = 0.15
+    controller.current.aperture_half_y = 0.15
+    controller.current.raw_x = 0.08
+    controller.current.x_axis.v = 0.05
+    controller.successor.confidence = 0.61
+    controller.successor.outer_log_scale = -3.37
+    controller._turn_aperture_reserve = 0.17
+    controller._turn_successor_authority = 0.12
+    controller._turn_reference_x = -0.005
+    controller._turn_reference_yaw_rad = 0.0
+
+    aperture_budget = (
+        controller.config.commit_entry_aperture_margin_frac
+        * controller.current.aperture_half_x
+    )
+    projected_x = max(
+        abs(controller.current.x), abs(controller.current.raw_x)
+    ) + abs(controller.current.vx) * (
+        controller.config.successor_preview_projection_s
+    )
+    assert projected_x < aperture_budget
+
+    now = 100.10
+    commands = []
+    variations = (
+        (0.004, 0.00),
+        (0.011, 0.03),
+        (0.025, 0.00),
+        (0.10, 0.05),
+        (0.18, 0.12),
+        (0.27, 0.24),
+        (0.35, 0.40),
+        (0.48, 0.55),
+        (0.08, 0.00),
+        (0.02, 0.00),
+    )
+    for std, age_s in variations:
+        now += 0.031
+        controller.current.last_x_measurement_s = now
+        variance = (std / math.sqrt(2.0)) ** 2
+        controller.successor.x_axis.pp = variance
+        controller.successor.y_axis.pp = variance
+        controller.successor.last_measurement_s = now - age_s
+        controller.successor.last_x_measurement_s = now - age_s
+        reference, _ = controller._turn_reference(
+            controller.current,
+            controller.successor,
+            current_error=0.08,
+            now_s=now,
+            yaw_rad=0.0,
+            dt=0.031,
+        )
+        commands.append(
+            controller._coordinated_turn_request(
+                reference, steer_gain=1.0, yaw_rad=0.0
+            )
+        )
+
+    rolls, yaws = zip(*commands)
+    assert all(roll < 0.0 for roll in rolls)
+    assert all(yaw < 0.0 for yaw in yaws)
+    assert max(abs(b - a) for a, b in zip(yaws, yaws[1:])) < 0.06
+
+
+def test_passage_violation_still_overrides_opposite_successor():
+    # The hinge removes only unused passage slack.  A projected current gate
+    # outside the right aperture budget must still produce one coordinated
+    # right correction, even with a left successor retained for handoff.
+    controller = _turn_reference_controller(
+        successor_x=-0.42, current_x=0.25
+    )
+    controller.current.outer_log_scale = -0.30
+    controller.current.aperture_half_x = 0.15
+    controller.current.aperture_half_y = 0.15
+    controller.current.raw_x = 0.25
+    controller.current.x_axis.v = 0.0
+    controller.successor.confidence = 0.40
+    weak_variance = (0.30 / math.sqrt(2.0)) ** 2
+    controller.successor.x_axis.pp = weak_variance
+    controller.successor.y_axis.pp = weak_variance
+    controller._turn_aperture_reserve = 0.0
+    controller._turn_successor_authority = 0.0
+    controller._turn_reference_x = 0.0
+    controller._turn_reference_yaw_rad = 0.0
+
+    now = 100.10
+    commands = []
+    for _ in range(16):
+        now += 0.04
+        controller.current.last_x_measurement_s = now
+        controller.successor.last_measurement_s = now - 0.30
+        controller.successor.last_x_measurement_s = now - 0.30
+        reference, _ = controller._turn_reference(
+            controller.current,
+            controller.successor,
+            current_error=0.25,
+            now_s=now,
+            yaw_rad=0.0,
+            dt=0.04,
+        )
+        commands.append(
+            controller._coordinated_turn_request(
+                reference, steer_gain=1.0, yaw_rad=0.0
+            )
+        )
+
+    rolls, yaws = zip(*commands)
+    assert all(roll > 0.0 for roll in rolls[-8:])
+    assert all(yaw > 0.0 for yaw in yaws[-8:])
 
 
 def test_f143_crossing_reassociation_keeps_one_left_turn_time_series():

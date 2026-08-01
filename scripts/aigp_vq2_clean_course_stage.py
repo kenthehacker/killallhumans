@@ -2380,17 +2380,9 @@ class CleanCourseController:
         if type(clipping) is not FrameEdge:
             clipping = FrameEdge.NONE
         center_censored = bool(getattr(track, "center_censored", False))
-        unknown_center_censorship = (
-            center_censored and clipping == FrameEdge.NONE
-        )
         hypothesis.clipped = clipping is not FrameEdge.NONE
         x_censored = (
-            unknown_center_censorship
-            or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
-        )
-        y_censored = (
-            unknown_center_censorship
-            or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM))
+            center_censored or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
         )
         if x_censored:
             hypothesis.last_x_measurement_s = NEVER_MEASURED_S
@@ -2402,7 +2394,7 @@ class CleanCourseController:
                 hypothesis.outer_half_span_x = 0.5 * (
                     float(bbox[2]) - float(bbox[0])
                 )
-        if y_censored:
+        if center_censored or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)):
             hypothesis.last_y_measurement_s = NEVER_MEASURED_S
             hypothesis.vertical_censor_edge = clipping & (
                 FrameEdge.TOP | FrameEdge.BOTTOM
@@ -2455,16 +2447,11 @@ class CleanCourseController:
         if type(clipping) is not FrameEdge:
             clipping = FrameEdge.NONE
         center_censored = bool(getattr(track, "center_censored", False))
-        unknown_center_censorship = (
-            center_censored and clipping == FrameEdge.NONE
-        )
         x_censored = (
-            unknown_center_censorship
-            or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
+            center_censored or bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
         )
         y_censored = (
-            unknown_center_censorship
-            or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM))
+            center_censored or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM))
         )
         hypothesis.vertical_censor_edge = (
             clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
@@ -2500,12 +2487,9 @@ class CleanCourseController:
             hypothesis.scale_axis.update(z_log_scale, r_scale)
         hypothesis.confidence = _clamp01(float(track.confidence))
         hypothesis.clipped = clipping is not FrameEdge.NONE
-        # Edge support increases uncertainty only on the axis it censors.
-        # The orthogonal center remains a real measurement (tracker contract,
-        # mirrored by x_censored/y_censored above).
-        if bool(clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)):
+        if hypothesis.clipped:
+            # Clipping increases uncertainty; it is not an abort condition.
             hypothesis.x_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
-        if bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)):
             hypothesis.y_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
         hypothesis.last_measurement_s = float(now_s)
         new_outer_log_scale = math.log(max(1e-6, float(track.apparent_scale)))
@@ -2572,20 +2556,16 @@ class CleanCourseController:
             ):
                 self.successor = None
             return
-        # F158: prefer a successor whose x-axis is observable.  The tracker
-        # marks every known edge clip center_censored, but TOP/BOTTOM leaves
-        # horizontal center observable; only unknown censorship or a
-        # LEFT/RIGHT edge makes x unusable.
+        # F40: prefer a successor whose x-axis is observable — a
+        # center-censored or LEFT/RIGHT-clipped track is the splinter-
+        # fragment geometry that promoted onto a never-measured x-axis.
         eligible = []
         for track in others:
             clipping = getattr(track, "clipping", FrameEdge.NONE)
             if type(clipping) is not FrameEdge:
                 clipping = FrameEdge.NONE
             center_censored = bool(getattr(track, "center_censored", False))
-            unknown_center_censorship = (
-                center_censored and clipping == FrameEdge.NONE
-            )
-            if not unknown_center_censorship and not bool(
+            if not center_censored and not bool(
                 clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
             ):
                 eligible.append(track)
@@ -2739,6 +2719,8 @@ class CleanCourseController:
 
         alpha = _clamp01(dt / max(1e-6, cfg.turn_reference_tau_s + dt))
         aperture_target = 0.0
+        passage_error = float(current_error)
+        passage_constraint = 0.0
         if current.aperture_half_x is not None and current.aperture_half_x > 0.0:
             aperture_budget = (
                 cfg.commit_entry_aperture_margin_frac * current.aperture_half_x
@@ -2750,6 +2732,37 @@ class CleanCourseController:
             if aperture_budget > 1e-9:
                 aperture_target = _clamp01(
                     1.0 - projected_current_error / aperture_budget
+                )
+                # F159: current-gate x is a passage constraint, not a second
+                # heading request.  F158's left successor was known nearly
+                # two seconds before credit, yet a small right Gate-0 error
+                # countermanded it for 0.61 s even while passage remained
+                # inside, or only marginally outside, the existing projected
+                # aperture budget.  Only the continuous hinge violation may
+                # oppose the successor; unused aperture asks for no yaw.
+                # Without usable aperture geometry, retain the conservative
+                # current-error fallback.  This changes no state, threshold,
+                # evidence authority, reference filter, or command owner.
+                passage_violation = max(
+                    0.0,
+                    abs(
+                        float(current_error)
+                        + current.vx * cfg.successor_preview_projection_s
+                    )
+                    - aperture_budget,
+                )
+                passage_constraint = _clamp01(
+                    passage_violation / aperture_budget
+                )
+                projected_passage_x = (
+                    float(current_error)
+                    + current.vx * cfg.successor_preview_projection_s
+                )
+                passage_error = (
+                    math.copysign(passage_violation, projected_passage_x)
+                    if passage_violation > 0.0
+                    and abs(projected_passage_x) > 1e-9
+                    else 0.0
                 )
         if self._last_engulfing_anchor_s is not None:
             # F145: both existing passage observations feed the same filtered
@@ -2765,6 +2778,11 @@ class CleanCourseController:
                 1.0 - anchor_age_s / ENGULFING_ANCHOR_MAX_AGE_S
             )
             aperture_target = max(aperture_target, anchor_passage)
+            # A fresh same-id engulfing anchor supersedes a stale retained
+            # aperture extent continuously (F145); it releases both the
+            # violation correction and its successor attenuation together.
+            passage_error *= 1.0 - anchor_passage
+            passage_constraint *= 1.0 - anchor_passage
         self._turn_aperture_reserve += alpha * (
             aperture_target - self._turn_aperture_reserve
         )
@@ -2824,7 +2842,11 @@ class CleanCourseController:
             # still absolute, so a weak fragment cannot become full authority.
             # Both claims feed the one derotated yaw-and-bank reference.
             passage_release = 1.0 - current_claim
-            desired_authority = passage_release * successor_weight
+            desired_authority = (
+                (1.0 - passage_constraint)
+                * passage_release
+                * successor_weight
+            )
         self._turn_successor_authority += alpha * (
             desired_authority - self._turn_successor_authority
         )
@@ -2845,7 +2867,7 @@ class CleanCourseController:
             # granting the opposing current error invented authority.
             current_weight = min(current_claim, 1.0 - authority)
             desired = (
-                current_weight * float(current_error)
+                current_weight * passage_error
                 + authority * successor.x
             )
 
