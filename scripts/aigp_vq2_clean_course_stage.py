@@ -659,13 +659,14 @@ FRAGMENT_CREEP_PITCH_RAD = 0.03  # creep OFFSET from spawn while centering a lon
 # climb budget; F32's climb-into-frame came from the fh floor and the
 # high-gate bias, which this band still caps.
 BRAKE_CEILING_BAND = 0.04
-PRE_CROSS_BRAKE_PITCH_RAD = -0.20  # nose-up Gate-0 brake OFFSET from spawn.
-# TRUE nose-up brake attitude under the verified F38 convention.  F111:
-# F110 acquired and centered Gate 1 correctly, but inherited closure reached
-# ~0.53/s at its first COMMIT-range frame versus the 0.35/s budget.  Move the
-# Gate-0 brake one bounded step from F103's -0.15 toward the -0.30 course
-# brake; effective target is ~-0.51, still well short of the self-blinding
-# full-course attitude seen in F106/F107.
+PRE_CROSS_BRAKE_PITCH_RAD = -0.15  # nose-up Gate-0 brake OFFSET from spawn.
+# TRUE nose-up brake attitude under the verified F38 convention.  F111 moved
+# this from -0.15 to -0.20 to reduce inherited Gate-1 closure, but F113 and
+# F114 then struck Gate 0's object-1001 structure without credit.  Across the
+# live sequence, the last visible outer-top passage margin degraded from
+# -0.349/-0.318 at F109/F110's -0.15 to -0.300/-0.290 at F111/F112 and then
+# -0.107 in F113.  F115 restores the passage-proven -0.15; inter-gate energy
+# remains the course leg's job, never a reason to make Gate 0 marginal.
 # (Pre-F38 this was +0.15 absolute — a powered DIVE into the gate; F31's
 # "5x too weak brake" was the sign error, not the magnitude.)  F46: -0.15
 # absolute (~1.5 m/s^2 + drag) could not kill the approach speed inside the
@@ -685,7 +686,7 @@ PRE_CROSS_BRAKE_SLEW_RAD_S = 1.0  # fast slew while the governor brakes
 # twice the brake offset: -0.30 from spawn (effective -0.61, ~3 m/s^2 +
 # drag), enough to stop inside the observed far window and re-center at
 # hover as the F54 hold intends.  The F51/F65 vision-custody relax still
-# outranks the brake near the plane; gate 0 uses the bounded F111 -0.20.
+# outranks the brake near the plane; gate 0 uses the live-proven -0.15.
 COURSE_PRE_CROSS_BRAKE_PITCH_RAD = -0.30
 # F51 near-plane brake self-blinding guard (F50 t=15 episode): the brake
 # attitude (rpy_p ~-0.45, ~0.14 rad nose-up from spawn) pitches the camera
@@ -2617,8 +2618,8 @@ class CleanCourseController:
             )
         # F80 (see the COURSE_PRE_CROSS_BRAKE_PITCH_RAD block): course legs
         # inherit the previous crossing's energy, so the TRUE brake doubles
-        # to -0.30 from spawn at gate_index >= 1.  Gate 0 keeps the bounded
-        # -0.20 attitude throughout.  F104/F108's near-plane escalation made
+        # to -0.30 from spawn at gate_index >= 1.  Gate 0 keeps the proved
+        # -0.15 attitude throughout.  F104/F108's near-plane escalation made
         # the first gate pitch sharply up while sinking and produced two
         # object-1001 strikes without credit; F102/F103 crossed with this
         # gentle Gate-0 regime.  Same single blend and custody floor throughout.
