@@ -43,10 +43,11 @@ Control-law constant sources:
   post-credit reuse.
 - ``VZ_LEAK_TAU_S``: bias guard for the IMU world-vertical-rate estimate.
 - ``CLOSURE_TARGET_RATE_S`` / ``CLOSURE_FULL_BRAKE_RATE_S``: the vision
-  closure-rate governor (F31).  The filtered log-scale expansion rate is
-  the only honest closure signal — fh is a signless drag magnitude that
-  conflates speed with braking — so speed is capped CONTINUOUSLY at every
-  range: the pitch target blends from the advance law toward the gentle
+  closure-rate governor (F31/F157).  One uncensored horizontal log-span
+  reference supplies closure; fh is a signless drag magnitude that
+  conflates speed with braking.  Its authority decays continuously during
+  bounded blindness, and speed is capped at every range as pitch blends
+  from the advance law toward the gentle
   ``PRE_CROSS_BRAKE_PITCH_RAD`` attitude as the expansion rate rises past
   the target.  This replaces the retired fh closure governor (wrong
   signal), the near-field log_scale/TTC triggers (late), and the
@@ -445,13 +446,13 @@ UNMEASURED_X_FORCE_SEARCH_S = 0.75
 # ceiling: the governor still blends brake continuously, while
 # the explicit near-plane budget-false hold still demands full braking.
 CLOSURE_FULL_BRAKE_RATE_S = 0.60
-# F156 retests F154's one 0.15/s energy target only after replacing the
-# detector-shape-contaminated closure signal below.  F154's fatal launch
-# pulse was a height-only bbox snap (0.161 -> 0.231 norm) at constant 0.125
-# width, not physical approach.  With one uncensored horizontal-span rate,
-# the target continuously removes inherited energy without that false full
-# brake; there is still one brake reference and no range policy switch.
-CLOSURE_TARGET_RATE_S = 0.15  # continuous energy target (TTC ~6.7 s)
+CLOSURE_TARGET_RATE_S = 0.35  # near-plane log-rate entry target
+# F157 returns to F150's evidence-backed range schedule after F156 showed
+# that retuning the target could not be interpreted through a discontinuous
+# closure handoff.  The policy is unchanged here; only the one closure
+# reference below changes.
+CLOSURE_FAR_TARGET_RATE_S = 0.15  # far-range closure target (~1.2 m/s at 8 m)
+CLOSURE_FAR_LOG_SCALE = -2.0  # ramp start; 0.35 target at commit_min_log_scale
 # F96: the F77 closure-excess collective brake (COURSE_CLOSURE_BRAKE_COLLECTIVE)
 # is deleted with its call site — under the unified vz-tracking law a
 # sub-support cut is immediately restored by the tracker (a masked no-op)
@@ -464,13 +465,12 @@ CLOSURE_TARGET_RATE_S = 0.15  # continuous energy target (TTC ~6.7 s)
 # (far-field real closure at our speeds never exceeds the target anyway:
 # 4 m/s at 10 m is 0.4/s with scale already >= ~0.08).
 CLOSURE_MIN_LOG_SCALE = -2.6
-# F156 keeps F99's fast response but removes the contradictory lagging
-# geometric-rate owner.  The sole closure signal is an EMA of uncensored
-# horizontal bbox log-span growth: it responds within a few frames while
-# rejecting F154's height-only fragment snap.  It naturally expires through
-# censorship/dropout instead of reusing a stale image measurement.
+# F157 keeps F156's shape-robust response but removes its 0.15 s hard expiry.
+# The sole closure signal is an EMA of uncensored horizontal bbox log-span
+# growth: it responds within a few frames while rejecting F154's height-only
+# fragment snap.  Through a bounded blind interval it loses authority
+# continuously, reaching zero only at the existing forced-SEARCH bound.
 OUTER_EXPANSION_TAU_S = 0.20  # horizontal log-span EMA time constant
-OUTER_EXPANSION_MAX_AGE_S = 0.15  # freshness bound on that image signal
 # Fragment advance gate (F43, 20260729T202844Z-visual-course-ee8fd1e5): the
 # gate-1 leg advanced at full +0.08 on a LONE span-(0.04,0.10) fragment
 # (log_scale ~-3.7), built fh 3-4 mps2, and parallax outran yaw authority
@@ -941,9 +941,10 @@ class CleanCourseConfig:
     x_steer_max_age_s: float = X_STEER_MAX_AGE_S
     closure_target_rate_s: float = CLOSURE_TARGET_RATE_S
     closure_full_brake_rate_s: float = CLOSURE_FULL_BRAKE_RATE_S
+    closure_far_target_rate_s: float = CLOSURE_FAR_TARGET_RATE_S
+    closure_far_log_scale: float = CLOSURE_FAR_LOG_SCALE
     closure_min_log_scale: float = CLOSURE_MIN_LOG_SCALE
     outer_expansion_tau_s: float = OUTER_EXPANSION_TAU_S
-    outer_expansion_max_age_s: float = OUTER_EXPANSION_MAX_AGE_S
     fragment_advance_min_log_scale: float = FRAGMENT_ADVANCE_MIN_LOG_SCALE
     fragment_creep_pitch_rad: float = FRAGMENT_CREEP_PITCH_RAD
     pre_cross_brake_pitch_rad: float = PRE_CROSS_BRAKE_PITCH_RAD
@@ -1922,18 +1923,26 @@ class CleanCourseController:
             and current.y_axis.std <= cfg.search_covariance_std_norm
         )
         floor_gate_y = ey_vertical if vertical_qualified else None
-        # Vision closure-rate governor (F156, see the CLOSURE_* block): one
+        # Vision closure-rate governor (F157, see the CLOSURE_* block): one
         # shape-robust signal owns governor, advance, and entry-budget
-        # decisions.  It is the EMA of fresh uncensored horizontal bbox
+        # decisions.  It is the EMA of uncensored horizontal bbox
         # growth, so a fragment gaining only vertical support cannot be
         # interpreted as physical approach.  The target blends continuously
         # toward the gentle brake at every trusted range; tiny far tracks and
-        # stale PREDICT evidence have no closure authority.  The lagging
-        # geometric Kalman rate and launch-only selector are deleted.
+        # uncertainty during PREDICT reduces authority smoothly instead of
+        # resetting a still-hot approach to zero.  The lagging geometric
+        # Kalman rate and launch-only selector remain deleted.
         closure_rate = self._closure_rate(current, now_s)
+        target_frac = _clamp01(
+            (current.outer_log_scale - cfg.closure_far_log_scale)
+            / (cfg.commit_min_log_scale - cfg.closure_far_log_scale)
+        )
+        closure_target = cfg.closure_far_target_rate_s + (
+            cfg.closure_target_rate_s - cfg.closure_far_target_rate_s
+        ) * target_frac
         closure_brake = _clamp01(
-            (closure_rate - cfg.closure_target_rate_s)
-            / (cfg.closure_full_brake_rate_s - cfg.closure_target_rate_s)
+            (closure_rate - closure_target)
+            / (cfg.closure_full_brake_rate_s - closure_target)
         )
         # Misalignment brake (F35, d25f23fe): a fully misaligned gate only
         # suppressed ADVANCE, leaving the pitch law at brake_pitch (near
@@ -2192,14 +2201,14 @@ class CleanCourseController:
         self._bearing_memory_valid = True
 
     def _closure_rate(self, current: _Hypothesis, now_s: float) -> float:
-        """Return the one fresh, shape-robust physical-approach signal."""
+        """Return one bounded, uncertainty-decayed approach reference."""
 
         cfg = self.config
         if current.outer_log_scale < cfg.closure_min_log_scale:
             return 0.0
-        if now_s - current.outer_expansion_s > cfg.outer_expansion_max_age_s:
-            return 0.0
-        return current.outer_expansion_rate
+        age_s = max(0.0, float(now_s) - current.outer_expansion_s)
+        authority = _clamp01(1.0 - age_s / PREDICT_STALL_FORCE_SEARCH_S)
+        return authority * current.outer_expansion_rate
 
     def _commit_entry_budget_ok(
         self, now_s: float, pitch_rad: float, cfg: "CleanCourseConfig"
@@ -2227,9 +2236,10 @@ class CleanCourseController:
             return False
         if current.aperture_half_x is None or current.aperture_half_y is None:
             return False
-        # F156: entry reads the same uncensored horizontal-span rate as the
-        # pitch law.  A second geometric/filter closure owner cannot veto or
-        # admit a crossing on contradictory detector-shape evidence.
+        # F157: entry reads the same uncertainty-decayed horizontal-span
+        # rate as the pitch law.  A second geometric/filter closure owner
+        # cannot veto or admit a crossing on contradictory detector-shape
+        # evidence.
         if self._closure_rate(current, now_s) > (
             cfg.commit_entry_max_expansion_rate_s
         ):
@@ -2424,7 +2434,7 @@ class CleanCourseController:
         new_outer_log_scale = math.log(max(1e-6, float(track.apparent_scale)))
         hypothesis.outer_log_scale = new_outer_log_scale
         if not x_censored:
-            # F156: horizontal bbox growth is the sole closure measurement.
+            # F157: horizontal bbox growth is the sole closure measurement.
             # F154's fatal launch pulse changed only height; using apparent
             # area made that association/shape correction look like 5.8/s
             # physical approach.  The x span is co-timed with accepted x and

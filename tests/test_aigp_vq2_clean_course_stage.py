@@ -1123,8 +1123,8 @@ def test_authoritative_promotion_does_not_switch_brake_reference():
 
 
 def test_closure_governor_does_not_brake_below_target_rate():
-    # Slow closure is free flight: below the 0.15/s target rate the
-    # governor contributes nothing and the advance law still closes.
+    # Slow closure is free flight: below the far-range 0.15/s target rate
+    # the governor contributes nothing and the advance law still closes.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.10))
     controller.current.outer_expansion_rate = 0.1
     controller.current.outer_expansion_s = 100.10
@@ -1189,15 +1189,15 @@ def test_closure_governor_is_a_continuous_blend():
     # Mid-band closure: the pitch target blends partway from the advance
     # law (spawn base) toward the spawn-0.15 Gate-0 brake attitude,
     # without latching the fast-slew brake flag.
-    # F156: one 0.15 target makes 0.35/s a mid-band response below the
-    # unchanged 0.60 full-brake rate.
+    # F157 keeps F150's range target: at log -1.40 it is 0.30, so 0.375/s
+    # is a mid-band response below the unchanged 0.60 full-brake rate.
     # (The commit
     # regime itself levels a centered gate via the F94 custody floor —
     # no blend is observable there.)
     controller = _tracked_controller(
         _track("A", 0.0, 0.0, scale=math.exp(-1.40))
     )
-    controller.current.outer_expansion_rate = 0.35
+    controller.current.outer_expansion_rate = 0.375
     now = 100.10
     out = None
     for _ in range(25):  # generic slew converges to the blended target
@@ -1212,18 +1212,24 @@ def test_closure_governor_is_a_continuous_blend():
     )
 
 
-def test_closure_governor_does_not_relax_energy_target_with_range():
-    # The same physical approach reads the same target throughout the trusted
-    # visible leg; range cannot silently release braking authority.
-    for outer_log_scale in (-1.90, -1.60, -1.30):
+def test_closure_governor_retains_the_f150_range_schedule():
+    # F157 changes evidence continuity, not F150's policy: the same 0.40/s
+    # closure receives more brake authority far away than near the entry
+    # regime, where the target rises toward the unchanged 0.35/s budget.
+    outputs = []
+    for outer_log_scale in (-1.90, -1.30):
         controller = _tracked_controller(
-            _track("A", 0.0, 0.0, scale=math.exp(outer_log_scale))
+            _track("A", 0.0, 0.0, scale=math.exp(outer_log_scale)),
+            config=_config(
+                target_slew_rad_s=100.0,
+                pre_cross_brake_slew_rad_s=100.0,
+            ),
         )
         controller.current.outer_log_scale = outer_log_scale
         controller.current.outer_expansion_rate = 0.40
         controller.current.outer_expansion_s = 100.10
-        _command(controller, 100.10, pitch=SPAWN_PITCH)
-        assert controller._pre_cross_brake_active
+        outputs.append(_command(controller, 100.10, pitch=SPAWN_PITCH))
+    assert outputs[0].target_pitch_rad < outputs[1].target_pitch_rad
 
 
 def test_misalignment_brake_is_invariant_to_its_own_camera_pitch():
@@ -1299,33 +1305,36 @@ def test_misaligned_far_gate_brakes_without_vertical_overlay():
     assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
 
 
-def test_predict_does_not_reuse_stale_closure_measurement():
-    # A horizontal span is physical evidence only while its x measurement is
-    # fresh.  PREDICT still suppresses advance through uncertainty and the
-    # current angular error, but cannot reuse a stale geometric rate as a
-    # second full-brake owner.
+def test_predict_decays_closure_reference_without_reversing_pitch_direction():
+    # F156 hard-reset a 1.37/s Gate-0 approach to zero before PREDICT could
+    # even begin, then reversed pitch toward advance.  The last horizontal
+    # span rate is retained with continuously falling authority through the
+    # existing bounded PREDICT window; it never becomes a second owner.
     controller = _tracked_controller(_track("A", 0.20, 0.0, scale=0.10))
     now = 100.10
     now += 0.033
     controller.observe(
         _update([_track("A", 0.20, 0.0, scale=0.10)], frame_id=39), now_s=now
     )  # fresh measurement so the dropout starts from TRACK
-    controller.current.outer_expansion_rate = 0.7
+    controller.current.outer_expansion_rate = 1.37
     controller.current.outer_expansion_s = now
-    for frame in range(9):  # ~0.3 s without a measurement -> PREDICT
+    pitch_targets = []
+    for frame in range(19):  # ~0.63 s: F156's last span through Gate-0 credit
         now += 0.033
+        # The live engulfing anchor kept the bounded credit wait in PREDICT
+        # beyond the ordinary 0.5 s loss bound without becoming a measurement.
+        controller._last_engulfing_anchor_s = now
         controller.observe(_update([], frame_id=40 + frame), now_s=now)
         out = _command(controller, now, pitch=SPAWN_PITCH)
+        pitch_targets.append(out.target_pitch_rad)
     assert controller.state is CleanCourseState.PREDICT
-    assert controller.state is CleanCourseState.PREDICT
-    assert controller._closure_rate(controller.current, now) == 0.0
+    assert controller._closure_rate(controller.current, now) > 0.6
     assert controller._pre_cross_brake_active
-    assert (
-        controller.config.spawn_pitch_rad
-        + controller.config.pre_cross_brake_pitch_rad
-        < out.target_pitch_rad
-        < controller.config.spawn_pitch_rad
+    assert all(
+        later <= earlier + 1e-12
+        for earlier, later in zip(pitch_targets, pitch_targets[1:])
     )
+    assert out.target_pitch_rad < controller.config.spawn_pitch_rad
 
 
 def test_pitch_offsets_follow_the_configured_spawn_attitude():
@@ -3670,9 +3679,10 @@ def test_closure_governor_demands_energy_reduction_early():
     # than custody-compatible attitude braking can kill inside the leg.
     # F100's gate-1 leg held pb=1 mid-leg and still ran away to ~1.2
     # log/s at the plane (COMMIT expansion veto, blind structure strike).
-    # F156 keeps the evidence-backed 0.15 target across the leg.  At the F100
-    # mid-leg state (outer log -1.90, closure 0.43), the governor continuously
-    # demands a meaningful fraction of the one F125 brake reference.
+    # F157 retains F150's evidence-backed range schedule.  At the F100
+    # mid-leg state (outer log -1.90, target ~0.175, closure 0.43), the
+    # governor continuously demands a meaningful fraction of the one F125
+    # brake reference.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.15))
     controller._alt_est_m = 2.0
     _promote_to_gate_one(controller)
