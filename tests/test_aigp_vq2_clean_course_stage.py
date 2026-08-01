@@ -770,6 +770,229 @@ def test_full_credible_closure_reaches_complete_optical_intercept():
     )
 
 
+_F162_DIRECTION_ROWS = (
+    # t, frame, pitch, filtered y, raw y, ydot, y std, inner log scale,
+    # outer log scale, filtered/raw closure, and supporting IMU vz.
+    (
+        5.359,
+        1907094,
+        -0.4544197644591279,
+        0.15168623663814268,
+        0.1611111111111112,
+        0.23906230902156228,
+        0.05370577868817966,
+        -0.8848248999833153,
+        -0.9422344336661613,
+        1.5921387255277188,
+        0.7895452201852513,
+        -0.12293242797737247,
+    ),
+    (
+        5.406,
+        1907095,
+        -0.4554753548939212,
+        0.17297428277105434,
+        0.1777777777777778,
+        0.26082292155121695,
+        0.051635861457027844,
+        -0.8549817344580977,
+        -0.9102777707943349,
+        1.4832478163116634,
+        0.76868707250974,
+        -0.13073258407356997,
+    ),
+    (
+        5.453,
+        1907096,
+        -0.4562610277027766,
+        0.19839781893336988,
+        0.2055555555555555,
+        0.2918651291337376,
+        0.0510593362988328,
+        -0.8223013511285067,
+        -0.8691093511500126,
+        1.3936901087533204,
+        0.7890924459173493,
+        -0.1412417877699674,
+    ),
+    (
+        5.500,
+        1907097,
+        -0.45595882332436766,
+        0.23519250112015266,
+        0.25,
+        0.3555700225302015,
+        0.051428164410942966,
+        -0.7765388577751083,
+        -0.8016036813417322,
+        1.3459058655489267,
+        0.9122435586759983,
+        -0.15274400480188632,
+    ),
+    (
+        5.593,
+        1907099,
+        -0.44425707350146254,
+        0.30233038428415315,
+        0.31666666666666665,
+        0.4516339891684342,
+        0.05375702369579412,
+        -0.6807685040370061,
+        -0.6828375369585774,
+        1.281392419069951,
+        1.0583266549091752,
+        -0.17631775894079366,
+    ),
+)
+
+
+def _f162_gate1_controller():
+    """Start at the authoritative Gate-1 boundary, without synthetic credit."""
+
+    controller = CleanCourseController(_config())
+    controller.initialize(
+        _update([_track("A", 0.0, 0.0)], frame_id=1907093),
+        gate_index=1,
+        fallback_center_norm=(0.0, 0.0),
+        fallback_apparent_scale=0.10,
+        now_s=105.30,
+    )
+    controller._alt_est_m = 2.0
+    return controller
+
+
+def _apply_f162_direction_row(controller, row):
+    (
+        elapsed,
+        frame_id,
+        pitch,
+        filtered_y,
+        raw_y,
+        image_rate_y,
+        y_std,
+        log_scale,
+        outer_log_scale,
+        filtered_closure,
+        raw_closure,
+        vz_est,
+    ) = row
+    now = 100.0 + elapsed
+    # Consume a distinct recorded camera observation through observe(); the
+    # state values below are the controller-boundary values recorded after
+    # that observation, not invented controller flags or passage state.
+    controller.observe(
+        _update(
+            [
+                _track(
+                    "A",
+                    -0.10,
+                    raw_y,
+                    scale=math.exp(outer_log_scale),
+                    confidence=0.95,
+                )
+            ],
+            frame_id=frame_id,
+        ),
+        now_s=now,
+    )
+    current = controller.current
+    current.y_axis.p = filtered_y
+    current.raw_y = raw_y
+    current.y_axis.v = image_rate_y
+    current.y_axis.pp = y_std**2
+    current.y_axis.pv = 0.0
+    current.y_axis.vv = 0.02**2
+    current.scale_axis.p = log_scale
+    current.scale_axis.v = filtered_closure
+    current.scale_axis.vv = 0.02**2
+    current.outer_log_scale = outer_log_scale
+    current.outer_log_scale_s = now
+    current.outer_expansion_rate = raw_closure
+    current.aperture_half_x = None
+    current.aperture_half_y = None
+    controller._vz_est_m_s = vz_est
+    return _command(controller, now, pitch=pitch)
+
+
+def test_f162_motion_direction_reverses_before_static_bearing_and_imu():
+    # F162's first three coherent near-plane samples all project the aperture
+    # downward even though static pitch compensation still says it is above
+    # center.  Three distinct frames own descent at t=5.453; uncertainty may
+    # reduce magnitude but sinking IMU vz may not add opposite-direction climb.
+    controller = _f162_gate1_controller()
+    controller._collective = 0.2762406
+    outputs = []
+    motions = []
+    for row in _F162_DIRECTION_ROWS:
+        # At the reversal boundary, preserve the actual F162 carried
+        # collective from the preceding recorded tick.  The counterfactual
+        # therefore has to erase the real climb reserve, not a cold start.
+        if row[0] == 5.453:
+            controller._collective = 0.27866674133727154
+        outputs.append(_apply_f162_direction_row(controller, row))
+        motions.append(controller._last_vertical_motion)
+        assert controller.state is CleanCourseState.TRACK
+        assert controller.gate_index == 1
+        assert controller._commit_entry_s is None
+
+    reversal = outputs[2]
+    reversal_motion = motions[2]
+    assert controller._vertical_direction_sign == 1
+    assert controller._vertical_direction_streak >= 3
+    assert controller._vertical_direction_source == "coherent_motion"
+    assert controller._last_vertical_imu_delta == 0.0
+    assert controller._last_vertical_collective_target < (
+        controller._last_vertical_support
+    )
+    # The recorded compensated bearing was still negative at the direction
+    # transition; it cannot own or delay this near-plane sign.
+    assert reversal_motion.bearing_error < 0.0
+    assert reversal_motion.fallback_intercept_error > 0.0
+    assert reversal_motion.optical_intercept_error > 0.0
+    assert reversal.thrust < 0.27866674133727154
+    # By the final exact frame (t=5.593), before first BOTTOM at 5.640, the
+    # bounded 0.12/s fast path has driven filtered collective below support.
+    assert outputs[-1].thrust < controller._last_vertical_support
+
+
+def test_republished_frame_cannot_satisfy_direction_streak():
+    controller = _f162_gate1_controller()
+    row = _F162_DIRECTION_ROWS[0]
+    _apply_f162_direction_row(controller, row)
+    assert controller._vertical_direction_streak == 1
+
+    frozen_update = _update(
+        [
+            _track(
+                "A",
+                -0.10,
+                row[4],
+                scale=math.exp(row[8]),
+                confidence=0.95,
+            )
+        ],
+        frame_id=row[1],
+    )
+    for offset in (0.020, 0.040, 0.060):
+        now = 100.0 + row[0] + offset
+        controller.observe(frozen_update, now_s=now)
+        # Preserve the same recorded coherent state: only its republication
+        # time changed, which is not another camera observation.
+        current = controller.current
+        current.y_axis.p = row[3]
+        current.raw_y = row[4]
+        current.y_axis.v = row[5]
+        current.y_axis.pp = row[6] ** 2
+        current.scale_axis.p = row[7]
+        current.scale_axis.v = row[9]
+        current.outer_log_scale = row[8]
+        current.outer_expansion_rate = row[10]
+        _command(controller, now, pitch=row[2])
+
+    assert controller._vertical_direction_streak == 1
+    assert controller._vertical_direction_sign == 0
+
+
 def test_exact_axis_optical_authority_fades_with_intercept_uncertainty():
     controller = _tracked_controller(_track("A", 0.0, 0.20))
     current = controller.current
@@ -1427,6 +1650,78 @@ def test_fh_latch_does_not_switch_collective_owner_or_add_margin():
     assert max(
         abs(after - before) for before, after in zip(thrusts, thrusts[1:])
     ) < 1e-9
+
+
+def test_f162_first_bottom_frame_immediately_owns_vertical_direction():
+    controller = _f162_gate1_controller()
+    controller._collective = 0.2762406
+    previous = None
+    for row in _F162_DIRECTION_ROWS:
+        if row[0] == 5.453:
+            controller._collective = 0.27866674133727154
+        previous = _apply_f162_direction_row(controller, row)
+
+    now = 105.640
+    old_y_stamp = controller.current.last_y_measurement_s
+    clipped = _track(
+        "A",
+        -0.11875,
+        0.3222222222222222,
+        scale=math.sqrt(0.3953125 * 0.6777777777777778),
+        confidence=0.9827799254573163,
+        clipping=FrameEdge.BOTTOM,
+        center_censored=True,
+    )
+    clipped.bbox_norm = (
+        -0.11875 - 0.3953125 / 2.0,
+        0.3222222222222222 - 0.6777777777777778 / 2.0,
+        -0.11875 + 0.3953125 / 2.0,
+        0.3222222222222222 + 0.6777777777777778 / 2.0,
+    )
+    controller.observe(
+        _update([clipped], frame_id=1907102),
+        now_s=now,
+    )
+    current = controller.current
+    # Recorded post-observation controller state for the first clipped frame.
+    current.y_axis.p = 0.3222222222222222
+    current.y_axis.v = 0.4516339891684342
+    current.y_axis.pp = 0.1600567239373518**2
+    current.scale_axis.p = -0.6205430603424339
+    current.scale_axis.v = 1.281392419069951
+    current.scale_axis.vv = 0.02**2
+    current.outer_log_scale = -0.6585072468915756
+    current.outer_expansion_rate = 0.9554478585024939
+    controller._vz_est_m_s = -0.18594823557539994
+
+    out = _command(
+        controller,
+        now,
+        pitch=-0.43438793458248665,
+    )
+
+    # The old exact y is only 47 ms old, but BOTTOM is the current frame and
+    # therefore wins immediately (F162 incorrectly waited until t=5.843).
+    assert current.last_y_measurement_s == pytest.approx(old_y_stamp)
+    assert current.last_x_measurement_s == pytest.approx(now)
+    assert not out.vertical_qualified
+    assert controller._last_vertical_motion.directional_censor == (
+        FrameEdge.BOTTOM
+    )
+    assert controller._vertical_direction_source == "bottom_censor"
+    assert controller._vertical_direction_sign == 1
+    assert controller._last_vertical_imu_delta == 0.0
+    assert controller._last_vertical_collective_target < (
+        controller._last_vertical_support
+    )
+    assert out.thrust < controller._last_vertical_support
+    assert out.thrust < previous.thrust
+    # Directional y censorship does not invalidate the fresh horizontal axis.
+    assert out.yaw_rate_rad_s < 0.0
+    assert out.target_roll_rad < 0.0
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.gate_index == 1
+    assert controller._commit_entry_s is None
 
 
 @pytest.mark.parametrize(
@@ -3721,6 +4016,95 @@ def test_commit_entry_uses_visual_intercept_not_imu_vz_as_a_veto():
     settled._vz_est_m_s = 0.10
     out, _ = _drive_commit_window(settled, 100.10)
     assert settled.state is CleanCourseState.COMMIT
+
+
+def test_f162_observations_have_no_live_aperture_commit_overlap():
+    # This is deliberately separate from the synthetic public-boundary
+    # reachability proof in test_aigp_vq2_runner.py.  F162's real Gate-1
+    # observations lost their usable aperture at t=4.656; proximity did not
+    # begin until t=5.062, and closure was still above the 0.35/s entry cap.
+    rows = (
+        # t, frame, x, y, bbox width/height, pitch, optional aperture half-size
+        (4.359, 1907073, -0.13125, 0.04444444444444451, 0.1625, 0.2833333333333333, -0.4576878453806965, (0.048412277765566725, 0.08626446521721656)),
+        (4.640, 1907079, -0.103125, 0.011111111111111072, 0.190625, 0.3111111111111111, -0.444454312243036, (0.05539495859669369, 0.09349205793547188)),
+        (4.656, 1907080, -0.10, 0.005555555555555536, 0.1953125, 0.3138888888888889, -0.4429891285637212, (0.051281969088538604, 0.09164662350284151)),
+        (4.812, 1907084, -0.090625, 0.0, 0.2078125, 0.3305555555555555, -0.43636218682192973, None),
+        (5.062, 1907088, -0.084375, 0.03333333333333344, 0.246875, 0.3722222222222222, -0.44265084811207817, None),
+        (5.125, 1907090, -0.0875, 0.05555555555555558, 0.259375, 0.39166666666666666, -0.44686735045384735, None),
+        (5.265, 1907092, -0.096875, 0.11111111111111116, 0.2890625, 0.4388888888888889, -0.4517531147379503, None),
+    )
+
+    def observation(row):
+        _, _, x, y, width, height, _, aperture_half = row
+        aperture = (
+            None
+            if aperture_half is None
+            else SimpleNamespace(
+                passage_usable=True,
+                half_size_norm=aperture_half,
+            )
+        )
+        track = _track(
+            "A",
+            x,
+            y,
+            scale=math.sqrt(width * height),
+            confidence=0.90,
+            aperture=aperture,
+        )
+        track.bbox_norm = (
+            x - width / 2.0,
+            y - height / 2.0,
+            x + width / 2.0,
+            y + height / 2.0,
+        )
+        return track
+
+    first = rows[0]
+    controller = CleanCourseController(_config())
+    controller.initialize(
+        _update([observation(first)], frame_id=first[1]),
+        gate_index=1,
+        fallback_center_norm=(first[2], first[3]),
+        fallback_apparent_scale=math.sqrt(first[4] * first[5]),
+        now_s=100.0 + first[0],
+    )
+    controller._alt_est_m = 2.0
+    last_usable_s = None
+    first_proximity_s = None
+    proximity_closures = []
+
+    for row in rows:
+        elapsed, frame_id, *_ = row
+        now = 100.0 + elapsed
+        if row is not first:
+            controller.observe(
+                _update([observation(row)], frame_id=frame_id),
+                now_s=now,
+            )
+        current = controller.current
+        if current.aperture_half_x is not None:
+            last_usable_s = elapsed
+        if current.outer_log_scale >= controller.config.commit_min_log_scale:
+            if first_proximity_s is None:
+                first_proximity_s = elapsed
+            proximity_closures.append(
+                max(current.expansion_rate, current.outer_expansion_rate)
+            )
+        _command(controller, now, pitch=row[6])
+        assert controller.state is CleanCourseState.TRACK
+        assert controller.gate_index == 1
+        assert controller._commit_entry_s is None
+
+    assert last_usable_s == pytest.approx(4.656)
+    assert first_proximity_s == pytest.approx(5.062)
+    assert last_usable_s < first_proximity_s
+    assert proximity_closures
+    assert min(proximity_closures) > (
+        controller.config.commit_entry_max_expansion_rate_s
+    )
+    assert controller.current.aperture_half_x is None
+    assert controller.current.aperture_half_y is None
 
 
 def test_commit_entry_requires_inner_aperture_budget():

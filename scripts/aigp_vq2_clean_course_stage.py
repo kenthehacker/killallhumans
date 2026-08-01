@@ -147,6 +147,17 @@ VERTICAL_OPTICAL_COLLECTIVE_GAIN = 0.12
 VERTICAL_IMU_DAMPING_GAIN = 0.12
 VERTICAL_IMU_MAX_OPPOSITION_FRACTION = 0.50
 VERTICAL_CENSORED_AUTHORITY = 0.65
+# F163: near the gate plane, a static attitude-compensated bearing is not a
+# trajectory direction.  Three distinct image measurements must agree in the
+# two complete passage projections and in de-dilated image motion before that
+# direction can override projection magnitude uncertainty.  A directional
+# clip is already one-sided evidence and therefore owns direction at once.
+VERTICAL_DIRECTION_STREAK_FRAMES = 3
+# The ordinary 0.25 s collective carry filter consumed F162's remaining
+# correction window.  A credible direction change gets a short, bounded slew
+# toward its target; all other collective changes retain the ordinary filter.
+VERTICAL_DIRECTION_FAST_SLEW_PER_S = 0.12
+VERTICAL_DIRECTION_FAST_WINDOW_S = 0.50
 COMMIT_ENTRY_SIGMA_MULT = 0.50
 
 # Launch boost is pure feedforward (it ignores ey).  Flight
@@ -785,7 +796,10 @@ class _PassageMotion:
     fallback_intercept_error: float
     optical_intercept_error: float
     intercept_error: float
+    bearing_std: float
     intercept_std: float
+    freshness_authority: float
+    measurement_authority: float
     control_authority: float
     directional_censor: FrameEdge = FrameEdge.NONE
 
@@ -925,6 +939,11 @@ class CleanCourseConfig:
         VERTICAL_IMU_MAX_OPPOSITION_FRACTION
     )
     vertical_censored_authority: float = VERTICAL_CENSORED_AUTHORITY
+    vertical_direction_streak_frames: int = VERTICAL_DIRECTION_STREAK_FRAMES
+    vertical_direction_fast_slew_per_s: float = (
+        VERTICAL_DIRECTION_FAST_SLEW_PER_S
+    )
+    vertical_direction_fast_window_s: float = VERTICAL_DIRECTION_FAST_WINDOW_S
     commit_entry_sigma_mult: float = COMMIT_ENTRY_SIGMA_MULT
     min_thrust: float = MIN_COURSE_THRUST
     max_thrust: float = MAX_COURSE_THRUST
@@ -1084,6 +1103,14 @@ class CleanCourseController:
         # Underlying camera-frame identity of the last consumed update; a
         # republished frozen frame (same identity) is never fresh evidence.
         self._last_frame_identity: Optional[Tuple[Any, Any]] = None
+        # Explicit fresh-camera observation ownership for the current track.
+        # Tracker republishes may advance hypothesis timestamps, so the
+        # near-plane direction streak must not infer freshness from those
+        # timestamps alone.
+        self._current_fresh_observation_track_id: Optional[str] = None
+        self._current_fresh_observation_s: Optional[float] = None
+        self._current_fresh_y_observation_s: Optional[float] = None
+        self._current_fresh_y_observation_serial = 0
         # Leaky world-vertical-rate estimate (m/s, up positive) fed by IMU
         # specific force; the stage starts on the pad, so zero is honest.
         self._vz_est_m_s = 0.0
@@ -1124,6 +1151,27 @@ class CleanCourseController:
         self._lateral_intercept_reference_x: Optional[float] = None
         self._last_lateral_motion: Optional[_PassageMotion] = None
         self._last_vertical_motion: Optional[_PassageMotion] = None
+        # Near-plane vertical direction is a trajectory state, deliberately
+        # separate from the attitude-compensated image bearing.  The streak is
+        # advanced only by distinct y measurements, never by 50 Hz command
+        # ticks replaying one camera frame.  TOP/BOTTOM censorship bypasses
+        # the streak because it is direct one-sided evidence.
+        self._vertical_direction_track_id: Optional[str] = None
+        self._vertical_direction_last_y_observation_serial = 0
+        self._vertical_direction_streak_sign = 0
+        self._vertical_direction_streak = 0
+        self._vertical_direction_sign = 0
+        self._vertical_direction_supported = False
+        self._vertical_direction_source: Optional[str] = None
+        self._vertical_direction_fast_until_s: Optional[float] = None
+        self._vertical_direction_edge_active = False
+        self._vertical_direction_magnitude = 0.0
+        # Trace the terms at their real controller boundary.  These are
+        # diagnostics only and never become a second collective owner.
+        self._last_vertical_support: Optional[float] = None
+        self._last_vertical_visual_delta = 0.0
+        self._last_vertical_imu_delta = 0.0
+        self._last_vertical_collective_target: Optional[float] = None
         # Course-heading anchor (F31): yaw at the leg start (lazily
         # captured on the first command tick with a live yaw measurement,
         # re-armed on every authoritative promotion).  Yaw commands that
@@ -1157,6 +1205,7 @@ class CleanCourseController:
         self._lateral_intercept_reference_x = None
         self._last_lateral_motion = None
         self._last_vertical_motion = None
+        self._reset_vertical_direction()
         identity = _frame_identity(update)
         if identity is not None:
             self._last_frame_identity = identity
@@ -1175,6 +1224,7 @@ class CleanCourseController:
             self.current = self._hypothesis_from_track(current_track, now_s)
             self.state = CleanCourseState.TRACK
             self._set_reliable_bearing(self.current.x, self.current.y)
+            self._seed_current_fresh_observation(self.current, now_s=now_s)
         else:
             self.current = _Hypothesis(
                 track_id=None,
@@ -1269,7 +1319,14 @@ class CleanCourseController:
         if self.state is CleanCourseState.COAST_FOR_CREDIT:
             resumed = self._find(tracks, self._current_track_id())
             if resumed is not None:
+                before_y_s = self.current.last_y_measurement_s
                 self._update_hypothesis(self.current, resumed, now_s)
+                self._record_current_fresh_observation(
+                    self.current,
+                    now_s=now_s,
+                    fresh=fresh,
+                    previous_y_measurement_s=before_y_s,
+                )
                 self._exit_coast()
                 self.state = CleanCourseState.TRACK
             self._refresh_successor(tracks, now_s)
@@ -1287,7 +1344,14 @@ class CleanCourseController:
         # leave the state.
         if self.state is CleanCourseState.COMMIT:
             if match is not None:
+                before_y_s = self.current.last_y_measurement_s
                 self._update_hypothesis(self.current, match, now_s)
+                self._record_current_fresh_observation(
+                    self.current,
+                    now_s=now_s,
+                    fresh=fresh,
+                    previous_y_measurement_s=before_y_s,
+                )
                 self._set_reliable_bearing(self.current.x, self.current.y)
             elif (
                 fresh
@@ -1311,7 +1375,14 @@ class CleanCourseController:
         if match is not None and not (
             self.state is CleanCourseState.SEARCH and pending_credit
         ):
+            before_y_s = self.current.last_y_measurement_s
             self._update_hypothesis(self.current, match, now_s)
+            self._record_current_fresh_observation(
+                self.current,
+                now_s=now_s,
+                fresh=fresh,
+                previous_y_measurement_s=before_y_s,
+            )
             self.state = CleanCourseState.TRACK
         elif self.state is CleanCourseState.SEARCH or self.current is None:
             # F78 (20260730T082159Z-visual-course-7e18243d): while
@@ -1330,6 +1401,12 @@ class CleanCourseController:
             )
             if adopted is not None:
                 self.current = self._hypothesis_from_track(adopted, now_s)
+                if fresh:
+                    self._seed_current_fresh_observation(
+                        self.current, now_s=now_s
+                    )
+                else:
+                    self._clear_current_fresh_observation()
                 # After an authoritative increment can no longer promote a
                 # marginal cached successor directly, SEARCH is allowed to
                 # qualify and adopt that now-current gate.  Remove its stale
@@ -1425,6 +1502,11 @@ class CleanCourseController:
         self.gate_index = int(gate_index)
         self.max_gate_index = max(self.max_gate_index, self.gate_index)
         self.transitions.append((previous, self.gate_index))
+        # Directional passage evidence belongs to the race-owned gate that
+        # produced it.  Never carry a prior gate's near-plane reversal into
+        # the newly authoritative leg.
+        self._reset_vertical_direction()
+        self._clear_current_fresh_observation()
         # Preserve the filtered bearing through promotion, but start the new
         # gate's future-successor aperture calculation from zero.  The newly
         # promoted current hypothesis is the same derotated bearing that fed
@@ -1485,6 +1567,16 @@ class CleanCourseController:
         """Produce the single navigation request for one tick."""
 
         cfg = self.config
+        # Directional support is re-earned from this tick's live passage
+        # evidence.  The established sign/streak persists across command
+        # ticks, but cannot silently authorize SEARCH or stale vision.
+        self._vertical_direction_supported = False
+        self._vertical_direction_source = None
+        self._vertical_direction_magnitude = 0.0
+        self._last_vertical_support = None
+        self._last_vertical_visual_delta = 0.0
+        self._last_vertical_imu_delta = 0.0
+        self._last_vertical_collective_target = None
         self._pre_cross_brake_active = False  # main path recomputes below
         self._successor_heading_blend = 0.0
         self._successor_heading_error_norm = None
@@ -1715,6 +1807,10 @@ class CleanCourseController:
                     <= cfg.vertical_qualify_max_age_s
                     and self.current.y_axis.std
                     <= cfg.search_covariance_std_norm
+                    and not (
+                        self.current.vertical_censor_edge
+                        & (FrameEdge.TOP | FrameEdge.BOTTOM)
+                    )
                 )
                 commit_ey = self._compensated_ey(
                     self.current.y, pitch_rad
@@ -1761,7 +1857,9 @@ class CleanCourseController:
                         slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
                     ),
                     yaw_rate_rad_s=commit_yaw,
-                    thrust=self._continuous_collective(commit_target, dt),
+                    thrust=self._continuous_collective(
+                        commit_target, dt, now_s=now_s
+                    ),
                     state=self.state,
                     gate_index=self.gate_index,
                     successor_blend=commit_blend,
@@ -1827,7 +1925,9 @@ class CleanCourseController:
                         cfg.spawn_pitch_rad + cfg.brake_pitch_rad, dt
                     ),
                     yaw_rate_rad_s=pending_yaw,
-                    thrust=self._continuous_collective(search_target, dt),
+                    thrust=self._continuous_collective(
+                        search_target, dt, now_s=now_s
+                    ),
                     state=self.state,
                     gate_index=self.gate_index,
                     successor_blend=pending_blend,
@@ -1853,7 +1953,9 @@ class CleanCourseController:
                 target_roll_rad=target_roll,
                 target_pitch_rad=target_pitch,
                 yaw_rate_rad_s=sweep_yaw,
-                thrust=self._continuous_collective(search_target, dt),
+                thrust=self._continuous_collective(
+                    search_target, dt, now_s=now_s
+                ),
                 state=self.state,
                 gate_index=self.gate_index,
                 current_track_id=self._current_track_id(),
@@ -1875,7 +1977,9 @@ class CleanCourseController:
                 target_roll_rad=0.0,
                 target_pitch_rad=cfg.spawn_pitch_rad + cfg.brake_pitch_rad,
                 yaw_rate_rad_s=0.0,
-                thrust=self._continuous_collective(fallback_target, dt),
+                thrust=self._continuous_collective(
+                    fallback_target, dt, now_s=now_s
+                ),
                 state=self.state,
                 gate_index=self.gate_index,
             )
@@ -1981,6 +2085,10 @@ class CleanCourseController:
             and now_s - current.last_y_measurement_s
             <= cfg.vertical_qualify_max_age_s
             and current.y_axis.std <= cfg.search_covariance_std_norm
+            and not (
+                current.vertical_censor_edge
+                & (FrameEdge.TOP | FrameEdge.BOTTOM)
+            )
         )
         floor_gate_y = ey_vertical if vertical_qualified else None
         # Vision closure-rate governor (F31, see the CLOSURE_* constant
@@ -2108,7 +2216,9 @@ class CleanCourseController:
             support,
             gate_y=floor_gate_y,
         )
-        thrust = self._continuous_collective(collective_target, dt)
+        thrust = self._continuous_collective(
+            collective_target, dt, now_s=now_s
+        )
 
         # Lateral: per the 2026-07-29 crossing-geometry analysis, positive
         # image-x error requires POSITIVE yaw (negative yaw rotates the
@@ -2521,11 +2631,12 @@ class CleanCourseController:
             # valid while the frame is fresh; covariance cannot turn BOTTOM
             # into climb or TOP into descent.  Confidence and age still fade
             # its bounded authority.
-            control_authority = (
+            measurement_authority = (
                 cfg.vertical_censored_authority
                 * _clamp01(current.confidence)
                 * freshness
             )
+            control_authority = measurement_authority
         else:
             # Exact observations use the full projected intercept uncertainty,
             # not merely a binary position-covariance qualification.  The
@@ -2536,6 +2647,7 @@ class CleanCourseController:
                 - intercept_std
                 / max(1e-6, cfg.passage_motion_full_std_norm)
             )
+            measurement_authority = freshness * position_certainty
             control_authority = freshness * uncertainty_authority
         return _PassageMotion(
             bearing_error=error,
@@ -2548,7 +2660,10 @@ class CleanCourseController:
             fallback_intercept_error=fallback_intercept,
             optical_intercept_error=optical_intercept,
             intercept_error=intercept_error,
+            bearing_std=axis.std,
             intercept_std=intercept_std,
+            freshness_authority=freshness,
+            measurement_authority=measurement_authority,
             control_authority=control_authority,
             directional_censor=directional_censor,
         )
@@ -3158,12 +3273,20 @@ class CleanCourseController:
         censor = current.vertical_censor_edge & (
             FrameEdge.TOP | FrameEdge.BOTTOM
         )
-        if vertical_qualified:
-            censor = FrameEdge.NONE
-            age_s = now_s - current.last_y_measurement_s
-            error = float(vertical_error)
-        elif (
+        fresh_current_owned = bool(
+            self._current_fresh_observation_track_id == current.track_id
+            and self._current_fresh_observation_s is not None
+            and now_s - self._current_fresh_observation_s
+            <= self.config.predict_max_gap_s
+        )
+        # A fresh directional clip is newer evidence than the last exact y
+        # sample.  F162 kept treating BOTTOM frames as uncensored for about
+        # 0.20 s because last_y_measurement_s still satisfied the 0.30 s
+        # exact-axis qualification.  Consume the one-sided observation on its
+        # first frame instead of waiting for that old exact stamp to expire.
+        if (
             censor != FrameEdge.NONE
+            and fresh_current_owned
             and now_s - current.last_measurement_s
             <= self.config.predict_max_gap_s
         ):
@@ -3177,8 +3300,13 @@ class CleanCourseController:
                     error = max(error, bound, 0.0)
                 elif censor & FrameEdge.TOP:
                     error = min(error, bound, 0.0)
+        elif vertical_qualified:
+            censor = FrameEdge.NONE
+            age_s = now_s - current.last_y_measurement_s
+            error = float(vertical_error)
         else:
             self._last_vertical_motion = None
+            self._vertical_direction_edge_active = False
             return None
 
         motion = self._passage_motion(
@@ -3206,12 +3334,196 @@ class CleanCourseController:
                 fallback_intercept_error=motion.fallback_intercept_error,
                 optical_intercept_error=motion.optical_intercept_error,
                 intercept_error=intercept,
+                bearing_std=motion.bearing_std,
                 intercept_std=motion.intercept_std,
+                freshness_authority=motion.freshness_authority,
+                measurement_authority=motion.measurement_authority,
                 control_authority=motion.control_authority,
                 directional_censor=motion.directional_censor,
             )
+        self._update_vertical_direction(current, motion, now_s=now_s)
         self._last_vertical_motion = motion
         return motion
+
+    def _clear_current_fresh_observation(self) -> None:
+        self._current_fresh_observation_track_id = None
+        self._current_fresh_observation_s = None
+        self._current_fresh_y_observation_s = None
+        self._current_fresh_y_observation_serial = 0
+
+    def _seed_current_fresh_observation(
+        self, current: _Hypothesis, *, now_s: float
+    ) -> None:
+        """Seed explicit freshness from a newly consumed camera frame."""
+
+        self._current_fresh_observation_track_id = current.track_id
+        self._current_fresh_observation_s = float(now_s)
+        if current.last_y_measurement_s > NEVER_MEASURED_S + 1.0:
+            self._current_fresh_y_observation_s = float(now_s)
+            self._current_fresh_y_observation_serial = 1
+        else:
+            self._current_fresh_y_observation_s = None
+            self._current_fresh_y_observation_serial = 0
+
+    def _record_current_fresh_observation(
+        self,
+        current: _Hypothesis,
+        *,
+        now_s: float,
+        fresh: bool,
+        previous_y_measurement_s: float,
+    ) -> None:
+        """Record one current-track update only if its camera frame is new."""
+
+        if not fresh:
+            return
+        if self._current_fresh_observation_track_id != current.track_id:
+            self._seed_current_fresh_observation(current, now_s=now_s)
+            return
+        self._current_fresh_observation_s = float(now_s)
+        if (
+            current.last_y_measurement_s
+            > float(previous_y_measurement_s) + 1e-9
+        ):
+            self._current_fresh_y_observation_s = float(now_s)
+            self._current_fresh_y_observation_serial += 1
+
+    def _reset_vertical_direction(
+        self, track_id: Optional[str] = None
+    ) -> None:
+        """Clear trajectory-direction evidence at a gate/track boundary."""
+
+        self._vertical_direction_track_id = track_id
+        self._vertical_direction_last_y_observation_serial = 0
+        self._vertical_direction_streak_sign = 0
+        self._vertical_direction_streak = 0
+        self._vertical_direction_sign = 0
+        self._vertical_direction_supported = False
+        self._vertical_direction_source = None
+        self._vertical_direction_fast_until_s = None
+        self._vertical_direction_edge_active = False
+        self._vertical_direction_magnitude = 0.0
+
+    @staticmethod
+    def _coherent_vertical_motion_sign(motion: _PassageMotion) -> int:
+        """Return a shared optical trajectory sign, independent of bearing."""
+
+        values = (
+            motion.fallback_intercept_error,
+            motion.optical_intercept_error,
+            motion.physical_rate_norm_s,
+        )
+        if all(value > 0.0 for value in values):
+            return 1
+        if all(value < 0.0 for value in values):
+            return -1
+        return 0
+
+    def _update_vertical_direction(
+        self,
+        current: _Hypothesis,
+        motion: _PassageMotion,
+        *,
+        now_s: float,
+    ) -> None:
+        """Update direction from distinct optical observations or clipping.
+
+        Static pitch compensation remains useful for level-frame position and
+        conservative correction magnitude, but it does not vote on the
+        near-plane trajectory sign.  Exact direction requires three distinct
+        y measurements whose short-horizon projection, TTC projection, and
+        de-dilated image motion agree.  Projection covariance controls normal
+        magnitude; it cannot erase this separately established direction.
+        """
+
+        cfg = self.config
+        if self._vertical_direction_track_id != current.track_id:
+            self._reset_vertical_direction(current.track_id)
+
+        censor = motion.directional_censor & (
+            FrameEdge.TOP | FrameEdge.BOTTOM
+        )
+        if censor != FrameEdge.NONE:
+            sign = 1 if censor & FrameEdge.BOTTOM else -1
+            first_edge_frame = not self._vertical_direction_edge_active
+            self._vertical_direction_edge_active = True
+            if sign != self._vertical_direction_sign or first_edge_frame:
+                self._vertical_direction_fast_until_s = (
+                    now_s + cfg.vertical_direction_fast_window_s
+                )
+            self._vertical_direction_sign = sign
+            self._vertical_direction_streak_sign = sign
+            self._vertical_direction_streak = max(
+                self._vertical_direction_streak,
+                cfg.vertical_direction_streak_frames,
+            )
+            self._vertical_direction_supported = True
+            self._vertical_direction_source = (
+                "bottom_censor" if sign > 0 else "top_censor"
+            )
+            return
+
+        self._vertical_direction_edge_active = False
+        # Coherent exact motion only takes directional ownership in the
+        # near-plane regime.  Far away, the ordinary uncertainty-weighted
+        # passage controller retains continuous authority.
+        if current.outer_log_scale < cfg.commit_min_log_scale:
+            self._vertical_direction_streak_sign = 0
+            self._vertical_direction_streak = 0
+            return
+
+        sign = self._coherent_vertical_motion_sign(motion)
+        fresh_y_owned = bool(
+            self._current_fresh_observation_track_id == current.track_id
+            and self._current_fresh_y_observation_s is not None
+            and now_s - self._current_fresh_y_observation_s
+            <= cfg.vertical_qualify_max_age_s
+        )
+        direction_resolved = bool(
+            fresh_y_owned
+            and sign != 0
+            and abs(motion.physical_rate_norm_s) * cfg.commit_blackout_s
+            > motion.bearing_std
+        )
+        observation_serial = self._current_fresh_y_observation_serial
+        is_new_measurement = (
+            fresh_y_owned
+            and observation_serial
+            > self._vertical_direction_last_y_observation_serial
+        )
+        if is_new_measurement:
+            self._vertical_direction_last_y_observation_serial = (
+                observation_serial
+            )
+            if direction_resolved:
+                if sign == self._vertical_direction_streak_sign:
+                    self._vertical_direction_streak += 1
+                else:
+                    self._vertical_direction_streak_sign = sign
+                    self._vertical_direction_streak = 1
+            else:
+                self._vertical_direction_streak_sign = 0
+                self._vertical_direction_streak = 0
+
+            if (
+                direction_resolved
+                and self._vertical_direction_streak
+                >= cfg.vertical_direction_streak_frames
+                and sign != self._vertical_direction_sign
+            ):
+                self._vertical_direction_sign = sign
+                self._vertical_direction_fast_until_s = (
+                    now_s + cfg.vertical_direction_fast_window_s
+                )
+
+        if (
+            direction_resolved
+            and sign == self._vertical_direction_sign
+            and self._vertical_direction_streak
+            >= cfg.vertical_direction_streak_frames
+        ):
+            self._vertical_direction_supported = True
+            self._vertical_direction_source = "coherent_motion"
 
     def _vertical_collective_target(
         self,
@@ -3230,21 +3542,59 @@ class CleanCourseController:
                 cfg.vertical_optical_error_max_far_norm
                 - cfg.vertical_optical_error_max_near_norm
             ) * ramp
-            bounded_miss = _clamp(
-                motion.intercept_error, -error_cap, error_cap
-            )
-            visual_delta = (
-                -cfg.vertical_optical_collective_gain
-                * motion.control_authority
-                * bounded_miss
-            )
-            visually_clear = bool(
-                motion.directional_censor != FrameEdge.NONE
-                or abs(motion.intercept_error) > motion.intercept_std
-            )
+            if self._vertical_direction_supported:
+                if motion.directional_censor != FrameEdge.NONE:
+                    # A one-sided bound owns direction immediately.  The cap
+                    # keeps its response inside the same optical envelope.
+                    magnitude = min(abs(motion.bearing_error), error_cap)
+                else:
+                    # Magnitude uncertainty is handled conservatively without
+                    # discarding a coherent sign: use the smaller complete
+                    # model endpoint, not their uncertain blend/covariance.
+                    magnitude = min(
+                        abs(motion.fallback_intercept_error),
+                        abs(motion.optical_intercept_error),
+                        error_cap,
+                    )
+                # Direction remains owned while valid, but correction
+                # magnitude fades to zero across the bounded prediction gap.
+                # This prevents an established sign from turning a frozen
+                # frame into full stale collective authority.
+                magnitude *= motion.freshness_authority
+                self._vertical_direction_magnitude = magnitude
+                visual_delta = (
+                    -cfg.vertical_optical_collective_gain
+                    * self._vertical_direction_sign
+                    * magnitude
+                )
+                visually_clear = magnitude > 0.0
+            else:
+                # F162 baseline away from a resolved near-plane direction:
+                # covariance continuously fades the blended optical miss.
+                bounded_miss = _clamp(
+                    motion.intercept_error, -error_cap, error_cap
+                )
+                visual_delta = (
+                    -cfg.vertical_optical_collective_gain
+                    * motion.control_authority
+                    * bounded_miss
+                )
+                visually_clear = bool(
+                    motion.directional_censor != FrameEdge.NONE
+                    or abs(motion.intercept_error) > motion.intercept_std
+                )
 
         imu_delta = -cfg.vertical_imu_damping_gain * self._vz_est_m_s
-        if visually_clear and visual_delta * imu_delta < 0.0:
+        if (
+            self._vertical_direction_supported
+            and visually_clear
+            and self._vertical_direction_sign * imu_delta > 0.0
+        ):
+            # IMU vz is supporting damping, never a visual veto.  In F162 the
+            # leaky estimate still said "sinking" and added climb after the
+            # coherent optical trajectory already required descent.
+            imu_delta = 0.0
+        elif visually_clear and visual_delta * imu_delta < 0.0:
             imu_delta = math.copysign(
                 min(
                     abs(imu_delta),
@@ -3253,7 +3603,12 @@ class CleanCourseController:
                 ),
                 imu_delta,
             )
-        return support + visual_delta + imu_delta
+        target = support + visual_delta + imu_delta
+        self._last_vertical_support = float(support)
+        self._last_vertical_visual_delta = float(visual_delta)
+        self._last_vertical_imu_delta = float(imu_delta)
+        self._last_vertical_collective_target = float(target)
+        return target
 
     def _lateral_intercept_reference(
         self,
@@ -3329,17 +3684,58 @@ class CleanCourseController:
             cfg.near_plane_steer_gain_mult - 1.0
         ) * self._course_range_ramp(current)
 
-    def _continuous_collective(self, target: float, dt: float) -> float:
-        """Carry one bounded collective request continuously across states."""
+    def _continuous_collective(
+        self, target: float, dt: float, *, now_s: float
+    ) -> float:
+        """Carry one bounded collective, with a bounded direction reversal."""
 
         target = _clamp(target, self.config.min_thrust, self.config.max_thrust)
         if self._collective is None:
             self._collective = target
         else:
-            alpha = _clamp01(
-                dt / max(1e-6, self.config.collective_decay_tau_s + dt)
+            direction_delta = target - self._collective
+            direction_matches = bool(
+                self._vertical_direction_supported
+                and (
+                    (
+                        self._vertical_direction_sign > 0
+                        and direction_delta < 0.0
+                    )
+                    or (
+                        self._vertical_direction_sign < 0
+                        and direction_delta > 0.0
+                    )
+                )
             )
-            self._collective += alpha * (target - self._collective)
+            fast_active = bool(
+                direction_matches
+                and self._vertical_direction_fast_until_s is not None
+                and now_s <= self._vertical_direction_fast_until_s
+            )
+            alpha = _clamp01(
+                dt
+                / max(
+                    1e-6,
+                    self.config.collective_decay_tau_s + dt,
+                )
+            )
+            filtered_step = alpha * direction_delta
+            if fast_active:
+                limit = (
+                    self.config.vertical_direction_fast_slew_per_s * dt
+                )
+                fast_step = _clamp(
+                    direction_delta, -limit, limit
+                )
+                # This path removes response latency; it must never make an
+                # already-faster ordinary filter slower for a large reversal.
+                self._collective += (
+                    fast_step
+                    if abs(fast_step) > abs(filtered_step)
+                    else filtered_step
+                )
+            else:
+                self._collective += filtered_step
         self._collective = _clamp(
             self._collective, self.config.min_thrust, self.config.max_thrust
         )
@@ -3487,6 +3883,8 @@ class CleanCourseController:
 
     def _enter_search(self, now_s: float) -> None:
         self.state = CleanCourseState.SEARCH
+        self._reset_vertical_direction()
+        self._clear_current_fresh_observation()
         # Initialize the real bounded yaw sweep from the last observed
         # target/successor bearing: under the measured 2026-07-29 yaw
         # convention a last image-right bearing is recentered by a POSITIVE
@@ -3901,8 +4299,14 @@ def _clean_course_tick_trace(
             "fallback_intercept_error": motion.fallback_intercept_error,
             "optical_intercept_error": motion.optical_intercept_error,
             "intercept_error": motion.intercept_error,
+            "bearing_std": motion.bearing_std,
             "intercept_std": motion.intercept_std,
+            "freshness_authority": motion.freshness_authority,
+            "measurement_authority": motion.measurement_authority,
             "control_authority": motion.control_authority,
+            "uncertainty_weighted_miss": (
+                motion.control_authority * motion.intercept_error
+            ),
             "directional_censor": int(motion.directional_censor),
         }
 
@@ -3945,6 +4349,36 @@ def _clean_course_tick_trace(
         "vertical_passage_motion": passage_motion_trace(
             controller._last_vertical_motion
         ),
+        "vertical_control": {
+            "direction_sign": controller._vertical_direction_sign,
+            "direction_streak": controller._vertical_direction_streak,
+            "direction_supported": controller._vertical_direction_supported,
+            "direction_source": controller._vertical_direction_source,
+            "direction_magnitude": controller._vertical_direction_magnitude,
+            "fresh_y_observation_serial": (
+                controller._current_fresh_y_observation_serial
+            ),
+            "fresh_y_observation_age_s": (
+                None
+                if controller._current_fresh_y_observation_s is None
+                else now_s - controller._current_fresh_y_observation_s
+            ),
+            "fast_response_remaining_s": (
+                None
+                if controller._vertical_direction_fast_until_s is None
+                else max(
+                    0.0,
+                    controller._vertical_direction_fast_until_s - now_s,
+                )
+            ),
+            "tilt_support": controller._last_vertical_support,
+            "visual_delta": controller._last_vertical_visual_delta,
+            "imu_delta": controller._last_vertical_imu_delta,
+            "target_collective": (
+                controller._last_vertical_collective_target
+            ),
+            "filtered_collective": controller._collective,
+        },
         "turn_aperture_reserve": controller._turn_aperture_reserve,
         "vertical_censor_edge": (
             None if current is None else int(current.vertical_censor_edge)
