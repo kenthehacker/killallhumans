@@ -30,6 +30,7 @@ from scripts.aigp_vq2_clean_course_stage import (
     CleanCourseRuntime,
     CleanCourseState,
     NavigationOutput,
+    _directional_brake_response_authority,
     clamp_final_command,
     run_clean_course_stage,
 )
@@ -52,6 +53,76 @@ def _config(**overrides):
     }
     values.update(overrides)
     return CleanCourseConfig(**values)
+
+
+def _expected_vertical_trajectory_terms(controller, path, motion):
+    """Mirror the outer position/rate/TTC decomposition for law tests."""
+
+    config = controller.config
+    cap = max(
+        config.vertical_optical_error_max_far_norm,
+        config.vertical_optical_error_max_near_norm,
+    )
+    position_miss = max(-cap, min(cap, path.error))
+    rate_observation = path.image_rate_norm_s
+    trajectory_ttc_s = config.passage_ttc_max_s
+    if motion is not None:
+        authority = max(0.0, min(1.0, motion.projection_authority))
+        rate_observation += authority * (
+            motion.physical_rate_norm_s - rate_observation
+        )
+        trajectory_ttc_s += authority * (
+            motion.ttc_s - trajectory_ttc_s
+        )
+    trajectory_ttc_s = max(
+        config.passage_ttc_min_s,
+        min(config.passage_ttc_max_s, trajectory_ttc_s),
+    )
+    required_rate = -position_miss / trajectory_ttc_s
+    rate_miss = max(
+        -cap,
+        min(
+            cap,
+            (rate_observation - required_rate)
+            * config.commit_blackout_s,
+        ),
+    )
+    if position_miss * rate_miss < 0.0:
+        rate_miss = math.copysign(
+            min(abs(rate_miss), 0.5 * abs(position_miss)),
+            rate_miss,
+        )
+    position_delta = (
+        -config.vertical_optical_collective_gain
+        * path.freshness_authority
+        * position_miss
+    )
+    rate_delta = (
+        -config.vertical_optical_collective_gain
+        * path.freshness_authority
+        * rate_miss
+    )
+    projection_delta = 0.0
+    if motion is not None:
+        baseline_intercept = path.error + (
+            rate_observation * trajectory_ttc_s
+        )
+        residual = max(
+            -cap,
+            min(cap, motion.intercept_error - baseline_intercept),
+        )
+        projection_delta = (
+            -config.vertical_optical_collective_gain
+            * motion.control_authority
+            * residual
+        )
+        visual = position_delta + rate_delta
+        if visual * projection_delta < 0.0:
+            projection_delta = math.copysign(
+                min(abs(projection_delta), 0.5 * abs(visual)),
+                projection_delta,
+            )
+    return position_delta, rate_delta, projection_delta
 
 
 def _track(
@@ -248,8 +319,13 @@ def test_vertical_sign_is_the_gate0_minus_form_by_default():
     high_delta = output.thrust - SPAWN_SUPPORT
     assert high_delta > 0.0
     assert high_delta == pytest.approx(-low_delta, abs=1e-9)
+    # Position plus the required image-rate trajectory remains bounded by the
+    # single global optical envelope; it is intentionally a little stronger
+    # than static position alone because zero measured motion cannot erase the
+    # miss by the outer-led TTC.
     assert abs(high_delta) < (
-        controller.config.vertical_optical_collective_gain * 0.20
+        controller.config.vertical_optical_collective_gain
+        * controller.config.vertical_optical_error_max_far_norm
     )
 
 
@@ -315,28 +391,21 @@ def test_vertical_error_is_pitch_attitude_compensated():
     path = level._vertical_path_observation(
         level.current, now_s=100.10, pitch_rad=SPAWN_PITCH
     )
-    expected_position = (
-        -level.config.vertical_optical_collective_gain
-        * path.freshness_authority
-        * level.current.confidence
-        * path.outer_error
-    )
-    expected_projection = (
-        -level.config.vertical_optical_collective_gain
-        * motion.control_authority
-        * (motion.intercept_error - path.error)
+    expected_position, expected_rate, expected_projection = (
+        _expected_vertical_trajectory_terms(level, path, motion)
     )
     assert level._last_vertical_position_delta == pytest.approx(
         expected_position, abs=1e-12
     )
     assert level._last_vertical_motion_delta == pytest.approx(
-        expected_projection, abs=1e-12
+        expected_rate + expected_projection, abs=1e-12
     )
     assert level._last_vertical_direction_delta == pytest.approx(
         0.0, abs=1e-12
     )
     assert level._last_vertical_visual_delta == pytest.approx(
-        expected_position + expected_projection, abs=1e-12
+        expected_position + expected_rate + expected_projection,
+        abs=1e-12,
     )
     assert level._last_vertical_collective_target == pytest.approx(
         level._last_vertical_support
@@ -350,18 +419,29 @@ def test_vertical_error_is_pitch_attitude_compensated():
     assert out.thrust < SPAWN_SUPPORT
 
 
-def test_gate0_takeoff_boost_is_feedforward_only():
-    # Boost-window behavior isolated from the gate-0 climb offset.  A far
-    # track keeps the brake ceiling band out of the window (with the F49
-    # 0.247 support the band top 0.287 would cap the 0.30 boost).
+def test_gate0_takeoff_feedforward_is_owned_by_outer_trajectory():
+    # The configured 0.30 value is a bound, not a launch-phase collective
+    # owner.  A clearly high gate requests bounded spin-up; a low gate keeps
+    # the same outer-y trajectory in control and cannot be forced into a
+    # fixed boost or a below-support pad dip.
     config = CleanCourseConfig(gate0_climb_vertical_offset_norm=0.0)
-    controller = _tracked_controller(
+    high = _tracked_controller(
+        _track("A", 0.0, -0.20, scale=0.05), config=config
+    )
+    boosted = _command(high, 100.10, pitch=SPAWN_PITCH)
+    assert 0.29 < boosted.thrust <= config.launch_boost_thrust
+    assert high._last_launch_collective_delta > 0.0
+
+    low = _tracked_controller(
         _track("A", 0.0, 0.20, scale=0.05), config=config
     )
-    boosted = _command(controller, 100.10, pitch=SPAWN_PITCH)
-    assert boosted.thrust == pytest.approx(config.launch_boost_thrust)
+    low_output = _command(low, 100.10, pitch=SPAWN_PITCH)
+    assert low._last_launch_collective_delta > 0.0
+    assert low_output.thrust >= low._last_vertical_support - 0.0005
+    assert low_output.thrust < boosted.thrust
+
     first_after = _command(
-        controller, 100.0 + config.launch_boost_duration_s + 0.05,
+        high, 100.0 + config.launch_boost_duration_s + 0.05,
         pitch=SPAWN_PITCH,
     )
     # The one collective owner carries the launch request through the seam
@@ -371,7 +451,7 @@ def test_gate0_takeoff_boost_is_feedforward_only():
     now = 100.0 + config.launch_boost_duration_s + 0.05
     for _ in range(30):
         now += 0.033
-        thrusts.append(_command(controller, now, pitch=SPAWN_PITCH).thrust)
+        thrusts.append(_command(high, now, pitch=SPAWN_PITCH).thrust)
     assert all(b <= a + 1e-12 for a, b in zip(thrusts, thrusts[1:]))
     assert thrusts[-1] == pytest.approx(SPAWN_SUPPORT, abs=0.003)
 
@@ -513,28 +593,21 @@ def test_gate0_climb_vertical_offset_is_bounded_feedforward():
     )
     assert path.outer_error == pytest.approx(-0.10, abs=1e-12)
     assert motion.bearing_error == pytest.approx(-0.35, abs=1e-12)
-    expected_position = (
-        -config.vertical_optical_collective_gain
-        * path.freshness_authority
-        * controller.current.confidence
-        * path.outer_error
-    )
-    expected_projection = (
-        -config.vertical_optical_collective_gain
-        * motion.control_authority
-        * (motion.intercept_error - path.error)
+    expected_position, expected_rate, expected_projection = (
+        _expected_vertical_trajectory_terms(controller, path, motion)
     )
     assert controller._last_vertical_position_delta == pytest.approx(
         expected_position, abs=1e-12
     )
     assert controller._last_vertical_motion_delta == pytest.approx(
-        expected_projection, abs=1e-12
+        expected_rate + expected_projection, abs=1e-12
     )
     assert controller._last_vertical_direction_delta == pytest.approx(
         0.0, abs=1e-12
     )
     assert controller._last_vertical_visual_delta == pytest.approx(
-        expected_position + expected_projection, abs=1e-12
+        expected_position + expected_rate + expected_projection,
+        abs=1e-12,
     )
     assert controller._last_vertical_collective_target == pytest.approx(
         controller._last_vertical_support
@@ -654,25 +727,18 @@ def test_gate0_climb_offset_never_lifts_aim_above_center():
     )
     assert path.outer_error == pytest.approx(0.10, abs=1e-12)
     assert motion.bearing_error == pytest.approx(path.error, abs=1e-12)
-    expected_position = (
-        -config.vertical_optical_collective_gain
-        * path.freshness_authority
-        * below.current.confidence
-        * path.outer_error
-    )
-    expected_projection = (
-        -config.vertical_optical_collective_gain
-        * motion.control_authority
-        * (motion.intercept_error - path.error)
+    expected_position, expected_rate, expected_projection = (
+        _expected_vertical_trajectory_terms(below, path, motion)
     )
     assert below._last_vertical_position_delta == pytest.approx(
         expected_position, abs=1e-12
     )
     assert below._last_vertical_motion_delta == pytest.approx(
-        expected_projection, abs=1e-12
+        expected_rate + expected_projection, abs=1e-12
     )
     assert below._last_vertical_visual_delta == pytest.approx(
         expected_position
+        + expected_rate
         + expected_projection
         + below._last_vertical_direction_delta,
         abs=1e-12,
@@ -726,25 +792,8 @@ def test_gate0_closure_dilation_is_not_a_vertical_term():
     path = controller._vertical_path_observation(
         controller.current, now_s=100.10, pitch_rad=SPAWN_PITCH
     )
-    freshness = path.freshness_authority * controller.current.confidence
-    expected_position = (
-        -controller.config.vertical_optical_collective_gain
-        * freshness
-        * path.outer_error
-    )
-    expected_rate = (
-        -controller.config.vertical_optical_collective_gain
-        * freshness
-        * path.image_rate_norm_s
-        * controller.config.commit_blackout_s
-    )
-    baseline_intercept = path.error + (
-        path.image_rate_norm_s * controller.config.commit_blackout_s
-    )
-    expected_projection = (
-        -controller.config.vertical_optical_collective_gain
-        * motion.control_authority
-        * (motion.intercept_error - baseline_intercept)
+    expected_position, expected_rate, expected_projection = (
+        _expected_vertical_trajectory_terms(controller, path, motion)
     )
     assert expected_rate > 0.0
     assert expected_projection < 0.0
@@ -1097,7 +1146,8 @@ def test_f162_motion_direction_reverses_before_static_bearing_and_imu():
     # F162's first three coherent near-plane samples all project the aperture
     # downward even though static pitch compensation still says it is above
     # center.  Three distinct frames own descent at t=5.453; uncertainty may
-    # reduce magnitude but sinking IMU vz may not add opposite-direction climb.
+    # reduce magnitude, while IMU damping remains only a bounded innovation
+    # and cannot veto the visually owned direction.
     controller = _f162_gate1_controller()
     controller._collective = 0.2762406
     outputs = []
@@ -1119,7 +1169,19 @@ def test_f162_motion_direction_reverses_before_static_bearing_and_imu():
     assert controller._vertical_direction_sign == 1
     assert controller._vertical_direction_streak >= 3
     assert controller._vertical_direction_source == "coherent_motion"
-    assert controller._last_vertical_imu_delta == 0.0
+    assert abs(controller._last_vertical_imu_delta) <= (
+        controller.config.vertical_imu_max_opposition_fraction
+        * max(
+            abs(controller._last_vertical_visual_delta),
+            abs(controller._last_vertical_motion_delta),
+        )
+        + 1e-12
+    )
+    assert (
+        controller._last_vertical_visual_delta
+        + controller._last_vertical_imu_delta
+        < 0.0
+    )
     assert controller._last_vertical_collective_target < (
         controller._last_vertical_support
     )
@@ -1904,7 +1966,19 @@ def test_f162_first_bottom_frame_immediately_owns_vertical_direction():
     )
     assert controller._vertical_direction_source == "bottom_censor"
     assert controller._vertical_direction_sign == 1
-    assert controller._last_vertical_imu_delta == 0.0
+    assert abs(controller._last_vertical_imu_delta) <= (
+        controller.config.vertical_imu_max_opposition_fraction
+        * max(
+            abs(controller._last_vertical_visual_delta),
+            abs(controller._last_vertical_motion_delta),
+        )
+        + 1e-12
+    )
+    assert (
+        controller._last_vertical_visual_delta
+        + controller._last_vertical_imu_delta
+        < 0.0
+    )
     assert controller._last_vertical_collective_target < (
         controller._last_vertical_support
     )
@@ -3386,6 +3460,331 @@ def test_successor_reassociation_cannot_recreate_precredit_s_turn():
         for left, right in zip(samples, samples[1:])
     ]
     assert max(yaw_steps) < 0.08
+
+
+def test_f168_f167_credit_before_replacement_reconciles_authorized_gate():
+    # Exact ordering from duplicate b47c8d21.  Race credit is delivered before
+    # tracker frame 2563268.  The top-level target frame froze at 2563264 in
+    # the live trace, but these clean tracker tokens continued advancing and
+    # are the only valid freshness identity for this replay.
+    rows = (
+        (2.266, 2563246, (-0.074467, 0.553317, -0.092444), (("000001", (0.068750, -0.088889), (0.335938, 0.586111), 0.995212), ("000002", (-0.362500, -0.127778), (0.076562, 0.166667), 0.625495))),
+        (2.313, 2563248, (-0.067452, 0.487299, -0.082652), (("000001", (0.006250, -0.177778), (0.446875, 0.650000), 0.961898),)),
+        (2.359, 2563249, (-0.082505, 0.411948, -0.066429), (("000001", (0.021875, -0.222222), (0.462500, 0.691667), 0.952734),)),
+        (2.406, 2563251, (-0.064116, 0.363754, -0.055701), ()),
+        (2.453, 2563252, (-0.039754, 0.312770, -0.040357), ()),
+        (2.484, 2563253, (-0.028495, 0.287961, -0.035850), ()),
+        (2.516, 2563254, (-0.002528, 0.240838, -0.029696), ()),
+        (2.563, 2563255, (0.042319, 0.212398, -0.000098), ()),
+        (2.609, 2563257, (0.071036, 0.181519, 0.050051), ()),
+        (2.656, 2563258, (0.105947, 0.148797, 0.115410), ()),
+        (2.703, 2563259, (0.105623, 0.122730, 0.141680), ()),
+        (2.750, 2563261, (0.029472, -0.010910, 0.096297), ()),
+        (2.797, 2563262, (0.050517, -0.030163, 0.121178), ()),
+        (2.844, 2563264, (0.073114, 0.004247, 0.226815), (("000003", (-0.465625, -0.450000), (0.106250, 0.219444), 0.702566),)),
+        (2.891, 2563265, (0.055314, -0.023534, 0.308919), (("000003", (-0.478125, -0.455556), (0.109375, 0.222222), 0.709395),)),
+        (2.922, 2563266, (0.071544, -0.041841, 0.347190), (("000003", (-0.496875, -0.466667), (0.114063, 0.230556), 0.717633),)),
+        (2.953, 2563267, (0.088708, -0.039556, 0.340910), (("000003", (-0.518750, -0.472222), (0.117188, 0.236111), 0.720079),)),
+        (2.984, 2563268, (0.067378, -0.046544, 0.326438), (("000003", (-0.540625, -0.477778), (0.121875, 0.241667), 0.738271),)),
+        (3.016, 2563269, (0.068769, -0.056515, 0.222989), (("000003", (-0.562500, -0.483333), (0.125000, 0.250000), 0.741436),)),
+        (3.141, 2563273, (-0.000012, -0.076464, -0.293137), (("000003", (-0.559375, -0.472222), (0.135937, 0.261111), 0.783725),)),
+        # One republished tracker frame stays PREDICT at most; the next real
+        # token restores TRACK and never becomes a frozen-frame SEARCH.
+        (3.172, 2563273, (0.024671, -0.078661, -0.297917), (("000003", (-0.559375, -0.472222), (0.135937, 0.261111), 0.783725),)),
+        (3.203, 2563275, (-0.040266, -0.083746, -0.335957), (("000003", (-0.553125, -0.461111), (0.140625, 0.261111), 0.799198),)),
+        (3.422, 2563281, (-0.054991, -0.069531, -0.329468), (("000003", (-0.525000, -0.438889), (0.157813, 0.277778), 0.834724), ("000004", (0.003125, -0.155556), (0.029687, 0.086111), 0.420400))),
+        (3.703, 2563290, (-0.063707, -0.056485, -0.329596), (("000003", (-0.503125, -0.438889), (0.192187, 0.313889), 0.825139), ("000004", (0.096875, -0.133333), (0.032813, 0.091667), 0.426510))),
+        (3.766, 2563291, (-0.066407, -0.054044, -0.329594), (("000003", (-0.503125, -0.438889), (0.196875, 0.319444), 0.807909), ("000004", (0.109375, -0.127778), (0.032813, 0.094444), 0.429344))),
+        (3.797, 2563292, (-0.115047, -0.157195, -0.236294), (("000003", (-0.503125, -0.438889), (0.203125, 0.327778), 0.800529), ("000004", (0.121875, -0.127778), (0.032813, 0.094444), 0.429738))),
+    )
+
+    def tracks(specs):
+        return [
+            _f163_trace_track(
+                track_id=f"vq2-track-{track_id}",
+                outer_center=center,
+                outer_span=span,
+                confidence=confidence,
+            )
+            for track_id, center, span, confidence in specs
+        ]
+
+    first = rows[0]
+    initial_tracks = tracks(first[3])
+    gate_zero = initial_tracks[0]
+    controller = CleanCourseController(_config())
+    controller.initialize(
+        _update(initial_tracks, frame_id=first[1]),
+        gate_index=0,
+        fallback_center_norm=gate_zero.center_norm,
+        fallback_apparent_scale=gate_zero.apparent_scale,
+        now_s=100.0 + first[0],
+    )
+    post_credit = []
+    previous_frame_id = first[1]
+    promoted_lineage = None
+    for elapsed, frame_id, body_rates, specs in rows[1:]:
+        now = 100.0 + elapsed
+        if elapsed == 2.984:
+            promoted_lineage = controller.successor
+            assert controller.note_race(
+                gate_index=1, race_boot_ms=2400, now_s=now
+            )
+            assert controller.current is promoted_lineage
+            assert controller.current.track_id == "vq2-track-000002"
+            assert controller.state is CleanCourseState.PREDICT
+        measurement_before = (
+            controller.current.last_measurement_s
+            if controller.current is not None
+            else None
+        )
+        controller.observe(
+            _update(tracks(specs), frame_id=frame_id),
+            now_s=now,
+            body_rates=body_rates,
+        )
+        if elapsed >= 2.984:
+            assert controller.current is promoted_lineage
+            if frame_id == previous_frame_id:
+                assert controller.current.last_measurement_s == pytest.approx(
+                    measurement_before
+                )
+            else:
+                assert controller.current.last_measurement_s == pytest.approx(now)
+            output = _command(
+                controller,
+                now,
+                pitch=SPAWN_PITCH,
+                yaw=0.0,
+            )
+            post_credit.append((elapsed, frame_id, output))
+            assert controller.current.track_id == "vq2-track-000003"
+            assert output.current_track_id == "vq2-track-000003"
+            assert output.successor_track_id != "vq2-track-000003"
+            assert controller.state is not CleanCourseState.SEARCH
+            assert output.yaw_rate_rad_s < 0.0
+            assert output.target_roll_rad < 0.0
+            assert output.yaw_rate_rad_s * output.target_roll_rad > 0.0
+            assert controller._last_vertical_path_error < 0.0
+        previous_frame_id = frame_id
+
+    assert controller._last_reconcile_status == "promoted-current-rebound"
+    assert all(frame_id >= 2563268 for _t, frame_id, _out in post_credit)
+    assert any(
+        left[1] != right[1]
+        for left, right in zip(post_credit, post_credit[1:])
+    )
+    assert all(
+        output.current_track_id != "vq2-track-000004"
+        for _elapsed, _frame_id, output in post_credit
+    )
+
+
+def test_f168_promoted_lineage_holds_ambiguous_and_tiny_replacements():
+    # Race authority promotes one logical successor, not whichever detector id
+    # wins the next confidence ranking.  Two compatible replacements are
+    # ambiguous; a tiny fragment and a tracker-ambiguous candidate are not
+    # identity evidence.  Even after prediction authority expires they hold a
+    # bounded SEARCH until one accepted replacement becomes unique.
+    gate_zero = _track("gate-zero", 0.0, 0.0, scale=0.30, confidence=0.95)
+    successor = _track(
+        "successor-old", -0.30, -0.20, scale=0.17, confidence=0.80
+    )
+    controller = CleanCourseController(_config())
+    controller.initialize(
+        _update([gate_zero, successor], frame_id=10),
+        gate_index=0,
+        fallback_center_norm=gate_zero.center_norm,
+        fallback_apparent_scale=gate_zero.apparent_scale,
+        now_s=100.0,
+    )
+    successor_lineage = controller.successor
+    assert controller.note_race(
+        gate_index=1, race_boot_ms=1000, now_s=100.10
+    )
+    assert controller.current is successor_lineage
+    assert controller.state is CleanCourseState.TRACK
+
+    candidate_a = _track(
+        "candidate-a", -0.31, -0.20, scale=0.18, confidence=0.90
+    )
+    candidate_b = _track(
+        "candidate-b", -0.29, -0.19, scale=0.18, confidence=0.89
+    )
+    controller.observe(
+        _update([candidate_a, candidate_b], frame_id=11), now_s=100.13
+    )
+    assert controller.state is CleanCourseState.SEARCH
+    assert controller.current is successor_lineage
+    assert controller.current.track_id == "successor-old"
+    assert controller.successor is None
+    assert controller._last_reconcile_status == "ambiguous-search-hold"
+
+    tiny = _track("tiny-fragment", -0.30, -0.20, scale=0.05, confidence=0.99)
+    tracker_ambiguous = _track(
+        "tracker-ambiguous", -0.30, -0.20, scale=0.18, confidence=0.99
+    )
+    tracker_ambiguous.ambiguous = True
+    controller.observe(
+        _update([tiny, tracker_ambiguous], frame_id=12), now_s=101.70
+    )
+    assert controller.state is CleanCourseState.SEARCH
+    assert controller.current is successor_lineage
+    assert controller.current.track_id == "successor-old"
+    assert controller.successor is None
+    assert controller._last_reconcile_status == "expired-search-hold"
+    assert controller._promoted_reconcile_gate_index == 1
+
+    accepted = _track(
+        "accepted-replacement", -0.30, -0.20, scale=0.19, confidence=0.85
+    )
+    controller.observe(_update([accepted], frame_id=13), now_s=101.73)
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.current is successor_lineage
+    assert controller.current.track_id == "accepted-replacement"
+    assert controller._last_reconcile_status == "promoted-current-rebound"
+
+
+def test_f168_tracker_replacement_does_not_inherit_aperture_fit_sigma():
+    # Aperture fitting and tracker-alias identity are independent contracts.
+    # A deliberately permissive aperture fit must not authorize a spatially
+    # incompatible replacement when the identity innovation gate rejects it.
+    config = _config(
+        aperture_scale_innovation_sigma=100.0,
+        track_replacement_innovation_sigma=0.25,
+    )
+    gate_zero = _track("gate-zero", 0.0, 0.0, scale=0.30, confidence=0.95)
+    successor = _track(
+        "successor-old", -0.30, -0.20, scale=0.17, confidence=0.80
+    )
+    controller = CleanCourseController(config)
+    controller.initialize(
+        _update([gate_zero, successor], frame_id=20),
+        gate_index=0,
+        fallback_center_norm=gate_zero.center_norm,
+        fallback_apparent_scale=gate_zero.apparent_scale,
+        now_s=100.0,
+    )
+    lineage = controller.successor
+    assert controller.note_race(
+        gate_index=1, race_boot_ms=1000, now_s=100.10
+    )
+
+    incompatible = _track(
+        "spatial-outlier", -0.20, -0.20, scale=0.17, confidence=0.99
+    )
+    controller.observe(_update([incompatible], frame_id=21), now_s=100.13)
+    assert controller.state is CleanCourseState.SEARCH
+    assert controller.current is lineage
+    assert controller.current.track_id == "successor-old"
+    assert controller._last_reconcile_status == "incompatible-search-hold"
+
+    accepted = _track(
+        "spatial-match", -0.30, -0.20, scale=0.17, confidence=0.85
+    )
+    controller.observe(_update([accepted], frame_id=22), now_s=100.16)
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.current is lineage
+    assert controller.current.track_id == "spatial-match"
+
+
+def test_f168_release_rebind_keeps_successor_yaw_roll_and_vertical_coherent():
+    # Reach COMMIT through recorded observations, retain a left Gate-1
+    # successor, and then lose Gate 0 with a stale RIGHT edge.  Exact zero is
+    # still mandatory.  During the bounded credit delay a compatible fresh id
+    # must inherit the successor lineage and own yaw, bank, and outer-y
+    # together; the released old-current edge has no remaining authority.
+    passage_rows = (
+        (1.953, 2052998, (0.053125, 0.161111), (0.25, 0.408333), -0.429284, 0, (0.040326, 0.148286), (0.118122, 0.212459), (-0.069072, -0.117701, -0.093605), FrameEdge.NONE),
+        (2.141, 2053004, (0.068750, 0.205556), (0.2828125, 0.486111), -0.445374, 0, (0.064315, 0.182856), (0.136344, 0.246483), (-0.046209, -0.054793, -0.075266), FrameEdge.NONE),
+        (2.297, 2053009, (0.084375, 0.238889), (0.3328125, 0.577778), -0.452093, 0, (0.082114, 0.200117), (0.157505, 0.286893), (-0.005388, -0.033068, -0.031834), FrameEdge.NONE),
+        (2.422, 2053012, (0.093750, 0.261111), (0.375000, 0.647222), -0.455251, 0, (0.088084, 0.210567), (0.173966, 0.319578), (0.047329, -0.020963, 0.016417), FrameEdge.NONE),
+        (2.469, 2053014, (0.034375, 0.283333), (0.4828125, 0.713889), -0.456153, 0, None, None, (0.065514, -0.016982, 0.029759), FrameEdge.BOTTOM),
+    )
+    controller, _outputs = _replay_f163_rows(passage_rows, gate_index=0)
+    assert controller.state is CleanCourseState.COMMIT
+    current_edge = _f163_trace_track(
+        track_id="recorded-current",
+        outer_center=(0.20, 0.10),
+        outer_span=(0.70, 0.80),
+        confidence=0.80,
+        clipping=FrameEdge.RIGHT,
+    )
+    old_successor = _f163_trace_track(
+        track_id="old-successor",
+        outer_center=(-0.42, -0.28),
+        outer_span=(0.11, 0.22),
+        confidence=0.80,
+    )
+    controller.observe(
+        _update([current_edge, old_successor], frame_id=2053015),
+        now_s=102.50,
+    )
+    assert controller.current.horizontal_censor_edge == FrameEdge.RIGHT
+    controller.observe(
+        _update([old_successor], frame_id=2053016), now_s=102.54
+    )
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    exact_zero = _command(
+        controller, 102.56, pitch=-0.45, yaw=0.0
+    )
+    assert (
+        exact_zero.target_roll_rad,
+        exact_zero.target_pitch_rad,
+        exact_zero.yaw_rate_rad_s,
+        exact_zero.thrust,
+    ) == (0.0, 0.0, 0.0, 0.0)
+    pending = _command(controller, 102.58, pitch=-0.45, yaw=0.0)
+    assert pending.state is CleanCourseState.SEARCH
+
+    replacement = _f163_trace_track(
+        track_id="fresh-successor",
+        outer_center=(-0.45, -0.30),
+        outer_span=(0.12, 0.24),
+        confidence=0.84,
+    )
+    controller.observe(
+        _update([replacement], frame_id=2053017), now_s=102.62
+    )
+    assert controller.successor.track_id == "fresh-successor"
+    assert controller._last_reconcile_status == "released-successor-rebound"
+    successor_lineage = controller.successor
+    precredit = _command(controller, 102.63, pitch=-0.40, yaw=0.0)
+    assert precredit.yaw_rate_rad_s < 0.0
+    assert precredit.target_roll_rad < 0.0
+    assert precredit.yaw_rate_rad_s * precredit.target_roll_rad > 0.0
+    assert controller._last_vertical_path_error < 0.0
+    assert precredit.successor_track_id == "fresh-successor"
+
+    prepromotion_reference = controller._lateral_intercept_reference_x
+    assert controller.note_race(
+        gate_index=1, race_boot_ms=4000, now_s=102.64
+    )
+    assert controller.current is successor_lineage
+    assert controller.current.track_id == "fresh-successor"
+    assert controller._lateral_intercept_reference_x == pytest.approx(
+        prepromotion_reference
+    )
+    # Even a successor that was fresh enough to promote as TRACK can change
+    # tracker aliases on the next frame.  The logical hypothesis and its path
+    # state survive that immediate handoff.
+    second_alias = _f163_trace_track(
+        track_id="fresh-successor-2",
+        outer_center=(-0.46, -0.31),
+        outer_span=(0.13, 0.25),
+        confidence=0.86,
+    )
+    controller.observe(
+        _update([second_alias], frame_id=2053018), now_s=102.67
+    )
+    assert controller.current is successor_lineage
+    assert controller.current.track_id == "fresh-successor-2"
+    assert controller._last_reconcile_status == "promoted-current-rebound"
+    postcredit = _command(controller, 102.68, pitch=-0.40, yaw=0.0)
+    assert postcredit.yaw_rate_rad_s < 0.0
+    assert postcredit.target_roll_rad < 0.0
+    assert postcredit.yaw_rate_rad_s * postcredit.target_roll_rad > 0.0
+    assert controller._last_vertical_path_error < 0.0
 
 
 def test_weak_successor_evidence_decays_turn_reference_smoothly():
@@ -5074,29 +5473,251 @@ def test_f167_recorded_f166_launch_keeps_visual_primary_collective():
                 controller._last_vertical_path_error,
                 controller._last_vertical_visual_delta,
                 controller._last_vertical_imu_delta,
+                controller._last_vertical_imu_raw_delta,
+                controller._last_vertical_motion_delta,
                 controller._last_vertical_support,
                 controller._last_vertical_collective_target,
                 output.thrust,
+                controller._last_launch_collective_delta,
             )
         )
 
-    for elapsed, path, visual, imu, support, target, wire in samples:
-        if visual * imu > 0.0:
-            assert abs(imu) <= abs(visual) + 1e-12
-        if elapsed <= controller.config.launch_pitch_blend_s and path <= 0.0:
-            assert target >= support - 1e-12
+    for (
+        elapsed,
+        path,
+        visual,
+        imu,
+        imu_raw,
+        optical_motion,
+        support,
+        target,
+        wire,
+        launch,
+    ) in samples:
+        # IMU damping remains present as a bounded innovation around optical
+        # image motion; it is neither deleted on every fresh frame nor added
+        # as a second full copy of the same launch motion.
+        innovation_bound = (
+            controller.config.vertical_imu_max_opposition_fraction
+            * max(abs(visual), abs(optical_motion), 1e-6)
+        )
+        assert abs(imu) <= innovation_bound + 1e-12
+        if abs(imu_raw) > innovation_bound + abs(optical_motion):
+            assert abs(imu) < abs(imu_raw)
+        assert target == pytest.approx(
+            support + visual + imu + launch, abs=1e-12
+        )
         assert controller.config.min_thrust <= wire <= controller.config.max_thrust
+    assert max(
+        abs(right[5] - left[5])
+        for left, right in zip(samples, samples[1:])
+    ) < 0.015
     # The original wire was below support continuously from .704 to 1.172.
     # With one visual-primary owner the same recorded-state counterfactual
     # returns to the previously smooth F163 support envelope instead of the
     # F166 ~-0.018 collective deficit.
     late = [sample for sample in samples if 0.704 <= sample[0] <= 1.172]
-    assert min(wire - support for *_, support, _target, wire in late) >= -0.007
+    assert min(
+        wire - support
+        for *_, support, _target, wire, _launch in late
+    ) >= -0.0071
     maximum_nose_up_reversal = _maximum_advance_to_brake_reversal(pitches)
     assert maximum_nose_up_reversal < math.radians(0.5)
     assert sum(
         abs(right - left) for left, right in zip(pitches, pitches[1:])
     ) < 0.10
+
+
+def test_f168_newest_f167_launch_replay_has_one_bumpless_vertical_owner():
+    # F167 duplicate 20260802T035806Z-visual-course-b47c8d21, trace SHA-256
+    # B4F9C9610D53D44A86749BBC1E6BDFC397DFAA5218A61117FAC2FF107D53BA20.
+    # The .609/.641 command ticks intentionally share tracker frame 18: a
+    # command-rate replay must not invent another coherent-motion sample.
+    rows = (
+        # t, frame, outer center/span/conf, pitch, rates, aperture center/half, a_up
+        (0.000, 1, (-0.006250, -0.033333), (0.125000, 0.222222), 0.846257, -0.310343, (-0.000049, 0.000126, 0.0), (-0.005176, -0.046216), (0.049398, 0.104840), 0.003350),
+        (0.375, 12, (0.0, -0.022222), (0.128125, 0.225000), 0.849718, -0.313632, (0.003633, -0.010614, -0.000344), (0.002675, -0.006987), (0.053654, 0.102581), 1.416966),
+        (0.469, 14, (0.0, -0.016667), (0.129688, 0.227778), 0.854410, -0.314665, (0.005709, -0.009120, 0.003094), (0.002152, -0.009474), (0.054492, 0.104931), 1.321874),
+        (0.578, 17, (0.0, -0.005556), (0.131250, 0.233333), 0.860686, -0.315472, (-0.008664, -0.006671, -0.009546), (0.002335, 0.003248), (0.060591, 0.116197), 0.819822),
+        (0.609, 18, (0.0, 0.0), (0.132812, 0.233333), 0.854119, -0.315693, (-0.002579, -0.005893, -0.011755), (0.000037, -0.001236), (0.065966, 0.118626), 0.606837),
+        (0.641, 18, (0.0, 0.0), (0.132812, 0.233333), 0.854119, -0.315829, (0.003167, -0.004412, -0.005886), (0.000037, -0.001236), (0.065966, 0.118626), 0.335494),
+        (0.672, 19, (0.0, 0.0), (0.134375, 0.236111), 0.854300, -0.315936, (-0.002832, -0.003565, -0.000695), (-0.000293, 0.003314), (0.067886, 0.121686), 0.033715),
+        (0.703, 20, (0.0, 0.005556), (0.134375, 0.236111), 0.858551, -0.316052, (-0.003070, -0.002931, 0.000333), (0.003512, 0.006195), (0.067047, 0.124361), -0.071521),
+        (0.734, 21, (0.0, 0.011111), (0.137500, 0.238889), 0.862748, -0.316088, (0.004421, -0.000299, -0.000702), (0.001454, 0.011676), (0.067310, 0.124435), -0.403316),
+        (0.766, 22, (0.0, 0.011111), (0.137500, 0.244444), 0.879133, -0.316006, (0.004264, 0.003645, 0.000487), (0.003827, 0.012353), (0.064554, 0.124475), -0.705802),
+        (0.797, 23, (0.0, 0.016667), (0.137500, 0.244444), 0.889103, -0.315841, (0.000540, 0.005251, 0.002399), (0.004198, 0.018659), (0.063788, 0.123007), -0.918585),
+        (0.875, 25, (0.0, 0.022222), (0.142188, 0.247222), 0.895798, -0.315296, (0.006856, 0.008487, 0.005611), (0.006090, 0.031870), (0.066813, 0.120908), -1.376124),
+        (0.969, 27, (0.0, 0.027778), (0.146875, 0.255556), 0.913806, -0.314330, (0.010915, 0.011837, 0.009216), (-0.000502, 0.026725), (0.076007, 0.131608), -1.996676),
+        (1.063, 30, (-0.003125, 0.022222), (0.150000, 0.263889), 0.937356, -0.313174, (0.007135, 0.013733, 0.001391), (-0.001563, 0.025000), (0.078125, 0.138889), -1.805453),
+        (1.156, 33, (0.0, 0.022222), (0.154687, 0.275000), 0.960827, -0.311814, (0.001546, 0.013752, -0.000936), (0.000028, 0.023683), (0.079236, 0.138670), -1.327557),
+        (1.281, 37, (0.003125, 0.016667), (0.164062, 0.286111), 0.989677, -0.310143, (-0.000498, 0.016166, -0.002576), (-0.000410, 0.014893), (0.084366, 0.151004), -1.154699),
+    )
+    controller = CleanCourseController(
+        _config(launch_boost_duration_s=LAUNCH_BOOST_DURATION_S)
+    )
+    samples = []
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        track = _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            aperture_center=row[7],
+            aperture_half=row[8],
+        )
+        update = _update([track], frame_id=row[1])
+        if index == 0:
+            controller.initialize(
+                update,
+                gate_index=0,
+                fallback_center_norm=row[2],
+                fallback_apparent_scale=math.sqrt(row[3][0] * row[3][1]),
+                now_s=now,
+            )
+        else:
+            controller.observe(update, now_s=now, body_rates=row[6])
+        output = _command(
+            controller,
+            now,
+            pitch=row[5],
+            a_up=row[9],
+        )
+        samples.append(
+            {
+                "t": row[0],
+                "serial": controller._current_fresh_outer_y_observation_serial,
+                "visual": controller._last_vertical_visual_delta,
+                "motion": controller._last_vertical_motion_delta,
+                "imu": controller._last_vertical_imu_delta,
+                "imu_raw": controller._last_vertical_imu_raw_delta,
+                "support": controller._last_vertical_support,
+                "target": controller._last_vertical_collective_target,
+                "wire": output.thrust,
+                "pitch": output.target_pitch_rad,
+            }
+        )
+
+    assert samples[4]["serial"] == samples[5]["serial"]
+    assert any(abs(sample["imu"]) > 1e-6 for sample in samples)
+    for sample in samples:
+        bound = (
+            controller.config.vertical_imu_max_opposition_fraction
+            * max(
+                abs(sample["visual"]),
+                abs(sample["motion"]),
+                1e-6,
+            )
+        )
+        assert abs(sample["imu"]) <= bound + 1e-12
+        if abs(sample["imu_raw"]) > bound + abs(sample["motion"]):
+            assert abs(sample["imu"]) < abs(sample["imu_raw"])
+    crossing = [sample for sample in samples if 0.609 <= sample["t"] <= 0.797]
+    assert max(
+        abs(right["target"] - left["target"])
+        for left, right in zip(crossing, crossing[1:])
+    ) < 0.005
+    assert min(
+        sample["wire"] - sample["support"] for sample in samples
+    ) >= -0.0073
+    recovery = [sample for sample in samples if sample["t"] >= 0.969]
+    assert all(
+        right["wire"] >= left["wire"] - 1e-12
+        for left, right in zip(recovery, recovery[1:])
+    )
+    assert _maximum_advance_to_brake_reversal(
+        [sample["pitch"] for sample in samples]
+    ) < math.radians(0.5)
+
+
+def test_f168_commit_pitch_transfer_and_response_are_direction_safe():
+    # Recorded F167 COMMIT counterfactual.  The old runtime applied the 0.9537
+    # brake demand as a generic high gain while its target reversed toward
+    # advance.  Extra authority is now nonzero only for a brake-direction
+    # error; its marginal pitch-rate contribution can never be nose-down.
+    rows = (
+        (1.953, -0.4527, -0.3754, 0.9537),
+        (1.984, -0.4217, -0.3840, 0.9537),
+        (2.031, -0.3747, -0.3914, 0.9537),
+        (2.109, -0.2967, -0.3868, 0.9537),
+        (2.219, -0.1867, -0.3504, 0.9537),
+        (2.406, -0.1603, -0.2624, 0.9537),
+    )
+    authorities = []
+    for _t, target, measured, demand in rows:
+        authority = _directional_brake_response_authority(
+            demand,
+            target_pitch_rad=target,
+            measured_pitch_rad=measured,
+            brake_pitch_offset_rad=-0.15,
+        )
+        authorities.append(authority)
+        marginal = authority * (target - measured)
+        assert marginal <= 1e-12
+    assert authorities[:2] == pytest.approx([0.9537, 0.9537])
+    assert authorities[2:] == pytest.approx([0.0] * 4)
+
+    # A real public-observation replay reaches COMMIT without injecting state.
+    # Its first COMMIT tick and every later one carry the preceding TRACK
+    # target exactly instead of selecting a new phase endpoint.
+    passage_rows = (
+        (1.953, 2052998, (0.053125, 0.161111), (0.25, 0.408333), -0.429284, 0, (0.040326, 0.148286), (0.118122, 0.212459), (-0.069072, -0.117701, -0.093605), FrameEdge.NONE),
+        (2.141, 2053004, (0.06875, 0.205556), (0.2828125, 0.486111), -0.445374, 0, (0.064315, 0.182856), (0.136344, 0.246483), (-0.046209, -0.054793, -0.075266), FrameEdge.NONE),
+        (2.297, 2053009, (0.084375, 0.238889), (0.3328125, 0.577778), -0.452093, 0, (0.082114, 0.200117), (0.157505, 0.286893), (-0.005388, -0.033068, -0.031834), FrameEdge.NONE),
+        (2.422, 2053012, (0.093750, 0.261111), (0.375, 0.647222), -0.455251, 0, (0.088084, 0.210567), (0.173966, 0.319578), (0.047329, -0.020963, 0.016417), FrameEdge.NONE),
+    )
+    controller, outputs = _replay_f163_rows(passage_rows, gate_index=0)
+    first_commit = next(
+        index
+        for index, output in enumerate(outputs)
+        if output.state is CleanCourseState.COMMIT
+    )
+    assert first_commit > 0
+    admitted_pitch = outputs[first_commit - 1].target_pitch_rad
+    assert controller._commit_pitch_target_rad == pytest.approx(admitted_pitch)
+    assert all(
+        output.target_pitch_rad == pytest.approx(admitted_pitch)
+        for output in outputs[first_commit:]
+    )
+
+
+def test_f168_f167_commit_carries_positive_lower_clearance_to_exact_zero():
+    # F167's recorded corridor translation is held fixed while only the
+    # camera-pitch component is counterfactually reprojected.  Carrying the
+    # entry pitch (rather than injecting the +0.15 COMMIT advance) keeps the
+    # lower opening margin positive through the exact-zero tick.  The raw
+    # recorded image path went negative, so this specifically closes the
+    # pitch-owner regression without claiming a full vehicle-dynamics replay.
+    rows = (
+        (1.953, -0.375353, 0.035272, 0.223011),
+        (1.984, -0.384021, 0.035272, 0.223011),
+        (2.031, -0.391418, 0.040752, 0.237602),
+        (2.109, -0.386751, 0.031477, 0.245366),
+        (2.219, -0.350420, -0.063544, 0.289317),
+        (2.359, -0.278570, -0.223269, 0.347108),
+        (2.453, -0.245939, -0.283425, 0.347108),
+        (2.563, -0.218012, -0.341387, 0.347108),
+        (2.609, -0.208207, -0.361177, 0.347108),
+        (2.656, -0.200133, -0.378936, 0.347108),
+    )
+    carried_pitch = rows[1][1]
+    counterfactual_margins_px = []
+    recorded_margins_px = []
+    for _t, recorded_pitch, center_y, half_y in rows:
+        attitude_invariant_center = center_y - (
+            (SPAWN_PITCH - recorded_pitch)
+            * ROTATION_COMP_FOCAL_NORM
+        )
+        carried_center = attitude_invariant_center + (
+            (SPAWN_PITCH - carried_pitch)
+            * ROTATION_COMP_FOCAL_NORM
+        )
+        counterfactual_margins_px.append(
+            (carried_center + half_y) * 180.0
+        )
+        recorded_margins_px.append((center_y + half_y) * 180.0)
+    assert rows[-1][0] == pytest.approx(2.656)
+    assert min(counterfactual_margins_px) > 40.0
+    assert recorded_margins_px[-1] < 0.0
 
 
 def test_f167_predict_keeps_recent_outer_vertical_direction_over_imu():
@@ -5873,9 +6494,7 @@ def test_far_vertical_arrival_damping_never_vetoes_clear_visual_direction():
 
     gate0_climbing = _gate0_thrust(0.60)
     gate0_settled = _gate0_thrust(0.0)
-    assert gate0_climbing.thrust == pytest.approx(
-        gate0_settled.thrust, abs=1e-12
-    )
+    assert SPAWN_SUPPORT < gate0_climbing.thrust <= gate0_settled.thrust
     assert gate0_climbing.thrust > SPAWN_SUPPORT
 
 
@@ -5904,7 +6523,15 @@ def test_course_leg_projects_corrected_image_motion_into_optical_intercept():
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.TRACK
     assert out.vertical_qualified
-    assert out.thrust < SPAWN_SUPPORT - 0.01
+    assert controller._last_vertical_motion_delta == pytest.approx(-0.009)
+    assert controller._last_vertical_imu_delta > 0.0
+    assert out.thrust == pytest.approx(
+        controller._last_vertical_support
+        + controller._last_vertical_visual_delta
+        + controller._last_vertical_imu_delta,
+        abs=1e-12,
+    )
+    assert out.thrust < SPAWN_SUPPORT - 0.0075
 
 
 def test_course_leg_closure_excess_leaves_collective_alone():
@@ -5981,10 +6608,10 @@ def test_clear_visual_correction_is_independent_of_integrated_altitude():
     assert biased_low.thrust == pytest.approx(nominal.thrust, abs=1e-9)
 
 
-def test_optical_vertical_authority_tightens_near_the_plane():
-    # Near the plane, a normalized miss represents a smaller remaining
-    # trajectory and the optical correction cap tightens continuously.  The
-    # supporting IMU damping remains present at both ranges.
+def test_optical_vertical_baseline_does_not_weaken_near_the_plane():
+    # F167's near-plane cap reduced correction while Gate 1's high miss was
+    # worsening.  Fresh outer-y keeps one bounded position baseline at both
+    # ranges; outer closure/TTC shapes rate urgency rather than attenuating it.
     # F98: the ramp reads outer_log_scale (COMMIT's own proximity
     # signal) — F97 keyed on the filtered hypothesis scale, which lagged
     # (-1.67) while the gate already engulfed the frame.  This test
@@ -6010,10 +6637,19 @@ def test_optical_vertical_authority_tightens_near_the_plane():
         current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.TRACK
-    # At/inside commit range the optical correction is capped at 0.20, while
-    # the same supporting IMU term damps the measured +0.10 m/s climb.
+    # Fresh visual motion owns the trajectory; IMU remains only a bounded
+    # innovation around that motion, never a second full damping copy.
     assert out.thrust < SPAWN_SUPPORT
-    # Far away the full 0.30 visual miss and +0.10 IMU climb both apply.
+    assert controller._last_vertical_imu_delta < 0.0
+    assert abs(controller._last_vertical_imu_delta) <= (
+        controller.config.vertical_imu_max_opposition_fraction
+        * max(
+            abs(controller._last_vertical_visual_delta),
+            abs(controller._last_vertical_motion_delta),
+        )
+        + 1e-12
+    )
+    # Far away the same full 0.30 position miss applies.
     far = _tracked_controller(_track("A", 0.0, 0.30, scale=0.20))
     _promote_to_gate_one(far)
     far._alt_est_m = 2.0
@@ -6034,7 +6670,17 @@ def test_optical_vertical_authority_tightens_near_the_plane():
         far_current.last_x_measurement_s = far_now
         far_current.last_y_measurement_s = far_now
         far_out = _command(far, far_now, pitch=SPAWN_PITCH)
-    assert far_out.thrust < out.thrust
+    assert far._last_vertical_imu_delta < 0.0
+    assert abs(far._last_vertical_imu_delta) <= (
+        far.config.vertical_imu_max_opposition_fraction
+        * max(
+            abs(far._last_vertical_visual_delta),
+            abs(far._last_vertical_motion_delta),
+        )
+        + 1e-12
+    )
+    assert far_out.thrust == pytest.approx(out.thrust, abs=1e-12)
+    assert out.thrust <= SPAWN_SUPPORT - 0.02
 
 
 def test_raw_closure_brakes_when_the_filtered_rate_lags():
@@ -6165,7 +6811,7 @@ def test_blind_hold_tracks_zero_vz_when_fh_trusted():
     )
 
 
-def test_far_qualified_low_gate_request_damps_inherited_climb():
+def test_far_qualified_low_gate_visual_path_is_not_double_damped_by_imu():
     # F90 (20260730T134602Z-visual-course-6e302725): the gate-1 leg
     # inherited vz +0.18 and a 0.024 support trim from the credited
     # gate-0 wait, then climbed vz +0.3..+0.4 for 1.3 s with the gate
@@ -6202,10 +6848,12 @@ def test_far_qualified_low_gate_request_damps_inherited_climb():
 
     climbing = _gate_low_thrust(0.30)
     settled = _gate_low_thrust(0.0)
-    # Fresh low-gate vision remains the primary descent owner.  Positive-vz
-    # damping reinforces it, but cannot dwarf the bounded visual correction.
-    assert climbing.thrust < settled.thrust
-    assert settled.thrust - climbing.thrust < 0.01
+    # Fresh outer position+image motion owns the descent trajectory.  The
+    # integrated vz estimate may strengthen that same sign only inside the
+    # bounded innovation envelope; it is never summed as a second full copy.
+    assert climbing.thrust <= settled.thrust
+    assert settled.thrust - climbing.thrust < 0.004
+    assert climbing.thrust < SPAWN_SUPPORT
 
 
 def test_clear_far_visual_miss_cannot_be_reversed_by_imu_damping():
@@ -6280,16 +6928,14 @@ def test_gate0_qualified_imu_damping_continues_through_near_plane():
         assert controller.state is CleanCourseState.TRACK
         return out
 
-    # Near plane and far away, coherent high-gate direction removes opposing
-    # climb damping rather than letting it veto the fresh visual correction.
+    # Near plane and far away, opposing climb damping may reduce but never
+    # veto the fresh high-gate correction.
     climbing = _gate0_thrust(0.45, -0.70)
     settled = _gate0_thrust(0.0, -0.70)
-    assert climbing.thrust == pytest.approx(settled.thrust, abs=1e-12)
-    assert climbing.thrust > SPAWN_SUPPORT
+    assert SPAWN_SUPPORT < climbing.thrust <= settled.thrust
     far_climbing = _gate0_thrust(0.45, -2.20)
     far_settled = _gate0_thrust(0.0, -2.20)
-    assert far_climbing.thrust == pytest.approx(far_settled.thrust, abs=1e-12)
-    assert far_climbing.thrust > SPAWN_SUPPORT
+    assert SPAWN_SUPPORT < far_climbing.thrust <= far_settled.thrust
 
     # With no visual miss there is no opposing path request, so the same
     # bounded IMU term remains effective on both sides of the range schedule.
@@ -6449,40 +7095,20 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
         * controller._lateral_intercept_reference_x,
         abs=1e-9,
     )
-    # F58: the real 0.15 rad advance drive, not the coast's 0.05 nudge.
-    # F66: the F60 vertical-aim term is deleted — in commit the attitude is
-    # the forward drive only; vertical translation is the servo's alone.
+    # COMMIT carries the exact TRACK pitch admitted at the transition.  It
+    # must not replace that path with a phase-owned +0.15 advance endpoint.
     assert out.target_pitch_rad == pytest.approx(
-        SPAWN_PITCH + 0.15, abs=1e-9
+        controller._commit_pitch_target_rad, abs=1e-9
     )
+    assert out.target_pitch_rad < SPAWN_PITCH + 0.15
     # COMMIT uses the same outer-owned position baseline and bounded
     # motion/projection decomposition as TRACK.
     motion = controller._last_vertical_motion
     path = controller._vertical_path_observation(
         controller.current, now_s=now, pitch_rad=SPAWN_PITCH
     )
-    expected_position = (
-        -controller.config.vertical_optical_collective_gain
-        * path.freshness_authority
-        * controller.current.confidence
-        * path.outer_error
-    )
-    expected_rate = (
-        -controller.config.vertical_optical_collective_gain
-        * path.freshness_authority
-        * controller.current.confidence
-        * path.image_rate_norm_s
-        * controller.config.commit_blackout_s
-    )
-    expected_projection = (
-        -controller.config.vertical_optical_collective_gain
-        * motion.control_authority
-        * (
-            motion.intercept_error
-            - path.error
-            - path.image_rate_norm_s
-            * controller.config.commit_blackout_s
-        )
+    expected_position, expected_rate, expected_projection = (
+        _expected_vertical_trajectory_terms(controller, path, motion)
     )
     assert controller._last_vertical_position_delta == pytest.approx(
         expected_position, abs=1e-12
@@ -6515,21 +7141,30 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     controller.current.last_y_measurement_s = now
     out = _command(controller, now, pitch=SPAWN_PITCH)
     descend_target = controller._last_vertical_collective_target
-    expected_capped_position = (
-        -controller.config.vertical_optical_collective_gain
-        * controller.current.confidence
-        * controller.config.vertical_optical_error_max_near_norm
+    path = controller._vertical_path_observation(
+        controller.current, now_s=now, pitch_rad=SPAWN_PITCH
+    )
+    expected_capped_position, expected_rate, expected_projection = (
+        _expected_vertical_trajectory_terms(
+            controller, path, controller._last_vertical_motion
+        )
     )
     assert controller._last_vertical_position_delta == pytest.approx(
         expected_capped_position, abs=1e-12
     )
     assert controller._last_vertical_motion_delta == pytest.approx(
-        0.0, abs=1e-12
+        expected_rate + expected_projection, abs=1e-12
     )
     assert descend_target == pytest.approx(
-        controller._last_vertical_support
-        + expected_capped_position
-        + controller._last_vertical_imu_delta,
+        max(
+            controller.config.min_thrust,
+            controller._last_vertical_support
+            + expected_capped_position
+            + expected_rate
+            + expected_projection
+            + controller._last_vertical_direction_delta
+            + controller._last_vertical_imu_delta,
+        ),
         abs=1e-12,
     )
     assert descend_target < out.thrust < baseline_thrust
@@ -6551,21 +7186,30 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     controller.current.last_y_measurement_s = now
     rebound = _command(controller, now, pitch=SPAWN_PITCH)
     climb_target = controller._last_vertical_collective_target
+    rebound_path = controller._vertical_path_observation(
+        controller.current, now_s=now, pitch_rad=SPAWN_PITCH
+    )
+    rebound_position, rebound_rate, rebound_projection = (
+        _expected_vertical_trajectory_terms(
+            controller, rebound_path, controller._last_vertical_motion
+        )
+    )
     assert controller._last_vertical_position_delta == pytest.approx(
-        -expected_capped_position, abs=1e-12
+        rebound_position, abs=1e-12
     )
     assert climb_target == pytest.approx(
         controller._last_vertical_support
-        - expected_capped_position
+        + rebound_position
+        + rebound_rate
+        + rebound_projection
+        + controller._last_vertical_direction_delta
         + controller._last_vertical_imu_delta,
         abs=1e-12,
     )
     assert deeper.thrust < rebound.thrust < climb_target
-    assert rebound.thrust - deeper.thrust < 0.01
-    # The progress-removers stay bypassed: a bearing that would fully
-    # engage the misalignment brake in TRACK gets no brake pitch — the
-    # advance continues; steering follows the fresh bearing (yaw gain
-    # 0.9*0.8 clamped to the 0.15 production yaw command cap).
+    assert rebound.thrust - deeper.thrust < 0.012
+    # Horizontal misalignment changes steering but cannot introduce another
+    # COMMIT pitch owner.  The admitted TRACK pitch remains continuous.
     controller.current.y_axis.p = 0.05
     controller.current.x_axis.p = 0.80
     now += 0.033
@@ -6575,8 +7219,9 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     out = _command(controller, now, pitch=SPAWN_PITCH)
     assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
     assert out.target_pitch_rad == pytest.approx(
-        SPAWN_PITCH + 0.15, abs=1e-9
+        controller._commit_pitch_target_rad, abs=1e-9
     )
+    assert out.target_pitch_rad < SPAWN_PITCH + 0.15
     # F62/F63: once x goes STALE/censored the commit steers the PREDICTED
     # hypothesis with the same range gain — heading-hold committed the residual drift
     # (F61 clipped the left post) and F62's half-gain derate

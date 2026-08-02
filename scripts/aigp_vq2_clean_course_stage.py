@@ -147,6 +147,7 @@ PASSAGE_MOTION_FULL_STD_NORM = 0.50
 # so the independent aperture series rejects only statistically impossible
 # updates instead of injecting them into either control or admission.
 APERTURE_SCALE_INNOVATION_SIGMA = 6.0
+TRACK_REPLACEMENT_INNOVATION_SIGMA = 3.0
 VERTICAL_OPTICAL_ERROR_MAX_FAR_NORM = 0.50
 VERTICAL_OPTICAL_ERROR_MAX_NEAR_NORM = 0.20
 VERTICAL_OPTICAL_COLLECTIVE_GAIN = 0.12
@@ -752,6 +753,24 @@ def _clamp01(value: float) -> float:
     return _clamp(value, 0.0, 1.0)
 
 
+def _directional_brake_response_authority(
+    brake_demand: float,
+    *,
+    target_pitch_rad: float,
+    measured_pitch_rad: float,
+    brake_pitch_offset_rad: float,
+) -> float:
+    """Lease extra pitch response only toward the physical brake."""
+
+    brake_direction = math.copysign(1.0, brake_pitch_offset_rad)
+    pitch_error = float(target_pitch_rad) - float(measured_pitch_rad)
+    return (
+        _clamp01(brake_demand)
+        if brake_direction * pitch_error > 0.0
+        else 0.0
+    )
+
+
 class _AxisFilter:
     """One 2-state (position, rate) variable-dt Kalman filter."""
 
@@ -1084,6 +1103,10 @@ class NavigationOutput:
     vertical_qualified: bool = False
     current_track_id: Optional[str] = None
     successor_track_id: Optional[str] = None
+    # Extra pitch response is a directional brake lease, not a generic
+    # TRACK/COMMIT gain.  The runtime consumes this already-qualified value
+    # instead of reinterpreting the controller's energy state.
+    pitch_response_authority: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1098,6 +1121,9 @@ class CleanCourseConfig:
     passage_motion_model_std_norm: float = PASSAGE_MOTION_MODEL_STD_NORM
     passage_motion_full_std_norm: float = PASSAGE_MOTION_FULL_STD_NORM
     aperture_scale_innovation_sigma: float = APERTURE_SCALE_INNOVATION_SIGMA
+    track_replacement_innovation_sigma: float = (
+        TRACK_REPLACEMENT_INNOVATION_SIGMA
+    )
     vertical_optical_error_max_far_norm: float = VERTICAL_OPTICAL_ERROR_MAX_FAR_NORM
     vertical_optical_error_max_near_norm: float = VERTICAL_OPTICAL_ERROR_MAX_NEAR_NORM
     vertical_optical_collective_gain: float = VERTICAL_OPTICAL_COLLECTIVE_GAIN
@@ -1257,6 +1283,7 @@ class CleanCourseController:
         )
         self._pitch_energy_brake_demand = 0.0
         self._pitch_energy_brake_active = False
+        self._last_pitch_response_authority = 0.0
         self._coast_zero_sent = False
         # The mandatory one-send exact-zero crossing is a known impulse.  Keep
         # the wire zero exact, then let the next bounded target bypass only the
@@ -1281,6 +1308,7 @@ class CleanCourseController:
         # COMMIT_* constant block).
         self._near_plane_since_s: Optional[float] = None
         self._commit_entry_s: Optional[float] = None
+        self._commit_pitch_target_rad: Optional[float] = None
         self._last_commit_admission = _CommitAdmission(
             False, "not-evaluated"
         )
@@ -1371,6 +1399,17 @@ class CleanCourseController:
         self._last_vertical_motion_delta = 0.0
         self._last_vertical_direction_delta = 0.0
         self._last_launch_collective_delta = 0.0
+        self._last_vertical_required_rate_norm_s = 0.0
+        self._last_vertical_observed_rate_norm_s = 0.0
+        self._last_vertical_imu_raw_delta = 0.0
+        self._last_pitch_response_authority = 0.0
+        # A tracker id is an observation alias, not a race role.  Only an
+        # authoritative promotion can open this bounded reconciliation lease;
+        # it lets a stale promoted lineage bind to one fresh compatible id
+        # before generic SEARCH or successor ranking can invert the roles.
+        self._promoted_reconcile_gate_index: Optional[int] = None
+        self._promoted_reconcile_expiry_s: Optional[float] = None
+        self._last_reconcile_status = "inactive"
         # Course-heading anchor (F31): yaw at the leg start (lazily
         # captured on the first command tick with a live yaw measurement,
         # re-armed on every authoritative promotion).  Yaw commands that
@@ -1407,8 +1446,12 @@ class CleanCourseController:
         self._last_lateral_projection_delta_x = 0.0
         self._last_lateral_direction_override_x = 0.0
         self._last_vertical_motion = None
+        self._promoted_reconcile_gate_index = None
+        self._promoted_reconcile_expiry_s = None
+        self._last_reconcile_status = "inactive"
         self._pitch_energy_brake_demand = 0.0
         self._pitch_energy_brake_active = False
+        self._last_pitch_response_authority = 0.0
         self._zero_recovery_pending = False
         self._zero_recovery_applied = False
         self._zero_sink_debt_m_s = 0.0
@@ -1502,6 +1545,11 @@ class CleanCourseController:
             self._predict(self.current, dt, body_rates)
         if self.successor is not None:
             self._predict(self.successor, dt, body_rates)
+
+        reconciliation_hold = bool(
+            fresh
+            and self._reconcile_promoted_current(tracks, now_s=now_s)
+        )
 
         # Engulfing-box anchor (flight bc8c6003): useless for scale/vertical
         # servo, but its center still says "gate centered, very close", so it
@@ -1613,7 +1661,7 @@ class CleanCourseController:
             # successor immediately; on expiry the normal pick resumes.
             adopted = (
                 None
-                if pending_credit or not fresh
+                if pending_credit or not fresh or reconciliation_hold
                 else self._select_search_reacquisition(tracks, now_s)
             )
             if adopted is not None:
@@ -1685,7 +1733,7 @@ class CleanCourseController:
         ):
             self._enter_search(now_s)
 
-        if fresh:
+        if fresh and not reconciliation_hold:
             self._refresh_successor(tracks, now_s)
         if self.current is not None and match is not None and fresh:
             self._set_reliable_bearing(self.current.x, self.current.y)
@@ -1729,6 +1777,7 @@ class CleanCourseController:
         self._clear_current_fresh_observation()
         self._near_plane_since_s = None
         self._commit_entry_s = None
+        self._commit_pitch_target_rad = None
         self._last_commit_admission = _CommitAdmission(
             False, "authoritative-gate-change"
         )
@@ -1747,6 +1796,9 @@ class CleanCourseController:
             self._exit_coast()
         # An authoritative increment settles the pending-credit hold.
         self._pending_credit_until_s = None
+        self._promoted_reconcile_gate_index = None
+        self._promoted_reconcile_expiry_s = None
+        self._last_reconcile_status = "authoritative-promotion"
 
         successor = self.successor
         if (
@@ -1771,6 +1823,17 @@ class CleanCourseController:
                 <= self.config.predict_frame_gap_s
                 else CleanCourseState.PREDICT
             )
+            # Promotion authorizes a logical gate hypothesis, never one
+            # tracker alias.  Arm reconciliation for every measured
+            # promotion, including a currently fresh successor: its id may
+            # change on the very next detector frame, before PREDICT begins.
+            # An exact-id observation closes this lease in observe().
+            self._promoted_reconcile_gate_index = self.gate_index
+            self._promoted_reconcile_expiry_s = (
+                self.current.last_measurement_s
+                + PREDICT_STALL_FORCE_SEARCH_S
+            )
+            self._last_reconcile_status = "promoted-lineage-pending"
             self._set_reliable_bearing(self.current.x, self.current.y)
         else:
             self.current = None
@@ -1783,14 +1846,14 @@ class CleanCourseController:
             elif cached is not None:
                 self._set_reliable_bearing(cached[0], cached[1])
             self._enter_search(now_s)
-        # The physical intercept is gate-owned path state, not camera heading
-        # memory.  Seed it from the newly race-owned current hypothesis instead
-        # of carrying the previous gate's bank request across promotion.
-        self._lateral_intercept_reference_x = (
-            self._horizontal_control_observable(self.current, now_s)[0]
-            if self.current is not None
-            else None
-        )
+        # The physical intercept is maintained path state, not a camera
+        # bearing that promotion may reseed.  The successor object and the
+        # filtered lateral reference already owned the pre-credit turn; carry
+        # both unchanged across the authoritative role transfer.  Subsequent
+        # command ticks move the reference only through the normal bounded
+        # turn filter and roll slew.
+        if self.current is None:
+            self._lateral_intercept_reference_x = None
         # Re-arm the course-heading anchor for the new leg (F31).
         self._course_anchor_yaw_rad = None
         return True
@@ -1830,6 +1893,10 @@ class CleanCourseController:
         self._last_vertical_motion_delta = 0.0
         self._last_vertical_direction_delta = 0.0
         self._last_launch_collective_delta = 0.0
+        self._last_vertical_required_rate_norm_s = 0.0
+        self._last_vertical_observed_rate_norm_s = 0.0
+        self._last_vertical_imu_raw_delta = 0.0
+        self._last_pitch_response_authority = 0.0
         self._last_lateral_baseline_reference_x = 0.0
         self._last_lateral_projection_delta_x = 0.0
         self._last_lateral_direction_override_x = 0.0
@@ -2017,6 +2084,10 @@ class CleanCourseController:
         ):
             self.state = CleanCourseState.COMMIT
             self._commit_entry_s = float(now_s)
+            # Admission certifies the TRACK trajectory already in progress.
+            # COMMIT carries that exact longitudinal target; it cannot inject
+            # a new nose-down endpoint after certifying a braking approach.
+            self._commit_pitch_target_rad = float(self._prev_target_pitch)
 
         if self.state is CleanCourseState.COMMIT:
             commit_timed_out = (
@@ -2032,6 +2103,7 @@ class CleanCourseController:
                 # lock-out).
                 self.current = None
                 self._commit_entry_s = None
+                self._commit_pitch_target_rad = None
                 self._enter_search(now_s)
             else:
                 # COMMIT certifies the trajectory established in TRACK.  F165
@@ -2153,23 +2225,29 @@ class CleanCourseController:
                 # with the opening 0.45 norm below the aim.  Vertical
                 # translation now lives only in the shared vertical-rate
                 # owner above.
+                commit_pitch_target = self._slew_pitch(
+                    (
+                        self._commit_pitch_target_rad
+                        if self._commit_pitch_target_rad is not None
+                        else self._prev_target_pitch
+                    ),
+                    dt,
+                    slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
+                )
+                commit_pitch_response = self._pitch_response_authority(
+                    commit_pitch_target, pitch_rad
+                )
                 return NavigationOutput(
                     target_roll_rad=self._slew_roll(
                         commit_roll,
                         dt,
                         directional_censor=commit_heading_edge,
                     ),
-                    # F55: the advance attitude must actually be reached —
-                    # Admission transfers the continuous TRACK trajectory to
-                    # the bounded crossing drive.  The fast but bounded slew
-                    # is bumpless from the carried target; freezing the
-                    # carried brake for all of COMMIT would make the admitted
-                    # tube unreachable.
-                    target_pitch_rad=self._slew_pitch(
-                        cfg.spawn_pitch_rad + cfg.commit_advance_pitch_rad,
-                        dt,
-                        slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
-                    ),
+                    # F168: no phase-owned advance is introduced here.
+                    # COMMIT preserves the exact TRACK pitch trajectory that
+                    # admission certified; reachability comes from its
+                    # measured closure, not a second forward-energy target.
+                    target_pitch_rad=commit_pitch_target,
                     yaw_rate_rad_s=commit_yaw,
                     thrust=self._continuous_collective(
                         commit_target, dt, now_s=now_s
@@ -2180,6 +2258,7 @@ class CleanCourseController:
                     vertical_qualified=commit_vertical_qualified,
                     current_track_id=self._current_track_id(),
                     successor_track_id=self._successor_track_id(),
+                    pitch_response_authority=commit_pitch_response,
                 )
 
         if self.state is CleanCourseState.SEARCH:
@@ -2212,6 +2291,49 @@ class CleanCourseController:
                 pending_roll = 0.0
                 pending_yaw = 0.0
                 pending_blend = 0.0
+                pending_vertical_owner = self.successor
+                if pending_vertical_owner is not None:
+                    # The exact-zero command proves physical release but does
+                    # not promote race ownership.  A retained successor may
+                    # nevertheless prepare the recovery trajectory on its
+                    # fresh OUTER y, just as it prepares bounded yaw/bank.
+                    # Admission, pitch advance, state and gate index remain
+                    # owned by the authoritative current gate.
+                    pending_vertical_path = self._vertical_path_observation(
+                        pending_vertical_owner,
+                        now_s=now_s,
+                        pitch_rad=pitch_rad,
+                    )
+                    if pending_vertical_path.freshness_authority > 0.0:
+                        self._last_vertical_path_error = (
+                            pending_vertical_path.outer_error
+                        )
+                        self._last_vertical_aim_error = (
+                            pending_vertical_path.error
+                        )
+                        self._last_vertical_path_rate = (
+                            pending_vertical_path.image_rate_norm_s
+                        )
+                        self._last_vertical_aperture_offset = 0.0
+                        self._last_vertical_aperture_live = False
+                        pending_vertical_motion = (
+                            self._vertical_passage_motion(
+                                pending_vertical_owner,
+                                pending_vertical_path,
+                                now_s=now_s,
+                            )
+                        )
+                        search_hold = self._vertical_collective_target(
+                            pending_vertical_owner,
+                            support,
+                            pending_vertical_motion,
+                            path=pending_vertical_path,
+                        )
+                        search_target = self._governed_collective(
+                            search_hold,
+                            support,
+                            gate_y=pending_vertical_path.error,
+                        )
                 if self.current is not None:
                     pending_current_heading, _axis, _age, _edge = (
                         self._horizontal_control_observable(
@@ -2246,6 +2368,15 @@ class CleanCourseController:
                     # passage lease may preturn both FOV and physical path;
                     # pitch/advance/admission remain neutral and only the
                     # authoritative increment can promote the successor.
+                    if (
+                        pending_blend > 0.0
+                        and pending_roll * self._prev_target_roll < 0.0
+                    ):
+                        # Exact-zero physically released the old path.  Its
+                        # opposite bank is no longer a continuity asset: clear
+                        # it before the bounded slew so yaw and roll begin the
+                        # same fresh successor turn on this tick.
+                        self._prev_target_roll = 0.0
                     pending_roll = self._slew_roll(
                         pending_roll,
                         dt,
@@ -2597,44 +2728,62 @@ class CleanCourseController:
         # of relabelling an image angle as a metric velocity setpoint.
 
         # Gate-0 motor spin-up remains bounded feedforward, but its release is
-        # a continuous transfer to the outer-owned visual target.  The IMU
-        # term is already constrained below so this handoff cannot reveal a
-        # hidden request on the opposite side of the visual trajectory.
+        # a continuous, outer-trajectory-owned energy term.  It is never a
+        # time-switched collective target.  As soon as measured image motion
+        # satisfies the required climb rate, the boost drains smoothly; the
+        # same motion cannot then be counted again by additive IMU damping.
         unshaped_collective = collective
+        launch_energy_hold = 0.0
         if (
             self.gate_index == 0
             and self._course_start_s is not None
             and cfg.launch_boost_duration_s > 0.0
         ):
             launch_elapsed_s = max(0.0, now_s - self._course_start_s)
-            if launch_elapsed_s < (
+            launch_horizon_s = (
                 cfg.launch_boost_duration_s
                 + cfg.launch_collective_transfer_s
-            ):
-                boost_authority = (
-                    1.0
-                    if launch_elapsed_s <= cfg.launch_boost_duration_s
-                    else _clamp01(
-                        1.0
-                        - (
-                            launch_elapsed_s - cfg.launch_boost_duration_s
-                        )
-                        / max(1e-6, cfg.launch_collective_transfer_s)
-                    )
+            )
+            phase = _clamp01(
+                launch_elapsed_s / max(1e-6, launch_horizon_s)
+            )
+            # Complementary smoothstep: value and slope are continuous at
+            # both ends of the bounded feedforward horizon.
+            time_authority = 1.0 - phase * phase * (3.0 - 2.0 * phase)
+            required_rate = self._last_vertical_required_rate_norm_s
+            observed_rate = self._last_vertical_observed_rate_norm_s
+            climb_deficit = max(0.0, required_rate - observed_rate)
+            trajectory_authority = _clamp01(
+                climb_deficit
+                / max(
+                    1e-6,
+                    abs(required_rate) + abs(observed_rate),
                 )
-                collective += boost_authority * (
-                    cfg.launch_boost_thrust - collective
+            )
+            launch_energy_hold = time_authority * trajectory_authority
+            if launch_energy_hold > 0.0:
+                collective += launch_energy_hold * max(
+                    0.0, cfg.launch_boost_thrust - collective
                 )
-            if (
-                launch_elapsed_s <= cfg.launch_pitch_blend_s
-                and vertical_path.outer_error <= 0.0
-            ):
-                # During the bumpless launch transfer, a high/centered fresh
-                # outer gate has not requested a descent.  Optical direction
-                # may already describe the climb-induced image motion, but it
-                # cannot license the much larger IMU damping term to drive the
-                # target below tilt support while position still asks high.
-                collective = max(collective, support)
+            # Fade descent authority in over the complete bumpless launch
+            # trajectory.  This is a continuous magnitude envelope on the
+            # same outer-owned correction, not F167's y-sign-switched support
+            # floor: crossing outer-y==0 cannot change authority or expose a
+            # hidden IMU request in one frame.
+            launch_trajectory_horizon_s = (
+                launch_horizon_s + cfg.launch_pitch_blend_s
+            )
+            launch_phase = _clamp01(
+                launch_elapsed_s
+                / max(1e-6, launch_trajectory_horizon_s)
+            )
+            launch_progress = launch_phase * launch_phase * (
+                3.0 - 2.0 * launch_phase
+            )
+            if collective < support:
+                collective = support + launch_progress * (
+                    collective - support
+                )
         self._last_launch_collective_delta = float(
             collective - unshaped_collective
         )
@@ -2709,30 +2858,25 @@ class CleanCourseController:
             and self._course_start_s is not None
             and cfg.launch_boost_duration_s > 0.0
         ):
-            # The vertical motor-spinup transfer completes before longitudinal
-            # advance begins.  Then the same outer-energy law grows in over the
-            # combined collective-transfer and pitch-blend horizon.  F166
-            # overlapped these transfers:
+            # The shared launch-energy trajectory completes before
+            # longitudinal advance begins, then releases through one C1
+            # blend.  F166 overlapped independent time owners:
             # target pitch advanced to -0.263 by t=.797 and then reversed
             # nose-up as closure caught up, despite zero brake-mode chatter.
-            # Sequencing the two references removes that handoff reversal;
-            # brake authority itself remains immediate and unscaled.
+            # Brake authority itself remains immediate and unscaled.
             launch_pitch_start_s = (
                 cfg.launch_boost_duration_s
                 + cfg.launch_collective_transfer_s
+                + cfg.launch_pitch_blend_s
             )
-            advance *= _clamp01(
-                (
-                    now_s
-                    - self._course_start_s
-                    - launch_pitch_start_s
-                )
-                / max(
-                    1e-6,
-                    cfg.launch_collective_transfer_s
-                    + cfg.launch_pitch_blend_s,
-                )
+            launch_pitch_phase = _clamp01(
+                (now_s - self._course_start_s - launch_pitch_start_s)
+                / max(1e-6, cfg.launch_pitch_blend_s)
             )
+            launch_pitch_release = launch_pitch_phase * launch_pitch_phase * (
+                3.0 - 2.0 * launch_pitch_phase
+            )
+            advance *= launch_pitch_release
         # F73 (20260730T063739Z-visual-course-34c53413): TRACK kept closing
         # while the COMMIT entry budget was false — the gate-1 aim walked
         # ey +0.31 -> +0.49 into bottom censorship at the plane, the track
@@ -2823,6 +2967,14 @@ class CleanCourseController:
             + (0.0 if commit_regime else cfg.brake_pitch_rad),
         )
         target_pitch = max(target_pitch, custody_floor)
+        slewed_pitch_target = self._slew_pitch(
+            target_pitch,
+            dt,
+            slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
+        )
+        pitch_response = self._pitch_response_authority(
+            slewed_pitch_target, pitch_rad
+        )
 
         return NavigationOutput(
             target_roll_rad=self._slew_roll(
@@ -2838,11 +2990,7 @@ class CleanCourseController:
             # One bounded slew follows the continuous energy trajectory in
             # both directions.  Brake-state hysteresis is diagnostic/safety
             # state only and cannot switch the pitch response framewise.
-            target_pitch_rad=self._slew_pitch(
-                target_pitch,
-                dt,
-                slew_rad_s=cfg.pre_cross_brake_slew_rad_s,
-            ),
+            target_pitch_rad=slewed_pitch_target,
             yaw_rate_rad_s=yaw_rate,
             thrust=thrust,
             state=self.state,
@@ -2852,6 +3000,7 @@ class CleanCourseController:
             vertical_qualified=vertical_qualified,
             current_track_id=self._current_track_id(),
             successor_track_id=self._successor_track_id(),
+            pitch_response_authority=pitch_response,
         )
 
     # -- internals -----------------------------------------------------------
@@ -3366,6 +3515,18 @@ class CleanCourseController:
                 if self._current_fresh_outer_y_observation_s is not None
                 else NEVER_MEASURED_S
             )
+        elif current is self.successor:
+            # Once an exact-zero crossing has physically released the old
+            # path, pending-credit control may preview the retained successor
+            # without promoting it.  Successor timestamps advance only from a
+            # distinct camera frame in observe(), so this is real outer-y
+            # evidence with the same bounded prediction horizon, not a race-
+            # ownership or admission transfer.
+            evidence_s = (
+                current.last_outer_y_evidence_s
+                if edge != FrameEdge.NONE
+                else current.last_y_measurement_s
+            )
         elif direct_outer_only:
             # Compatibility for focused direct-state fixtures that do not pass
             # through initialize/observe.  Production current tracks always
@@ -3509,6 +3670,251 @@ class CleanCourseController:
         if first_seen is None:
             return 0.0
         return float(now_s) - first_seen
+
+    def _replacement_innovation(
+        self,
+        hypothesis: _Hypothesis,
+        track: Any,
+    ) -> Optional[float]:
+        """Return normalized outer-state innovation for one id replacement.
+
+        This is not generic association.  Callers first establish a logical
+        current/successor lineage and use this score only while that lineage
+        has lost its tracker alias.  The ordinary outer measurement model is
+        reused verbatim, with the existing SEARCH radius as a hard geometric
+        cap so an inflated stale covariance cannot claim the whole frame.
+        Directionally censored axes contribute only one-sided violations.
+        """
+
+        (zx, zy), zscale, stds = _outer_track_measurement(track)
+        clipping = getattr(track, "clipping", FrameEdge.NONE)
+        if type(clipping) is not FrameEdge:
+            clipping = FrameEdge.NONE
+        center_censored = bool(getattr(track, "center_censored", False))
+        nondirectional_censor = center_censored and clipping == FrameEdge.NONE
+        if nondirectional_censor:
+            return None
+        confidence = max(
+            MIN_MEAS_CONFIDENCE,
+            float(track.confidence)
+            * float(getattr(track, "association_confidence", 1.0)),
+        )
+        variances = (
+            hypothesis.outer_x_axis.pp + (stds[0] ** 2) / confidence,
+            hypothesis.outer_y_axis.pp + (stds[1] ** 2) / confidence,
+            hypothesis.outer_scale_axis.pp + (stds[2] ** 2) / confidence,
+        )
+        residuals: List[Tuple[float, float]] = []
+        geometric_residuals: List[float] = []
+
+        if clipping & FrameEdge.LEFT:
+            residual = max(0.0, hypothesis.outer_x_axis.p - zx)
+        elif clipping & FrameEdge.RIGHT:
+            residual = min(0.0, hypothesis.outer_x_axis.p - zx)
+        else:
+            residual = zx - hypothesis.outer_x_axis.p
+        residuals.append((residual, variances[0]))
+        geometric_residuals.append(residual)
+
+        if clipping & FrameEdge.TOP:
+            residual = max(0.0, hypothesis.outer_y_axis.p - zy)
+        elif clipping & FrameEdge.BOTTOM:
+            residual = min(0.0, hypothesis.outer_y_axis.p - zy)
+        else:
+            residual = zy - hypothesis.outer_y_axis.p
+        residuals.append((residual, variances[1]))
+        geometric_residuals.append(residual)
+
+        # A clipped box has no truthful scale observation.  Its directional
+        # center can still reconcile a lineage, but range is deliberately
+        # omitted from the compatibility score.
+        if clipping == FrameEdge.NONE:
+            residuals.append(
+                (zscale - hypothesis.outer_scale_axis.p, variances[2])
+            )
+        if math.hypot(*geometric_residuals) > self.config.search_covariance_std_norm:
+            return None
+        d2 = sum(
+            residual * residual / max(1e-12, variance)
+            for residual, variance in residuals
+        )
+        sigma = self.config.track_replacement_innovation_sigma
+        if d2 > sigma * sigma * len(residuals):
+            return None
+        return float(d2)
+
+    def _compatible_replacements(
+        self,
+        hypothesis: _Hypothesis,
+        tracks: List[Any],
+    ) -> List[Any]:
+        """Fresh candidates compatible with exactly one logical lineage."""
+
+        compatible = []
+        for track in tracks:
+            if track.track_id == hypothesis.track_id:
+                continue
+            if bool(getattr(track, "ambiguous", False)):
+                continue
+            if _suspicious_adoption_geometry(track):
+                continue
+            clipping = getattr(track, "clipping", FrameEdge.NONE)
+            if type(clipping) is not FrameEdge:
+                clipping = FrameEdge.NONE
+            # A small uncensored box is explicitly ambiguous between a whole
+            # distant gate and a near fragment.  It may be searched for, but
+            # cannot silently inherit the already-authorized lineage.  A
+            # directional clip keeps its one-sided evidence and is judged by
+            # the censored innovation model instead.
+            if (
+                clipping == FrameEdge.NONE
+                and math.log(max(1e-6, float(track.apparent_scale)))
+                < self.config.fragment_advance_min_log_scale
+            ):
+                continue
+            innovation = self._replacement_innovation(hypothesis, track)
+            if innovation is not None:
+                compatible.append((innovation, track))
+        compatible.sort(key=lambda item: item[0])
+        return [track for _innovation, track in compatible]
+
+    def _rebind_hypothesis_id(
+        self,
+        hypothesis: _Hypothesis,
+        track_id: str,
+    ) -> None:
+        """Move one logical gate hypothesis to a fresh tracker alias."""
+
+        old_id = hypothesis.track_id
+        new_id = str(track_id)
+        if old_id == new_id:
+            return
+        hypothesis.track_id = new_id
+        certificate = hypothesis.corridor_certificate
+        if certificate is not None and certificate.track_id == old_id:
+            certificate.track_id = new_id
+            if hypothesis is self.current:
+                certificate.gate_index = self.gate_index
+        if self._vertical_direction_track_id == old_id:
+            self._vertical_direction_track_id = new_id
+        if (
+            hypothesis is self.current
+            and self._current_fresh_observation_track_id == old_id
+        ):
+            self._current_fresh_observation_track_id = new_id
+        if (
+            hypothesis is self.current
+            and self.successor is not None
+            and self.successor.track_id == new_id
+        ):
+            self.successor = None
+
+    def _reconcile_promoted_current(
+        self,
+        tracks: List[Any],
+        *,
+        now_s: float,
+    ) -> bool:
+        """Resolve a stale race-promoted lineage before role selection.
+
+        Returns True while generic SEARCH adoption and successor ranking must
+        be held for this frame.  Race index remains the sole gate authority;
+        this operation changes only the tracker alias of that authorized
+        logical hypothesis.
+        """
+
+        if (
+            self._promoted_reconcile_gate_index != self.gate_index
+            or self.current is None
+            or self._promoted_reconcile_expiry_s is None
+        ):
+            return False
+        exact = self._find(tracks, self.current.track_id)
+        if exact is not None:
+            self._promoted_reconcile_gate_index = None
+            self._promoted_reconcile_expiry_s = None
+            self._last_reconcile_status = "exact-current"
+            return False
+        compatible = self._compatible_replacements(self.current, tracks)
+        if len(compatible) == 1:
+            self._rebind_hypothesis_id(
+                self.current, str(compatible[0].track_id)
+            )
+            self._promoted_reconcile_gate_index = None
+            self._promoted_reconcile_expiry_s = None
+            self._last_reconcile_status = "promoted-current-rebound"
+            return False
+        if now_s > self._promoted_reconcile_expiry_s:
+            # Prediction authority is bounded, but the authoritative logical
+            # gate does not become a random detector fragment when that bound
+            # expires.  Retain the lineage without steering from it, and keep
+            # generic adoption locked out until exact or uniquely compatible
+            # fresh evidence arrives (or race authority advances).
+            self._last_reconcile_status = "expired-search-hold"
+            if self.state is not CleanCourseState.SEARCH:
+                self._enter_search(now_s)
+        elif compatible:
+            self._last_reconcile_status = (
+                "ambiguous-search-hold"
+            )
+            if self.state is not CleanCourseState.SEARCH:
+                self._enter_search(now_s)
+        elif tracks:
+            # Fresh but incompatible alternatives are contradictory identity
+            # evidence.  Hold SEARCH immediately; do not let a tiny or
+            # tracker-ambiguous fragment acquire physical custody.
+            self._last_reconcile_status = "incompatible-search-hold"
+            if self.state is not CleanCourseState.SEARCH:
+                self._enter_search(now_s)
+        else:
+            # A genuinely empty frame carries no competing identity evidence.
+            # Preserve the ordinary TRACK->PREDICT close-loss contract until
+            # its bounded prediction lease expires; generic adoption remains
+            # disabled by the True return value.
+            self._last_reconcile_status = "missing-predict-hold"
+        return True
+
+    def _reconcile_released_successor(
+        self,
+        tracks: List[Any],
+        *,
+        now_s: float,
+    ) -> bool:
+        """Keep post-cross physical custody on a fresh successor lineage."""
+
+        pending_credit = (
+            self._pending_credit_until_s is not None
+            and now_s < self._pending_credit_until_s
+        )
+        successor = self.successor
+        if not pending_credit or successor is None:
+            return False
+        if self._find(tracks, successor.track_id) is not None:
+            return False
+        candidates = [
+            track
+            for track in tracks
+            if track.track_id != self._current_track_id()
+        ]
+        compatible = self._compatible_replacements(successor, candidates)
+        if len(compatible) != 1:
+            self._last_reconcile_status = (
+                "released-successor-ambiguous"
+                if compatible
+                else "released-successor-missing"
+            )
+            # During physical release an unresolved lineage must not be
+            # replaced by generic confidence/persistence ranking.
+            return True
+        replacement = compatible[0]
+        self._rebind_hypothesis_id(successor, str(replacement.track_id))
+        self._update_hypothesis(successor, replacement, now_s)
+        self.successor_bearing_cache[self.gate_index] = (
+            successor.x,
+            successor.y,
+        )
+        self._last_reconcile_status = "released-successor-rebound"
+        return True
 
     def _refresh_corridor_certificate(
         self,
@@ -4051,6 +4457,8 @@ class CleanCourseController:
             hypothesis.y_axis.inflate(CLIPPED_INFLATE_VAR_NORM)
 
     def _refresh_successor(self, tracks: List[Any], now_s: float) -> None:
+        if self._reconcile_released_successor(tracks, now_s=now_s):
+            return
         current_id = self._current_track_id()
         others = [track for track in tracks if track.track_id != current_id]
         # F49: a newborn suspicious-geometry track (extreme aspect or a
@@ -4434,15 +4842,29 @@ class CleanCourseController:
                     * current_freshness
                 )
             )
-            # F165: only gate-owned safe-passage reserve releases preturn.
-            # Aging aperture state cannot grant the next gate yaw authority
-            # while a fresh outer current gate remains visibly misaligned.
+            # Before crossing, only gate-owned safe-passage reserve releases
+            # preturn.  After the mandatory exact-zero physically releases
+            # that path, continuing to multiply the successor by the OLD
+            # gate's fading aperture reserve delayed both yaw and bank until
+            # after F167 promotion.  The fresh successor's own bounded
+            # confidence/covariance/freshness weight becomes the lease; race
+            # promotion and admission authority remain unchanged.
             desired_authority = (
-                self._turn_aperture_reserve * successor_weight
+                successor_weight
+                if current_path_released
+                else self._turn_aperture_reserve * successor_weight
             )
-        self._turn_successor_authority += alpha * (
-            desired_authority - self._turn_successor_authority
-        )
+        if current_path_released:
+            # Exact-zero is already a command discontinuity required by the
+            # safety contract.  On the next powered tick, use the current
+            # successor evidence directly and leave continuity to the shared
+            # turn-reference and bounded roll slew, rather than cascading a
+            # second authority low-pass.
+            self._turn_successor_authority = desired_authority
+        else:
+            self._turn_successor_authority += alpha * (
+                desired_authority - self._turn_successor_authority
+            )
         self._turn_successor_authority = _clamp01(
             self._turn_successor_authority
         )
@@ -4452,7 +4874,7 @@ class CleanCourseController:
         _owned_heading, _owned_axis, _owned_age, owned_edge = (
             self._horizontal_control_observable(current, now_s)
         )
-        if owned_edge != FrameEdge.NONE:
+        if owned_edge != FrameEdge.NONE and not current_path_released:
             # A one-sided current-gate observation revokes any carried preturn
             # lease immediately; passage is no longer demonstrably secured.
             self._turn_successor_authority = 0.0
@@ -4487,9 +4909,9 @@ class CleanCourseController:
                 float(desired) - self._turn_reference_x
             )
         self._turn_reference_x = _clamp(self._turn_reference_x, -1.0, 1.0)
-        if owned_edge & FrameEdge.RIGHT:
+        if not current_path_released and owned_edge & FrameEdge.RIGHT:
             self._turn_reference_x = max(self._turn_reference_x, 0.0)
-        elif owned_edge & FrameEdge.LEFT:
+        elif not current_path_released and owned_edge & FrameEdge.LEFT:
             self._turn_reference_x = min(self._turn_reference_x, 0.0)
         elif current_path_released and successor is not None and authority > 0.0:
             # Exact crossing completion makes the old physical intercept
@@ -4823,18 +5245,58 @@ class CleanCourseController:
         visual_delta = 0.0
         visually_clear = False
         directional_override_delta = 0.0
+        visual_freshness = 0.0
+        position_delta = 0.0
+        optical_motion_delta = 0.0
+        motion_measurement_authority = 0.0
         if current is not None and path is not None:
-            ramp = self._course_range_ramp(current)
-            error_cap = cfg.vertical_optical_error_max_far_norm - (
-                cfg.vertical_optical_error_max_far_norm
-                - cfg.vertical_optical_error_max_near_norm
-            ) * ramp
-            freshness = path.freshness_authority * _clamp01(
-                current.confidence
+            # A bounded angular miss must not lose baseline authority merely
+            # because the plane is nearer.  F167 did the opposite of the
+            # required trajectory: while Gate 1 worsened from -0.29 to -0.71,
+            # its range-ramped cap shrank the position correction from .035
+            # to .013.  TTC now increases RATE urgency; the position bound is
+            # one gate-independent outer-y contract.
+            error_cap = max(
+                cfg.vertical_optical_error_max_far_norm,
+                cfg.vertical_optical_error_max_near_norm,
             )
+            # Association/confidence decides which hypothesis is accepted.
+            # Once accepted, a distinct fresh outer measurement owns the
+            # baseline continuously.  Confidence and covariance remain in
+            # the projected residual and admission model, not as a second
+            # multiplier that can weaken clear high/low feedback.
+            freshness = path.freshness_authority
+            visual_freshness = freshness
             position_miss = _clamp(path.error, -error_cap, error_cap)
+            rate_observation = float(path.image_rate_norm_s)
+            trajectory_ttc_s = cfg.passage_ttc_max_s
+            if motion is not None:
+                # Expansion de-dilates image motion and shortens the required
+                # correction horizon.  Its agreement/certainty shapes how far
+                # the magnitude moves from the raw/max-TTC baseline; it never
+                # multiplies the baseline position direction to zero.
+                model_authority = _clamp01(motion.projection_authority)
+                rate_observation += model_authority * (
+                    motion.physical_rate_norm_s - rate_observation
+                )
+                trajectory_ttc_s += model_authority * (
+                    motion.ttc_s - trajectory_ttc_s
+                )
+            trajectory_ttc_s = _clamp(
+                trajectory_ttc_s,
+                cfg.passage_ttc_min_s,
+                cfg.passage_ttc_max_s,
+            )
+            required_rate = -position_miss / max(
+                cfg.passage_ttc_min_s, trajectory_ttc_s
+            )
+            self._last_vertical_required_rate_norm_s = float(required_rate)
+            self._last_vertical_observed_rate_norm_s = float(
+                rate_observation
+            )
             rate_miss = _clamp(
-                path.image_rate_norm_s * cfg.commit_blackout_s,
+                (rate_observation - required_rate)
+                * cfg.commit_blackout_s,
                 -error_cap,
                 error_cap,
             )
@@ -4860,7 +5322,7 @@ class CleanCourseController:
             projection_delta = 0.0
             if motion is not None:
                 baseline_intercept = path.error + (
-                    path.image_rate_norm_s * cfg.commit_blackout_s
+                    rate_observation * trajectory_ttc_s
                 )
                 projection_residual = _clamp(
                     motion.intercept_error - baseline_intercept,
@@ -4912,8 +5374,14 @@ class CleanCourseController:
                         visual_delta - before_directional_override
                     )
             self._last_vertical_position_delta = float(position_delta)
+            optical_motion_delta = visual_delta - position_delta
+            motion_measurement_authority = (
+                _clamp01(motion.measurement_authority)
+                if motion is not None
+                else 0.0
+            )
             self._last_vertical_motion_delta = float(
-                rate_delta + projection_delta
+                optical_motion_delta
             )
             self._last_vertical_direction_delta = float(
                 directional_override_delta
@@ -4928,7 +5396,9 @@ class CleanCourseController:
             )
 
         effective_vz_m_s = self._vz_est_m_s - self._zero_sink_debt_m_s
-        imu_delta = -cfg.vertical_imu_damping_gain * effective_vz_m_s
+        imu_raw_delta = -cfg.vertical_imu_damping_gain * effective_vz_m_s
+        self._last_vertical_imu_raw_delta = float(imu_raw_delta)
+        imu_delta = imu_raw_delta
         command_now_s = self._last_command_s
         launch_transfer_active = bool(
             current is self.current
@@ -4950,35 +5420,36 @@ class CleanCourseController:
             # their own launch transient.  Once visual position/motion supplies
             # a direction, the ordinary supporting/opposing rules below own it.
             imu_delta = 0.0
-        if (
-            self._vertical_direction_supported
-            and visually_clear
-            and self._vertical_direction_sign * imu_delta > 0.0
-        ):
-            # IMU vz is supporting damping, never a visual veto.  In F162 the
-            # leaky estimate still said "sinking" and added climb after the
-            # coherent optical trajectory already required descent.
-            imu_delta = 0.0
-        elif visually_clear and visual_delta * imu_delta < 0.0:
-            imu_delta = math.copysign(
-                min(
-                    abs(imu_delta),
-                    cfg.vertical_imu_max_opposition_fraction
-                    * abs(visual_delta),
-                ),
-                imu_delta,
+        if visually_clear:
+            # Optical rate and IMU velocity are two observations of the SAME
+            # vertical motion, not additive command owners.  Fuse only the
+            # bounded innovation from the IMU estimate around the optical
+            # damping channel.  Identical requests therefore count once;
+            # uncertain motion retains a bounded inertial contribution even
+            # on a fresh frame, while position feedback remains visual-owned.
+            innovation_bound = (
+                cfg.vertical_imu_max_opposition_fraction
+                * max(
+                    abs(visual_delta),
+                    abs(optical_motion_delta),
+                    1e-6,
+                )
             )
-        elif visually_clear and visual_delta * imu_delta > 0.0:
-            # "Supporting" is a magnitude contract as well as a sign
-            # contract.  F166's launch visual request was only -0.001 while
-            # the leaky IMU term contributed -0.066, so the supporting
-            # estimate became the primary trajectory owner and drove the wire
-            # below tilt support.  IMU damping may reinforce a clear visual
-            # path, but never by more than that path's bounded correction.
-            imu_delta = math.copysign(
-                min(abs(imu_delta), abs(visual_delta)),
-                imu_delta,
+            imu_innovation = _clamp(
+                imu_raw_delta - optical_motion_delta,
+                -innovation_bound,
+                innovation_bound,
             )
+            imu_weight = _clamp01(
+                1.0
+                - visual_freshness
+                * (
+                    _clamp01(motion.control_authority)
+                    if motion is not None
+                    else motion_measurement_authority
+                )
+            )
+            imu_delta = imu_weight * imu_innovation
         target = support + visual_delta + imu_delta
         self._last_vertical_support = float(support)
         self._last_vertical_visual_delta = float(visual_delta)
@@ -5065,9 +5536,9 @@ class CleanCourseController:
             record=True,
         )
         desired = 0.0 if current_path_released else current_desired
-        if current_edge & FrameEdge.RIGHT:
+        if not current_path_released and current_edge & FrameEdge.RIGHT:
             desired = max(desired, current_error, 0.0)
-        elif current_edge & FrameEdge.LEFT:
+        elif not current_path_released and current_edge & FrameEdge.LEFT:
             desired = min(desired, current_error, 0.0)
 
         # The same safe-passage authority that moves yaw may preturn the
@@ -5107,11 +5578,11 @@ class CleanCourseController:
         # The underlying magnitude remains filtered and the final roll target
         # keeps its existing slew/bounds, but stale opposite aperture state can
         # never command the wrong image side for another tick.
-        if current_edge & FrameEdge.RIGHT:
+        if not current_path_released and current_edge & FrameEdge.RIGHT:
             self._lateral_intercept_reference_x = max(
                 self._lateral_intercept_reference_x, 0.0
             )
-        elif current_edge & FrameEdge.LEFT:
+        elif not current_path_released and current_edge & FrameEdge.LEFT:
             self._lateral_intercept_reference_x = min(
                 self._lateral_intercept_reference_x, 0.0
             )
@@ -5356,6 +5827,8 @@ class CleanCourseController:
 
     def _enter_search(self, now_s: float) -> None:
         self.state = CleanCourseState.SEARCH
+        self._commit_entry_s = None
+        self._commit_pitch_target_rad = None
         self._reset_vertical_direction()
         self._clear_current_fresh_observation()
         # Initialize the real bounded yaw sweep from the last observed
@@ -5431,6 +5904,33 @@ class CleanCourseController:
             self._prev_target_pitch + limit,
         )
         return self._prev_target_pitch
+
+    def _pitch_response_authority(
+        self,
+        target_pitch_rad: float,
+        measured_pitch_rad: float,
+    ) -> float:
+        """Qualify extra pitch response in the physical brake direction.
+
+        ``_pitch_energy_brake_demand`` describes approach energy; it is not a
+        generic gain selector.  Base attitude PD always owns the full signed
+        error.  Extra response is leased only when that error points toward
+        ``pre_cross_brake_pitch_rad``.  The zero-error boundary is continuous
+        and introduces no tunable phase threshold.
+        """
+
+        authority = 0.0
+        if self.state in (CleanCourseState.TRACK, CleanCourseState.COMMIT):
+            authority = _directional_brake_response_authority(
+                self._pitch_energy_brake_demand,
+                target_pitch_rad=target_pitch_rad,
+                measured_pitch_rad=measured_pitch_rad,
+                brake_pitch_offset_rad=(
+                    self.config.pre_cross_brake_pitch_rad
+                ),
+            )
+        self._last_pitch_response_authority = _clamp01(authority)
+        return self._last_pitch_response_authority
 
 
 def _frame_identity(update: Any) -> Optional[Tuple[Any, Any]]:
@@ -5944,7 +6444,11 @@ def _clean_course_tick_trace(
         "pitch_energy": {
             "brake_demand": controller._pitch_energy_brake_demand,
             "brake_active": controller._pitch_energy_brake_active,
+            "response_authority": (
+                controller._last_pitch_response_authority
+            ),
         },
+        "track_reconciliation": controller._last_reconcile_status,
         "lateral_intercept_reference_x": (
             controller._lateral_intercept_reference_x
         ),
@@ -6005,6 +6509,13 @@ def _clean_course_tick_trace(
             ),
             "launch_shape_delta": controller._last_launch_collective_delta,
             "imu_delta": controller._last_vertical_imu_delta,
+            "imu_raw_delta": controller._last_vertical_imu_raw_delta,
+            "required_rate_norm_s": (
+                controller._last_vertical_required_rate_norm_s
+            ),
+            "observed_rate_norm_s": (
+                controller._last_vertical_observed_rate_norm_s
+            ),
             "target_collective": (
                 controller._last_vertical_collective_target
             ),
@@ -6200,18 +6711,14 @@ async def run_clean_course_stage(
             if controller.state is CleanCourseState.COAST_FOR_CREDIT:
                 command = rt.attitude_rate_command_type(0.0, 0.0, 0.0, 0.0)
             else:
-                intercept_authority = (
-                    controller._pitch_energy_brake_demand
-                    if controller.state
-                    in (CleanCourseState.TRACK, CleanCourseState.COMMIT)
-                    else 0.0
-                )
                 pd_command = rt.attitude_rate_command(
                     estimate,
                     target_roll_rad=nav.target_roll_rad,
                     target_pitch_rad=nav.target_pitch_rad,
                     thrust=nav.thrust,
-                    intercept_response_authority=intercept_authority,
+                    intercept_response_authority=(
+                        nav.pitch_response_authority
+                    ),
                 )
                 command = rt.attitude_rate_command_type(
                     float(pd_command.roll_rate),
