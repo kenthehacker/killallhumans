@@ -5862,6 +5862,7 @@ def test_f167_recorded_f166_launch_keeps_visual_primary_collective():
                 controller._last_vertical_collective_target,
                 output.thrust,
                 controller._last_launch_collective_delta,
+                controller._last_gate0_energy_floor_delta,
             )
         )
 
@@ -5876,6 +5877,7 @@ def test_f167_recorded_f166_launch_keeps_visual_primary_collective():
         target,
         wire,
         launch,
+        floor,
     ) in samples:
         # IMU damping remains present as a bounded innovation around optical
         # image motion; it is neither deleted on every fresh frame nor added
@@ -5888,7 +5890,7 @@ def test_f167_recorded_f166_launch_keeps_visual_primary_collective():
         if abs(imu_raw) > innovation_bound + abs(optical_motion):
             assert abs(imu) < abs(imu_raw)
         assert target == pytest.approx(
-            support + visual + imu + launch, abs=1e-12
+            support + visual + imu + floor + launch, abs=1e-12
         )
         assert controller.config.min_thrust <= wire <= controller.config.max_thrust
     assert max(
@@ -5902,7 +5904,7 @@ def test_f167_recorded_f166_launch_keeps_visual_primary_collective():
     late = [sample for sample in samples if 0.704 <= sample[0] <= 1.172]
     assert min(
         wire - support
-        for *_, support, _target, wire, _launch in late
+        for *_, support, _target, wire, _launch, _floor in late
     ) >= -0.0071
     maximum_nose_up_reversal = _maximum_advance_to_brake_reversal(pitches)
     assert maximum_nose_up_reversal < math.radians(0.5)
@@ -6085,6 +6087,105 @@ def test_f175_f174_launch_motion_cannot_retire_boost_carry_to_support():
     assert reversal["target"] <= reversal["support"]
     assert reversal["wire"] > reversal["support"] + 0.01
     assert before["wire"] - reversal["wire"] < 0.01
+
+
+def test_f176_f175_gate0_energy_handoff_has_no_support_dip_or_rebound():
+    # F175 run 20260802T084143Z-visual-course-4ab9249d, trace SHA-256
+    # 73351EE0F7ABE464951A9C75CFB5C8F9929F690255343460EE9B60F6E24373A7.
+    # The live wire fell below tilt support from about1.19--2.11 s, then the
+    # direction reversal stepped it sharply upward at2.14.  Replay actual
+    # tracker geometry/rates and attitude through COMMIT.  The minimum launch
+    # energy must smoothstep to support, never pass through it into a dip, and
+    # preserve the safe COMMIT reached by the recorded observations.
+    rows = (
+        # t, frame, outer center/span/conf, aperture center/half, rates, pitch, fh
+        (0.000, 3073646, (-.006250, -.033333), (.125000, .222222), .847488296, (-.006113, -.042682), (.049318, .100244), (-.000024735, .000363776, -.000001474), -.309571434, .011122872),
+        (0.109, 3073650, (.000000, -.033333), (.126563, .222222), .843629977, (-.008410, -.037079), (.045737, .076062), (-.028331258, -.009409628, -.030623206), -.310022793, 3.347744642),
+        (0.234, 3073653, (.000000, -.027778), (.126563, .222222), .844568248, (-.003130, -.036354), (.050461, .083921), (-.003274694, -.012023755, -.012341820), -.311326904, 3.609882700),
+        (0.359, 3073657, (.000000, -.022222), (.128125, .222222), .847376810, (-.007010, -.022514), (.044983, .074520), (.002276813, -.010231535, -.004670497), -.312723056, 3.584837460),
+        (0.484, 3073661, (.000000, -.016667), (.131250, .230556), .858219463, (.004493, -.002115), (.057381, .110448), (.004102914, -.008281858, -.004259432), -.313822632, 3.530197408),
+        (0.609, 3073665, (.000000, .055556), (.131250, .180556), .731396104, (.005288, .000849), (.062968, .118596), (.004878310, -.005011773, .007829528), -.314700638, 3.227360083),
+        (0.672, 3073666, (.000000, .066667), (.134375, .172222), .662520214, (.004797, .055154), (.063709, .086505), (.009697448, -.003529357, .006456821), -.314930457, 3.028541740),
+        (0.734, 3073668, (.000000, .005556), (.137500, .241667), .826108780, (.000295, .014077), (.067806, .122034), (.003240241, -.007332622, .002497297), -.315242471, 2.910478612),
+        (0.859, 3073672, (.000000, .022222), (.142188, .247222), .895715330, (.006261, .036936), (.064062, .115842), (.011674733, -.006708833, .006396893), -.315904763, 2.721589594),
+        (1.000, 3073676, (-.003125, .038889), (.146875, .261111), .926745438, (-.001032, .039330), (.077668, .135670), (.010613632, -.016696635, .005976519), -.317655444, 2.598744423),
+        (1.125, 3073680, (.000000, .055556), (.154687, .269444), .954610896, (-.001270, .051395), (.079422, .143061), (.000526690, -.029077734, -.001079195), -.320104373, 2.482537900),
+        (1.250, 3073684, (-.003125, .061111), (.162500, .286111), .985727518, (-.000717, .064765), (.081768, .148392), (.001915902, -.016977184, -.002080671), -.322693952, 2.372343805),
+        (1.375, 3073687, (.000000, .077778), (.167187, .300000), .996453112, (.000146, .073725), (.087520, .159836), (-.004643283, -.031352195, -.006878889), -.326820059, 2.278436912),
+        (1.531, 3073692, (.003125, .094444), (.185937, .325000), .996220824, (.002853, .091595), (.095505, .172151), (-.022766336, -.067160255, -.020547150), -.333647943, 2.161331662),
+        (1.656, 3073696, (.006250, .116667), (.198438, .350000), .997260672, (.009233, .106403), (.098638, .181403), (-.038609206, -.092282153, -.039110585), -.344277961, 2.148497593),
+        (1.781, 3073700, (.015625, .138889), (.218750, .386111), .996272139, (.014882, .132806), (.112146, .200127), (-.056887373, -.180699549, -.058049208), -.362335771, 2.261689097),
+        (1.922, 3073704, (.040625, .177778), (.257813, .430556), .987338993, (.028334, .165031), (.121425, .216157), (-.076560094, -.206804982, -.083039663), -.391286492, 2.469921439),
+        (2.000, 3073706, (.040625, .200000), (.265625, .455556), .992412904, (.036020, .178993), (.127747, .233068), (-.077245816, -.183967656, -.091635926), -.407737998, 2.602497730),
+        (2.031, 3073707, (.046875, .205556), (.278125, .472222), .988833018, (.039890, .185222), (.132289, .236256), (-.086104020, -.157673976, -.094913310), -.412419197, 2.644494983),
+        (2.078, 3073709, (.056250, .211111), (.292188, .502778), .989433052, (.048659, .192180), (.140371, .255189), (-.083834595, -.130377359, -.096977918), -.420089179, 2.714718230),
+        (2.125, 3073710, (.053125, .216667), (.300000, .522222), .991436814, (.053511, .192994), (.145121, .259288), (-.079512163, -.114269397, -.097197055), -.425356802, 2.764910195),
+        (2.156, 3073711, (.056250, .216667), (.309375, .541667), .991175833, (.059462, .185214), (.149957, .265350), (-.081483065, -.097450129, -.095037861), -.429029452, 2.804295245),
+        (2.187, 3073712, (.062500, .216667), (.321875, .561111), .991080825, (.063470, .185813), (.153335, .280015), (-.085401877, -.087523280, -.098169370), -.431597867, 2.834670037),
+        (2.219, 3073713, (.065625, .216667), (.334375, .583333), .991929331, (.068824, .180408), (.158094, .287351), (-.082310065, -.081474415, -.098120405), -.433974040, 2.862608566),
+    )
+    controller = CleanCourseController(
+        _config(launch_boost_duration_s=LAUNCH_BOOST_DURATION_S)
+    )
+    samples = []
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        track = _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            aperture_center=row[5],
+            aperture_half=row[6],
+        )
+        update = _update([track], frame_id=row[1])
+        if index == 0:
+            controller.initialize(
+                update,
+                gate_index=0,
+                fallback_center_norm=row[2],
+                fallback_apparent_scale=math.sqrt(row[3][0] * row[3][1]),
+                now_s=now,
+            )
+        else:
+            controller.observe(update, now_s=now, body_rates=row[7])
+        output = _command(
+            controller,
+            now,
+            pitch=row[8],
+            fh=row[9],
+            accel_trust=0.0,
+        )
+        samples.append(
+            {
+                "t": row[0],
+                "state": controller.state,
+                "support": controller._last_vertical_support,
+                "target": controller._last_vertical_collective_target,
+                "wire": output.thrust,
+                "floor": controller._last_gate0_energy_floor_delta,
+                "admission": controller._last_commit_admission,
+            }
+        )
+
+    handoff = [sample for sample in samples if 1.125 <= sample["t"] <= 2.219]
+    assert any(sample["floor"] > 0.0 for sample in handoff)
+    assert all(
+        sample["target"] >= sample["support"] - 1e-12
+        and sample["wire"] >= sample["support"] - 1e-12
+        for sample in handoff
+    )
+    assert max(
+        abs(right["wire"] - left["wire"])
+        for left, right in zip(handoff, handoff[1:])
+    ) < 0.003
+    committed = [sample for sample in samples if sample["state"] is CleanCourseState.COMMIT]
+    assert committed
+    assert committed[0]["t"] <= 2.031
+    assert committed[0]["admission"].admissible
+    assert all(
+        controller.config.min_thrust <= sample["wire"] <= controller.config.max_thrust
+        for sample in samples
+    )
 
 
 def test_f170_failed_f168_topology_jump_cannot_cancel_launch_floor():
@@ -6425,58 +6526,63 @@ def _replay_f170_gate1_latency_rows():
 def test_f171_f170_gate1_motion_reverses_collective_before_censorship():
     controller, samples, outputs = _replay_f170_gate1_latency_rows()
 
-    assert samples[4.218]["direction_sign"] == -1
-    assert samples[4.218]["direction_supported"]
-    assert samples[4.250]["direction_streak"] == 1
-    assert not samples[4.250]["direction_supported"]
-    # A command tick that republishes frame 2846899 is not another optical
-    # vote; the distinct-frame evidence clock stays at one.
-    assert samples[4.281]["serial"] == samples[4.250]["serial"]
-    assert samples[4.281]["direction_streak"] == 1
-    assert samples[4.312]["direction_streak"] == 2
-    assert not samples[4.312]["direction_supported"]
+    assert samples[4.125]["direction_sign"] == -1
+    assert samples[4.125]["direction_supported"]
+    assert samples[4.156]["direction_streak"] == 1
+    assert not samples[4.156]["direction_supported"]
+    assert samples[4.187]["direction_streak"] == 2
+    assert not samples[4.187]["direction_supported"]
 
-    reversal = samples[4.343]
+    reversal = samples[4.218]
     motion = reversal["vertical_motion"]
     assert reversal["direction_sign"] == 1
     assert reversal["direction_streak"] == 3
     assert reversal["direction_supported"]
-    assert reversal["direction_source"] == "coherent_optical_motion"
+    assert reversal["direction_source"] == "coherent_optical_brake"
     assert motion.bearing_error < 0.0
     assert motion.fallback_intercept_error < 0.0
-    assert motion.optical_intercept_error > 0.0
+    assert motion.optical_intercept_error < 0.0
+    response_endpoint = motion.optical_intercept_error + (
+        motion.physical_rate_norm_s * controller.config.commit_blackout_s
+    )
+    assert motion.physical_rate_norm_s > 0.0
+    assert response_endpoint > 0.0
     assert motion.control_authority == pytest.approx(0.0)
-    # F175: coherent raw/de-dilated motion establishes the sign, but the
-    # bounded TTC endpoint—not the smallest 0.5 s rate displacement—owns the
-    # anticipatory magnitude.  This is the defect reproduced again by F174 at
-    # t=4.406..5.031 before its bottom-censored miss.
+    # F176: de-dilated motion establishes a response-horizon brake before the
+    # static mathematical plane endpoint crosses.  This is the same phase-
+    # plane defect reproduced by F175: full endpoint magnitude merely shifted
+    # the bang-bang reversal while accumulated climb remained unbraked.
     assert reversal["direction_magnitude"] == pytest.approx(
         min(
-            abs(motion.optical_intercept_error),
+            abs(response_endpoint),
             controller.config.vertical_optical_error_max_near_norm,
         )
     )
-    assert reversal["vertical_visual"] < 0.0
-    assert reversal["vertical_target"] < reversal["support"]
-    # F174: a confirmed trajectory reversal retires only the stale
-    # above-support carry to neutral support, then the ordinary bounded
-    # filter continues toward the visual descent target on the same tick.
-    assert reversal["vertical_target"] <= reversal["wire"]
-    assert reversal["wire"] <= reversal["support"]
+    # The response endpoint first owns a neutral pre-brake.  It retires the
+    # accumulated climb without starting descent while the mathematical plane
+    # endpoint still predicts a high-side passage.
+    assert reversal["vertical_visual"] == pytest.approx(0.0)
+    assert reversal["vertical_target"] == pytest.approx(reversal["support"])
+    assert reversal["wire"] == pytest.approx(reversal["support"])
 
-    filtered_reversal = samples[4.687]
+    # A command tick that republishes frame 2846899 is not another optical
+    # vote; the distinct-frame evidence streak does not advance.
+    assert samples[4.281]["serial"] == samples[4.250]["serial"]
+    assert samples[4.281]["direction_streak"] == samples[4.250][
+        "direction_streak"
+    ]
+
+    filtered_reversal = samples[4.250]
+    assert filtered_reversal["direction_source"] == "coherent_optical_motion"
+    assert filtered_reversal["vertical_target"] < filtered_reversal["support"]
     assert filtered_reversal["wire"] < filtered_reversal["support"]
-    # The full bounded endpoint now supplies material braking well before the
-    # recorded censor, instead of waiting for the raw center displacement.
-    assert filtered_reversal["wire"] < 0.25
+    # The wire has already retired climb and begun bounded braking before the
+    # unextended plane endpoint changes sign at t=4.250.
+    assert filtered_reversal["wire"] < filtered_reversal["support"] - 0.003
     assert filtered_reversal["wire"] > controller.config.min_thrust
-    # Scheduling/evidence costs 93 ms, but the old bounded carry no longer
-    # consumes another 344 ms before crossing support.  This is the same seam
-    # isolated live by F173 (360 ms command carry versus ~62 ms scheduling and
-    # ~62 ms actuator follow-up); cadence and command bounds stay unchanged.
-    assert 4.343 - 4.250 == pytest.approx(0.093, abs=1e-9)
+    assert 4.218 - 4.156 == pytest.approx(0.062, abs=1e-9)
     assert reversal["wire"] <= reversal["support"]
-    assert 4.687 + 0.220 < 5.281
+    assert 4.250 + 0.220 < 5.281
     assert all(
         controller.config.min_thrust <= output.thrust <= controller.config.max_thrust
         for output in outputs

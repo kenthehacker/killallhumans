@@ -1402,6 +1402,7 @@ class CleanCourseController:
         # the streak because it is direct one-sided evidence.
         self._vertical_direction_track_id: Optional[str] = None
         self._vertical_direction_last_y_observation_serial = 0
+        self._vertical_direction_last_bearing_error: Optional[float] = None
         self._vertical_direction_streak_sign = 0
         self._vertical_direction_streak = 0
         self._vertical_direction_sign = 0
@@ -1427,6 +1428,7 @@ class CleanCourseController:
         self._last_vertical_motion_delta = 0.0
         self._last_vertical_direction_delta = 0.0
         self._last_launch_collective_delta = 0.0
+        self._last_gate0_energy_floor_delta = 0.0
         self._last_vertical_required_rate_norm_s = 0.0
         self._last_vertical_observed_rate_norm_s = 0.0
         self._last_vertical_imu_raw_delta = 0.0
@@ -1932,6 +1934,7 @@ class CleanCourseController:
         self._last_vertical_motion_delta = 0.0
         self._last_vertical_direction_delta = 0.0
         self._last_launch_collective_delta = 0.0
+        self._last_gate0_energy_floor_delta = 0.0
         self._last_vertical_required_rate_norm_s = 0.0
         self._last_vertical_observed_rate_norm_s = 0.0
         self._last_vertical_imu_raw_delta = 0.0
@@ -5336,6 +5339,7 @@ class CleanCourseController:
 
         self._vertical_direction_track_id = track_id
         self._vertical_direction_last_y_observation_serial = 0
+        self._vertical_direction_last_bearing_error = None
         self._vertical_direction_streak_sign = 0
         self._vertical_direction_streak = 0
         self._vertical_direction_sign = 0
@@ -5388,38 +5392,36 @@ class CleanCourseController:
         """Return a coherent sign and bounded TTC-endpoint magnitude.
 
         This is deliberately independent of the static compensated bearing.
-        Raw image motion, expansion-de-dilated motion, and the TTC endpoint all
-        have to agree while closure is credible.  The rates establish direction;
-        once they do, the TTC endpoint owns bounded miss magnitude.  F174 showed
-        that taking the minimum short-horizon rate displacement waited for the
-        gate center to move before acting even though the endpoint already
-        predicted the bottom-side miss.  Covariance may shape feedforward
-        elsewhere but cannot shrink this independently coherent direction back
-        to a near-zero correction.
+        Expansion-de-dilated motion and a response-horizon endpoint have to
+        agree while closure is credible.  The response endpoint extends the
+        constant-velocity plane arrival by the existing bounded blackout
+        horizon: a vehicle with accumulated optical momentum must begin braking
+        before its camera center is predicted to cross the aperture.  Raw image
+        rate is deliberately not a sign veto because perspective dilation can
+        oppose translational motion while an off-axis gate expands.  F175 kept
+        climbing for exactly that reason even though de-dilated motion already
+        showed the required brake.  Covariance may shape feedforward elsewhere
+        but cannot erase this independently coherent direction.
         """
 
         cfg = self.config
         horizon_s = max(1e-6, cfg.commit_blackout_s)
-        image_rate = (
-            float(motion.fallback_intercept_error)
-            - float(motion.bearing_error)
-        ) / horizon_s
         optical = float(motion.optical_intercept_error)
         physical_rate = float(motion.physical_rate_norm_s)
+        response_endpoint = optical + physical_rate * horizon_s
         if not all(
             math.isfinite(value)
             for value in (
                 motion.closure_rate_s,
                 optical,
                 physical_rate,
-                image_rate,
+                response_endpoint,
             )
         ):
             return 0, 0.0
         if (
             motion.closure_rate_s < cfg.passage_min_closure_rate_s
-            or optical * physical_rate <= 0.0
-            or optical * image_rate <= 0.0
+            or response_endpoint * physical_rate <= 0.0
         ):
             return 0, 0.0
         # This path is specifically near-plane arrival ownership, so retain the
@@ -5427,8 +5429,8 @@ class CleanCourseController:
         # far-field position range to a projected endpoint.
         error_cap = cfg.vertical_optical_error_max_near_norm
         return (
-            1 if optical > 0.0 else -1,
-            min(abs(optical), error_cap),
+            1 if response_endpoint > 0.0 else -1,
+            min(abs(response_endpoint), error_cap),
         )
 
     def _update_vertical_direction(
@@ -5515,19 +5517,26 @@ class CleanCourseController:
                 ),
             )
         direction_source = "coherent_motion"
-        if sign == 0 and motion_sign != 0:
-            # F171, F170 Gate 1: static pitch compensation kept the short
-            # fallback endpoint above the aperture for another 0.84 s after
-            # fresh outer image motion and the TTC/de-dilated endpoint already
-            # showed a bottom-side miss.  Requiring that static endpoint to
-            # agree made it a direction veto.  Three distinct outer frames
-            # still earn ownership below, but closure-credible, same-sign raw
-            # and de-dilated motion may now establish the near-plane direction
-            # before the compensated position crosses.  Projection covariance
-            # continues to bound magnitude; it does not erase sign.
+        brake_only = False
+        if motion_sign != 0 and motion_sign != sign:
+            # F171/F175, Gate 1: static pitch compensation and the mathematical
+            # plane endpoint retained climb after the de-dilated trajectory had
+            # accumulated enough momentum to require braking.  The coherent
+            # response endpoint may therefore start the three-distinct-frame
+            # reversal even while those static projections still have the old
+            # sign.  Projection covariance continues to bound feedforward and
+            # admission; it does not veto this direction.
             sign = motion_sign
             direction_magnitude = motion_magnitude
-            direction_source = "coherent_optical_motion"
+            plane_agrees = (
+                motion_sign * float(motion.optical_intercept_error) > 0.0
+            )
+            brake_only = not plane_agrees
+            direction_source = (
+                "coherent_optical_brake"
+                if brake_only
+                else "coherent_optical_motion"
+            )
         elif sign != 0 and motion_sign == sign:
             # Crossing the static fallback through zero must not collapse an
             # already coherent momentum request.  Keep the stronger of two
@@ -5546,7 +5555,23 @@ class CleanCourseController:
         # Endpoint agreement establishes direction; covariance remains a
         # magnitude/feedforward fact.  Requiring projection authority here was
         # the F165 veto that erased 48/71 unmistakable high-gate corrections.
-        direction_resolved = bool(fresh_y_owned and sign != 0)
+        previous_bearing = self._vertical_direction_last_bearing_error
+        bearing_progressing = bool(
+            previous_bearing is not None
+            and abs(float(motion.bearing_error))
+            <= abs(float(previous_bearing))
+        )
+        # A response endpoint beyond the mathematical plane is a pre-brake,
+        # not yet proof that the opposite translation should begin.  Require
+        # the measured bearing itself to make non-worsening progress on each
+        # distinct frame.  This rejects the failed F168 Gate-0 low trajectory,
+        # whose compensated miss kept worsening even though expansion alone
+        # produced a small opposite response endpoint.
+        direction_resolved = bool(
+            fresh_y_owned
+            and sign != 0
+            and (not brake_only or bearing_progressing)
+        )
         observation_serial = self._current_fresh_outer_y_observation_serial
         is_new_measurement = (
             fresh_y_owned
@@ -5578,6 +5603,9 @@ class CleanCourseController:
                     now_s + cfg.vertical_direction_fast_window_s
                 )
                 self._vertical_direction_fast_applied = False
+            self._vertical_direction_last_bearing_error = float(
+                motion.bearing_error
+            )
 
         if (
             fresh_y_owned
@@ -5711,7 +5739,26 @@ class CleanCourseController:
                 visual_delta += projection_delta
 
                 if self._vertical_direction_supported:
-                    if motion.directional_censor != FrameEdge.NONE:
+                    brake_only = (
+                        self._vertical_direction_source
+                        == "coherent_optical_brake"
+                    )
+                    if brake_only:
+                        # Phase-plane pre-brake owns only retirement of the
+                        # old acceleration.  It may cap an opposing position
+                        # request at neutral support, but may not command the
+                        # new translation direction until the mathematical
+                        # plane endpoint agrees.
+                        before_directional_override = visual_delta
+                        if (
+                            visual_delta * self._vertical_direction_sign
+                            > 0.0
+                        ):
+                            visual_delta = 0.0
+                        directional_override_delta = (
+                            visual_delta - before_directional_override
+                        )
+                    elif motion.directional_censor != FrameEdge.NONE:
                         magnitude = min(
                             max(
                                 abs(motion.bearing_error),
@@ -5724,25 +5771,26 @@ class CleanCourseController:
                             abs(self._vertical_direction_magnitude),
                             error_cap,
                         )
-                    effective_magnitude = (
-                        magnitude * path.freshness_authority
-                    )
-                    directional_delta = (
-                        -cfg.vertical_optical_collective_gain
-                        * self._vertical_direction_sign
-                        * effective_magnitude
-                    )
-                    # Coherent motion/one-sided clipping may reverse a static
-                    # compensated bearing near the plane.  When both agree,
-                    # keep the stronger bounded request rather than stacking.
-                    before_directional_override = visual_delta
-                    if directional_delta * visual_delta < 0.0:
-                        visual_delta = directional_delta
-                    elif abs(directional_delta) > abs(visual_delta):
-                        visual_delta = directional_delta
-                    directional_override_delta = (
-                        visual_delta - before_directional_override
-                    )
+                    if not brake_only:
+                        effective_magnitude = (
+                            magnitude * path.freshness_authority
+                        )
+                        directional_delta = (
+                            -cfg.vertical_optical_collective_gain
+                            * self._vertical_direction_sign
+                            * effective_magnitude
+                        )
+                        # Coherent motion/one-sided clipping may reverse a static
+                        # compensated bearing near the plane.  When both agree,
+                        # keep the stronger bounded request rather than stacking.
+                        before_directional_override = visual_delta
+                        if directional_delta * visual_delta < 0.0:
+                            visual_delta = directional_delta
+                        elif abs(directional_delta) > abs(visual_delta):
+                            visual_delta = directional_delta
+                        directional_override_delta = (
+                            visual_delta - before_directional_override
+                        )
             self._last_vertical_position_delta = float(position_delta)
             optical_motion_delta = visual_delta - position_delta
             motion_measurement_authority = (
@@ -5785,8 +5833,8 @@ class CleanCourseController:
             current is self.current
             and self.gate_index == 0
             and self._course_start_s is not None
-            and command_now_s is not None
             and cfg.launch_boost_duration_s > 0.0
+            and command_now_s is not None
             and command_now_s - self._course_start_s
             <= max(
                 cfg.launch_pitch_blend_s,
@@ -5841,6 +5889,24 @@ class CleanCourseController:
                     zero_recovery_delta,
                 )
         target = support + visual_delta + imu_delta + zero_recovery_delta
+        if self._vertical_direction_source == "coherent_optical_brake":
+            target = min(target, support)
+        unfloored_target = target
+        if (
+            current is self.current
+            and self.gate_index == 0
+            and self._course_start_s is not None
+            and self.config.launch_boost_duration_s > 0.0
+        ):
+            # Gate 0 inherits the bounded launch-energy objective until race
+            # ownership advances.  Boost still smoothsteps to neutral support
+            # and fresh outer vision may request more lift, but no later visual
+            # handoff creates F175's support-to-descent-to-climb cycle.  Exact
+            # zero is emitted on its separate mandatory crossing path.
+            target = max(target, support)
+        self._last_gate0_energy_floor_delta = float(
+            target - unfloored_target
+        )
         self._last_vertical_support = float(support)
         self._last_vertical_visual_delta = float(visual_delta)
         self._last_vertical_imu_delta = float(imu_delta)
@@ -6135,11 +6201,11 @@ class CleanCourseController:
                 wrong_sign_carry = bool(
                     (
                         self._vertical_direction_sign > 0
-                        and target < neutral < self._collective
+                        and target <= neutral < self._collective
                     )
                     or (
                         self._vertical_direction_sign < 0
-                        and target > neutral > self._collective
+                        and target >= neutral > self._collective
                     )
                 )
                 if wrong_sign_carry:
@@ -6178,6 +6244,20 @@ class CleanCourseController:
         self._collective = _clamp(
             self._collective, self.config.min_thrust, self.config.max_thrust
         )
+        if (
+            support is not None
+            and math.isfinite(float(support))
+            and self.gate_index == 0
+            and self._course_start_s is not None
+            and self.config.launch_boost_duration_s > 0.0
+        ):
+            # The Gate-0 launch owner promises a minimum tilt-adjusted energy
+            # trajectory until authoritative ownership advances.  Enforce the
+            # same floor at the carried wire boundary so a rising support
+            # estimate cannot slip through the 0.25 s filter and recreate the
+            # F175 below-support dip.  Mandatory exact zero bypasses this
+            # helper on its separate crossing-safety path.
+            self._collective = max(self._collective, float(support))
         return self._collective
 
     def _governed_collective(
@@ -7025,6 +7105,9 @@ def _clean_course_tick_trace(
                 controller._last_vertical_direction_delta
             ),
             "launch_shape_delta": controller._last_launch_collective_delta,
+            "gate0_energy_floor_delta": (
+                controller._last_gate0_energy_floor_delta
+            ),
             "imu_delta": controller._last_vertical_imu_delta,
             "imu_raw_delta": controller._last_vertical_imu_raw_delta,
             "imu_trust": controller._last_vertical_imu_trust,
