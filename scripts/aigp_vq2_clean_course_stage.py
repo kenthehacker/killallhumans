@@ -4039,8 +4039,15 @@ class CleanCourseController:
         successor = self.successor
         if not pending_credit or successor is None:
             return False
-        if self._find(tracks, successor.track_id) is not None:
-            return False
+        exact = self._find(tracks, successor.track_id)
+        if exact is not None:
+            self._update_hypothesis(successor, exact, now_s)
+            self.successor_bearing_cache[self.gate_index] = (
+                successor.x,
+                successor.y,
+            )
+            self._last_reconcile_status = "released-successor-exact"
+            return True
         candidates = [
             track
             for track in tracks
@@ -4065,6 +4072,69 @@ class CleanCourseController:
         )
         self._last_reconcile_status = "released-successor-rebound"
         return True
+
+    def _reconcile_successor_lineage(
+        self,
+        tracks: List[Any],
+        *,
+        now_s: float,
+    ) -> bool:
+        """Keep an established next-gate hypothesis across tracker aliases.
+
+        A tracker id is not a race role.  When an established successor id
+        disappears, first try the same innovation-gated alias transfer used
+        after promotion.  If the only alternatives are newborn and none is a
+        unique compatible continuation, retain the measured lineage for the
+        ordinary bounded stale interval instead of replacing it with a
+        one-frame fragment.  Once an incompatible alternative itself becomes
+        established, generic successor ranking may replace the old hypothesis.
+        """
+
+        successor = self.successor
+        if successor is None:
+            return False
+        current_id = self._current_track_id()
+        candidates = [
+            track for track in tracks if track.track_id != current_id
+        ]
+        exact = self._find(candidates, successor.track_id)
+        if exact is not None:
+            # Away from the strict released/pending-credit interval, retain
+            # the existing ranking contract among simultaneously visible,
+            # established successor candidates.  The generic path below
+            # updates this exact alias if it remains the best evidence.
+            return False
+        if not candidates:
+            # Preserve the existing one-second no-candidate retirement path
+            # in _refresh_successor().
+            return False
+        compatible = self._compatible_replacements(successor, candidates)
+        if len(compatible) == 1:
+            replacement = compatible[0]
+            self._rebind_hypothesis_id(
+                successor, str(replacement.track_id)
+            )
+            self._update_hypothesis(successor, replacement, now_s)
+            self.successor_bearing_cache[self.gate_index] = (
+                successor.x,
+                successor.y,
+            )
+            self._last_reconcile_status = "successor-lineage-rebound"
+            return True
+        established = [
+            track
+            for track in candidates
+            if self._track_age_s(track.track_id, now_s)
+            >= REACQUIRE_MIN_AGE_S
+        ]
+        if not established:
+            self._last_reconcile_status = (
+                "successor-lineage-ambiguous-hold"
+                if compatible
+                else "successor-lineage-newborn-hold"
+            )
+            return True
+        return False
 
     def _refresh_corridor_certificate(
         self,
@@ -4608,6 +4678,8 @@ class CleanCourseController:
 
     def _refresh_successor(self, tracks: List[Any], now_s: float) -> None:
         if self._reconcile_released_successor(tracks, now_s=now_s):
+            return
+        if self._reconcile_successor_lineage(tracks, now_s=now_s):
             return
         current_id = self._current_track_id()
         others = [track for track in tracks if track.track_id != current_id]

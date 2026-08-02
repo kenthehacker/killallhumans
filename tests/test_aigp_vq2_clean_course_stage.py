@@ -3590,8 +3590,11 @@ def test_f168_f167_credit_before_replacement_reconciles_authorized_gate():
                 gate_index=1, race_boot_ms=2400, now_s=now
             )
             assert controller.current is promoted_lineage
-            assert controller.current.track_id == "vq2-track-000002"
-            assert controller.state is CleanCourseState.PREDICT
+            # The uniquely compatible tracker alias may inherit the logical
+            # successor before credit, but it remains successor-only until
+            # this authoritative promotion.
+            assert controller.current.track_id == "vq2-track-000003"
+            assert controller.state is CleanCourseState.TRACK
         measurement_before = (
             controller.current.last_measurement_s
             if controller.current is not None
@@ -3627,7 +3630,7 @@ def test_f168_f167_credit_before_replacement_reconciles_authorized_gate():
             assert controller._last_vertical_path_error < 0.0
         previous_frame_id = frame_id
 
-    assert controller._last_reconcile_status == "promoted-current-rebound"
+    assert controller._last_reconcile_status == "exact-current"
     assert all(frame_id >= 2563268 for _t, frame_id, _out in post_credit)
     assert any(
         left[1] != right[1]
@@ -6526,6 +6529,105 @@ def test_f172_f170_revoked_commit_loss_stays_powered_until_current_proof():
     assert loss["output"].thrust > 0.0
     assert sum(output.thrust == 0.0 for output in outputs) == 0
     assert controller.gate_index == 0
+
+
+def test_f173_f172_successor_lineage_rejects_one_frame_fragment():
+    # F172 flight 20260802T074154Z-visual-course-aac36a6b.  Track 000002
+    # represented Gate 1 for 65 accepted frames before its tracker alias went
+    # stale.  A one-frame sub-fragment 000003 then displaced it immediately;
+    # the physical Gate 1 reappeared as compatible 000004 before credit, but
+    # stale 000003 was promoted and excluded the real gate forever.  Replay
+    # the advancing clean tracker tokens (the selected-target frame id froze)
+    # and the exact credit-before-frame ordering through several Gate-1 ticks.
+    rows = (
+        # t, clean frame, body rates, visible id/center/span/confidence.
+        (2.281, 2966030, (-.1089778781, -.0991894014, -.1074062436), (("000001", (.075, .1222222222), (.35625, .6138888889), .9893300582), ("000002", (-.35625, .05), (.0765625, .1666666667), .6296388358))),
+        (2.516, 2966036, (-.0173739247, -.0344168551, -.0029082933), (("000001", (.084375, .0944444444), (.5203125, .825), .9586396671),)),
+        (2.562, 2966038, (.2085980385, -.0287490420, .0270199069), (("000001", (.121875, .0666666667), (.56875, .9305555556), .9685039333),)),
+        (2.844, 2966046, (.0528511203, -.0014319576, -.0977687239), (("000001", (.06875, 0.0), (.9328125, 1.0), .8229938167),)),
+        (2.891, 2966048, (.0606091082, -.0018174283, -.1000110506), (("000001", (0.0, 0.0), (1.0, 1.0), .7916564097), ("000003", (-.890625, .5888888889), (.04375, .0861111111), .5937266667))),
+        (2.937, 2966049, (.0113349272, -.0023141864, -.1456660479), (("000001", (-.00625, 0.0), (.9921875, 1.0), .7798526267),)),
+        (2.984, 2966051, (-.0897522882, -.0017934821, -.3395731746), (("000005", (-.859375, 0.0), (.1390625, 1.0), .4), ("000004", (-.378125, .0555555556), (.0984375, .2), .7078429997))),
+        (3.016, 2966052, (-.1064052076, -.0022058271, -.3616677820), (("000004", (-.36875, .0555555556), (.1, .2), .7079896933),)),
+        (3.047, 2966053, (-.2217551560, -.0033812605, -.3347360193), (("000004", (-.35625, .05), (.1015625, .2055555556), .7103847606),)),
+        (3.078, 2966054, (-.1912899703, -.0035115860, -.3208803236), (("000004", (-.346875, .05), (.1015625, .2055555556), .7118375524),)),
+        (3.125, 2966055, (-.1959250808, -.0019390367, -.3254914879), (("000004", (-.3375, .0444444444), (.1015625, .2055555556), .7156401735),)),
+        # A repeated clean token is not a second identity vote.
+        (3.156, 2966055, (-.2730655760, -.0014776669, -.3309340774), (("000004", (-.3375, .0444444444), (.1015625, .2055555556), .7156401735),)),
+        (3.187, 2966056, (-.2827597946, -.0033534847, -.3314221799), (("000004", (-.328125, .0388888889), (.103125, .2083333333), .7171011858),)),
+        (3.219, 2966057, (-.2740092069, -.0018854670, -.3297076821), (("000004", (-.315625, .0388888889), (.1046875, .2111111111), .7142892365),)),
+        (3.250, 2966058, (-.2577025980, .0033350207, -.2613406479), (("000004", (-.303125, .0333333333), (.1046875, .2111111111), .7130703579),)),
+        (3.281, 2966059, (-.1838798315, .0156853266, -.0416888855), (("000004", (-.296875, .0277777778), (.1046875, .2138888889), .7109744946),)),
+        (3.312, 2966060, (-.1231062800, .0219652422, -.0227896887), (("000004", (-.296875, .0222222222), (.10625, .2166666667), .7108266000),)),
+    )
+
+    def tracks(specs):
+        return [
+            _f163_trace_track(
+                track_id=f"vq2-track-{track_id}",
+                outer_center=center,
+                outer_span=span,
+                confidence=confidence,
+            )
+            for track_id, center, span, confidence in specs
+        ]
+
+    base_s = 100.0
+    first = rows[0]
+    initial_tracks = tracks(first[3])
+    controller = CleanCourseController(_config())
+    controller.initialize(
+        _update(initial_tracks, frame_id=first[1]),
+        gate_index=0,
+        fallback_center_norm=initial_tracks[0].center_norm,
+        fallback_apparent_scale=initial_tracks[0].apparent_scale,
+        now_s=base_s + first[0],
+    )
+    lineage = controller.successor
+    assert lineage is not None
+    assert lineage.track_id == "vq2-track-000002"
+
+    post_credit_frames = []
+    for elapsed, frame_id, body_rates, specs in rows[1:]:
+        now = base_s + elapsed
+        if elapsed == 3.219:
+            assert controller.gate_index == 0
+            assert controller.current.track_id == "vq2-track-000001"
+            assert controller.note_race(
+                gate_index=1, race_boot_ms=5200, now_s=now
+            )
+            assert controller.current is lineage
+            assert controller.current.track_id == "vq2-track-000004"
+        controller.observe(
+            _update(tracks(specs), frame_id=frame_id),
+            now_s=now,
+            body_rates=body_rates,
+        )
+        if elapsed == 2.891:
+            assert controller.successor is lineage
+            assert controller.successor.track_id == "vq2-track-000002"
+            assert controller._last_reconcile_status == (
+                "successor-lineage-newborn-hold"
+            )
+        if elapsed == 2.984:
+            assert controller.successor is lineage
+            assert controller.successor.track_id == "vq2-track-000004"
+            assert controller._last_reconcile_status == (
+                "successor-lineage-rebound"
+            )
+        if elapsed >= 3.219:
+            output = _command(
+                controller, now, pitch=SPAWN_PITCH, yaw=0.0
+            )
+            post_credit_frames.append(frame_id)
+            assert controller.gate_index == 1
+            assert controller.current is lineage
+            assert controller.current.track_id == "vq2-track-000004"
+            assert output.current_track_id == "vq2-track-000004"
+            assert controller.state is CleanCourseState.TRACK
+
+    assert post_credit_frames == [2966057, 2966058, 2966059, 2966060]
+    assert controller._last_reconcile_status == "exact-current"
 
 
 def test_f168_commit_pitch_transfer_and_response_are_direction_safe():
