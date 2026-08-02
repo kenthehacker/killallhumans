@@ -2643,7 +2643,7 @@ def _turn_reference_controller(
     return controller
 
 
-def test_successor_preview_changes_yaw_but_not_current_gate_bank():
+def test_safe_successor_preview_coordinates_yaw_and_bank():
     turn = _turn_reference_controller()
     current_only = _turn_reference_controller(successor_x=None)
     with_turn = None
@@ -2661,12 +2661,12 @@ def test_successor_preview_changes_yaw_but_not_current_gate_bank():
     assert with_turn.successor_track_id == "B"
     assert with_turn.successor_blend > 0.0
     assert with_turn.yaw_rate_rad_s < 0.0
-    # F164: successor preview manages camera/FOV yaw only.  Physical bank
-    # remains owned by the current gate's optical intercept until race credit.
-    assert with_turn.target_roll_rad > 0.0
-    assert with_turn.target_roll_rad == pytest.approx(
-        without_turn.target_roll_rad, abs=1e-12
-    )
+    # F165: once the current aperture has a safe horizontal reserve, useful
+    # preview enters the physical intercept coherently.  F164's yaw-only
+    # preview turned the camera left while the aircraft kept banking right.
+    assert with_turn.target_roll_rad < 0.0
+    assert with_turn.yaw_rate_rad_s * with_turn.target_roll_rad > 0.0
+    assert with_turn.target_roll_rad < without_turn.target_roll_rad
     assert without_turn.yaw_rate_rad_s > 0.0
     assert without_turn.target_roll_rad > 0.0
     # The successor changes only the shared lateral reference.
@@ -2703,10 +2703,8 @@ def test_continuous_turn_reference_continues_through_safe_commit():
     assert with_preview.state is CleanCourseState.COMMIT
     assert with_preview.successor_blend > 0.0
     assert with_preview.yaw_rate_rad_s < without_preview.yaw_rate_rad_s
-    assert with_preview.target_roll_rad == pytest.approx(
-        without_preview.target_roll_rad, abs=1e-12
-    )
-    assert with_preview.yaw_rate_rad_s * with_preview.target_roll_rad < 0.0
+    assert with_preview.target_roll_rad < without_preview.target_roll_rad
+    assert with_preview.yaw_rate_rad_s * with_preview.target_roll_rad > 0.0
     assert with_preview.target_pitch_rad == pytest.approx(
         without_preview.target_pitch_rad, abs=1e-12
     )
@@ -2791,7 +2789,7 @@ def test_turn_reference_eligibility_variation_never_reverses_left_handoff():
         controller.successor.last_x_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH, yaw=0.0)
     assert out.yaw_rate_rad_s < 0.0
-    assert out.target_roll_rad > 0.0
+    assert out.target_roll_rad < 0.0
 
     samples = []
     variations = (
@@ -2827,7 +2825,7 @@ def test_turn_reference_eligibility_variation_never_reverses_left_handoff():
         samples.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
 
     assert all(sample.yaw_rate_rad_s <= 1e-9 for sample in samples)
-    assert all(sample.target_roll_rad >= -1e-9 for sample in samples)
+    assert all(sample.target_roll_rad <= 1e-9 for sample in samples)
     assert any(sample.yaw_rate_rad_s < -0.02 for sample in samples)
     yaw_steps = [
         abs(right.yaw_rate_rad_s - left.yaw_rate_rad_s)
@@ -2851,10 +2849,11 @@ def test_fresh_reassociated_successor_has_no_second_turn_age_gate():
 
     assert out.successor_blend > 0.0
     assert out.yaw_rate_rad_s < 0.0
-    assert out.target_roll_rad == pytest.approx(0.0, abs=1e-12)
+    assert out.target_roll_rad < 0.0
+    assert out.yaw_rate_rad_s * out.target_roll_rad > 0.0
 
 
-def test_bottom_censored_successor_keeps_fresh_horizontal_turn_authority():
+def test_bottom_censored_successor_cannot_bypass_current_passage_safety():
     # BOTTOM clipping makes successor y uncertain, but its uncensored x axis
     # remains a current measurement.  The heading preview must use x-axis
     # uncertainty alone rather than letting the growing y covariance erase a
@@ -2896,8 +2895,66 @@ def test_bottom_censored_successor_keeps_fresh_horizontal_turn_authority():
     assert controller.successor.last_y_measurement_s == old_y_stamp
     assert controller.successor.y_axis.std > initial_y_std * 3.0
     assert controller.successor.x_axis.std < initial_y_std
+    # The successor x axis remains fresh, but F165 no longer treats loss of
+    # current aperture geometry as permission to hand it control.  Current A
+    # remains the shared yaw/roll owner until its passage is credible.
+    assert out.successor_blend == pytest.approx(0.0, abs=1e-12)
+    assert out.yaw_rate_rad_s > 0.0
+    assert out.target_roll_rad > 0.0
+
+
+def test_bottom_censored_successor_keeps_x_authority_after_safe_passage_release():
+    # Paired with the no-release case above: BOTTOM invalidates successor y,
+    # not its measured x axis.  With a fresh, contained current aperture the
+    # same recorded clipping class must produce a coherent left yaw AND bank.
+    def current_track():
+        return _f163_trace_track(
+            outer_center=(0.02, 0.0),
+            outer_span=(0.45, 0.45),
+            track_id="A",
+            aperture_center=(0.02, 0.0),
+            aperture_half=(0.20, 0.20),
+            aperture_log_scale=0.5 * math.log(0.20 * 0.20),
+        )
+
+    def successor_track():
+        return _f163_trace_track(
+            outer_center=(-0.45, 0.50),
+            outer_span=(0.10, 0.10),
+            track_id="B",
+            clipping=FrameEdge.BOTTOM,
+        )
+
+    controller = _tracked_controller(current_track())
+    controller.observe(
+        _update([current_track(), successor_track()], frame_id=3),
+        now_s=100.08,
+    )
+    assert controller.successor is not None
+    old_y_stamp = controller.successor.last_outer_y_measurement_s
+    now = 100.10
+    out = None
+    for frame in range(15):
+        now += 0.033
+        controller.observe(
+            _update(
+                [current_track(), successor_track()],
+                frame_id=60 + frame,
+            ),
+            now_s=now,
+        )
+        out = _command(
+            controller, now + 0.005, pitch=SPAWN_PITCH, yaw=0.0
+        )
+
+    assert controller.successor.last_outer_x_measurement_s == pytest.approx(
+        now, abs=1e-12
+    )
+    assert controller.successor.last_outer_y_measurement_s == old_y_stamp
     assert out.successor_blend > 0.10
     assert out.yaw_rate_rad_s < 0.0
+    assert out.target_roll_rad < 0.0
+    assert out.yaw_rate_rad_s * out.target_roll_rad > 0.0
 
 
 def test_successor_reassociation_cannot_recreate_precredit_s_turn():
@@ -2944,14 +3001,18 @@ def test_successor_reassociation_cannot_recreate_precredit_s_turn():
         samples.append(_command(controller, now, pitch=SPAWN_PITCH, yaw=0.0))
 
     assert all(sample.yaw_rate_rad_s < 0.0 for sample in samples)
-    # Roll consumes only the current gate's optical-intercept state.  It stays
-    # bounded and keeps current-gate custody while yaw previews the successor.
+    # Safe preview is one coordinated lateral path, not F164's yaw-only
+    # overlay.  It stays bounded and left through evidence/reassociation.
     assert all(
         abs(sample.target_roll_rad)
         <= controller.config.max_target_roll_rad + 1e-9
         for sample in samples
     )
-    assert samples[-1].target_roll_rad > 0.0
+    assert samples[-1].target_roll_rad < 0.0
+    assert all(
+        sample.yaw_rate_rad_s * sample.target_roll_rad > 0.0
+        for sample in samples
+    )
     yaw_steps = [
         abs(right.yaw_rate_rad_s - left.yaw_rate_rad_s)
         for left, right in zip(samples, samples[1:])
@@ -3072,9 +3133,10 @@ def test_bottom_y_covariance_cannot_release_fresh_lateral_custody():
         assert lateral[1] == pytest.approx(lateral[0], abs=1e-12)
 
 
-def test_arbitrarily_weak_successor_remains_weak_after_current_claim_ages():
-    # Aging current x releases custody, but it must not normalize an almost
-    # completely uncertain successor into full authority.
+def test_current_claim_age_cannot_create_successor_passage_authority():
+    # F164 released successor custody merely because the current aperture/x
+    # aged.  Missing current passage evidence must produce no authority at
+    # all, independent of how long the stale claim has aged.
     controller = _turn_reference_controller(successor_x=-0.45, current_x=0.0)
     controller.current.aperture_half_x = None
     controller.current.aperture_half_y = None
@@ -3108,8 +3170,7 @@ def test_arbitrarily_weak_successor_remains_weak_after_current_claim_ages():
         )
         authorities.append(authority)
 
-    assert authorities[-1] > 0.0
-    assert max(authorities) < 0.03
+    assert authorities == pytest.approx([0.0] * len(authorities), abs=1e-12)
 
 
 def test_f143_crossing_reassociation_keeps_one_left_turn_time_series():
@@ -4032,10 +4093,11 @@ def test_f162_observations_have_no_live_aperture_commit_overlap():
     # begin until t=5.062, and closure was still above the controlled-approach
     # target.  This remains evidence of no live overlap, not a scalar veto.
     rows = (
-        # t, frame, x, y, bbox width/height, pitch, optional aperture half-size
-        (4.359, 1907073, -0.13125, 0.04444444444444451, 0.1625, 0.2833333333333333, -0.4576878453806965, (0.048412277765566725, 0.08626446521721656)),
-        (4.640, 1907079, -0.103125, 0.011111111111111072, 0.190625, 0.3111111111111111, -0.444454312243036, (0.05539495859669369, 0.09349205793547188)),
-        (4.656, 1907080, -0.10, 0.005555555555555536, 0.1953125, 0.3138888888888889, -0.4429891285637212, (0.051281969088538604, 0.09164662350284151)),
+        # t, frame, x, y, bbox width/height, pitch,
+        # optional (aperture center, half-size, raw log-scale)
+        (4.359, 1907073, -0.13125, 0.04444444444444451, 0.1625, 0.2833333333333333, -0.4576878453806965, ((-0.1563614426, -0.0043497345), (0.048412277765566725, 0.08626446521721656), -2.6106008221)),
+        (4.640, 1907079, -0.103125, 0.011111111111111072, 0.190625, 0.3111111111111111, -0.444454312243036, ((-0.1303246943, -0.0268291262), (0.05539495859669369, 0.09349205793547188), -2.6589443926)),
+        (4.656, 1907080, -0.10, 0.005555555555555536, 0.1953125, 0.3138888888888889, -0.4429891285637212, ((-0.1275914617, -0.0183558378), (0.051281969088538604, 0.09164662350284151), -2.6656886059)),
         (4.812, 1907084, -0.090625, 0.0, 0.2078125, 0.3305555555555555, -0.43636218682192973, None),
         (5.062, 1907088, -0.084375, 0.03333333333333344, 0.246875, 0.3722222222222222, -0.44265084811207817, None),
         (5.125, 1907090, -0.0875, 0.05555555555555558, 0.259375, 0.39166666666666666, -0.44686735045384735, None),
@@ -4043,30 +4105,21 @@ def test_f162_observations_have_no_live_aperture_commit_overlap():
     )
 
     def observation(row):
-        _, _, x, y, width, height, _, aperture_half = row
-        aperture = (
-            None
-            if aperture_half is None
-            else SimpleNamespace(
-                passage_usable=True,
-                half_size_norm=aperture_half,
-            )
+        _, _, x, y, width, height, _, aperture_fit = row
+        return _f163_trace_track(
+            outer_center=(x, y),
+            outer_span=(width, height),
+            track_id="A",
+            aperture_center=(
+                None if aperture_fit is None else aperture_fit[0]
+            ),
+            aperture_half=(
+                None if aperture_fit is None else aperture_fit[1]
+            ),
+            aperture_log_scale=(
+                None if aperture_fit is None else aperture_fit[2]
+            ),
         )
-        track = _track(
-            "A",
-            x,
-            y,
-            scale=math.sqrt(width * height),
-            confidence=0.90,
-            aperture=aperture,
-        )
-        track.bbox_norm = (
-            x - width / 2.0,
-            y - height / 2.0,
-            x + width / 2.0,
-            y + height / 2.0,
-        )
-        return track
 
     first = rows[0]
     controller = CleanCourseController(_config())
@@ -4097,7 +4150,7 @@ def test_f162_observations_have_no_live_aperture_commit_overlap():
             if first_proximity_s is None:
                 first_proximity_s = elapsed
             proximity_closures.append(
-                max(current.expansion_rate, current.outer_expansion_rate)
+                controller._outer_closure_estimate(current, now)[0]
             )
         _command(controller, now, pitch=row[6])
         assert controller.state is CleanCourseState.TRACK
@@ -4119,8 +4172,11 @@ def _f163_trace_track(
     *,
     outer_center,
     outer_span,
+    confidence=0.90,
+    track_id="recorded-current",
     aperture_center=None,
     aperture_half=None,
+    aperture_log_scale=None,
     clipping=FrameEdge.NONE,
 ):
     """Faithful recorded-state adapter using the real tracker unit contract.
@@ -4139,8 +4195,13 @@ def _f163_trace_track(
     if aperture_center is not None:
         aperture = SimpleNamespace(
             center_norm=tuple(float(v) for v in aperture_center),
-            log_scale=math.log(
-                max(1e-6, math.sqrt(4.0 * aperture_half[0] * aperture_half[1]))
+            log_scale=(
+                0.5
+                * math.log(
+                    max(1e-12, aperture_half[0] * aperture_half[1])
+                )
+                if aperture_log_scale is None
+                else float(aperture_log_scale)
             ),
             confidence=0.90,
             measurement_std=(0.006, 0.009, 0.03),
@@ -4148,7 +4209,7 @@ def _f163_trace_track(
             half_size_norm=tuple(float(v) for v in aperture_half),
         )
     return SimpleNamespace(
-        track_id="recorded-current",
+        track_id=track_id,
         center_norm=(float(x), float(y)),
         bbox_norm=(
             center_unit_x - width / 2.0,
@@ -4157,8 +4218,8 @@ def _f163_trace_track(
             center_unit_y + height / 2.0,
         ),
         apparent_scale=math.sqrt(width * height),
-        confidence=0.90,
-        association_confidence=0.90,
+        confidence=float(confidence),
+        association_confidence=float(confidence),
         clipping=clipping,
         center_censored=clipping != FrameEdge.NONE,
         ambiguous=False,
@@ -4199,6 +4260,111 @@ def _replay_f163_rows(rows, *, gate_index):
             )
         outputs.append(_command(controller, now, pitch=row[4], yaw=0.0))
     return controller, outputs
+
+
+def test_f163_gate0_trace_restores_early_brake_without_descent_collective():
+    # F163 trace 20260801T231436Z-visual-course-571628a6, SHA-256
+    # 98D73CC8FB87734DC44745E3283791B15622D12CE86362070F06D8A51C3F1B53.
+    # F164 fed truthful outer closure into the trajectory law as well as
+    # admission, deleting this early aperture-expansion brake and reversing
+    # Gate0's ordinary exit from y=+0.30 to y=-0.33.  Replay the actual public
+    # observations (including production aperture scale units), never injected
+    # controller state, and require the separated control cue to restore the
+    # F163 response without commanding a below-support vertical dip.
+    rows = (
+        # t, frame, outer center/span/confidence, aperture center/half/log,
+        # body rates, measured pitch, measured yaw
+        (0.407, 2052952, (0.0, -0.033333333), (0.1296875, 0.227777778), 0.851868156, (-0.000933081, -0.017385977), (0.045903510, 0.090086504), -2.744099305, (-0.008308031, 0.009424807, -0.002845698), -0.305993759, -0.001185045),
+        (0.453, 2052953, (-0.003125, -0.033333333), (0.128125, 0.227777778), 0.855911670, (-0.001167147, -0.034773992), (0.046731509, 0.109100640), -2.639410574, (-0.018228127, 0.020392066, -0.004411468), -0.305280245, -0.001392911),
+        (0.485, 2052954, (-0.003125, -0.033333333), (0.128125, 0.230555556), 0.857608214, (-0.015355154, -0.036636120), (0.039757721, 0.059959652), -3.019517308, (-0.008626368, 0.017318213, -0.003784995), -0.304711661, -0.001513124),
+        (0.516, 2052955, (-0.003125, -0.033333333), (0.128125, 0.230555556), 0.859020659, (-0.014679623, -0.032506987), (0.040688239, 0.068968167), -2.937963221, (-0.001311761, 0.001084940, -0.002400813), -0.304534776, -0.001612994),
+        (0.563, 2052957, (0.0, -0.027777778), (0.1328125, 0.233333333), 0.863247345, (0.001467546, -0.020777371), (0.056844649, 0.111670561), -2.529817679, (-0.024912961, 0.009831239, -0.004120315), -0.304370371, -0.001751474),
+        (0.594, 2052958, (0.0, -0.027777778), (0.1328125, 0.236111111), 0.868875305, (0.001654859, -0.020068872), (0.061655727, 0.117291094), -2.464642808, (-0.019537756, 0.008246623, -0.005552340), -0.303947059, -0.001946011),
+        (0.657, 2052959, (-0.003125, -0.022222222), (0.1375, 0.233333333), 0.865953079, (0.000486117, -0.016697485), (0.057350383, 0.112707698), -2.520766654, (0.003951231, -0.245745698, -0.000897831), -0.310695225, -0.002120039),
+        (0.688, 2052960, (-0.003125, -0.011111111), (0.1359375, 0.236111111), 0.871015313, (0.000612717, 0.000513752), (0.061687172, 0.117244633), -2.464585963, (-0.011348313, -0.201032633, 0.000179844), -0.319845210, -0.002079399),
+        (0.719, 2052961, (-0.003125, 0.005555556), (0.1375, 0.238888889), 0.875176538, (-0.001012115, 0.006616010), (0.064512614, 0.115768434), -2.448528929, (0.012021052, -0.087661372, -0.000271794), -0.320806494, -0.002077557),
+        (0.750, 2052962, (-0.003125, 0.005555556), (0.1375, 0.238888889), 0.878974089, (0.001971353, 0.011304708), (0.065016277, 0.119250847), -2.429821834, (0.013103569, -0.359451378, -0.000589905), -0.328703713, -0.002059033),
+    )
+
+    def track(row):
+        return _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            aperture_center=row[5],
+            aperture_half=row[6],
+            aperture_log_scale=row[7],
+        )
+
+    first = rows[0]
+    controller = CleanCourseController(_config())
+    controller.initialize(
+        _update([track(first)], frame_id=first[1]),
+        gate_index=0,
+        fallback_center_norm=first[2],
+        fallback_apparent_scale=math.sqrt(first[3][0] * first[3][1]),
+        now_s=100.0 + first[0],
+    )
+    controller._alt_est_m = 2.0
+    samples = []
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        if index:
+            controller.observe(
+                _update([track(row)], frame_id=row[1]),
+                now_s=now,
+                body_rates=row[8],
+            )
+        output = _command(
+            controller,
+            now,
+            pitch=row[9],
+            yaw=row[10],
+        )
+        samples.append(
+            (
+                row[0],
+                controller._pre_cross_brake_active,
+                output,
+                controller._control_closure_estimate(
+                    controller.current, now
+                )[0],
+                controller._outer_closure_estimate(
+                    controller.current, now
+                )[0],
+                controller._last_vertical_support,
+            )
+        )
+
+    first_brake = next(t for t, active, *_ in samples if active)
+    assert first_brake == pytest.approx(0.594, abs=1e-6)
+    by_time = {sample[0]: sample for sample in samples}
+    assert by_time[0.594][2].target_pitch_rad <= -0.32
+    assert by_time[0.719][2].target_pitch_rad <= -0.45
+    assert by_time[0.750][3] > 0.70
+    assert max(sample[4] for sample in samples) < 0.20
+    assert min(
+        sample[2].thrust - sample[5] for sample in samples
+    ) > -0.002
+
+    # Recorded F163 outcome label: after the aperture crosses image center it
+    # stays on the ordinary, non-dipping side through the last live fit and
+    # first BOTTOM observation.  The controller assertions above preserve the
+    # early causal response that produced this trajectory.
+    recorded_exit_y = (
+        0.061037839,
+        0.061399446,
+        0.110439823,
+        0.101164399,
+        0.148286357,
+        0.182855547,
+        0.200117110,
+        0.210566646,
+        0.283333333,
+    )
+    assert min(recorded_exit_y) > 0.05
+    assert recorded_exit_y[-2] > 0.20
+    assert recorded_exit_y[-1] > recorded_exit_y[-2]
 
 
 def test_f163_gate0_trace_reaches_owned_commit_before_bottom_censorship():
@@ -4269,6 +4435,152 @@ def test_f163_gate1_trace_transports_geometry_without_modality_false_closure():
         "corridor-known/not-contained"
     )
     assert not controller._last_commit_admission.admissible
+
+
+def test_f164_gate1_trace_never_steers_from_stale_aperture_wrong_side():
+    # F164 trace 20260801T235635Z-visual-course-aa5a3f98.  At 4.625 the
+    # opposite successor reversed yaw after the current aperture expired; at
+    # 6.781 the still-live current outer box was RIGHT/BOTTOM at x=+0.834 while
+    # the extrapolated aperture state remained near x=-0.922.  Replay normal
+    # observations only: fresh outer current-gate evidence owns both yaw and
+    # bank, unsafe successor preview stays revoked, and the right inequality
+    # immediately prevents the stale left sign from reaching steering.
+    rows = (
+        # t, frame, current center/span/conf/edge, optional aperture tuple,
+        # optional successor center/span/conf/edge, body rates, pitch, yaw
+        (3.906, 2128622, (-0.221875, 0.161111111), (0.146875, 0.238888889), 0.671792014, 0, ((-0.256985049, 0.109378578), (0.035378985, 0.048116964), -3.187878880), ((0.334375, 0.422222222), (0.0328125, 0.10), 0.407808831, 0), (-0.387679480, -0.049033876, -0.329588156), -0.448136049, -0.506405050),
+        (4.063, 2128627, (-0.196875, 0.133333333), (0.1609375, 0.258333333), 0.553402497, 0, None, ((0.396875, 0.466666667), (0.0359375, 0.105555556), 0.425165561, 0), (-0.407456390, 0.020964433, -0.329588394), -0.439268571, -0.561557841),
+        (4.156, 2128630, (-0.181250, 0.127777778), (0.1703125, 0.272222222), 0.509809626, 0, None, ((0.437500, 0.511111111), (0.0390625, 0.111111111), 0.432195569, 0), (-0.396001480, -0.025096651, -0.232772689), -0.439660522, -0.593350688),
+        (4.313, 2128634, (-0.178125, 0.105555556), (0.1796875, 0.288888889), 0.502317802, 0, None, ((0.465625, 0.555555556), (0.0421875, 0.116666667), 0.447672725, 0), (-0.378993652, 0.039850224, -0.145854618), -0.434441250, -0.624350061),
+        (4.391, 2128637, (-0.178125, 0.083333333), (0.190625, 0.308333333), 0.489367983, 0, None, ((0.484375, 0.588888889), (0.046875, 0.122222222), 0.449992986, 0), (-0.367389313, 0.025291358, -0.143996131), -0.432447887, -0.636661829),
+        (4.516, 2128640, (-0.181250, 0.072222222), (0.1984375, 0.322222222), 0.480734524, 0, None, ((0.506250, 0.627777778), (0.0484375, 0.130555556), 0.447759425, 0), (-0.359443657, 0.002858986, -0.050915416), -0.432616647, -0.653449736),
+        (4.625, 2128644, (-0.196875, 0.055555556), (0.2125000, 0.344444444), 0.467926489, 0, None, ((0.512500, 0.694444444), (0.0515625, 0.138888889), 0.454060875, 0), (-0.336344860, -0.037201266, 0.032074861), -0.435148248, -0.653937687),
+        (4.766, 2128648, (-0.231250, 0.044444444), (0.2265625, 0.372222222), 0.453144644, 0, None, ((0.500000, 0.766666667), (0.0562500, 0.144444444), 0.456563414, 0), (-0.278529040, -0.063551034, 0.148095403), -0.441651975, -0.637453818),
+        (4.922, 2128653, (-0.290625, 0.027777778), (0.2484375, 0.411111111), 0.437458389, 0, None, ((0.468750, 0.850000000), (0.0593750, 0.150000000), 0.456568261, 8), (-0.244444809, -0.053099297, 0.213641826), -0.444682564, -0.603149475),
+        (5.094, 2128658, (-0.350000, 0.005555556), (0.2750000, 0.455555556), 0.432574486, 0, None, ((0.440625, 0.883333333), (0.0640625, 0.113888889), 0.515802283, 8), (-0.223431728, -0.050227444, 0.177147333), -0.445419837, -0.566434482),
+        (5.281, 2128663, (-0.403125, -0.016666667), (0.3062500, 0.502777778), 0.428927906, 0, None, ((0.434375, 0.916666667), (0.0609375, 0.083333333), 0.583500241, 8), (-0.099544040, -0.046295695, 0.116031874), -0.446941557, -0.535128812),
+        (5.453, 2128669, (-0.456250, -0.022222222), (0.3484375, 0.558333333), 0.442261050, 0, None, None, (-0.040477395, -0.035739138, 0.054380503), -0.449527308, -0.518335916),
+        (5.625, 2128674, (-0.481250, -0.011111111), (0.3875000, 0.611111111), 0.462169348, 0, None, None, (-0.032426182, -0.024507014, 0.013508462), -0.453045161, -0.511015466),
+        (5.797, 2128679, (-0.500000, 0.005555556), (0.4328125, 0.663888889), 0.495050669, 0, None, None, (-0.016110751, -0.015147697, 0.004981172), -0.455345094, -0.508523970),
+        (5.953, 2128683, (-0.578125, -0.044444444), (0.3937500, 0.627777778), 0.768541761, 0, None, None, (-0.010042917, -0.009672853, 0.000605964), -0.457081881, -0.507469724),
+        (6.141, 2128689, (-0.525000, 0.127777778), (0.4734375, 0.813888889), 0.970908773, 1, None, None, (-0.006195319, -0.005151205, -0.000399903), -0.458325691, -0.507002857),
+        (6.313, 2128694, (-0.425000, 0.161111111), (0.5750000, 0.836111111), 0.954952201, 9, None, None, (-0.003302115, -0.002759674, -0.000423318), -0.458963729, -0.506836079),
+        (6.484, 2128699, (-0.221875, 0.200000000), (0.7765625, 0.800000000), 0.865331973, 9, None, None, (-0.035145353, 0.018945087, -0.423337739), -0.465090087, -0.525609346),
+        (6.531, 2128701, (0.000000, 0.222222222), (0.8765625, 0.777777778), 0.773216592, 8, None, ((0.146875, 0.788888889), (0.1843750, 0.211111111), 0.710723591, 8), (-0.148244567, 0.086754609, -0.346993547), -0.468616403, -0.543340900),
+        (6.578, 2128702, (0.103125, 0.233333333), (0.8984375, 0.766666667), 0.718547467, 12, None, ((0.184375, 0.794444444), (0.1828125, 0.202777778), 0.688995965, 8), (-0.101078286, 0.123076354, -0.311965119), -0.468416136, -0.563950916),
+        (6.625, 2128704, (0.228125, 0.261111111), (0.7718750, 0.736111111), 0.730221360, 12, None, ((0.262500, 0.816666667), (0.1875000, 0.180555556), 0.570642312, 8), (-0.096793629, 0.136764411, -0.335199904), -0.467682308, -0.580436874),
+        (6.781, 2128709, (0.834375, 0.461111111), (0.1671875, 0.538888889), 0.826410803, 12, None, ((0.440625, 0.866666667), (0.1640625, 0.133333333), 0.439284658, 8), (-0.157070331, 0.447318334, -0.106731873), -0.445495336, -0.645270117),
+    )
+
+    def tracks(row):
+        aperture = row[6]
+        current = _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            track_id="A",
+            aperture_center=None if aperture is None else aperture[0],
+            aperture_half=None if aperture is None else aperture[1],
+            aperture_log_scale=None if aperture is None else aperture[2],
+            clipping=FrameEdge(row[5]),
+        )
+        result = [current]
+        successor = row[7]
+        if successor is not None:
+            result.append(
+                _f163_trace_track(
+                    outer_center=successor[0],
+                    outer_span=successor[1],
+                    confidence=successor[2],
+                    track_id="B",
+                    clipping=FrameEdge(successor[3]),
+                )
+            )
+        return result
+
+    first = rows[0]
+    controller = CleanCourseController(_config())
+    controller.initialize(
+        _update(tracks(first), frame_id=first[1]),
+        gate_index=1,
+        fallback_center_norm=first[2],
+        fallback_apparent_scale=math.sqrt(first[3][0] * first[3][1]),
+        now_s=100.0 + first[0],
+    )
+    controller._alt_est_m = 2.0
+    samples = {}
+    control_time = 100.0 + first[0]
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        if index:
+            previous = rows[index - 1]
+            previous_time = 100.0 + previous[0]
+            # The compact rows retain selected camera updates, while the live
+            # controller still ran at ~30 Hz between them.  Exercise that same
+            # bounded command cadence so slew latency is represented rather
+            # than accidentally reduced to one command per selected frame.
+            while control_time + 0.033 < now - 1e-9:
+                control_time += 0.033
+                fraction = (control_time - previous_time) / max(
+                    1e-6, now - previous_time
+                )
+                _command(
+                    controller,
+                    control_time,
+                    pitch=previous[9]
+                    + fraction * (row[9] - previous[9]),
+                    yaw=previous[10]
+                    + fraction * (row[10] - previous[10]),
+                )
+            controller.observe(
+                _update(tracks(row), frame_id=row[1]),
+                now_s=now,
+                body_rates=row[8],
+            )
+        output = _command(
+            controller,
+            now,
+            pitch=row[9],
+            yaw=row[10],
+        )
+        control_time = now
+        outer_heading = controller._horizontal_control_observable(
+            controller.current, now
+        )[0]
+        samples[row[0]] = (
+            output,
+            outer_heading,
+            controller._turn_reference_x,
+            controller._lateral_intercept_reference_x,
+            controller.current.x,
+            controller.current.outer_x_axis.p,
+        )
+
+    for elapsed in (4.516, 4.625, 4.766):
+        output, outer_heading, reference, intercept, *_ = samples[elapsed]
+        assert outer_heading < 0.0
+        assert output.successor_blend == pytest.approx(0.0, abs=1e-12)
+        assert reference < 0.0
+        assert intercept < 0.0
+        assert output.yaw_rate_rad_s < 0.0
+        assert output.target_roll_rad < 0.0
+
+    first_right = samples[6.578]
+    assert first_right[1] > 0.0
+    assert first_right[2] >= 0.0
+    assert first_right[3] >= 0.0
+    assert first_right[0].successor_blend == pytest.approx(0.0, abs=1e-12)
+    assert first_right[0].yaw_rate_rad_s >= 0.0
+
+    final = samples[6.781]
+    assert final[1] > 0.50
+    assert final[4] < 0.0  # stale aperture projection remains inspectable
+    assert final[5] > 0.0  # but fresh outer x owns steering
+    assert final[0].yaw_rate_rad_s > 0.0
+    assert final[0].target_roll_rad > 0.0
+    assert final[0].yaw_rate_rad_s * final[0].target_roll_rad > 0.0
+    assert controller.state is CleanCourseState.TRACK
+    assert controller.gate_index == 1
 
 
 def test_commit_entry_requires_inner_aperture_budget():
@@ -4456,10 +4768,10 @@ def _converged_gate_one_vertical(vz_m_s):
     return out
 
 
-def test_far_vertical_arrival_damping_uses_one_imu_rate_term():
-    # Far from the crossing, retain F127's load-bearing IMU damping.  It
-    # arrests either sign of inherited vertical energy without stacking an
-    # image derivative or another collective owner.
+def test_far_vertical_arrival_damping_never_vetoes_clear_visual_direction():
+    # Far from the crossing, retain one bounded IMU damping term.  A fresh
+    # outer direction makes it supporting-only: it may arrest energy toward
+    # the requested path, but cannot command across tilt support against it.
     climbing = _converged_gate_one_vertical(0.60)
     settled = _converged_gate_one_vertical(0.0)
     assert climbing.thrust < settled.thrust - 0.04
@@ -4485,12 +4797,16 @@ def test_far_vertical_arrival_damping_uses_one_imu_rate_term():
             current.last_measurement_s = now
             current.last_x_measurement_s = now
             current.last_y_measurement_s = now
+            current.last_outer_y_measurement_s = now
+            current.last_outer_y_evidence_s = now
             out = _command(gate0, now, pitch=SPAWN_PITCH)
         return out
 
     gate0_climbing = _gate0_thrust(0.60)
     gate0_settled = _gate0_thrust(0.0)
-    assert gate0_climbing.thrust < gate0_settled.thrust - 0.04
+    assert gate0_climbing.thrust == pytest.approx(
+        gate0_settled.thrust, abs=1e-12
+    )
 
 
 def test_course_leg_projects_corrected_image_motion_into_optical_intercept():
