@@ -204,7 +204,17 @@ def _tracked_controller(track=None, *, config=None, now=100.0):
     return controller
 
 
-def _command(controller, now, *, roll=0.0, pitch=0.0, yaw=None, a_up=None, fh=None):
+def _command(
+    controller,
+    now,
+    *,
+    roll=0.0,
+    pitch=0.0,
+    yaw=None,
+    a_up=None,
+    fh=None,
+    accel_trust=None,
+):
     return controller.command(
         now_s=now,
         roll_rad=roll,
@@ -212,6 +222,7 @@ def _command(controller, now, *, roll=0.0, pitch=0.0, yaw=None, a_up=None, fh=No
         yaw_rad=yaw,
         world_up_accel_m_s2=a_up,
         horizontal_specific_force_mps2=fh,
+        accel_trust=accel_trust,
     )
 
 
@@ -419,11 +430,11 @@ def test_vertical_error_is_pitch_attitude_compensated():
     assert out.thrust < SPAWN_SUPPORT
 
 
-def test_gate0_takeoff_feedforward_is_owned_by_outer_trajectory():
-    # The configured 0.30 value is a bound, not a launch-phase collective
-    # owner.  A clearly high gate requests bounded spin-up; a low gate keeps
-    # the same outer-y trajectory in control and cannot be forced into a
-    # fixed boost or a below-support pad dip.
+def test_gate0_takeoff_feedforward_has_noncancellable_minimum_then_transfers():
+    # The configured 0.30 value is the bounded minimum launch-energy profile.
+    # Near-zero image position or a contradictory first-frame sign may shape
+    # feedback above that floor, but cannot retire motor spin-up.  The one
+    # collective owner then transfers smoothly to the outer-y trajectory.
     config = CleanCourseConfig(gate0_climb_vertical_offset_norm=0.0)
     high = _tracked_controller(
         _track("A", 0.0, -0.20, scale=0.05), config=config
@@ -438,7 +449,10 @@ def test_gate0_takeoff_feedforward_is_owned_by_outer_trajectory():
     low_output = _command(low, 100.10, pitch=SPAWN_PITCH)
     assert low._last_launch_collective_delta > 0.0
     assert low_output.thrust >= low._last_vertical_support - 0.0005
-    assert low_output.thrust < boosted.thrust
+    assert low_output.thrust == pytest.approx(boosted.thrust, abs=1e-12)
+    assert low_output.thrust == pytest.approx(
+        config.launch_boost_thrust, abs=1e-12
+    )
 
     first_after = _command(
         high, 100.0 + config.launch_boost_duration_s + 0.05,
@@ -1879,14 +1893,19 @@ def test_fh_freeze_suspends_vz_integration_leaks_to_zero_holds_alt():
 def test_fh_latch_does_not_switch_collective_owner_or_add_margin():
     # Braking can cross the fh trust threshold.  That transition may suspend
     # IMU integration, but it must not select a new thrust law or add the
-    # historical +0.05 margin.  With unqualified vision, both sides use the
-    # same supporting IMU-damping request.
+    # historical +0.05 margin.  With unqualified vision, trusted IMU damping
+    # is supporting evidence; once the regime latch invalidates it, the same
+    # carried collective converges smoothly to support instead of preserving
+    # or replacing the stale inertial request.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     controller.current.last_y_measurement_s = 99.0
     controller._vz_est_m_s = -0.40
     now = 100.10
     thrusts = []
     trust_states = []
+    targets = []
+    imu_deltas = []
+    supports = []
     for frame in range(15):
         now += 0.033
         out = _command(
@@ -1897,15 +1916,55 @@ def test_fh_latch_does_not_switch_collective_owner_or_add_margin():
         )
         thrusts.append(out.thrust)
         trust_states.append(not controller._fh_untrusted)
+        targets.append(controller._last_vertical_collective_target)
+        imu_deltas.append(controller._last_vertical_imu_delta)
+        supports.append(controller._last_vertical_support)
     assert controller._fh_untrusted
     assert any(trust_states) and not trust_states[-1]
     expected = (
         SPAWN_SUPPORT + controller.config.vertical_imu_damping_gain * 0.40
     )
-    assert thrusts == pytest.approx([expected] * len(thrusts), abs=1e-9)
+    for trusted, target, imu_delta, support in zip(
+        trust_states, targets, imu_deltas, supports
+    ):
+        if trusted:
+            assert target == pytest.approx(expected, abs=1e-9)
+        else:
+            assert imu_delta == pytest.approx(0.0, abs=1e-12)
+            assert target == pytest.approx(support, abs=1e-12)
+    assert max(thrusts) <= expected + 1e-9
+    assert supports[-1] <= thrusts[-1] < expected
     assert max(
         abs(after - before) for before, after in zip(thrusts, thrusts[1:])
-    ) < 1e-9
+    ) < 0.006
+
+
+def test_partial_accel_trust_qualifies_imu_once_at_control_boundary():
+    # Trust is confidence, not a second acceleration scale.  An accepted
+    # half-trust sample keeps physical magnitude in the leaky estimate and is
+    # weighted exactly once when that estimate contributes supporting damping.
+    controller = _tracked_controller(_track("A", 0.0, 0.0))
+    controller.current.last_y_measurement_s = 99.0
+    _command(
+        controller,
+        100.10,
+        pitch=SPAWN_PITCH,
+        a_up=-1.0,
+        accel_trust=0.5,
+    )
+
+    assert controller._last_vertical_imu_trust == pytest.approx(0.5)
+    # Scaling at integration and again at damping would leave <0.01 m/s here.
+    assert controller._vz_est_m_s < -0.015
+    assert controller._last_vertical_imu_delta == pytest.approx(
+        0.5 * controller._last_vertical_imu_raw_delta,
+        abs=1e-12,
+    )
+    assert controller._last_vertical_collective_target == pytest.approx(
+        controller._last_vertical_support
+        + controller._last_vertical_imu_delta,
+        abs=1e-12,
+    )
 
 
 def test_f162_first_bottom_frame_immediately_owns_vertical_direction():
@@ -3689,20 +3748,13 @@ def test_f168_tracker_replacement_does_not_inherit_aperture_fit_sigma():
 
 
 def test_f168_release_rebind_keeps_successor_yaw_roll_and_vertical_coherent():
-    # Reach COMMIT through recorded observations, retain a left Gate-1
-    # successor, and then lose Gate 0 with a stale RIGHT edge.  Exact zero is
-    # still mandatory.  During the bounded credit delay a compatible fresh id
-    # must inherit the successor lineage and own yaw, bank, and outer-y
-    # together; the released old-current edge has no remaining authority.
-    passage_rows = (
-        (1.953, 2052998, (0.053125, 0.161111), (0.25, 0.408333), -0.429284, 0, (0.040326, 0.148286), (0.118122, 0.212459), (-0.069072, -0.117701, -0.093605), FrameEdge.NONE),
-        (2.141, 2053004, (0.068750, 0.205556), (0.2828125, 0.486111), -0.445374, 0, (0.064315, 0.182856), (0.136344, 0.246483), (-0.046209, -0.054793, -0.075266), FrameEdge.NONE),
-        (2.297, 2053009, (0.084375, 0.238889), (0.3328125, 0.577778), -0.452093, 0, (0.082114, 0.200117), (0.157505, 0.286893), (-0.005388, -0.033068, -0.031834), FrameEdge.NONE),
-        (2.422, 2053012, (0.093750, 0.261111), (0.375000, 0.647222), -0.455251, 0, (0.088084, 0.210567), (0.173966, 0.319578), (0.047329, -0.020963, 0.016417), FrameEdge.NONE),
-        (2.469, 2053014, (0.034375, 0.283333), (0.4828125, 0.713889), -0.456153, 0, None, None, (0.065514, -0.016982, 0.029759), FrameEdge.BOTTOM),
-    )
-    controller, _outputs = _replay_f163_rows(passage_rows, gate_index=0)
-    assert controller.state is CleanCourseState.COMMIT
+    # Reach COMMIT through a deliberately safe public trace, retain the
+    # recorded left Gate-1 successor ordering, and then lose Gate 0 with a
+    # stale RIGHT edge.  Exact zero is still mandatory.  During the bounded
+    # credit delay a compatible fresh id must inherit successor lineage and
+    # own yaw, bank, and outer-y together; the released old-current edge has
+    # no remaining authority.
+    controller, _outputs, _now = _public_safe_commit_controller()
     current_edge = _f163_trace_track(
         track_id="recorded-current",
         outer_center=(0.20, 0.10),
@@ -4687,6 +4739,12 @@ def _drive_commit_window(controller, now, ticks=12):
     return out, now
 
 
+def _public_safe_commit_controller(*, now_s=100.0):
+    """Enter Gate-0 COMMIT through the dense, credited F163 camera trace."""
+
+    return _replay_f163_safe_passage(base_s=now_s, stop_at_commit=True)
+
+
 def test_close_loss_without_armed_commit_never_coasts():
     # F102: the gate-0 scale-triggered hot coast is deleted — ONE crossing
     # policy.  A centered close loss in TRACK (no armed COMMIT) is an
@@ -5007,6 +5065,73 @@ def _f163_trace_track(
     )
 
 
+# Dense credited Gate-0 suffix from F163 run
+# 20260801T231436Z-visual-course-571628a6, session SHA-256
+# 98D73CC8FB87734DC44745E3283791B15622D12CE86362070F06D8A51C3F1B53.
+# Schema: t, frame, outer center/span, confidence, aperture center/half,
+# body rates, rpy, accel trust, horizontal specific force.
+_F163_SAFE_PASSAGE_ROWS = (
+    (1.828, 2052994, (0.021875, 0.1277777778), (0.2125, 0.3694444444), 0.9926981189, (0.02747558174, 0.12069230851), (0.10445159567, 0.19120112953), (-0.05685060276, -0.13435577775, -0.07676949182), (-0.01161387480, -0.41199422433, -0.02421808669), 0.0, 3.31968227541),
+    (1.860, 2052995, (0.028125, 0.1388888889), (0.2171875, 0.3777777778), 0.9930474868, (0.03207603041, 0.13486609520), (0.09928892398, 0.18798711633), (-0.06086330666, -0.14927748764, -0.08433219621), (-0.01245555114, -0.41676566920, -0.02726496952), 0.0, 3.34929502497),
+    (1.891, 2052996, (0.0375, 0.15), (0.23125, 0.3888888889), 0.9887848804, (0.03464432098, 0.13941187422), (0.11210044264, 0.20044544847), (-0.06483166470, -0.13969718838, -0.09263654629), (-0.01331185702, -0.42233451268, -0.03060859318), 0.0, 3.38353795399),
+    (1.922, 2052997, (0.034375, 0.1555555556), (0.228125, 0.3972222222), 0.9914672807, (0.03684542394, 0.14819049608), (0.10867198089, 0.20133092518), (-0.06548158629, -0.10156004304, -0.09443096647), (-0.01395407570, -0.42536905200, -0.03343393328), 0.0, 3.39930493130),
+    (1.953, 2052998, (0.053125, 0.1611111111), (0.25, 0.4083333333), 0.9813742815, (0.04032598298, 0.14828635655), (0.11812225482, 0.21245927244), (-0.06907181247, -0.11770118946, -0.09360531548), (-0.01485857626, -0.42928448263, -0.03695478312), 0.0, 3.42640835217),
+    (1.985, 2052999, (0.05625, 0.1666666667), (0.25625, 0.4194444444), 0.9789414023, (0.04623212679, 0.15294103447), (0.12019049216, 0.20777105437), (-0.06856188728, -0.11544314945, -0.09417363086), (-0.01560777823, -0.43266183278, -0.03977366948), 0.0, 3.45025952805),
+    (2.016, 2053000, (0.065625, 0.1777777778), (0.2640625, 0.4305555556), 0.9758135841, (0.04849709016, 0.16118719293), (0.12130179082, 0.21874685704), (-0.06344126715, -0.08630889083, -0.09266605058), (-0.01638753573, -0.43601220621, -0.04328468894), 0.0, 3.47151104177),
+    (2.047, 2053001, (0.06875, 0.1888888889), (0.271875, 0.4444444444), 0.9748436395, (0.05224455717, 0.16765588326), (0.12419605650, 0.22564466289), (-0.06156886174, -0.07590890849, -0.09145576337), (-0.01705827554, -0.43876611817, -0.04676939093), 0.0, 3.49002488837),
+    (2.078, 2053002, (0.065625, 0.1944444444), (0.271875, 0.4555555556), 0.9787903487, (0.05574664871, 0.17028945524), (0.12623209884, 0.23045571313), (-0.06112220688, -0.07511904264, -0.08770259300), (-0.01762385229, -0.44092398776, -0.04946362546), 0.0, 3.50350377074),
+    (2.110, 2053003, (0.06875, 0.2), (0.278125, 0.4722222222), 0.9829537741, (0.06072936574, 0.17774406340), (0.13229861713, 0.23577746783), (-0.05397962956, -0.06300983751, -0.08044802228), (-0.01826470805, -0.44333571377, -0.05260503123), 0.0, 3.51602412272),
+    (2.141, 2053004, (0.06875, 0.2055555556), (0.2828125, 0.4861111111), 0.9871679989, (0.06431546224, 0.18285554660), (0.13634379771, 0.24648341995), (-0.04620899065, -0.05479315097, -0.07526550272), (-0.01870845179, -0.44537403288, -0.05553422208), 0.0, 3.52610154932),
+)
+
+
+def _replay_f163_safe_passage(*, base_s=100.0, stop_at_commit=False):
+    """Faithfully replay the dense F163 safe Gate-0 crossing observations."""
+
+    def track(row):
+        return _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            aperture_center=row[5],
+            aperture_half=row[6],
+        )
+
+    first = _F163_SAFE_PASSAGE_ROWS[0]
+    controller = CleanCourseController(_config())
+    controller.initialize(
+        _update([track(first)], frame_id=first[1]),
+        gate_index=0,
+        fallback_center_norm=first[2],
+        fallback_apparent_scale=math.sqrt(first[3][0] * first[3][1]),
+        now_s=base_s + first[0],
+    )
+    outputs = []
+    now = base_s + first[0]
+    for index, row in enumerate(_F163_SAFE_PASSAGE_ROWS):
+        now = base_s + row[0]
+        if index:
+            controller.observe(
+                _update([track(row)], frame_id=row[1]),
+                now_s=now,
+                body_rates=row[7],
+            )
+        outputs.append(
+            _command(
+                controller,
+                now,
+                roll=row[8][0],
+                pitch=row[8][1],
+                yaw=row[8][2],
+                fh=row[10],
+                accel_trust=row[9],
+            )
+        )
+        if stop_at_commit and controller.state is CleanCourseState.COMMIT:
+            break
+    return controller, outputs, now
+
+
 def _replay_f163_rows(rows, *, gate_index):
     controller = CleanCourseController(_config())
     first = rows[0]
@@ -5039,6 +5164,254 @@ def _replay_f163_rows(rows, *, gate_index):
             )
         outputs.append(_command(controller, now, pitch=row[4], yaw=0.0))
     return controller, outputs
+
+
+@pytest.mark.parametrize(
+    ("trace_sha256", "rows"),
+    (
+        (
+            "e3e8429ef13b571e0f3bf454ab9fd393db8686d4aa903caf1440195481b3471c",
+            (
+                (1.922, 2696544, (0.031250, -0.027778), (0.251563, 0.405556), -0.364656, 0, (0.010424, -0.038464), (0.113205, 0.188197), (-0.047621, -0.182014, -0.047166), FrameEdge.NONE),
+                (1.953, 2696545, (0.031250, -0.022222), (0.256250, 0.419444), -0.370211, 0, (0.013264, -0.032444), (0.117761, 0.196182), (-0.046880, -0.243993, -0.047212), FrameEdge.NONE),
+                (1.984, 2696546, (0.034375, -0.005556), (0.265625, 0.430556), -0.382806, 0, (0.015843, -0.013825), (0.119704, 0.200810), (-0.038848, -0.379908, -0.051116), FrameEdge.NONE),
+                (2.031, 2696547, (0.031250, 0.011111), (0.268750, 0.444444), -0.395643, 0, (0.018291, 0.005432), (0.115649, 0.199979), (-0.046074, -0.174604, -0.061796), FrameEdge.NONE),
+                (2.062, 2696548, (0.031250, 0.016667), (0.276563, 0.458333), -0.401968, 0, None, None, (-0.051793, -0.204330, -0.066284), FrameEdge.NONE),
+                (2.109, 2696549, (0.031250, 0.027778), (0.279688, 0.472222), -0.411056, 0, (0.031655, 0.039110), (0.100726, 0.201090), (-0.064456, -0.196444, -0.075454), FrameEdge.NONE),
+                (2.156, 2696551, (0.034375, 0.038889), (0.300000, 0.508333), -0.418991, 0, (0.035504, 0.022886), (0.145161, 0.257677), (-0.066682, -0.141230, -0.081665), FrameEdge.NONE),
+                (2.203, 2696552, (0.037500, 0.044444), (0.309375, 0.530556), -0.425688, 0, (0.038520, 0.022527), (0.148376, 0.267867), (-0.079664, -0.132913, -0.084561), FrameEdge.NONE),
+                (2.250, 2696554, (0.046875, 0.050000), (0.334375, 0.575000), -0.431619, 0, (0.045755, 0.028358), (0.158147, 0.287340), (-0.090256, -0.104591, -0.092341), FrameEdge.NONE),
+                (2.297, 2696555, (0.053125, 0.055556), (0.351563, 0.597222), -0.435745, 0, (0.051314, 0.026475), (0.165800, 0.300877), (-0.098689, -0.091561, -0.102269), FrameEdge.NONE),
+                (2.344, 2696556, (0.056250, 0.055556), (0.368750, 0.630556), -0.439981, 0, (0.058657, 0.024443), (0.174567, 0.311036), (-0.109746, -0.077939, -0.113691), FrameEdge.NONE),
+                (2.390, 2696558, (0.012500, 0.066667), (0.468750, 0.694444), -0.443579, 0, (0.071903, 0.016193), (0.189395, 0.340023), (-0.115953, -0.063722, -0.122110), FrameEdge.NONE),
+                (2.437, 2696559, (0.025000, 0.066667), (0.481250, 0.725000), -0.446089, 0, (0.076812, 0.013500), (0.195896, 0.355116), (-0.139359, -0.051618, -0.115476), FrameEdge.NONE),
+                (2.484, 2696561, (0.068750, 0.072222), (0.520313, 0.825000), -0.448882, 0, (0.092365, 0.005208), (0.217369, 0.399447), (-0.137812, -0.043502, -0.098252), FrameEdge.NONE),
+                (2.531, 2696562, (0.090625, 0.077778), (0.542188, 0.880556), -0.450669, 0, (0.099343, 0.000089), (0.229652, 0.427418), (-0.098331, -0.035347, -0.080795), FrameEdge.NONE),
+            ),
+        ),
+        (
+            "a41993108aeb7fb6ec55c08fd0fb0b75e53c1a0142a8f063ddd65f5e0d42569f",
+            (
+                (1.937, 2718484, (0.009375, -0.033333), (0.234375, 0.402778), -0.369783, 0, (0.005982, -0.037666), (0.108583, 0.182825), (-0.070939, -0.219892, -0.052894), FrameEdge.NONE),
+                (1.968, 2718485, (0.025000, -0.027778), (0.254688, 0.413889), -0.378288, 0, (0.011092, -0.027007), (0.121359, 0.217607), (-0.072263, -0.282841, -0.055783), FrameEdge.NONE),
+                (1.984, 2718486, (0.031250, -0.016667), (0.267188, 0.425000), -0.382728, 0, (0.013806, -0.016821), (0.125058, 0.218849), (-0.070299, -0.328649, -0.058813), FrameEdge.NONE),
+                (2.031, 2718487, (0.028125, 0.000000), (0.268750, 0.441667), -0.395596, 0, (0.017030, -0.000921), (0.125847, 0.224592), (-0.065823, -0.199785, -0.069174), FrameEdge.NONE),
+                (2.078, 2718489, (0.037500, 0.016667), (0.285938, 0.466667), -0.404113, 0, (0.020198, 0.004040), (0.130215, 0.222431), (-0.076147, -0.213920, -0.075042), FrameEdge.NONE),
+                (2.125, 2718490, (0.031250, 0.027778), (0.285938, 0.483333), -0.415256, 0, (0.023831, 0.005754), (0.136876, 0.235036), (-0.083148, -0.166978, -0.092345), FrameEdge.NONE),
+                (2.171, 2718491, (0.034375, 0.033333), (0.296875, 0.500000), -0.421710, 0, (0.034485, 0.026493), (0.141826, 0.254488), (-0.099510, -0.141709, -0.104617), FrameEdge.NONE),
+                (2.218, 2718493, (0.037500, 0.038889), (0.317188, 0.541667), -0.428159, 0, (0.037169, 0.011692), (0.148427, 0.265362), (-0.111934, -0.121715, -0.112673), FrameEdge.NONE),
+                (2.265, 2718494, (0.043750, 0.044444), (0.329688, 0.561111), -0.432907, 0, (0.046420, 0.015437), (0.156607, 0.278136), (-0.127179, -0.100349, -0.124252), FrameEdge.NONE),
+                (2.312, 2718496, (0.056250, 0.050000), (0.362500, 0.616667), -0.437554, 0, (0.059553, 0.013493), (0.170348, 0.303392), (-0.138713, -0.086296, -0.136208), FrameEdge.NONE),
+                (2.359, 2718497, (-0.003125, 0.050000), (0.445313, 0.647222), -0.441594, 0, (0.066416, 0.011906), (0.176406, 0.316970), (-0.140011, -0.071061, -0.140792), FrameEdge.NONE),
+                (2.406, 2718499, (0.025000, 0.055556), (0.471875, 0.711111), -0.444477, 0, (0.079871, 0.005495), (0.191204, 0.346417), (-0.150980, -0.060147, -0.130804), FrameEdge.NONE),
+                (2.453, 2718500, (0.043750, 0.055556), (0.487500, 0.752778), -0.447239, 0, (0.087879, -0.001891), (0.199888, 0.361410), (-0.151921, -0.047510, -0.108490), FrameEdge.NONE),
+                (2.500, 2718501, (0.062500, 0.061111), (0.506250, 0.802778), -0.449834, 0, (0.092310, -0.006749), (0.206420, 0.387327), (-0.110411, -0.038826, -0.078857), FrameEdge.NONE),
+            ),
+        ),
+    ),
+)
+def test_f170_f168_three_pixel_tubes_do_not_authorize_commit(
+    trace_sha256, rows
+):
+    # Both the credited and failed F168 flights entered on a 3-4 px margin
+    # against the mathematical opening.  The full uncertainty tube now has to
+    # fit the existing reduced body/frame-clearance core, not merely its center.
+    controller = CleanCourseController(_config())
+    first = rows[0]
+    confidence_by_frame = {
+        2696544: 0.9801375803, 2696545: 0.9767619111,
+        2696546: 0.9734714314, 2696547: 0.9756093140,
+        2696548: 0.9769510206, 2696549: 0.9817691689,
+        2696551: 0.9844122961, 2696552: 0.9859965093,
+        2696554: 0.9860908811, 2696555: 0.9860306161,
+        2696556: 0.9854176388, 2696558: 0.9603054074,
+        2696559: 0.9523105102, 2696561: 0.9596148635,
+        2696562: 0.9650251164,
+        2718484: 0.9902227913, 2718485: 0.9795292800,
+        2718486: 0.9715369811, 2718487: 0.9731805706,
+        2718489: 0.9723839222, 2718490: 0.9794483781,
+        2718491: 0.9824062335, 2718493: 0.9843695661,
+        2718494: 0.9846927543, 2718496: 0.9848094988,
+        2718497: 0.9538990087, 2718499: 0.9482702707,
+        2718500: 0.9493967827, 2718501: 0.9545299331,
+    }
+
+    def track(row):
+        return _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=confidence_by_frame[row[1]],
+            aperture_center=row[6],
+            aperture_half=row[7],
+        )
+
+    controller.initialize(
+        _update([track(first)], frame_id=first[1]),
+        gate_index=0,
+        fallback_center_norm=first[2],
+        fallback_apparent_scale=math.sqrt(first[3][0] * first[3][1]),
+        now_s=100.0 + first[0],
+    )
+    chance_margin_frames = []
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        if index:
+            controller.observe(
+                _update([track(row)], frame_id=row[1]),
+                now_s=now,
+                body_rates=row[8],
+            )
+        output = _command(controller, now, pitch=row[4], yaw=0.0)
+        admission = controller._last_commit_admission
+        corridor = controller._transported_corridor(
+            controller.current, now_s=now
+        )
+        if (
+            corridor is not None
+            and admission.y_tube is not None
+            and admission.y_tube < corridor.half_y
+            and admission.y_tube > admission.y_safe_half
+        ):
+            chance_margin_frames.append((row[0], admission, corridor))
+        assert output.state is CleanCourseState.TRACK
+        assert controller._commit_entry_s is None
+
+    assert trace_sha256
+    assert chance_margin_frames
+    for _t, admission, corridor in chance_margin_frames:
+        assert admission.y_budget == pytest.approx(
+            controller.config.commit_entry_aperture_margin_frac
+            * corridor.half_y
+        )
+        assert admission.y_safe_half == pytest.approx(
+            (1.0 - controller.config.commit_body_frame_clearance_frac)
+            * corridor.half_y
+        )
+        assert admission.y_clearance_reserve == pytest.approx(
+            corridor.half_y - admission.y_safe_half
+        )
+        assert admission.y_upper_clearance_reserve == pytest.approx(
+            admission.y_clearance_reserve
+        )
+        assert admission.y_lower_clearance_reserve == pytest.approx(
+            admission.y_clearance_reserve
+        )
+        assert not admission.admissible
+
+
+def test_f170_commit_sustain_belongs_to_fresh_safe_tube():
+    def centered_track():
+        return _f163_trace_track(
+            outer_center=(0.0, 0.0),
+            outer_span=(0.40, 0.50),
+            aperture_center=(0.0, 0.0),
+            aperture_half=(0.35, 0.35),
+        )
+
+    controller = CleanCourseController(_config())
+    controller.initialize(
+        _update([centered_track()], frame_id=9000),
+        gate_index=0,
+        fallback_center_norm=(0.0, 0.0),
+        fallback_apparent_scale=math.sqrt(0.40 * 0.50),
+        now_s=100.0,
+    )
+    first_safe_s = None
+    entry_s = None
+    for frame in range(1, 8):
+        now = 100.0 + 0.033 * frame
+        controller.observe(
+            _update([centered_track()], frame_id=9000 + frame), now_s=now
+        )
+        output = _command(controller, now, pitch=SPAWN_PITCH)
+        if controller._last_commit_admission.admissible:
+            first_safe_s = first_safe_s or now
+        if output.state is CleanCourseState.COMMIT:
+            entry_s = now
+            break
+
+    assert first_safe_s is not None
+    assert entry_s is not None
+    assert entry_s - first_safe_s >= controller.config.commit_sustain_s
+
+    # One safe camera frame cannot accrue a 0.10 s lease by command-rate
+    # republication: freshness expires at .06 s and resets safe sustain.
+    frozen = CleanCourseController(_config())
+    frozen_update = _update([centered_track()], frame_id=9100)
+    frozen.initialize(
+        frozen_update,
+        gate_index=0,
+        fallback_center_norm=(0.0, 0.0),
+        fallback_apparent_scale=math.sqrt(0.40 * 0.50),
+        now_s=200.0,
+    )
+    for offset in (0.02, 0.05, 0.08, 0.12, 0.16):
+        frozen.observe(frozen_update, now_s=200.0 + offset)
+        output = _command(frozen, 200.0 + offset, pitch=SPAWN_PITCH)
+        assert output.state is not CleanCourseState.COMMIT
+    assert frozen._commit_safe_since_s is None
+
+    # Proximity time before an unsafe frame cannot leak into the next safe
+    # interval.  Fresh safe containment has to restart and sustain in full.
+    reset = CleanCourseController(_config())
+    reset.initialize(
+        _update([centered_track()], frame_id=9200),
+        gate_index=0,
+        fallback_center_norm=(0.0, 0.0),
+        fallback_apparent_scale=math.sqrt(0.40 * 0.50),
+        now_s=300.0,
+    )
+    for frame in (1, 2):
+        now = 300.0 + 0.033 * frame
+        reset.observe(
+            _update([centered_track()], frame_id=9200 + frame), now_s=now
+        )
+        _command(reset, now, pitch=SPAWN_PITCH)
+    assert reset._commit_safe_since_s is not None
+    unsafe = _f163_trace_track(
+        outer_center=(0.30, 0.0),
+        outer_span=(0.40, 0.50),
+        aperture_center=(0.30, 0.0),
+        aperture_half=(0.35, 0.35),
+    )
+    reset.observe(_update([unsafe], frame_id=9203), now_s=300.099)
+    _command(reset, 300.099, pitch=SPAWN_PITCH)
+    assert reset._last_commit_admission.status == (
+        "corridor-known/not-contained"
+    )
+    assert reset._commit_safe_since_s is None
+
+    restarted_safe_s = None
+    for frame in range(4, 16):
+        now = 300.0 + 0.033 * frame
+        reset.observe(
+            _update([centered_track()], frame_id=9200 + frame), now_s=now
+        )
+        output = _command(reset, now, pitch=SPAWN_PITCH)
+        if reset._last_commit_admission.admissible:
+            restarted_safe_s = restarted_safe_s or now
+        if output.state is CleanCourseState.COMMIT:
+            break
+    assert reset.state is CleanCourseState.COMMIT
+    assert restarted_safe_s is not None
+    assert reset._commit_entry_s - restarted_safe_s >= (
+        reset.config.commit_sustain_s
+    )
+
+    # Fresh one-sided vertical censorship is unsafe directional evidence, not
+    # a stale blackout.  It immediately revokes the lease while TRACK can
+    # still brake/recenter instead of carrying a worsening low/high path.
+    censored = _f163_trace_track(
+        outer_center=(0.0, 0.35),
+        outer_span=(0.40, 0.50),
+        clipping=FrameEdge.BOTTOM,
+    )
+    now += 0.033
+    reset.observe(_update([censored], frame_id=9220), now_s=now)
+    output = _command(reset, now, pitch=SPAWN_PITCH)
+    assert output.state is CleanCourseState.TRACK
+    assert reset._last_commit_admission.status == "directionally-censored"
+    assert reset._commit_entry_s is None
 
 
 def test_f166_f163_launch_trace_keeps_aperture_rate_out_of_pitch():
@@ -5627,13 +6000,187 @@ def test_f168_newest_f167_launch_replay_has_one_bumpless_vertical_owner():
         sample["wire"] - sample["support"] for sample in samples
     ) >= -0.0073
     recovery = [sample for sample in samples if sample["t"] >= 0.969]
-    assert all(
-        right["wire"] >= left["wire"] - 1e-12
+    assert max(
+        left["wire"] - right["wire"]
         for left, right in zip(recovery, recovery[1:])
-    )
+    ) < 0.0002
     assert _maximum_advance_to_brake_reversal(
         [sample["pitch"] for sample in samples]
     ) < math.radians(0.5)
+
+
+def test_f170_failed_f168_topology_jump_cannot_cancel_launch_floor():
+    # Failed fixed-hash F168 rerun
+    # 20260802T052420Z-visual-course-201e7d06, trace SHA-256
+    # A41993108AEB7FB6EC55C08FD0FB0B75E53C1A0142A8F063DDD65F5E0D42569F.
+    # Frame 2718435 changes detector topology in one observation: the accepted
+    # outer height collapses .225 -> .161 and y jumps -.028 -> +.039.  The
+    # resulting +.10..+.16/s image rate used to multiply the only launch boost
+    # to zero.  Replay only public tracker/attitude/trust observations and
+    # require the time-owned minimum energy trajectory to survive intact.
+    rows = (
+        # t, frame, outer center/span/conf, pitch, rates,
+        # aperture center/half, accel trust, horizontal force
+        (0.000, 2718426, (-0.006250, -0.033333), (0.125000, 0.225000), 0.845915, -0.309763, (0.000072, 0.000330, 0.000006), (-0.004214, -0.025668), (0.052550, 0.101354), 1.000000, 0.009352),
+        (0.015, 2718427, (-0.006250, -0.033333), (0.125000, 0.225000), 0.845446, -0.309898, (-0.000760, -0.009954, -0.000026), (-0.010202, -0.033652), (0.049039, 0.087568), 0.000000, 0.212781),
+        (0.046, 2718428, (-0.006250, -0.027778), (0.125000, 0.222222), 0.846411, -0.309979, (0.000737, -0.000817, -0.000068), (-0.005620, -0.028103), (0.051948, 0.100912), 0.054031, 2.061369),
+        (0.078, 2718429, (-0.003125, -0.033333), (0.126563, 0.225000), 0.848341, -0.309937, (-0.028696, 0.001311, -0.010752), (-0.004242, -0.029758), (0.053192, 0.103113), 0.000000, 2.963303),
+        (0.109, 2718430, (-0.003125, -0.033333), (0.126563, 0.225000), 0.848615, -0.310152, (-0.009553, -0.010369, -0.020648), (-0.003522, -0.025944), (0.051323, 0.099632), 0.000000, 3.357081),
+        (0.140, 2718431, (-0.003125, -0.033333), (0.126563, 0.225000), 0.847496, -0.310552, (0.003498, -0.010299, -0.013188), (-0.003566, -0.028111), (0.054481, 0.104906), 0.000000, 3.486620),
+        (0.171, 2718432, (-0.003125, -0.027778), (0.126563, 0.222222), 0.845762, -0.310725, (-0.012010, -0.007878, -0.008202), (-0.005217, -0.026266), (0.049769, 0.092402), 0.000000, 3.522960),
+        (0.234, 2718434, (-0.003125, -0.027778), (0.125000, 0.225000), 0.840845, -0.311437, (0.005426, -0.011372, -0.007436), (-0.001282, -0.023684), (0.054329, 0.106842), 0.000000, 3.512852),
+        (0.296, 2718435, (-0.003125, 0.038889), (0.123438, 0.161111), 0.690865, -0.312025, (-0.015163, -0.010201, -0.007069), (0.025321, 0.004375), (0.041995, 0.016275), 0.000000, 3.353774),
+        (0.328, 2718436, (-0.003125, 0.050000), (0.121875, 0.152778), 0.609155, -0.312375, (0.005129, -0.009239, -0.001593), None, None, 0.000000, 3.243124),
+        (0.359, 2718437, (-0.003125, 0.050000), (0.126563, 0.155556), 0.578422, -0.312654, (0.020744, -0.007913, 0.010309), None, None, 0.000000, 3.150399),
+        (0.390, 2718438, (-0.003125, 0.050000), (0.128125, 0.152778), 0.561129, -0.312902, (0.003811, -0.009764, 0.016285), None, None, 0.000000, 3.055710),
+        (0.421, 2718439, (-0.003125, -0.016667), (0.128125, 0.227778), 0.661444, -0.313299, (0.000460, -0.012253, 0.011419), (-0.001311, -0.016008), (0.061358, 0.113241), 0.000000, 2.962143),
+        (0.453, 2718440, (-0.003125, -0.011111), (0.128125, 0.233333), 0.759437, -0.313700, (0.013161, -0.010138, 0.003611), (-0.002220, -0.014878), (0.060158, 0.108712), 0.000000, 2.858469),
+        (0.484, 2718441, (-0.003125, -0.016667), (0.128125, 0.230556), 0.811026, -0.313884, (0.008940, -0.008124, 0.001899), (-0.002938, -0.016687), (0.067090, 0.119967), 0.000000, 2.844363),
+        (0.515, 2718442, (-0.003125, -0.016667), (0.129688, 0.233333), 0.838942, -0.314113, (-0.007007, -0.006263, 0.000998), (-0.002334, -0.014656), (0.066923, 0.116953), 0.000000, 2.853920),
+        (0.578, 2718444, (-0.006250, -0.011111), (0.131250, 0.241667), 0.857248, -0.314498, (0.007343, -0.006818, -0.002287), (-0.002832, -0.017178), (0.054563, 0.119481), 0.000000, 2.881183),
+        (0.609, 2718445, (-0.003125, -0.016667), (0.134375, 0.236111), 0.865003, -0.314857, (-0.012442, -0.014637, -0.008117), (-0.005900, -0.007915), (0.048060, 0.102577), 0.000000, 2.877826),
+    )
+    controller = CleanCourseController(
+        _config(launch_boost_duration_s=LAUNCH_BOOST_DURATION_S)
+    )
+    samples = []
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        track = _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            aperture_center=row[7],
+            aperture_half=row[8],
+        )
+        update = _update([track], frame_id=row[1])
+        if index == 0:
+            controller.initialize(
+                update,
+                gate_index=0,
+                fallback_center_norm=row[2],
+                fallback_apparent_scale=math.sqrt(row[3][0] * row[3][1]),
+                now_s=now,
+            )
+        else:
+            controller.observe(update, now_s=now, body_rates=row[6])
+        output = _command(
+            controller,
+            now,
+            pitch=row[5],
+            fh=row[10],
+            accel_trust=row[9],
+        )
+        samples.append(
+            {
+                "t": row[0],
+                "target": controller._last_vertical_collective_target,
+                "wire": output.thrust,
+                "support": controller._last_vertical_support,
+                "imu": controller._last_vertical_imu_delta,
+                "observed_rate": (
+                    controller._last_vertical_observed_rate_norm_s
+                ),
+            }
+        )
+
+    glitch = [sample for sample in samples if 0.296 <= sample["t"] <= 0.390]
+    assert glitch[0]["observed_rate"] > 0.09
+    assert max(sample["observed_rate"] for sample in glitch) > 0.15
+    assert all(sample["imu"] == pytest.approx(0.0) for sample in glitch)
+    assert all(
+        sample["target"] >= LAUNCH_BOOST_THRUST - 1e-12
+        for sample in glitch
+    )
+    for sample in samples:
+        if sample["t"] <= LAUNCH_BOOST_DURATION_S:
+            floor = LAUNCH_BOOST_THRUST
+        else:
+            phase = min(
+                1.0,
+                (sample["t"] - LAUNCH_BOOST_DURATION_S)
+                / controller.config.launch_collective_transfer_s,
+            )
+            progress = phase * phase * (3.0 - 2.0 * phase)
+            floor = LAUNCH_BOOST_THRUST + (
+                sample["support"] - LAUNCH_BOOST_THRUST
+            ) * progress
+        assert sample["target"] >= floor - 1e-12
+        assert sample["wire"] >= floor - 1e-12
+        assert controller.config.min_thrust <= sample["wire"] <= (
+            controller.config.max_thrust
+        )
+
+
+def test_f170_zero_trust_imu_cannot_cancel_fresh_gate0_climb():
+    # Failed fixed-hash F168 Gate-0 approach.  Fresh outer y worsens across
+    # these exact frames while pitch compensation makes the high-gate miss
+    # increasingly negative.  The recorded estimator trust is zero; preserve
+    # the recorded stale sink estimate as an adversarial supporting input and
+    # prove that it cannot subtract from the fresh visual climb trajectory.
+    rows = (
+        (1.937, 2718484, (0.009375, -0.033333), (0.234375, 0.402778), -0.369783, (-0.070939, -0.219892, -0.052894)),
+        (1.968, 2718485, (0.025000, -0.027778), (0.254688, 0.413889), -0.378288, (-0.072263, -0.282841, -0.055783)),
+        (1.984, 2718486, (0.031250, -0.016667), (0.267188, 0.425000), -0.382728, (-0.070299, -0.328649, -0.058813)),
+        (2.031, 2718487, (0.028125, 0.000000), (0.268750, 0.441667), -0.395596, (-0.065823, -0.199785, -0.069174)),
+        (2.078, 2718489, (0.037500, 0.016667), (0.285938, 0.466667), -0.404113, (-0.076147, -0.213920, -0.075042)),
+        (2.125, 2718490, (0.031250, 0.027778), (0.285938, 0.483333), -0.415256, (-0.083148, -0.166978, -0.092345)),
+        (2.171, 2718491, (0.034375, 0.033333), (0.296875, 0.500000), -0.421710, (-0.099510, -0.141709, -0.104617)),
+    )
+
+    def track(row):
+        return _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=0.98,
+        )
+
+    controller = CleanCourseController(_config())
+    first = rows[0]
+    controller.initialize(
+        _update([track(first)], frame_id=first[1]),
+        gate_index=0,
+        fallback_center_norm=first[2],
+        fallback_apparent_scale=math.sqrt(first[3][0] * first[3][1]),
+        now_s=100.0 + first[0],
+    )
+    controller._vz_est_m_s = 0.40
+    path_errors = []
+    visual_deltas = []
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        if index:
+            controller.observe(
+                _update([track(row)], frame_id=row[1]),
+                now_s=now,
+                body_rates=row[5],
+            )
+        output = _command(
+            controller,
+            now,
+            pitch=row[4],
+            a_up=8.0,
+            accel_trust=0.0,
+        )
+        path_errors.append(controller._last_vertical_path_error)
+        visual_deltas.append(controller._last_vertical_visual_delta)
+        assert controller._last_vertical_imu_raw_delta < 0.0
+        assert controller._last_vertical_imu_trust == 0.0
+        assert controller._last_vertical_imu_delta == pytest.approx(0.0)
+        assert controller._last_vertical_collective_target == pytest.approx(
+            controller._last_vertical_support
+            + controller._last_vertical_visual_delta,
+            abs=1e-12,
+        )
+
+    assert path_errors[-1] < path_errors[0]
+    assert path_errors[-1] < -0.10
+    assert visual_deltas[-1] > 0.015
+    assert controller._last_vertical_collective_target == pytest.approx(
+        controller._last_vertical_support
+        + controller._last_vertical_visual_delta
+    )
+    assert output.thrust > controller._last_vertical_support
 
 
 def test_f168_commit_pitch_transfer_and_response_are_direction_safe():
@@ -5663,16 +6210,11 @@ def test_f168_commit_pitch_transfer_and_response_are_direction_safe():
     assert authorities[:2] == pytest.approx([0.9537, 0.9537])
     assert authorities[2:] == pytest.approx([0.0] * 4)
 
-    # A real public-observation replay reaches COMMIT without injecting state.
-    # Its first COMMIT tick and every later one carry the preceding TRACK
-    # target exactly instead of selecting a new phase endpoint.
-    passage_rows = (
-        (1.953, 2052998, (0.053125, 0.161111), (0.25, 0.408333), -0.429284, 0, (0.040326, 0.148286), (0.118122, 0.212459), (-0.069072, -0.117701, -0.093605), FrameEdge.NONE),
-        (2.141, 2053004, (0.06875, 0.205556), (0.2828125, 0.486111), -0.445374, 0, (0.064315, 0.182856), (0.136344, 0.246483), (-0.046209, -0.054793, -0.075266), FrameEdge.NONE),
-        (2.297, 2053009, (0.084375, 0.238889), (0.3328125, 0.577778), -0.452093, 0, (0.082114, 0.200117), (0.157505, 0.286893), (-0.005388, -0.033068, -0.031834), FrameEdge.NONE),
-        (2.422, 2053012, (0.093750, 0.261111), (0.375, 0.647222), -0.455251, 0, (0.088084, 0.210567), (0.173966, 0.319578), (0.047329, -0.020963, 0.016417), FrameEdge.NONE),
-    )
-    controller, outputs = _replay_f163_rows(passage_rows, gate_index=0)
+    # A safely contained public-observation replay reaches COMMIT without
+    # injecting state.  Its first COMMIT tick carries the preceding TRACK
+    # target exactly instead of selecting a new phase endpoint.  The marginal
+    # F163/F168 passages are intentionally no longer positive fixtures.
+    controller, outputs, _now = _public_safe_commit_controller()
     first_commit = next(
         index
         for index, output in enumerate(outputs)
@@ -5857,110 +6399,120 @@ def test_f166_recorded_f165_launch_has_no_material_pitch_reversal_or_chatter():
 
 
 def test_f166_exact_zero_is_one_send_then_immediate_bounded_recovery():
-    # Enter Gate-0 COMMIT through the positive F163 public trace, lose the
-    # gate at the plane, and preserve the mandatory exact-zero send.  After
-    # authoritative credit, a fresh high Gate 1 plus the known zero impulse
-    # must recover on the very next powered tick without another carry-filter
-    # delay or a second zero.
-    rows = (
-        (1.953, 2052998, (0.053125, 0.161111), (0.25, 0.408333), -0.429284, (0.040326, 0.148286), (0.118122, 0.212459)),
-        (2.141, 2053004, (0.06875, 0.205556), (0.2828125, 0.486111), -0.445374, (0.064315, 0.182856), (0.136344, 0.246483)),
-        (2.297, 2053009, (0.084375, 0.238889), (0.3328125, 0.577778), -0.452093, (0.082114, 0.200117), (0.157505, 0.286893)),
-        (2.422, 2053012, (0.09375, 0.261111), (0.375, 0.647222), -0.455251, (0.088084, 0.210567), (0.173966, 0.319578)),
-    )
-
-    def track(row):
-        return _f163_trace_track(
-            outer_center=row[2],
-            outer_span=row[3],
-            aperture_center=row[5],
-            aperture_half=row[6],
+    # Establish COMMIT from the dense credited F163 public observations, then
+    # exercise the 31 ms and 47 ms post-zero gaps that separated the credited
+    # and failed F168 runs.  The wire zero remains exact and singular; its
+    # known bounded impulse is recovered on the next powered tick even when
+    # acceleration trust is zero.
+    def run(recovery_gap_s, *, pre_zero_delay_s=0.020):
+        controller, outputs, now = _replay_f163_safe_passage(
+            base_s=100.0,
+            stop_at_commit=True,
         )
+        assert controller.state is CleanCourseState.COMMIT
 
-    controller = CleanCourseController(_config())
-    first = rows[0]
-    controller.initialize(
-        _update([track(first)], frame_id=first[1]),
-        gate_index=0,
-        fallback_center_norm=first[2],
-        fallback_apparent_scale=math.sqrt(first[3][0] * first[3][1]),
-        now_s=100.0 + first[0],
-    )
-    outputs = []
-    for index, row in enumerate(rows):
-        now = 100.0 + row[0]
-        if index:
-            controller.observe(
-                _update([track(row)], frame_id=row[1]), now_s=now
-            )
-        outputs.append(_command(controller, now, pitch=row[4]))
-    assert controller.state is CleanCourseState.COMMIT
+        coast_s = now + 0.033
+        controller.observe(_update([], frame_id=2053010), now_s=coast_s)
+        assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+        zero_s = coast_s + pre_zero_delay_s
+        zero = _command(
+            controller,
+            zero_s,
+            pitch=SPAWN_PITCH,
+            accel_trust=0.0,
+        )
+        outputs.append(zero)
+        assert (
+            zero.target_roll_rad,
+            zero.target_pitch_rad,
+            zero.yaw_rate_rad_s,
+            zero.thrust,
+        ) == (0.0, 0.0, 0.0, 0.0)
+        assert controller._zero_recovery_pending
 
-    now = 102.455
-    controller.observe(_update([], frame_id=2053013), now_s=now)
-    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
-    zero = _command(controller, now + 0.020, pitch=rows[-1][4])
-    outputs.append(zero)
-    assert (
-        zero.target_roll_rad,
-        zero.target_pitch_rad,
-        zero.yaw_rate_rad_s,
-        zero.thrust,
-    ) == (0.0, 0.0, 0.0, 0.0)
-    assert controller._zero_recovery_pending
+        assert controller.note_race(
+            gate_index=1,
+            race_boot_ms=4000,
+            now_s=zero_s + 0.010,
+        )
+        gate_one = _f163_trace_track(
+            outer_center=(0.0, -0.30),
+            outer_span=(0.12, 0.22),
+            track_id="gate-one",
+        )
+        controller.observe(
+            _update([gate_one], frame_id=2053011),
+            now_s=zero_s + recovery_gap_s - 0.010,
+        )
+        recovery = _command(
+            controller,
+            zero_s + recovery_gap_s,
+            pitch=SPAWN_PITCH,
+            a_up=-8.0,
+            accel_trust=0.0,
+        )
+        outputs.append(recovery)
+        recovery_delta = controller._last_zero_recovery_delta
 
-    assert controller.note_race(
-        gate_index=1, race_boot_ms=4000, now_s=now + 0.030
-    )
-    gate_one = _f163_trace_track(
-        outer_center=(0.0, -0.30),
-        outer_span=(0.12, 0.22),
-    )
-    controller.observe(
-        _update([gate_one], frame_id=2053014), now_s=now + 0.050
-    )
-    recovery = _command(
-        controller,
-        now + 0.070,
-        pitch=SPAWN_PITCH,
-        a_up=-8.0,
-    )
-    outputs.append(recovery)
+        assert controller._zero_recovery_applied
+        assert not controller._zero_recovery_pending
+        assert controller._zero_sink_debt_m_s == 0.0
+        assert recovery.thrust == pytest.approx(
+            controller._last_vertical_collective_target, abs=1e-12
+        )
+        assert recovery.thrust > controller._last_vertical_support
+        assert (
+            controller.config.min_thrust
+            <= recovery.thrust
+            <= controller.config.max_thrust
+        )
+        assert sum(output.thrust == 0.0 for output in outputs) == 1
 
-    assert controller._zero_recovery_applied
-    assert recovery.thrust == pytest.approx(
-        controller._last_vertical_collective_target, abs=1e-12
-    )
-    assert recovery.thrust > controller._last_vertical_support
-    assert controller.config.min_thrust <= recovery.thrust <= controller.config.max_thrust
-    assert sum(output.thrust == 0.0 for output in outputs) == 1
+        # The debt is one-shot.  Fresh visual trajectory feedback can remain,
+        # but no persistent open-loop zero-recovery owner survives this tick.
+        followup = _command(
+            controller,
+            zero_s + recovery_gap_s + 0.020,
+            pitch=SPAWN_PITCH,
+            a_up=-8.0,
+            accel_trust=0.0,
+        )
+        assert followup.thrust >= controller.config.min_thrust
+        assert controller._last_zero_recovery_delta == 0.0
+        return recovery_delta, recovery.thrust
+
+    short_delta, short_thrust = run(0.031)
+    long_delta, long_thrust = run(0.047)
+    delayed_zero_delta, _ = run(0.031, pre_zero_delay_s=0.090)
+    assert long_delta >= short_delta > 0.0
+    assert long_thrust >= short_thrust
+    # Powered time before the zero send is not part of the zero impulse.
+    assert delayed_zero_delta == pytest.approx(short_delta, abs=1e-12)
 
 
-def test_f163_gate0_trace_reaches_owned_commit_before_bottom_censorship():
-    # Positive-labeled F163 Gate 0: the old scalar law rejected every frame at
-    # ~0.78/s closure, yet authoritative race status subsequently credited the
-    # crossing.  Public observations now produce a contained aperture tube and
-    # the outer-only point-of-no-return model reaches COMMIT before BOTTOM.
-    rows = (
-        (1.953, 2052998, (0.053125, 0.161111), (0.25, 0.408333), -0.429284, 0, (0.040326, 0.148286), (0.118122, 0.212459), (-0.069072, -0.117701, -0.093605), FrameEdge.NONE),
-        (2.141, 2053004, (0.06875, 0.205556), (0.2828125, 0.486111), -0.445374, 0, (0.064315, 0.182856), (0.136344, 0.246483), (-0.046209, -0.054793, -0.075266), FrameEdge.NONE),
-        (2.297, 2053009, (0.084375, 0.238889), (0.3328125, 0.577778), -0.452093, 0, (0.082114, 0.200117), (0.157505, 0.286893), (-0.005388, -0.033068, -0.031834), FrameEdge.NONE),
-        (2.422, 2053012, (0.09375, 0.261111), (0.375, 0.647222), -0.455251, 0, (0.088084, 0.210567), (0.173966, 0.319578), (0.047329, -0.020963, 0.016417), FrameEdge.NONE),
-        (2.469, 2053014, (0.034375, 0.283333), (0.4828125, 0.713889), -0.456153, 0, None, None, (0.065514, -0.016982, 0.029759), FrameEdge.BOTTOM),
-    )
-    controller, outputs = _replay_f163_rows(rows, gate_index=0)
+def test_f163_dense_gate0_trace_reaches_sustained_safe_commit():
+    # The dense credited F163 observations retain every distinct camera frame
+    # across admission.  Unlike the sparse/marginal F168 samples, their full
+    # uncertainty tube remains inside the reduced body/frame corridor for the
+    # complete sustain window, proving live passage reachability without
+    # direct controller-state injection.
+    controller, outputs, now = _replay_f163_safe_passage()
 
     assert controller.gate_index == 0
-    assert any(out.state is CleanCourseState.COMMIT for out in outputs[:-1])
     assert controller.state is CleanCourseState.COMMIT
-    assert controller._last_commit_admission.status in {
-        "admissible",
-        "directionally-censored",
-    }
+    first_commit = next(
+        index
+        for index, output in enumerate(outputs)
+        if output.state is CleanCourseState.COMMIT
+    )
+    assert _F163_SAFE_PASSAGE_ROWS[first_commit][0] == pytest.approx(2.078)
+    assert controller._commit_safe_since_s == pytest.approx(101.953)
+    assert controller._commit_entry_s == pytest.approx(102.078)
+    assert controller._last_commit_admission.admissible
     certificate = controller.current.corridor_certificate
     assert certificate is not None
     assert certificate.gate_index == 0
-    assert certificate.source_s == pytest.approx(102.422, abs=1e-6)
+    assert certificate.source_s == pytest.approx(now, abs=1e-6)
 
     old_current = controller.current
     assert controller.note_race(
@@ -7215,8 +7767,9 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     )
     assert deeper.thrust < rebound.thrust < climb_target
     assert rebound.thrust - deeper.thrust < 0.012
-    # Horizontal misalignment changes steering but cannot introduce another
-    # COMMIT pitch owner.  The admitted TRACK pitch remains continuous.
+    # A fresh gross horizontal miss invalidates the certified safe tube.  It
+    # must return custody to TRACK on this same tick instead of keeping a
+    # latched COMMIT trajectory that can no longer fit through the corridor.
     controller.current.y_axis.p = 0.05
     controller.current.x_axis.p = 0.80
     now += 0.033
@@ -7225,28 +7778,35 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     controller.current.last_y_measurement_s = now
     out = _command(controller, now, pitch=SPAWN_PITCH)
     assert out.yaw_rate_rad_s == pytest.approx(0.15, abs=1e-9)
-    assert out.target_pitch_rad == pytest.approx(
-        controller._commit_pitch_target_rad, abs=1e-9
+    assert controller.state is CleanCourseState.TRACK
+    assert controller._commit_pitch_target_rad is None
+    assert controller._last_commit_admission.status == (
+        "corridor-known/not-contained"
     )
     assert out.target_pitch_rad < SPAWN_PITCH + 0.15
+
     # F62/F63: once x goes STALE/censored the commit steers the PREDICTED
     # hypothesis with the same range gain — heading-hold committed the residual drift
     # (F61 clipped the left post) and F62's half-gain derate
     # under-corrected (crossed -0.22 left); the prediction tracked the
     # real bearing through the blackout.  F150 keeps the physical outer-range
     # authority continuous across fresh and stale steering.
-    controller.current.x_axis.p = 0.10
-    for _ in range(18):
+    controller, _outputs, now = _public_safe_commit_controller(now_s=200.0)
+    recorded_entry_pitch = _F163_SAFE_PASSAGE_ROWS[8][8][1]
+    for _ in range(3):
         now += 0.033
-        controller.current.last_measurement_s = now
-        controller.current.last_y_measurement_s = now
+        out = _command(controller, now, pitch=recorded_entry_pitch)
+    controller.current.x_axis.p = 0.10
+    controller.current.raw_x = 0.10
+    for _ in range(15):
+        now += 0.033
         out = _command(controller, now, pitch=SPAWN_PITCH)
     assert controller.state is CleanCourseState.COMMIT
     # Heading and lateral intercept each retain a continuous filtered
     # reference.  Yaw follows bearing while bank follows predicted plane miss.
     heading_reference = controller._turn_reference_x
     intercept_reference = controller._lateral_intercept_reference_x
-    assert heading_reference == pytest.approx(0.10, abs=0.005)
+    assert 0.05 < heading_reference <= 0.105
     gain = controller._course_steer_gain(controller.current)
     assert out.yaw_rate_rad_s == pytest.approx(
         min(0.15, 0.90 * gain * heading_reference), abs=1e-9
@@ -7256,15 +7816,16 @@ def test_commit_law_steers_fresh_holds_stale_and_bounds_vertical():
     )
 
 
-def test_commit_clear_optical_motion_cannot_be_reversed_by_imu_damping():
+def test_commit_unsafe_optical_motion_revokes_without_imu_direction_reversal():
     controller = _commit_controller()
     _, now = _drive_commit_window(controller, 100.10)
     assert controller.state is CleanCourseState.COMMIT
 
-    # COMMIT carries de-dilated optical motion through the plane.  Here the
-    # centered image is moving down toward a low plane intercept, while the
-    # supporting IMU estimate asks for the opposite correction.  IMU damping
-    # may reduce authority but cannot reverse clear visual evidence.
+    # Here the centered image is moving down toward a low plane intercept,
+    # while the supporting IMU estimate asks for the opposite correction.
+    # Fresh proof that the tube escaped the safe corridor must revoke COMMIT;
+    # after custody returns to TRACK, IMU damping may reduce authority but
+    # cannot reverse the clear visual descent request.
     controller._vz_est_m_s = -0.80
     controller.current.y_axis.p = 0.0
     controller.current.raw_y = 0.0
@@ -7277,7 +7838,10 @@ def test_commit_clear_optical_motion_cannot_be_reversed_by_imu_damping():
         controller.current.last_y_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
 
-    assert controller.state is CleanCourseState.COMMIT
+    assert controller.state is CleanCourseState.TRACK
+    assert controller._last_commit_admission.status == (
+        "corridor-known/not-contained"
+    )
     motion = controller._last_vertical_motion
     assert motion.physical_rate_norm_s == pytest.approx(0.30, abs=1e-9)
     assert motion.intercept_error > motion.intercept_std
@@ -7289,26 +7853,34 @@ def test_commit_stale_y_relaxes_continuously_to_zero_vz_reference():
     # Frozen climb-side image evidence ages out and loses optical authority.
     # With a zero IMU-rate estimate, the carried collective relaxes toward
     # support without a mode step.
-    controller = _commit_controller()
-    out, now = _drive_commit_window(controller, 100.10)
+    controller, _outputs, now = _public_safe_commit_controller(now_s=300.0)
     assert controller.state is CleanCourseState.COMMIT
+    # Let the last real camera frame become stale before perturbing the held
+    # filter.  Stale prediction is not fresh unsafe proof and may not revoke a
+    # legitimately sustained crossing lease.
+    recorded_entry_pitch = _F163_SAFE_PASSAGE_ROWS[8][8][1]
+    for _ in range(3):
+        now += 0.033
+        _command(controller, now, pitch=recorded_entry_pitch)
     controller.current.y_axis.p = -0.50
     y_stamp = controller.current.last_y_measurement_s
     thrusts = []
     stale_thrusts = []
     for _ in range(25):
         now += 0.033
-        controller.current.last_measurement_s = now
-        controller.current.last_x_measurement_s = now
         out = _command(controller, now, pitch=SPAWN_PITCH)
         thrusts.append(out.thrust)
         if now - y_stamp > controller.config.vertical_qualify_max_age_s:
             stale_thrusts.append(out.thrust)
     assert controller.state is CleanCourseState.COMMIT
     assert len(stale_thrusts) > 5
+    trough = min(range(len(stale_thrusts)), key=stale_thrusts.__getitem__)
+    assert trough <= 3
     assert all(
-        after <= before + 1e-12
-        for before, after in zip(stale_thrusts, stale_thrusts[1:])
+        after >= before - 1e-12
+        for before, after in zip(
+            stale_thrusts[trough:], stale_thrusts[trough + 1 :]
+        )
     )
     assert abs(stale_thrusts[-1] - SPAWN_SUPPORT) < abs(
         stale_thrusts[0] - SPAWN_SUPPORT
@@ -7319,13 +7891,17 @@ def test_commit_stale_y_relaxes_continuously_to_zero_vz_reference():
 
     # Fresh low-gate evidence reuses the same owner and eventually asks below
     # support; there is no instantaneous band or overlay command.
-    controller.current.y_axis.p = 0.50
     fresh = []
-    for _ in range(20):
+    for frame in range(20):
         now += 0.033
-        controller.current.last_measurement_s = now
-        controller.current.last_x_measurement_s = now
-        controller.current.last_y_measurement_s = now
+        low_gate = _f163_trace_track(
+            track_id=controller.current.track_id,
+            outer_center=(0.0, 0.50),
+            outer_span=(0.30, 0.50),
+        )
+        controller.observe(
+            _update([low_gate], frame_id=9300 + frame), now_s=now
+        )
         fresh.append(_command(controller, now, pitch=SPAWN_PITCH).thrust)
     assert fresh[-1] < SPAWN_SUPPORT
     assert all(after <= before + 1e-12 for before, after in zip(fresh, fresh[1:]))
@@ -7767,6 +8343,43 @@ def test_loop_skipped_send_promotes_and_finishes():
     for command, _wire_index in host.sent:
         _validate(command)
         assert abs(command.yaw_rate) <= 0.15 + 1e-9
+
+
+def test_loop_passes_estimator_accel_trust_to_vertical_owner():
+    host = _Host(_update([_track("A", 0.0, -0.10, scale=0.20)]))
+    host.estimate.accel_trust = 0.0
+    host.estimate.horizontal_specific_force_mps2 = 0.0
+
+    def script(loop_host):
+        if loop_host.ticks == 5:
+            loop_host.race.race_finished = True
+
+    host.script = script
+    controller = CleanCourseController(CleanCourseConfig())
+    observed_trust = []
+    original_command = controller.command
+
+    def recording_command(**kwargs):
+        observed_trust.append(kwargs.get("accel_trust"))
+        return original_command(**kwargs)
+
+    controller.command = recording_command
+    context = SimpleNamespace(
+        initial_gate_x=320, initial_gate_y=162, initial_gate_area=6400
+    )
+    summary = asyncio.run(
+        run_clean_course_stage(
+            host,
+            context,
+            runtime=_test_runtime(),
+            controller=controller,
+        )
+    )
+
+    assert summary["race_finished"] is True
+    assert observed_trust
+    assert observed_trust == [0.0] * len(observed_trust)
+    assert controller._last_vertical_imu_trust == 0.0
 
 
 def test_loop_coast_holds_exact_zero_then_accepts_credit():

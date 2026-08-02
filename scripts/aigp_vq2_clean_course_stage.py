@@ -396,7 +396,14 @@ COMMIT_TIMEOUT_S = 3.0  # no credit this long -> arrest and search
 # veto, and missing geometry never becomes crossing authority.
 COMMIT_ENTRY_MEAS_MAX_AGE_S = 0.06  # "current frame" at ~30 Hz camera
 COMMIT_BLACKOUT_S = 0.50  # measured close-range censorship window 0.3-0.6 s
-COMMIT_ENTRY_APERTURE_MARGIN_FRAC = 0.60  # error+drift within 60% of half
+COMMIT_ENTRY_APERTURE_MARGIN_FRAC = 0.60  # instantaneous center core
+# Build-3385 exposes normalized opening geometry but no verified metric gate
+# pose from which older public chassis dimensions can be projected.  Reserve a
+# symmetric 40% of each measured half-opening for vehicle extent, camera/frame
+# transport, and unmodeled edge error; the COMPLETE projected center tube must
+# fit inside the remaining corridor.  This is deliberately separate from the
+# instantaneous-center core even though both defaults leave the same 60% half.
+COMMIT_BODY_FRAME_CLEARANCE_FRAC = 0.40
 # IMU vertical velocity is supporting evidence, never passage authority.  The
 # former hard |vz| gate could veto a visually clear correction using a leaky,
 # regime-gated integral; the optical miss interval now owns admission while vz
@@ -913,6 +920,12 @@ class _CommitAdmission:
     y_tube: Optional[float] = None
     x_budget: Optional[float] = None
     y_budget: Optional[float] = None
+    x_clearance_reserve: Optional[float] = None
+    y_clearance_reserve: Optional[float] = None
+    y_upper_clearance_reserve: Optional[float] = None
+    y_lower_clearance_reserve: Optional[float] = None
+    x_safe_half: Optional[float] = None
+    y_safe_half: Optional[float] = None
     closure_rate_s: Optional[float] = None
     closure_agreement: Optional[float] = None
     ttc_s: Optional[float] = None
@@ -1172,6 +1185,9 @@ class CleanCourseConfig:
     commit_entry_meas_max_age_s: float = COMMIT_ENTRY_MEAS_MAX_AGE_S
     commit_blackout_s: float = COMMIT_BLACKOUT_S
     commit_entry_aperture_margin_frac: float = COMMIT_ENTRY_APERTURE_MARGIN_FRAC
+    commit_body_frame_clearance_frac: float = (
+        COMMIT_BODY_FRAME_CLEARANCE_FRAC
+    )
     pitch_target_min_rad: float = PITCH_TARGET_MIN_RAD
     near_plane_steer_gain_mult: float = NEAR_PLANE_STEER_GAIN_MULT
     predict_frame_gap_s: float = PREDICT_FRAME_GAP_S
@@ -1292,6 +1308,7 @@ class CleanCourseController:
         self._zero_recovery_pending = False
         self._zero_recovery_applied = False
         self._zero_sink_debt_m_s = 0.0
+        self._zero_command_s: Optional[float] = None
         self._coast_race_boot_ms: Optional[int] = None
         self._last_race_boot_ms: Optional[int] = None
         # F76: bounded post-one-zero heading-hold window (see
@@ -1304,9 +1321,13 @@ class CleanCourseController:
         # F49: SEARCH sweep base heading — the yaw measured at search entry,
         # not the leg anchor (see _search_yaw_heading).
         self._search_base_yaw_rad: Optional[float] = None
-        # F53: near-plane COMMIT sustain timer and entry stamp (see the
-        # COMMIT_* constant block).
+        # Near-plane proximity and safe-containment are deliberately separate
+        # clocks.  F168 let proximity sustain while the trajectory was
+        # outside the aperture, then latched COMMIT on one marginal frame.
+        # Crossing authority now requires the complete reduced-corridor tube
+        # itself to remain continuously safe for the existing sustain window.
         self._near_plane_since_s: Optional[float] = None
+        self._commit_safe_since_s: Optional[float] = None
         self._commit_entry_s: Optional[float] = None
         self._commit_pitch_target_rad: Optional[float] = None
         self._last_commit_admission = _CommitAdmission(
@@ -1349,6 +1370,10 @@ class CleanCourseController:
         self._fh_mps2 = 0.0
         self._fh_untrusted = False
         self._fh_above_since_s: Optional[float] = None
+        # The attitude estimator's accelerometer trust qualifies the same IMU
+        # samples used by the vertical-rate integral.  It is supporting
+        # evidence only; zero trust must make its collective innovation zero.
+        self._imu_accel_trust = 1.0
         # F120 continuous lateral reference.  The reference itself carries
         # through crossing and authoritative promotion; it is derotated by
         # measured yaw between command ticks, then filtered toward the latest
@@ -1402,6 +1427,8 @@ class CleanCourseController:
         self._last_vertical_required_rate_norm_s = 0.0
         self._last_vertical_observed_rate_norm_s = 0.0
         self._last_vertical_imu_raw_delta = 0.0
+        self._last_vertical_imu_trust = 1.0
+        self._last_zero_recovery_delta = 0.0
         self._last_pitch_response_authority = 0.0
         # A tracker id is an observation alias, not a race role.  Only an
         # authoritative promotion can open this bounded reconciliation lease;
@@ -1455,6 +1482,12 @@ class CleanCourseController:
         self._zero_recovery_pending = False
         self._zero_recovery_applied = False
         self._zero_sink_debt_m_s = 0.0
+        self._zero_command_s = None
+        self._near_plane_since_s = None
+        self._commit_safe_since_s = None
+        self._commit_entry_s = None
+        self._commit_pitch_target_rad = None
+        self._imu_accel_trust = 1.0
         self._reset_vertical_direction()
         identity = _frame_identity(update)
         if identity is not None:
@@ -1776,6 +1809,7 @@ class CleanCourseController:
         self._reset_vertical_direction()
         self._clear_current_fresh_observation()
         self._near_plane_since_s = None
+        self._commit_safe_since_s = None
         self._commit_entry_s = None
         self._commit_pitch_target_rad = None
         self._last_commit_admission = _CommitAdmission(
@@ -1869,6 +1903,7 @@ class CleanCourseController:
         yaw_rad: Optional[float] = None,
         world_up_accel_m_s2: Optional[float] = None,
         horizontal_specific_force_mps2: Optional[float] = None,
+        accel_trust: Optional[float] = None,
     ) -> NavigationOutput:
         """Produce the single navigation request for one tick."""
 
@@ -1896,6 +1931,8 @@ class CleanCourseController:
         self._last_vertical_required_rate_norm_s = 0.0
         self._last_vertical_observed_rate_norm_s = 0.0
         self._last_vertical_imu_raw_delta = 0.0
+        self._last_vertical_imu_trust = 1.0
+        self._last_zero_recovery_delta = 0.0
         self._last_pitch_response_authority = 0.0
         self._last_lateral_baseline_reference_x = 0.0
         self._last_lateral_projection_delta_x = 0.0
@@ -1911,6 +1948,16 @@ class CleanCourseController:
         else:
             dt = _clamp(now_s - self._last_command_s, 1e-3, 0.10)
         self._last_command_s = float(now_s)
+        if self._zero_recovery_pending and self._zero_command_s is not None:
+            # The zero-send impulse lasts until the next powered controller
+            # tick, not for the duration of the tick that preceded it.  Use
+            # that measured bounded gap so scheduler cadence cannot make the
+            # recovery energy a lucky-flight variable.
+            zero_gap_s = _clamp(now_s - self._zero_command_s, 0.0, 0.10)
+            self._zero_sink_debt_m_s = max(
+                self._zero_sink_debt_m_s,
+                GRAVITY_M_S2 * zero_gap_s,
+            )
 
         # F14 inflow-regime gate (see the FH_* constant block): vz_est is
         # invalidated by REGIME (fh-proportional DC thrust deficit), not by
@@ -1930,12 +1977,33 @@ class CleanCourseController:
         else:
             self._fh_above_since_s = None
 
+        if accel_trust is None:
+            estimator_trust = 1.0
+        else:
+            raw_trust = float(accel_trust)
+            estimator_trust = (
+                _clamp01(raw_trust) if math.isfinite(raw_trust) else 0.0
+            )
+        self._imu_accel_trust = (
+            0.0 if self._fh_untrusted else estimator_trust
+        )
+        self._last_vertical_imu_trust = self._imu_accel_trust
+
         if world_up_accel_m_s2 is not None:
-            if not self._fh_untrusted:
+            if self._imu_accel_trust > 0.0:
                 # Leaky world-vertical-rate integrator for the climb
-                # governor; IMU-fed so it stays alive in every state,
-                # including COAST.
-                self._vz_est_m_s += float(world_up_accel_m_s2) * dt
+                # governor.  The same estimator trust that qualifies gravity
+                # correction qualifies this acceleration sample; F168's
+                # accel_trust=0 launch transient may not integrate a second,
+                # contradictory vertical trajectory.
+                # ``accel_trust`` is confidence, not a scale conversion for
+                # the measured acceleration.  Integrate an accepted sample at
+                # physical magnitude, then apply confidence exactly once when
+                # the estimate contributes damping/innovation below.  Scaling
+                # both here and at the control boundary would square partial
+                # trust and make arbitration cadence-dependent.
+                accepted_accel = float(world_up_accel_m_s2)
+                self._vz_est_m_s += accepted_accel * dt
                 if self._zero_sink_debt_m_s > 0.0:
                     # The debt bridges the known zero impulse only until fresh
                     # inertial acceleration begins representing it.  Reconcile
@@ -1944,13 +2012,14 @@ class CleanCourseController:
                     self._zero_sink_debt_m_s = max(
                         0.0,
                         self._zero_sink_debt_m_s
-                        - abs(float(world_up_accel_m_s2)) * dt,
+                        - self._imu_accel_trust
+                        * abs(accepted_accel)
+                        * dt,
                     )
-            # While fh-untrusted the integration is SUSPENDED (a biased
-            # regime a_up is never integrated) and only the leak relaxes
-            # the frozen estimate toward 0.
+            # While untrusted, integration is suspended and only the leak
+            # relaxes the frozen estimate toward zero.
             self._vz_est_m_s -= self._vz_est_m_s * dt / VZ_LEAK_TAU_S
-        if not self._fh_untrusted:
+        if self._imu_accel_trust > 0.0:
             # IMU altitude estimate from course start (takeoff pad = 0),
             # clamped below (F13: a biased integrator reached -10.7 m,
             # physically impossible, and drove the floor deeper than its
@@ -1979,16 +2048,18 @@ class CleanCourseController:
             else:
                 self._coast_zero_sent = True
                 self._zero_recovery_pending = True
+                self._zero_command_s = float(now_s)
                 # Keep the persistent command state truthful: the aircraft is
                 # about to receive exact wire zero, not the pre-crossing carry.
                 # The next powered tick may therefore recover from the actual
                 # bounded command discontinuity instead of a stale internal
                 # value.
                 self._collective = 0.0
-                self._zero_sink_debt_m_s = max(
-                    self._zero_sink_debt_m_s,
-                    GRAVITY_M_S2 * max(dt, cfg.control_period_s),
-                )
+                # Debt begins at the exact wire-zero timestamp.  The interval
+                # that preceded this send was powered flight and must not be
+                # charged as zero-command sink energy; the next command tick
+                # derives the bounded debt from ``now - _zero_command_s``.
+                self._zero_sink_debt_m_s = 0.0
                 # July-18 contract item 9: the credible-crossing credit wait
                 # is EXACT WIRE ZERO on all four channels while awaiting a
                 # newer authoritative race packet.  The F25/F26
@@ -2070,6 +2141,11 @@ class CleanCourseController:
             if near_plane_close
             else _CommitAdmission(False, "outside-proximity")
         )
+        if near_plane_close and commit_admission.admissible:
+            if self._commit_safe_since_s is None:
+                self._commit_safe_since_s = now_s
+        elif self.state is not CleanCourseState.COMMIT:
+            self._commit_safe_since_s = None
         if not near_plane_close and self.state is not CleanCourseState.COMMIT:
             self._last_commit_admission = commit_admission
         # F164 unified entry model (see the COMMIT_ENTRY_* block): one outer
@@ -2077,24 +2153,53 @@ class CleanCourseController:
         # contained trajectory commits from controlled closure or at the
         # bounded visual point-of-no-return; otherwise TRACK continues
         # braking/re-centering outside the censorship blackout.
+        entered_commit = False
         if (
             near_plane_close
-            and now_s - self._near_plane_since_s >= cfg.commit_sustain_s
-            and commit_admission.admissible
+            and self._commit_safe_since_s is not None
+            and now_s - self._commit_safe_since_s >= cfg.commit_sustain_s
         ):
             self.state = CleanCourseState.COMMIT
             self._commit_entry_s = float(now_s)
+            entered_commit = True
             # Admission certifies the TRACK trajectory already in progress.
             # COMMIT carries that exact longitudinal target; it cannot inject
             # a new nose-down endpoint after certifying a braking approach.
             self._commit_pitch_target_rad = float(self._prev_target_pitch)
 
         if self.state is CleanCourseState.COMMIT:
+            if not entered_commit and self.current is not None:
+                continued_admission = self._commit_admission(
+                    now_s,
+                    pitch_rad,
+                    cfg,
+                )
+                # COMMIT remains inertial through the expected visual
+                # blackout, but fresh uncensored proof that the complete
+                # body-clearance tube has left the safe corridor revokes the
+                # lease while TRACK can still brake and recenter.  A fresh
+                # TOP/BOTTOM/side censor is itself one-sided evidence that the
+                # safe tube escaped the frame, so it also revokes immediately;
+                # stale or missing evidence cannot revoke a legitimately
+                # established exact-zero crossing.
+                if continued_admission.status in {
+                    "corridor-known/not-contained",
+                    "directionally-censored",
+                }:
+                    self.state = CleanCourseState.TRACK
+                    self._commit_entry_s = None
+                    self._commit_pitch_target_rad = None
+                    self._commit_safe_since_s = None
+                    commit_admission = continued_admission
             commit_timed_out = (
                 self._commit_entry_s is None
                 or now_s - self._commit_entry_s > cfg.commit_timeout_s
             )
-            if self.current is None or commit_timed_out:
+            if self.state is not CleanCourseState.COMMIT:
+                # A fresh unsafe tube returned custody to the ordinary TRACK
+                # path below in this same command tick.
+                pass
+            elif self.current is None or commit_timed_out:
                 # No authoritative credit inside the bounded commit window:
                 # arrest forward motion (the SEARCH branch below slews
                 # pitch back to level) and search.  Dropping the hypothesis
@@ -2727,13 +2832,15 @@ class CleanCourseController:
         # Image motion and expansion predict the aperture intercept instead
         # of relabelling an image angle as a metric velocity setpoint.
 
-        # Gate-0 motor spin-up remains bounded feedforward, but its release is
-        # a continuous, outer-trajectory-owned energy term.  It is never a
-        # time-switched collective target.  As soon as measured image motion
-        # satisfies the required climb rate, the boost drains smoothly; the
-        # same motion cannot then be counted again by additive IMU damping.
+        # Gate-0 motor spin-up is a bounded MINIMUM energy trajectory.  F168
+        # multiplied it by near-zero outer-y/rate authority, so one accepted
+        # detector topology jump at t=.296 drained the only launch lift.  The
+        # minimum is now time-owned: hold the validated 0.30 spin-up level,
+        # then smoothstep to tilt support over the existing transfer window.
+        # Vision may ask for more, but no image position/rate discontinuity
+        # can cancel this floor.  After the bounded window the same outer-y
+        # feedback remains the sole trajectory owner.
         unshaped_collective = collective
-        launch_energy_hold = 0.0
         if (
             self.gate_index == 0
             and self._course_start_s is not None
@@ -2744,38 +2851,33 @@ class CleanCourseController:
                 cfg.launch_boost_duration_s
                 + cfg.launch_collective_transfer_s
             )
-            phase = _clamp01(
-                launch_elapsed_s / max(1e-6, launch_horizon_s)
-            )
-            # Complementary smoothstep: value and slope are continuous at
-            # both ends of the bounded feedforward horizon.
-            time_authority = 1.0 - phase * phase * (3.0 - 2.0 * phase)
-            required_rate = self._last_vertical_required_rate_norm_s
-            observed_rate = self._last_vertical_observed_rate_norm_s
-            climb_deficit = max(0.0, required_rate - observed_rate)
-            trajectory_authority = _clamp01(
-                climb_deficit
-                / max(
-                    1e-6,
-                    abs(required_rate) + abs(observed_rate),
+            launch_floor: Optional[float] = None
+            if launch_elapsed_s <= cfg.launch_boost_duration_s:
+                launch_floor = cfg.launch_boost_thrust
+            elif launch_elapsed_s < launch_horizon_s:
+                transfer_phase = _clamp01(
+                    (
+                        launch_elapsed_s
+                        - cfg.launch_boost_duration_s
+                    )
+                    / max(1e-6, cfg.launch_collective_transfer_s)
                 )
-            )
-            launch_energy_hold = time_authority * trajectory_authority
-            if launch_energy_hold > 0.0:
-                collective += launch_energy_hold * max(
-                    0.0, cfg.launch_boost_thrust - collective
+                transfer_progress = transfer_phase * transfer_phase * (
+                    3.0 - 2.0 * transfer_phase
                 )
+                launch_floor = cfg.launch_boost_thrust + (
+                    support - cfg.launch_boost_thrust
+                ) * transfer_progress
+            if launch_floor is not None:
+                collective = max(collective, launch_floor)
             # Fade descent authority in over the complete bumpless launch
             # trajectory.  This is a continuous magnitude envelope on the
             # same outer-owned correction, not F167's y-sign-switched support
             # floor: crossing outer-y==0 cannot change authority or expose a
             # hidden IMU request in one frame.
-            launch_trajectory_horizon_s = (
-                launch_horizon_s + cfg.launch_pitch_blend_s
-            )
             launch_phase = _clamp01(
-                launch_elapsed_s
-                / max(1e-6, launch_trajectory_horizon_s)
+                (launch_elapsed_s - launch_horizon_s)
+                / max(1e-6, cfg.launch_pitch_blend_s)
             )
             launch_progress = launch_phase * launch_phase * (
                 3.0 - 2.0 * launch_phase
@@ -3022,14 +3124,18 @@ class CleanCourseController:
         return self._commit_admission(now_s, pitch_rad, cfg).admissible
 
     def _commit_admission(
-        self, now_s: float, pitch_rad: float, cfg: "CleanCourseConfig"
+        self,
+        now_s: float,
+        pitch_rad: float,
+        cfg: "CleanCourseConfig",
     ) -> _CommitAdmission:
         """Evaluate one gate-owned trajectory tube and longitudinal model.
 
         Outer-box observations alone own closure/TTC; a separately transported
         aperture certificate owns geometry.  The current center must sit in the
         conservative core, while both complete optical projection endpoints
-        plus bounded model/transport uncertainty must fit in the full opening.
+        plus bounded model/transport uncertainty must fit in that same reduced
+        body/frame-clearance corridor.
         Fast closure is not categorically rejected: a contained approach may
         commit at the modeled censorship point-of-no-return.
         """
@@ -3138,11 +3244,32 @@ class CleanCourseController:
             + cfg.passage_motion_model_std_norm
             + corridor.center_std_y
         )
+        # Center containment and vehicle/frame clearance are separate
+        # contracts.  F168 applied only the former, then let the COMPLETE
+        # camera-center trajectory tube consume the reserve and nearly touch
+        # the mathematical opening.  VQ2 has no verified metric gate pose, so
+        # use the explicit normalized build-specific reserve above rather than
+        # importing unverified public-VQ1 chassis geometry.
+        reserve_frac = _clamp(
+            cfg.commit_body_frame_clearance_frac, 0.0, 1.0
+        )
+        x_safe_half = (1.0 - reserve_frac) * corridor.half_x
+        y_safe_half = (1.0 - reserve_frac) * corridor.half_y
+        x_clearance_reserve = corridor.half_x - x_safe_half
+        y_clearance_reserve = corridor.half_y - y_safe_half
+        clearance = {
+            "x_clearance_reserve": x_clearance_reserve,
+            "y_clearance_reserve": y_clearance_reserve,
+            "y_upper_clearance_reserve": y_clearance_reserve,
+            "y_lower_clearance_reserve": y_clearance_reserve,
+            "x_safe_half": x_safe_half,
+            "y_safe_half": y_safe_half,
+        }
         if (
             abs(corridor.center_x) > x_budget
             or abs(compensated_center_y) > y_budget
-            or x_tube > corridor.half_x
-            or y_tube > corridor.half_y
+            or x_tube > x_safe_half
+            or y_tube > y_safe_half
         ):
             result = _CommitAdmission(
                 False,
@@ -3151,6 +3278,7 @@ class CleanCourseController:
                 y_tube=y_tube,
                 x_budget=x_budget,
                 y_budget=y_budget,
+                **clearance,
                 **common,
             )
             self._last_commit_admission = result
@@ -3186,6 +3314,7 @@ class CleanCourseController:
             y_tube=y_tube,
             x_budget=x_budget,
             y_budget=y_budget,
+            **clearance,
             closure_rate_s=closure,
             closure_agreement=agreement,
             ttc_s=ttc_s,
@@ -5397,10 +5526,21 @@ class CleanCourseController:
                 )
             )
 
-        effective_vz_m_s = self._vz_est_m_s - self._zero_sink_debt_m_s
-        imu_raw_delta = -cfg.vertical_imu_damping_gain * effective_vz_m_s
+        # The estimator's velocity is only as authoritative as the
+        # accelerometer evidence that maintained it.
+        imu_raw_delta = (
+            -cfg.vertical_imu_damping_gain
+            * self._vz_est_m_s
+        )
         self._last_vertical_imu_raw_delta = float(imu_raw_delta)
-        imu_delta = imu_raw_delta
+        imu_delta = self._imu_accel_trust * imu_raw_delta
+        # Exact-zero debt is deterministic actuator feedforward, not an IMU
+        # observation.  Keep it outside the optical/IMU innovation so it can
+        # neither lend trust to a bad accelerometer sample nor replace the
+        # direct optical-motion owner.
+        zero_recovery_delta = (
+            cfg.vertical_imu_damping_gain * self._zero_sink_debt_m_s
+        )
         command_now_s = self._last_command_s
         launch_transfer_active = bool(
             current is self.current
@@ -5437,7 +5577,7 @@ class CleanCourseController:
                     1e-6,
                 )
             )
-            imu_innovation = _clamp(
+            imu_innovation = self._imu_accel_trust * _clamp(
                 imu_raw_delta - optical_motion_delta,
                 -innovation_bound,
                 innovation_bound,
@@ -5452,10 +5592,20 @@ class CleanCourseController:
                 )
             )
             imu_delta = imu_weight * imu_innovation
-        target = support + visual_delta + imu_delta
+            if visual_delta * zero_recovery_delta < 0.0:
+                zero_recovery_delta = math.copysign(
+                    min(
+                        abs(zero_recovery_delta),
+                        cfg.vertical_imu_max_opposition_fraction
+                        * abs(visual_delta),
+                    ),
+                    zero_recovery_delta,
+                )
+        target = support + visual_delta + imu_delta + zero_recovery_delta
         self._last_vertical_support = float(support)
         self._last_vertical_visual_delta = float(visual_delta)
         self._last_vertical_imu_delta = float(imu_delta)
+        self._last_zero_recovery_delta = float(zero_recovery_delta)
         self._last_vertical_collective_target = float(target)
         return target
 
@@ -5635,6 +5785,12 @@ class CleanCourseController:
                 self._collective = target
                 self._zero_recovery_applied = True
             self._zero_recovery_pending = False
+            # The known impulse has now shaped one immediate bounded target.
+            # The carried collective supplies the recovery tail; retaining the
+            # debt would create a new open-loop climb owner when IMU trust is
+            # unavailable on the next leg.
+            self._zero_sink_debt_m_s = 0.0
+            self._zero_command_s = None
         elif self._collective is None:
             self._collective = target
         else:
@@ -5829,6 +5985,8 @@ class CleanCourseController:
 
     def _enter_search(self, now_s: float) -> None:
         self.state = CleanCourseState.SEARCH
+        self._near_plane_since_s = None
+        self._commit_safe_since_s = None
         self._commit_entry_s = None
         self._commit_pitch_target_rad = None
         self._reset_vertical_direction()
@@ -6433,6 +6591,21 @@ def _clean_course_tick_trace(
             "y_tube": admission.y_tube,
             "x_budget": admission.x_budget,
             "y_budget": admission.y_budget,
+            "x_clearance_reserve": admission.x_clearance_reserve,
+            "y_clearance_reserve": admission.y_clearance_reserve,
+            "y_upper_clearance_reserve": (
+                admission.y_upper_clearance_reserve
+            ),
+            "y_lower_clearance_reserve": (
+                admission.y_lower_clearance_reserve
+            ),
+            "x_safe_half": admission.x_safe_half,
+            "y_safe_half": admission.y_safe_half,
+            "safe_sustain_s": (
+                None
+                if controller._commit_safe_since_s is None
+                else max(0.0, now_s - controller._commit_safe_since_s)
+            ),
             "closure_rate_s": admission.closure_rate_s,
             "closure_agreement": admission.closure_agreement,
             "ttc_s": admission.ttc_s,
@@ -6512,6 +6685,8 @@ def _clean_course_tick_trace(
             "launch_shape_delta": controller._last_launch_collective_delta,
             "imu_delta": controller._last_vertical_imu_delta,
             "imu_raw_delta": controller._last_vertical_imu_raw_delta,
+            "imu_trust": controller._last_vertical_imu_trust,
+            "zero_recovery_delta": controller._last_zero_recovery_delta,
             "required_rate_norm_s": (
                 controller._last_vertical_required_rate_norm_s
             ),
@@ -6697,6 +6872,7 @@ async def run_clean_course_stage(
                 horizontal_specific_force_mps2=getattr(
                     estimate, "horizontal_specific_force_mps2", None
                 ),
+                accel_trust=getattr(estimate, "accel_trust", None),
             )
             # One attitude PD for roll/pitch; yaw stays an explicit
             # channel.  COAST_FOR_CREDIT bypasses the PD entirely (July-18
