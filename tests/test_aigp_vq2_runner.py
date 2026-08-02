@@ -116,6 +116,10 @@ from scripts.aigp_vq2_run import (
 from scripts import aigp_vq2_powered_attempt as powered_contract
 from scripts import aigp_vq2_powered_runtime as powered_runtime
 from scripts import aigp_vq2_controller_config as controller_config_module
+from scripts.aigp_vq2_clean_course_stage import (
+    CleanCourseController,
+    CleanCourseState,
+)
 from tests import test_aigp_vq2_powered_attempt as powered_fixtures
 
 
@@ -334,6 +338,164 @@ def _visual_frame(
         aperture_geometries=(inner,),
         camera_source_time_ns=10_000 + sequence,
     )
+
+
+def _empty_visual_frame(sequence: int) -> VisualDetectionFrame:
+    return VisualDetectionFrame.from_detector_results(
+        (),
+        generation=4,
+        frame_id=100 + sequence,
+        publication_sequence=sequence,
+        stream_id="runner-prior-test",
+        final_unique_packet_monotonic_ns=(
+            1_000_000_000 + 40_000_000 * sequence
+        ),
+        publish_monotonic_ns=(
+            1_001_000_000 + 40_000_000 * sequence
+        ),
+        time_basis_id="host-perf-counter",
+        image_size_px=(200, 160),
+        aperture_geometries=(),
+        camera_source_time_ns=10_000 + sequence,
+    )
+
+
+def test_real_aperture_half_extents_reach_clean_course_boundary_unchanged(
+) -> None:
+    tracker = MultiTargetVisualTracker()
+    aperture = vq2_module._visual_inner_aperture_from_fit(
+        _nominal_aperture_fit()
+    )
+    detection = _detection(50, 30, 100, 100)
+    first = tracker.update(_visual_frame(1, detection, inner=aperture))
+    controller = CleanCourseController()
+    controller.initialize(
+        first,
+        gate_index=0,
+        fallback_center_norm=(0.0, 0.0),
+        fallback_apparent_scale=0.10,
+        now_s=100.0,
+    )
+
+    second = tracker.update(_visual_frame(2, detection, inner=aperture))
+    controller.observe(second, now_s=100.04)
+
+    assert second.visible_track_ids == first.visible_track_ids
+    assert aperture.half_size_norm == pytest.approx((0.305, 0.38125))
+    tracked_aperture = second.track(
+        second.visible_track_ids[0]
+    ).history[-1].inner_aperture
+    assert tracked_aperture is not None
+    assert tracked_aperture.half_size_norm == pytest.approx((0.305, 0.38125))
+    assert controller.current is not None
+    assert controller.current.aperture_half_x == pytest.approx(0.305)
+    assert controller.current.aperture_half_y == pytest.approx(0.38125)
+
+
+def test_public_close_approach_replay_reaches_commit_and_credit_coast(
+) -> None:
+    """Replay co-timed vision through public boundaries, without state injection."""
+
+    tracker = MultiTargetVisualTracker()
+    fit = _nominal_aperture_fit()
+    assert fit.fitted_corners_px is not None
+    shifted_corners = tuple(
+        (x - 5.0, y) for x, y in fit.fitted_corners_px
+    )
+    fit = replace(
+        fit,
+        support_bbox_px=(54, 39, 83, 83),
+        fitted_corners_px=shifted_corners,
+        visible_segments_px=tuple(
+            (
+                shifted_corners[index],
+                shifted_corners[(index + 1) % 4],
+            )
+            for index in range(4)
+        ),
+    )
+    aperture = vq2_module._visual_inner_aperture_from_fit(fit)
+    assert aperture.center_norm is not None
+    assert aperture.half_size_norm is not None
+    assert aperture.center_norm == pytest.approx((0.05, 0.0))
+    close_aligned_gate = _detection(45, 30, 100, 100)
+    controller = CleanCourseController()
+    half_x = aperture.half_size_norm[0]
+    margin = controller.config.commit_entry_aperture_margin_frac
+    assert abs(aperture.center_norm[0]) < margin * half_x
+    states = []
+    now_s = 100.0
+
+    for sequence in range(1, 41):
+        update = tracker.update(
+            _visual_frame(
+                sequence,
+                close_aligned_gate,
+                inner=aperture,
+            )
+        )
+        now_s = 100.0 + 0.04 * (sequence - 1)
+        if sequence == 1:
+            controller.initialize(
+                update,
+                gate_index=0,
+                fallback_center_norm=(0.0, 0.0),
+                fallback_apparent_scale=0.10,
+                now_s=now_s,
+            )
+            assert not controller.note_race(
+                gate_index=0,
+                race_boot_ms=1_000,
+                now_s=now_s,
+            )
+        else:
+            controller.observe(update, now_s=now_s)
+            output = controller.command(
+                now_s=now_s,
+                roll_rad=0.0,
+                pitch_rad=controller.config.spawn_pitch_rad,
+                yaw_rad=0.0,
+            )
+            assert output.gate_index == 0
+        states.append(controller.state)
+        assert controller.gate_index == 0
+        if controller.state is CleanCourseState.COMMIT:
+            break
+
+    assert states[0] is CleanCourseState.TRACK
+    assert states[-1] is CleanCourseState.COMMIT
+
+    loss_sequence = sequence + 1
+    now_s += 0.04
+    lost = tracker.update(_empty_visual_frame(loss_sequence))
+    assert not lost.visible_track_ids
+    controller.observe(lost, now_s=now_s)
+    assert controller.state is CleanCourseState.COAST_FOR_CREDIT
+    assert controller.gate_index == 0
+
+    coast = controller.command(
+        now_s=now_s,
+        roll_rad=0.0,
+        pitch_rad=controller.config.spawn_pitch_rad,
+        yaw_rad=0.0,
+    )
+    assert coast.state is CleanCourseState.COAST_FOR_CREDIT
+    assert coast.gate_index == 0
+    assert (
+        coast.target_roll_rad,
+        coast.target_pitch_rad,
+        coast.yaw_rate_rad_s,
+        coast.thrust,
+    ) == (0.0, 0.0, 0.0, 0.0)
+
+    assert controller.note_race(
+        gate_index=1,
+        race_boot_ms=1_001,
+        now_s=now_s + 0.001,
+    )
+    assert controller.gate_index == 1
+    assert controller.max_gate_index == 1
+    assert controller.transitions == [(0, 1)]
 
 
 @pytest.mark.parametrize(
