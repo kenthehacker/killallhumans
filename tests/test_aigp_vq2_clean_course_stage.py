@@ -464,11 +464,11 @@ def test_centered_bearing_does_not_unwind_optical_intercept_bank():
     assert out.target_roll_rad > 0.0
 
 
-def test_uncertain_lateral_intercept_falls_back_to_measured_bearing():
-    # A nominal TTC intercept can cross to the opposite image side when the
-    # expansion estimate is extremely uncertain.  That uncertain projection
-    # must not reverse bank: roll falls back to the measured bearing while yaw
-    # continues ordinary FOV centering.
+def test_uncertain_lateral_ttc_cannot_veto_coherent_image_motion():
+    # Camera bearing and physical interception have separate owners.  Broad
+    # TTC covariance removes the uncertain residual magnitude, but fresh image
+    # motion still supplies the short-horizon path: yaw keeps the left-side
+    # target in view while roll bends right toward its coherent crossing miss.
     controller = _tracked_controller(_track("A", -0.25, 0.0))
     current = controller.current
     _settle_commit_passage_covariance(current)
@@ -486,11 +486,13 @@ def test_uncertain_lateral_intercept_falls_back_to_measured_bearing():
 
     assert motion.intercept_error > 0.0
     assert motion.control_authority == pytest.approx(0.0, abs=1e-12)
-    assert controller._lateral_intercept_reference_x == pytest.approx(
-        current.x, abs=1e-12
-    )
+    assert motion.fallback_intercept_error > 0.0
+    assert motion.optical_intercept_error > 0.0
+    assert controller._last_lateral_baseline_reference_x < 0.0
+    assert controller._last_lateral_direction_override_x > 0.0
+    assert controller._lateral_intercept_reference_x > 0.0
     assert out.yaw_rate_rad_s < 0.0
-    assert out.target_roll_rad < 0.0
+    assert out.target_roll_rad > 0.0
 
 
 def test_gate0_climb_vertical_offset_is_bounded_feedforward():
@@ -1297,12 +1299,13 @@ def test_near_plane_compensated_gate_y_keeps_physical_sink_damping():
     support = SPAWN_SUPPORT / math.cos(brake_pitch - SPAWN_PITCH)
     compensated = controller._compensated_ey(0.10, brake_pitch)
     assert compensated < 0.0
-    imu_only = (
-        support
-        - controller.config.vertical_imu_damping_gain
-        * controller._vz_est_m_s
+    # The sink estimate reinforces the clear climb correction, but remains a
+    # supporting magnitude rather than becoming a second primary trajectory.
+    assert controller._last_vertical_visual_delta > 0.0
+    assert 0.0 < controller._last_vertical_imu_delta <= (
+        controller._last_vertical_visual_delta
     )
-    assert out.thrust > imu_only
+    assert out.thrust > support
     assert out.thrust <= controller.config.max_thrust
 
 
@@ -1424,7 +1427,7 @@ def test_stale_vertical_motion_has_no_optical_authority_and_holds_support():
     # IMU vertical motion, collective holds tilt-compensated support.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     controller.current.y_axis.v = 0.38  # phantom rate from the crossing
-    output = _command(controller, 100.45, pitch=SPAWN_PITCH)  # last y measurement 0.42 s stale
+    output = _command(controller, 100.55, pitch=SPAWN_PITCH)
     assert not output.vertical_qualified
     assert controller.current.y_axis.v == pytest.approx(0.38, abs=1e-12)
     assert controller._last_vertical_motion is None
@@ -1437,7 +1440,7 @@ def test_qualification_regain_restores_optical_authority_from_measurements():
     # and restore optical-passage authority.
     controller = _tracked_controller(_track("A", 0.0, 0.0))
     controller.current.y_axis.v = 0.38
-    stale = _command(controller, 100.45, pitch=SPAWN_PITCH)
+    stale = _command(controller, 100.55, pitch=SPAWN_PITCH)
     assert not stale.vertical_qualified
     assert controller._last_vertical_motion is None
     now = 100.46
@@ -1975,7 +1978,7 @@ def test_stale_directional_censor_has_no_optical_authority():
     controller.current.last_measurement_s = 99.0
     controller._vz_est_m_s = 0.0
 
-    out = _command(controller, 100.50, pitch=SPAWN_PITCH)
+    out = _command(controller, 100.60, pitch=SPAWN_PITCH)
 
     assert not out.vertical_qualified
     assert controller._last_vertical_motion is None
@@ -3929,8 +3932,9 @@ def test_pending_credit_hold_never_sweeps_before_delayed_credit():
     now += 0.02
     out = _command(controller, now, yaw=0.0)  # the single wire-zero send (F72)
     assert out.thrust == 0.0
-    # Pending-credit window (~0.33 s << PENDING_CREDIT_HOLD_S): heading
-    # held level, zero roll, governed altitude support — no sweep.  F78:
+    # Pending-credit window (~0.33 s << PENDING_CREDIT_HOLD_S): level pitch,
+    # governed altitude support, and one bounded successor preturn — no sweep.
+    # F78/F167:
     # the still-credible left successor may steer a BOUNDED leftward
     # recentering (see test_pending_credit_recenters_toward_credible_
     # successor), so the invariant here is only the F76 one: never yaw
@@ -3940,7 +3944,8 @@ def test_pending_credit_hold_never_sweeps_before_delayed_credit():
         out = _command(controller, t, yaw=0.0)
         assert controller.state is CleanCourseState.SEARCH
         assert out.yaw_rate_rad_s <= 0.0
-        assert out.target_roll_rad == pytest.approx(0.0, abs=1e-12)
+        assert out.target_roll_rad <= 0.0
+        assert out.yaw_rate_rad_s * out.target_roll_rad >= 0.0
         assert out.thrust > 0.0
     # Delayed credit inside the window: the retained left-side successor is
     # stale by construction, so it remains the current PREDICT hypothesis —
@@ -3977,8 +3982,8 @@ def test_pending_credit_recenters_toward_credible_successor():
     # saturated constant-bearing pursuit it never centered (crossed
     # displaced, no credit).  While credit is in flight, a FRESH,
     # persistent, qualified successor's bearing steers a bounded
-    # recentering: yaw left toward a left successor, at/below the 0.15
-    # command cap, with zero roll and no forward advance — and crucially
+    # recentering: yaw and bank left toward a left successor, at/below their
+    # command bounds, with no forward advance — and crucially
     # WITHOUT promoting or changing authoritative gate ownership.
     controller = _tracked_controller(_track("A", 0.0, 0.0, scale=0.50))
     controller.observe(
@@ -4019,7 +4024,8 @@ def test_pending_credit_recenters_toward_credible_successor():
         assert controller.state is CleanCourseState.SEARCH
         assert controller.gate_index == 0  # authoritative ownership intact
         assert -MAX_COURSE_YAW_RATE_RAD_S <= out.yaw_rate_rad_s < 0.0
-        assert out.target_roll_rad == pytest.approx(0.0, abs=1e-12)
+        assert -controller.config.max_target_roll_rad <= out.target_roll_rad < 0.0
+        assert out.yaw_rate_rad_s * out.target_roll_rad > 0.0
         # No forward advance before credit: the crossing brake may still be
         # slewing back toward level, but must never cross into nose-down drive.
         assert out.target_pitch_rad <= level_pitch + 1e-6
@@ -4724,9 +4730,9 @@ def test_f166_republished_outer_frame_cannot_refresh_vertical_authority():
     # A tracker publication can repeat one decoded camera frame.  Replaying
     # an outer-only current track with the identical frame identity must be
     # prediction, not another y observation: timestamps remain at the real
-    # source frame, TRACK exits immediately, and visual collective authority
-    # is gone after vertical_qualify_max_age_s even though the track object is
-    # still present in every publication.
+    # source frame, TRACK exits immediately, exact qualification ends at its
+    # stricter age, and visual control expires at the bounded PREDICT horizon
+    # even though the track object is still present in every publication.
     frozen = _update(
         [_track("A", 0.0, -0.20, scale=0.14)], frame_id=2264999
     )
@@ -4753,17 +4759,30 @@ def test_f166_republished_outer_frame_cannot_refresh_vertical_authority():
         frozen,
         now_s=100.0 + controller.config.vertical_qualify_max_age_s + 0.01,
     )
-    stale = _command(
+    unqualified = _command(
         controller,
         100.0 + controller.config.vertical_qualify_max_age_s + 0.02,
         pitch=SPAWN_PITCH,
     )
-
-    assert controller.state is CleanCourseState.PREDICT
-    assert controller.current.last_measurement_s == source_measurement_s
-    assert controller.current.last_outer_y_evidence_s == source_outer_y_s
+    assert not unqualified.vertical_qualified
+    assert controller._last_vertical_visual_delta > 0.0
     assert controller._current_fresh_outer_y_observation_s == source_fresh_y_s
     assert controller._current_fresh_outer_y_observation_serial == source_serial
+    controller.observe(
+        frozen,
+        now_s=100.0 + controller.config.predict_max_gap_s + 0.01,
+    )
+    stale = _command(
+        controller,
+        100.0 + controller.config.predict_max_gap_s + 0.02,
+        pitch=SPAWN_PITCH,
+    )
+
+    assert controller.state is CleanCourseState.SEARCH
+    assert controller.current.last_measurement_s == source_measurement_s
+    assert controller.current.last_outer_y_evidence_s == source_outer_y_s
+    assert controller._current_fresh_outer_y_observation_s is None
+    assert controller._current_fresh_outer_y_observation_serial == 0
     assert not stale.vertical_qualified
     assert controller._last_vertical_visual_delta == pytest.approx(0.0)
 
@@ -4897,6 +4916,29 @@ def test_f166_first_missing_aperture_frame_returns_vertical_to_outer():
     assert controller._last_vertical_visual_delta > 0.0
 
 
+def _maximum_advance_to_brake_reversal(pitches):
+    """Measure nose-up motion only after launch has advanced past its start."""
+
+    initial_pitch = pitches[0]
+    running_nose_down_peak = initial_pitch
+    advance_established = False
+    maximum_reversal = 0.0
+    for pitch in pitches[1:]:
+        if pitch > initial_pitch:
+            advance_established = True
+        if not advance_established:
+            # An immediate monotonic brake from the spawn attitude is not the
+            # F165 failure.  The failure was advance first, then a large
+            # derivative-triggered brake after the launch handoff.
+            continue
+        running_nose_down_peak = max(running_nose_down_peak, pitch)
+        maximum_reversal = max(
+            maximum_reversal,
+            running_nose_down_peak - pitch,
+        )
+    return maximum_reversal
+
+
 def test_f166_launch_transfer_is_bumpless_and_never_below_support():
     # F165 dipped when the fixed boost ended and the accumulated IMU climb
     # estimate was suddenly exposed.  A stationary, clearly high Gate 0
@@ -4952,21 +4994,161 @@ def test_f166_launch_transfer_is_bumpless_and_never_below_support():
         <= pitches[0]
         <= SPAWN_PITCH
     )
-    running_nose_down_peak = pitches[0]
-    maximum_nose_up_reversal = 0.0
-    for pitch in pitches[1:]:
-        running_nose_down_peak = max(running_nose_down_peak, pitch)
-        maximum_nose_up_reversal = max(
-            maximum_nose_up_reversal,
-            running_nose_down_peak - pitch,
-        )
-    # Sub-milliradian settling is harmless.  Reject a material trajectory
-    # reversal (the F165 launch reversal was about 0.15 rad).
+    maximum_nose_up_reversal = _maximum_advance_to_brake_reversal(pitches)
+    # Reject a material advance-to-brake trajectory reversal (the F165
+    # launch reversal was about 0.15 rad).  A monotonic brake directly from
+    # spawn is safe and is deliberately not classified as a reversal.
     assert maximum_nose_up_reversal < math.radians(0.5)
     assert not any(modes)
     transfer = [index for index in range(30) if 0.40 <= 0.033 * index <= 0.70]
     assert all(targets[index] >= supports[index] for index in transfer)
     assert all(outputs[index].thrust >= supports[index] for index in transfer)
+
+
+def test_f167_recorded_f166_launch_keeps_visual_primary_collective():
+    # F166 run 20260802T025041Z-visual-course-c9059224.  These selected public
+    # outer observations and command-boundary vertical accelerations reproduce
+    # the launch transient that drove target collective below support from
+    # t=.594--1.172 and wire collective below support from .704--1.172.  IMU
+    # damping is supporting only: it cannot dwarf the outer path correction,
+    # and the carried wire must not reproduce the recorded undershoot.
+    rows = (
+        # t, frame, outer center/span/conf, rates, pitch, world-up accel
+        (0.000, 2441820, (-0.006250, -0.027778), (0.125000, 0.219444), 0.754608, (0.000072, 0.000140, 0.000007), -0.310159, 0.003349),
+        (0.063, 2441822, (-0.006250, -0.033333), (0.125000, 0.225000), 0.813381, (0.000754, -0.001062, -0.000044), -0.310459, -0.344913),
+        (0.141, 2441825, (-0.003125, -0.033333), (0.126563, 0.225000), 0.818499, (-0.003271, -0.006114, -0.013719), -0.310515, 0.729606),
+        (0.204, 2441827, (-0.003125, -0.033333), (0.128125, 0.222222), 0.836780, (-0.019868, -0.000353, -0.005794), -0.310728, 1.381741),
+        (0.266, 2441828, (-0.003125, -0.033333), (0.126563, 0.225000), 0.843204, (0.005276, 0.000135, -0.003219), -0.310754, 1.472685),
+        (0.329, 2441830, (0.000000, -0.033333), (0.129688, 0.225000), 0.842756, (-0.012464, 0.003328, -0.004710), -0.310619, 1.466791),
+        (0.391, 2441832, (0.000000, -0.027778), (0.129688, 0.225000), 0.845212, (0.000779, 0.006823, -0.004866), -0.310300, 1.442861),
+        (0.454, 2441834, (-0.003125, -0.027778), (0.128125, 0.227778), 0.853139, (-0.001806, 0.010564, -0.002752), -0.309744, 1.403646),
+        (0.532, 2441836, (0.000000, -0.022222), (0.129688, 0.233333), 0.856925, (-0.001484, 0.015140, -0.000950), -0.308796, 1.179828),
+        (0.594, 2441838, (-0.003125, -0.022222), (0.131250, 0.230556), 0.863858, (0.004699, 0.019275, -0.000567), -0.307551, 0.747757),
+        (0.657, 2441840, (-0.003125, -0.016667), (0.135938, 0.236111), 0.868841, (0.001406, 0.023894, -0.000733), -0.306197, -0.375087),
+        (0.704, 2441841, (-0.003125, -0.016667), (0.135938, 0.238889), 0.875468, (0.008070, 0.026009, 0.000331), -0.305320, -1.272684),
+        (0.735, 2441842, (-0.003125, -0.016667), (0.135938, 0.241667), 0.881745, (0.004194, 0.029584, 0.001532), -0.304344, -2.022859),
+        (0.797, 2441844, (-0.003125, -0.011111), (0.137500, 0.247222), 0.887423, (0.006332, 0.033966, 0.002095), -0.302324, -2.345382),
+        (0.860, 2441846, (-0.003125, 0.027778), (0.140625, 0.211111), 0.753603, (0.001345, 0.035609, 0.000361), -0.300343, -2.415678),
+        (0.922, 2441848, (-0.003125, 0.016667), (0.140625, 0.216667), 0.724308, (0.001373, 0.014665, -0.000856), -0.298652, -2.187906),
+        (0.985, 2441850, (0.000000, -0.016667), (0.145313, 0.250000), 0.861734, (-0.001696, 0.020933, -0.001834), -0.297656, -1.682436),
+        (1.047, 2441852, (-0.003125, -0.022222), (0.148438, 0.255556), 0.913310, (-0.000750, 0.028621, -0.002061), -0.295959, -1.437391),
+        (1.110, 2441853, (-0.003125, -0.027778), (0.150000, 0.261111), 0.927675, (-0.004719, 0.022240, -0.003624), -0.294375, -1.287698),
+        (1.172, 2441855, (0.000000, -0.038889), (0.154687, 0.269444), 0.952243, (0.003849, 0.015363, -0.000745), -0.293186, -1.078695),
+    )
+
+    def track(row):
+        return _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+        )
+
+    controller = CleanCourseController(
+        _config(launch_boost_duration_s=LAUNCH_BOOST_DURATION_S)
+    )
+    samples = []
+    pitches = []
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        update = _update([track(row)], frame_id=row[1])
+        if index == 0:
+            controller.initialize(
+                update,
+                gate_index=0,
+                fallback_center_norm=row[2],
+                fallback_apparent_scale=math.sqrt(row[3][0] * row[3][1]),
+                now_s=now,
+            )
+        else:
+            controller.observe(update, now_s=now, body_rates=row[5])
+        output = _command(
+            controller,
+            now,
+            pitch=row[6],
+            a_up=row[7],
+        )
+        pitches.append(output.target_pitch_rad)
+        samples.append(
+            (
+                row[0],
+                controller._last_vertical_path_error,
+                controller._last_vertical_visual_delta,
+                controller._last_vertical_imu_delta,
+                controller._last_vertical_support,
+                controller._last_vertical_collective_target,
+                output.thrust,
+            )
+        )
+
+    for elapsed, path, visual, imu, support, target, wire in samples:
+        if visual * imu > 0.0:
+            assert abs(imu) <= abs(visual) + 1e-12
+        if elapsed <= controller.config.launch_pitch_blend_s and path <= 0.0:
+            assert target >= support - 1e-12
+        assert controller.config.min_thrust <= wire <= controller.config.max_thrust
+    # The original wire was below support continuously from .704 to 1.172.
+    # With one visual-primary owner the same recorded-state counterfactual
+    # returns to the previously smooth F163 support envelope instead of the
+    # F166 ~-0.018 collective deficit.
+    late = [sample for sample in samples if 0.704 <= sample[0] <= 1.172]
+    assert min(wire - support for *_, support, _target, wire in late) >= -0.007
+    maximum_nose_up_reversal = _maximum_advance_to_brake_reversal(pitches)
+    assert maximum_nose_up_reversal < math.radians(0.5)
+    assert sum(
+        abs(right - left) for left, right in zip(pitches, pitches[1:])
+    ) < 0.10
+
+
+def test_f167_predict_keeps_recent_outer_vertical_direction_over_imu():
+    # TRACK->PREDICT does not invalidate the most recent accepted outer path.
+    # A high Gate 1 with coherent climb direction retains decaying visual
+    # correction on the first frozen-frame tick; opposing IMU climb damping
+    # cannot instantly become the owner merely because association missed.
+    first = _update(
+        [_track("A", -0.10, -0.30, scale=0.18)], frame_id=6000
+    )
+    controller = CleanCourseController(_config())
+    controller.initialize(
+        first,
+        gate_index=1,
+        fallback_center_norm=(-0.10, -0.30),
+        fallback_apparent_scale=0.18,
+        now_s=100.0,
+    )
+    for frame in range(1, 5):
+        now = 100.0 + 0.033 * frame
+        controller.observe(
+            _update(
+                [_track("A", -0.10, -0.30, scale=0.18 + 0.002 * frame)],
+                frame_id=6000 + frame,
+            ),
+            now_s=now,
+        )
+        _command(controller, now, pitch=SPAWN_PITCH, a_up=2.0)
+    assert controller._vertical_direction_supported
+    controller.observe(
+        _update([], frame_id=6005),
+        now_s=now + 0.033,
+    )
+    controller.observe(
+        _update([], frame_id=6006),
+        now_s=now + 0.280,
+    )
+    assert controller.state is CleanCourseState.PREDICT
+    predicted = _command(
+        controller,
+        now + 0.300,
+        pitch=SPAWN_PITCH,
+        a_up=2.0,
+    )
+
+    assert controller._last_vertical_path_error < 0.0
+    assert controller._last_vertical_visual_delta > 0.0
+    assert controller._last_vertical_imu_delta <= 0.0
+    assert controller._last_vertical_collective_target > (
+        controller._last_vertical_support
+    )
+    assert predicted.thrust >= controller._last_vertical_support
 
 
 def test_f166_recorded_f165_launch_has_no_material_pitch_reversal_or_chatter():
@@ -5031,14 +5213,7 @@ def test_f166_recorded_f165_launch_has_no_material_pitch_reversal_or_chatter():
         brake_modes.append(controller._pitch_energy_brake_active)
 
     pitches = [output.target_pitch_rad for output in outputs]
-    running_nose_down_peak = pitches[0]
-    maximum_nose_up_reversal = 0.0
-    for pitch in pitches[1:]:
-        running_nose_down_peak = max(running_nose_down_peak, pitch)
-        maximum_nose_up_reversal = max(
-            maximum_nose_up_reversal,
-            running_nose_down_peak - pitch,
-        )
+    maximum_nose_up_reversal = _maximum_advance_to_brake_reversal(pitches)
     accumulated_variation = sum(
         abs(right - left) for left, right in zip(pitches, pitches[1:])
     )
@@ -5201,6 +5376,140 @@ def test_f163_gate1_trace_transports_geometry_without_modality_false_closure():
         "corridor-known/not-contained"
     )
     assert not controller._last_commit_admission.admissible
+
+
+def test_f167_f166_gate1_trace_keeps_coherent_lateral_intercept_authority():
+    # F166 run 20260802T025041Z-visual-course-c9059224, trace SHA-256
+    # E2345D27ADB0E22FA9858EF4534C2A1AB980B8BCE0269F5862C21587B1234A9B.
+    # The camera bearing improved left-to-center, but both projected endpoints
+    # began escaping left again while covariance held control_authority at 0.
+    # Replay only normal tracker observations and IMU attitude/rates: fresh
+    # outer image motion remains a physical path owner, so bank cannot unwind
+    # merely because yaw made the bearing look better.
+    rows = (
+        # t, frame, outer center/span/conf, aperture center/half, rates, pitch, yaw
+        (3.000, 2441910, (-0.428125, -0.394444), (0.114062, 0.219444), 0.724430, (-0.438601, -0.445152), (0.044199, 0.068649), (-0.017411, -0.051506, -0.301625), -0.214778, -0.110072),
+        (3.125, 2441914, (-0.393750, -0.327778), (0.117188, 0.225000), 0.732855, (-0.409434, -0.376945), (0.048496, 0.075380), (-0.299430, -0.448958, -0.335780), -0.261323, -0.150727),
+        (3.250, 2441918, (-0.343750, -0.233333), (0.121875, 0.236111), 0.748821, (-0.358973, -0.286569), (0.047336, 0.076430), (-0.591809, -0.441315, -0.329715), -0.330260, -0.191020),
+        (3.360, 2441921, (-0.306250, -0.194444), (0.128125, 0.250000), 0.774885, (-0.320434, -0.260926), (0.049062, 0.070979), (-0.512699, -0.288887, -0.329506), -0.376210, -0.228173),
+        (3.485, 2441925, (-0.262500, -0.172222), (0.137500, 0.266667), 0.773870, (-0.278047, -0.239662), (0.047805, 0.078688), (-0.367664, -0.160233, -0.329579), -0.411054, -0.270455),
+        (3.532, 2441926, (-0.253125, -0.166667), (0.139062, 0.272222), 0.773615, (-0.271938, -0.240569), (0.049248, 0.076669), (-0.351168, -0.142659, -0.329585), -0.416587, -0.279586),
+        (3.625, 2441929, (-0.231250, -0.166667), (0.146875, 0.286111), 0.777498, (-0.248638, -0.242922), (0.051179, 0.082375), (-0.282222, -0.081637, -0.329588), -0.432852, -0.312150),
+        (3.719, 2441932, (-0.209375, -0.172222), (0.154688, 0.302778), 0.773330, (-0.241086, -0.235070), (0.046910, 0.079751), (-0.225886, -0.046854, -0.329588), -0.444025, -0.343255),
+        (3.750, 2441933, (-0.203125, -0.172222), (0.157813, 0.305556), 0.747828, None, None, (-0.247260, -0.031372, -0.329588), -0.447494, -0.355424),
+        (3.813, 2441934, (-0.196875, -0.177778), (0.164062, 0.308333), 0.737245, None, None, (-0.169514, -0.008925, -0.329588), -0.452792, -0.377580),
+        (3.875, 2441936, (-0.190625, -0.183333), (0.168750, 0.319444), 0.734999, None, None, (-0.180970, -0.002653, -0.329588), -0.457194, -0.399991),
+        (4.000, 2441940, (-0.171875, -0.200000), (0.185937, 0.341667), 0.752614, None, None, (-0.135423, 0.021483, -0.261356), -0.463190, -0.443165),
+        (4.032, 2441941, (-0.171875, -0.200000), (0.190625, 0.350000), 0.757875, None, None, (-0.082437, 0.026789, -0.223829), -0.463929, -0.452303),
+        (4.141, 2441944, (-0.175000, -0.216667), (0.207813, 0.369444), 0.589668, None, None, (-0.091214, 0.030485, -0.226391), -0.465921, -0.478633),
+        (4.188, 2441946, (-0.178125, -0.222222), (0.217188, 0.383333), 0.560892, None, None, (-0.109086, 0.031502, -0.197793), -0.466450, -0.491835),
+    )
+
+    def track(row):
+        return _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            aperture_center=row[5],
+            aperture_half=row[6],
+        )
+
+    controller = CleanCourseController(_config())
+    first = rows[0]
+    samples = {}
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        update = _update([track(row)], frame_id=row[1])
+        if index == 0:
+            controller.initialize(
+                update,
+                gate_index=1,
+                fallback_center_norm=first[2],
+                fallback_apparent_scale=math.sqrt(first[3][0] * first[3][1]),
+                now_s=now,
+            )
+        else:
+            controller.observe(update, now_s=now, body_rates=row[7])
+        output = _command(controller, now, pitch=row[8], yaw=row[9])
+        motion = controller._last_lateral_motion
+        samples[row[0]] = (
+            motion,
+            controller._last_lateral_baseline_reference_x,
+            controller._lateral_intercept_reference_x,
+            output,
+        )
+
+    for elapsed in (3.813, 4.032, 4.188):
+        motion, baseline, reference, output = samples[elapsed]
+        assert motion.control_authority < 0.05
+        assert motion.fallback_intercept_error < 0.0
+        assert motion.optical_intercept_error < 0.0
+        assert baseline < motion.bearing_error
+        assert reference < motion.bearing_error
+        assert output.target_roll_rad < 0.0
+    # From 3.813 to 4.032 the camera bearing improves, while the physical
+    # fallback miss worsens.  The carried bank reference remains materially
+    # beyond the camera bearing instead of collapsing to bearing-only control.
+    early = samples[3.813]
+    late = samples[4.032]
+    assert abs(late[0].bearing_error) < abs(early[0].bearing_error)
+    assert abs(late[0].fallback_intercept_error) > abs(
+        early[0].fallback_intercept_error
+    )
+    assert late[2] < late[0].bearing_error - 0.07
+    assert abs(late[2]) > 0.25
+
+
+def test_f167_f166_zero_authority_successor_cannot_attenuate_current_heading():
+    # At F166 t=3.719 Gate 2 first appeared at x=+0.325 while the race-owned
+    # Gate 1 remained x=-0.209.  Its safe-passage authority was exactly zero,
+    # yet the old successor-present branch reduced current yaw custody.  The
+    # public observations below retain the actual geometry: existence alone
+    # cannot change either current heading direction or magnitude.
+    current_only = CleanCourseController(_config())
+    with_successor = CleanCourseController(_config())
+    current = _f163_trace_track(
+        outer_center=(-0.209375, -0.172222),
+        outer_span=(0.154688, 0.302778),
+        confidence=0.773330,
+        aperture_center=(-0.241086, -0.235070),
+        aperture_half=(0.046910, 0.079751),
+        track_id="A",
+    )
+    successor = _f163_trace_track(
+        outer_center=(0.325000, 0.277778),
+        outer_span=(0.039062, 0.100000),
+        confidence=0.450548,
+        track_id="B",
+    )
+    for controller, tracks in (
+        (current_only, [current]),
+        (with_successor, [current, successor]),
+    ):
+        controller.initialize(
+            _update(tracks, frame_id=2441932),
+            gate_index=1,
+            fallback_center_norm=current.center_norm,
+            fallback_apparent_scale=current.apparent_scale,
+            now_s=103.719,
+        )
+    alone = _command(current_only, 103.719, pitch=-0.444025, yaw=-0.343255)
+    preview = _command(with_successor, 103.719, pitch=-0.444025, yaw=-0.343255)
+
+    assert preview.successor_blend == pytest.approx(0.0, abs=1e-12)
+    assert with_successor._turn_reference_x == pytest.approx(
+        current_only._turn_reference_x, abs=1e-12
+    )
+    assert preview.yaw_rate_rad_s == pytest.approx(
+        alone.yaw_rate_rad_s, abs=1e-12
+    )
+    assert with_successor._lateral_intercept_reference_x == pytest.approx(
+        current_only._lateral_intercept_reference_x, abs=1e-12
+    )
+    assert preview.target_roll_rad == pytest.approx(
+        alone.target_roll_rad, abs=1e-12
+    )
+    assert preview.yaw_rate_rad_s < 0.0
 
 
 def test_f164_gate1_trace_never_steers_from_stale_aperture_wrong_side():
@@ -5893,7 +6202,10 @@ def test_far_qualified_low_gate_request_damps_inherited_climb():
 
     climbing = _gate_low_thrust(0.30)
     settled = _gate_low_thrust(0.0)
-    assert climbing.thrust < settled.thrust - 0.02
+    # Fresh low-gate vision remains the primary descent owner.  Positive-vz
+    # damping reinforces it, but cannot dwarf the bounded visual correction.
+    assert climbing.thrust < settled.thrust
+    assert settled.thrust - climbing.thrust < 0.01
 
 
 def test_clear_far_visual_miss_cannot_be_reversed_by_imu_damping():

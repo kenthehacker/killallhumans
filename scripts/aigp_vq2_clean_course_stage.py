@@ -1336,6 +1336,9 @@ class CleanCourseController:
         # plane miss, so yaw-centering cannot unwind a still-needed bank.
         self._lateral_intercept_reference_x: Optional[float] = None
         self._last_lateral_motion: Optional[_PassageMotion] = None
+        self._last_lateral_baseline_reference_x = 0.0
+        self._last_lateral_projection_delta_x = 0.0
+        self._last_lateral_direction_override_x = 0.0
         self._last_vertical_motion: Optional[_PassageMotion] = None
         # Near-plane vertical direction is a trajectory state, deliberately
         # separate from the attitude-compensated image bearing.  The streak is
@@ -1400,6 +1403,9 @@ class CleanCourseController:
         self._turn_successor_authority = 0.0
         self._lateral_intercept_reference_x = None
         self._last_lateral_motion = None
+        self._last_lateral_baseline_reference_x = 0.0
+        self._last_lateral_projection_delta_x = 0.0
+        self._last_lateral_direction_override_x = 0.0
         self._last_vertical_motion = None
         self._pitch_energy_brake_demand = 0.0
         self._pitch_energy_brake_active = False
@@ -1824,6 +1830,9 @@ class CleanCourseController:
         self._last_vertical_motion_delta = 0.0
         self._last_vertical_direction_delta = 0.0
         self._last_launch_collective_delta = 0.0
+        self._last_lateral_baseline_reference_x = 0.0
+        self._last_lateral_projection_delta_x = 0.0
+        self._last_lateral_direction_override_x = 0.0
         self._zero_recovery_applied = False
         self._pre_cross_brake_active = False  # main path recomputes below
         self._successor_heading_blend = 0.0
@@ -2196,8 +2205,8 @@ class CleanCourseController:
                 # the delayed credit, handing the new leg a saturated
                 # constant-bearing pursuit it never centered.  While
                 # credit is in flight, a fresh/persistent/qualified
-                # successor's BEARING steers a bounded recentering (same
-                # gain and cap as the TRACK law, no roll, no advance, no
+                # successor bearing and physical intercept steer one bounded
+                # coherent preturn (same TRACK gains/caps, no advance and no
                 # promotion — authoritative ownership is unchanged);
                 # absent or ambiguous evidence keeps the neutral hold.
                 pending_roll = 0.0
@@ -2216,6 +2225,7 @@ class CleanCourseController:
                         now_s=now_s,
                         yaw_rad=yaw_rad,
                         dt=dt,
+                        current_path_released=True,
                     )
                     pending_steer_gain = self._course_steer_gain(self.current)
                     pending_roll, pending_yaw = self._coordinated_turn_request(
@@ -2228,14 +2238,24 @@ class CleanCourseController:
                             successor_authority=pending_blend,
                             now_s=now_s,
                             dt=dt,
+                            current_path_released=True,
                         ),
                     )
-                    # Authoritative credit is still pending: successor
-                    # bearing may keep the camera from losing the next gate,
-                    # but the exact-zero-forward hold does not begin a new
-                    # lateral interception before ownership advances.
-                    pending_roll = 0.0
-                    self._prev_target_roll = 0.0
+                    # The crossing is physically complete, but race ownership
+                    # remains unchanged until note_race().  Its gate-owned
+                    # passage lease may preturn both FOV and physical path;
+                    # pitch/advance/admission remain neutral and only the
+                    # authoritative increment can promote the successor.
+                    pending_roll = self._slew_roll(
+                        pending_roll,
+                        dt,
+                        slew_rad_s=(
+                            cfg.roll_pursuit_slew_rad_s
+                            if abs(self._lateral_intercept_reference_x or 0.0)
+                            > cfg.roll_pursuit_fast_ex_norm
+                            else None
+                        ),
+                    )
                 return NavigationOutput(
                     target_roll_rad=pending_roll,
                     target_pitch_rad=self._slew_pitch(
@@ -2415,12 +2435,17 @@ class CleanCourseController:
         vertical_qualified = (
             self.state is CleanCourseState.TRACK
             and vertical_path.freshness_authority > 0.0
+            and vertical_path.evidence_age_s
+            <= cfg.vertical_qualify_max_age_s
             and vertical_path.directional_censor == FrameEdge.NONE
         )
-        vertical_path_fresh = bool(
-            self.state is CleanCourseState.TRACK
-            and vertical_path.freshness_authority > 0.0
-        )
+        # TRACK/PREDICT is an evidence-quality distinction, not a vertical
+        # control-owner switch.  A recently measured outer trajectory keeps
+        # decaying visual authority through the bounded prediction window;
+        # F166 dropped it to zero on the first PREDICT tick and let IMU
+        # damping command the opposite direction while the retained TOP path
+        # was still clear.
+        vertical_path_fresh = vertical_path.freshness_authority > 0.0
         floor_gate_y = ey_vertical if vertical_path_fresh else None
         # Vision closure-rate governor (F31, see the CLOSURE_* constant
         # block): the filtered log-scale rate is the only honest closure
@@ -2602,14 +2627,13 @@ class CleanCourseController:
                 )
             if (
                 launch_elapsed_s <= cfg.launch_pitch_blend_s
-                and not self._vertical_direction_supported
+                and vertical_path.outer_error <= 0.0
             ):
-                # The launch trajectory has not earned a downward leg yet.
-                # Keep the complete shaped target at least at tilt support so
-                # a one-frame image-rate transient plus accumulated IMU
-                # damping cannot recreate F165's dip.  Three coherent outer
-                # observations or immediate one-sided clipping may still take
-                # directional ownership and command a bounded descent.
+                # During the bumpless launch transfer, a high/centered fresh
+                # outer gate has not requested a descent.  Optical direction
+                # may already describe the climb-induced image motion, but it
+                # cannot license the much larger IMU damping term to drive the
+                # target below tilt support while position still asks high.
                 collective = max(collective, support)
         self._last_launch_collective_delta = float(
             collective - unshaped_collective
@@ -2685,12 +2709,29 @@ class CleanCourseController:
             and self._course_start_s is not None
             and cfg.launch_boost_duration_s > 0.0
         ):
-            # Begin from the proved level spawn attitude and grow forward
-            # authority continuously while the outer energy filter settles.
-            # Brake authority is never delayed by this transfer.
+            # The vertical motor-spinup transfer completes before longitudinal
+            # advance begins.  Then the same outer-energy law grows in over the
+            # combined collective-transfer and pitch-blend horizon.  F166
+            # overlapped these transfers:
+            # target pitch advanced to -0.263 by t=.797 and then reversed
+            # nose-up as closure caught up, despite zero brake-mode chatter.
+            # Sequencing the two references removes that handoff reversal;
+            # brake authority itself remains immediate and unscaled.
+            launch_pitch_start_s = (
+                cfg.launch_boost_duration_s
+                + cfg.launch_collective_transfer_s
+            )
             advance *= _clamp01(
-                (now_s - self._course_start_s)
-                / max(1e-6, cfg.launch_pitch_blend_s)
+                (
+                    now_s
+                    - self._course_start_s
+                    - launch_pitch_start_s
+                )
+                / max(
+                    1e-6,
+                    cfg.launch_collective_transfer_s
+                    + cfg.launch_pitch_blend_s,
+                )
             )
         # F73 (20260730T063739Z-visual-course-34c53413): TRACK kept closing
         # while the COMMIT entry budget was false — the gate-1 aim walked
@@ -3337,8 +3378,14 @@ class CleanCourseController:
         else:
             evidence_s = NEVER_MEASURED_S
         age_s = max(0.0, now_s - evidence_s)
+        # Control ownership decays over the same bounded horizon as the
+        # hypothesis prediction.  ``vertical_qualify_max_age_s`` remains the
+        # stricter exact-measurement/admission contract; using it as the
+        # control horizon made visual authority hit zero at 0.30 s while a
+        # race-owned PREDICT path remained valid to 0.50 s, exposing an abrupt
+        # opposite IMU command in the middle of that state.
         freshness = _clamp01(
-            1.0 - age_s / max(1e-6, cfg.vertical_qualify_max_age_s)
+            1.0 - age_s / max(1e-6, cfg.predict_max_gap_s)
         )
 
         raw_outer_error = float(axis.p)
@@ -4279,6 +4326,7 @@ class CleanCourseController:
         now_s: float,
         yaw_rad: Optional[float],
         dt: float,
+        current_path_released: bool = False,
     ) -> Tuple[float, float]:
         """One continuous current-passage/successor lateral reference.
 
@@ -4331,7 +4379,9 @@ class CleanCourseController:
         self._turn_aperture_reserve = _clamp01(self._turn_aperture_reserve)
 
         desired_authority = 0.0
-        desired = float(current_error)
+        desired = 0.0 if current_path_released else float(current_error)
+        successor_heading = 0.0
+        current_claim = 0.0
         if successor is not None:
             successor_heading, successor_axis, successor_age, _successor_edge = (
                 self._horizontal_control_observable(successor, now_s)
@@ -4375,10 +4425,14 @@ class CleanCourseController:
                 1.0 - max(0.0, current_age) / cfg.x_steer_max_age_s
             )
             current_claim = (
-                (1.0 - self._turn_aperture_reserve)
-                * current_confidence
-                * current_uncertainty
-                * current_freshness
+                0.0
+                if current_path_released
+                else (
+                    (1.0 - self._turn_aperture_reserve)
+                    * current_confidence
+                    * current_uncertainty
+                    * current_freshness
+                )
             )
             # F165: only gate-owned safe-passage reserve releases preturn.
             # Aging aperture state cannot grant the next gate yaw authority
@@ -4403,7 +4457,8 @@ class CleanCourseController:
             # lease immediately; passage is no longer demonstrably secured.
             self._turn_successor_authority = 0.0
             authority = 0.0
-        if successor is not None:
+            desired = float(current_error)
+        if successor is not None and authority > 0.0:
             # F146: F145 computed an evidence-backed current claim, then the
             # final blend discarded it and implicitly restored current error
             # to (1 - successor authority).  That recreated the rightward
@@ -4417,6 +4472,13 @@ class CleanCourseController:
                 current_weight * float(current_error)
                 + authority * successor_heading
             )
+        elif not current_path_released:
+            # Merely detecting a successor does not release current-gate FOV
+            # custody.  F166's Gate-2 object existed from t=3.719 onward with
+            # exactly zero authority, yet this branch attenuated the fresh
+            # Gate-1 heading and helped the target escape.  Until a positive
+            # safe-passage lease exists, current outer x keeps full ownership.
+            desired = float(current_error)
 
         if self._turn_reference_x is None:
             self._turn_reference_x = float(desired)
@@ -4429,6 +4491,15 @@ class CleanCourseController:
             self._turn_reference_x = max(self._turn_reference_x, 0.0)
         elif owned_edge & FrameEdge.LEFT:
             self._turn_reference_x = min(self._turn_reference_x, 0.0)
+        elif current_path_released and successor is not None and authority > 0.0:
+            # Exact crossing completion makes the old physical intercept
+            # neutral.  Begin the already-bounded successor preturn in its
+            # leased direction instead of carrying an opposing old-gate sign
+            # through the short authoritative-credit delay.
+            if successor_heading > 0.0:
+                self._turn_reference_x = max(self._turn_reference_x, 0.0)
+            elif successor_heading < 0.0:
+                self._turn_reference_x = min(self._turn_reference_x, 0.0)
 
         self._successor_heading_blend = authority
         self._successor_heading_error_norm = self._turn_reference_x
@@ -4897,12 +4968,73 @@ class CleanCourseController:
                 ),
                 imu_delta,
             )
+        elif visually_clear and visual_delta * imu_delta > 0.0:
+            # "Supporting" is a magnitude contract as well as a sign
+            # contract.  F166's launch visual request was only -0.001 while
+            # the leaky IMU term contributed -0.066, so the supporting
+            # estimate became the primary trajectory owner and drove the wire
+            # below tilt support.  IMU damping may reinforce a clear visual
+            # path, but never by more than that path's bounded correction.
+            imu_delta = math.copysign(
+                min(abs(imu_delta), abs(visual_delta)),
+                imu_delta,
+            )
         target = support + visual_delta + imu_delta
         self._last_vertical_support = float(support)
         self._last_vertical_visual_delta = float(visual_delta)
         self._last_vertical_imu_delta = float(imu_delta)
         self._last_vertical_collective_target = float(target)
         return target
+
+    def _lateral_path_reference(
+        self,
+        motion: _PassageMotion,
+        *,
+        record: bool,
+    ) -> float:
+        """Return a visual-primary physical path reference for one track.
+
+        Fresh outer position plus its short-horizon image motion is the
+        continuous baseline.  TTC/covariance may shape only the residual to
+        the full plane projection.  Broad plane covariance therefore cannot
+        turn a coherent escaping path into bearing-only bank, which is what
+        let F166 yaw-center Gate 1 while its physical miss worsened.
+        """
+
+        error = float(motion.bearing_error)
+        rate_miss = float(motion.fallback_intercept_error) - error
+        if error * rate_miss < 0.0:
+            # Image motion damps arrival but cannot reverse a clear current
+            # position by itself.  A separately coherent pair of projected
+            # endpoints below may still take directional ownership.
+            rate_miss = math.copysign(
+                min(abs(rate_miss), 0.5 * abs(error)),
+                rate_miss,
+            )
+        baseline = error + rate_miss
+        projection_delta = motion.control_authority * (
+            motion.intercept_error - motion.fallback_intercept_error
+        )
+        desired = baseline + projection_delta
+        before_direction = desired
+        direction_sign, direction_magnitude = self._projected_passage_direction(
+            motion
+        )
+        if direction_sign != 0:
+            directional = direction_sign * direction_magnitude
+            if directional * desired < 0.0:
+                desired = directional
+            elif abs(directional) > abs(desired):
+                desired = directional
+        direction_override = desired - before_direction
+        desired = _clamp(desired, -1.0, 1.0)
+        if record:
+            self._last_lateral_baseline_reference_x = float(baseline)
+            self._last_lateral_projection_delta_x = float(projection_delta)
+            self._last_lateral_direction_override_x = float(
+                direction_override
+            )
+        return desired
 
     def _lateral_intercept_reference(
         self,
@@ -4912,6 +5044,7 @@ class CleanCourseController:
         successor_authority: float,
         now_s: float,
         dt: float,
+        current_path_released: bool = False,
     ) -> float:
         """Continuous outer-owned roll reference plus safe coherent preturn."""
 
@@ -4927,9 +5060,11 @@ class CleanCourseController:
             directional_censor=current_edge,
         )
         self._last_lateral_motion = current_motion
-        desired = current_error + current_motion.control_authority * (
-            current_motion.intercept_error - current_error
+        current_desired = self._lateral_path_reference(
+            current_motion,
+            record=True,
         )
+        desired = 0.0 if current_path_released else current_desired
         if current_edge & FrameEdge.RIGHT:
             desired = max(desired, current_error, 0.0)
         elif current_edge & FrameEdge.LEFT:
@@ -4951,14 +5086,11 @@ class CleanCourseController:
                 measurement_age_s=successor_age,
                 directional_censor=successor_edge,
             )
-            successor_desired = successor_error + (
-                successor_motion.control_authority
-                * (successor_motion.intercept_error - successor_error)
+            successor_desired = self._lateral_path_reference(
+                successor_motion,
+                record=False,
             )
-            desired = (
-                (1.0 - authority) * desired
-                + authority * successor_desired
-            )
+            desired = desired + authority * (successor_desired - desired)
         alpha = _clamp01(
             dt / max(1e-6, self.config.turn_reference_tau_s + dt)
         )
@@ -4983,6 +5115,15 @@ class CleanCourseController:
             self._lateral_intercept_reference_x = min(
                 self._lateral_intercept_reference_x, 0.0
             )
+        elif current_path_released and successor is not None and authority > 0.0:
+            if successor_desired > 0.0:
+                self._lateral_intercept_reference_x = max(
+                    self._lateral_intercept_reference_x, 0.0
+                )
+            elif successor_desired < 0.0:
+                self._lateral_intercept_reference_x = min(
+                    self._lateral_intercept_reference_x, 0.0
+                )
         return self._lateral_intercept_reference_x
 
     def _course_range_ramp(self, current: _Hypothesis) -> float:
@@ -5807,6 +5948,17 @@ def _clean_course_tick_trace(
         "lateral_intercept_reference_x": (
             controller._lateral_intercept_reference_x
         ),
+        "lateral_path_control": {
+            "baseline_reference_x": (
+                controller._last_lateral_baseline_reference_x
+            ),
+            "projection_delta_x": (
+                controller._last_lateral_projection_delta_x
+            ),
+            "direction_override_x": (
+                controller._last_lateral_direction_override_x
+            ),
+        },
         "lateral_passage_motion": passage_motion_trace(
             controller._last_lateral_motion
         ),
