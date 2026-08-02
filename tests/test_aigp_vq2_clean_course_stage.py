@@ -30,6 +30,7 @@ from scripts.aigp_vq2_clean_course_stage import (
     CleanCourseRuntime,
     CleanCourseState,
     NavigationOutput,
+    _CommitAdmission,
     _directional_brake_response_authority,
     clamp_final_command,
     run_clean_course_stage,
@@ -6181,6 +6182,437 @@ def test_f170_zero_trust_imu_cannot_cancel_fresh_gate0_climb():
         + controller._last_vertical_visual_delta
     )
     assert output.thrust > controller._last_vertical_support
+
+
+_F170_GATE1_LATENCY_ROWS = (
+    # t, frame, outer x/y/w/h/confidence, optional aperture x/y/hx/hy,
+    # body p/q/r, roll/pitch/yaw, clipping.  F170 trace SHA-256:
+    # 5C1283A13340D3231738D3DE053E2A41A0529BE275AC1DFC6CBBF92F8E9612F.
+    (3.172, 2846866, -.384375, .050000, .107812, .208333, .719242, -.387794, -.002138, .041599, .066950, .030366, -.002059, -.162959, .018815, -.457629, -.135081, 0),
+    (3.203, 2846867, -.384375, .050000, .109375, .208333, .706344, None, None, None, None, .005362, -.003919, -.204062, .021943, -.457592, -.141039, 0),
+    (3.234, 2846868, -.381250, .050000, .109375, .211111, .695037, None, None, None, None, -.075884, -.010264, -.262745, .024385, -.457711, -.150160, 0),
+    (3.265, 2846869, -.375000, .050000, .109375, .213889, .693108, None, None, None, None, -.113681, -.008137, -.349037, .026265, -.457745, -.162665, 0),
+    (3.297, 2846870, -.362500, .050000, .110938, .213889, .692679, None, None, None, None, -.142053, -.008209, -.355832, .027596, -.457698, -.173713, 0),
+    (3.328, 2846871, -.353125, .050000, .110938, .216667, .689682, None, None, None, None, -.192543, -.010273, -.329879, .027310, -.457708, -.186853, 0),
+    (3.359, 2846872, -.343750, .044444, .114063, .216667, .715680, -.353766, -.010008, .047087, .072925, -.199323, -.009542, -.321934, .025861, -.457758, -.199360, 0),
+    (3.390, 2846873, -.334375, .038889, .114062, .219444, .735170, -.345133, -.013822, .045965, .073266, -.202698, -.008839, -.325744, .025060, -.457775, -.206894, 0),
+    (3.422, 2846874, -.325000, .038889, .117188, .222222, .740139, -.334848, -.018400, .047345, .070863, -.320763, -.007712, -.331373, .021965, -.457790, -.219667, 0),
+    (3.453, 2846875, -.315625, .033333, .115625, .225000, .742123, -.323239, -.022839, .045798, .072425, -.422577, -.009352, -.330899, .013912, -.457882, -.232509, 0),
+    (3.484, 2846876, -.300000, .027778, .120313, .227778, .746515, -.311122, -.028167, .041763, .073731, -.446989, -.008372, -.329416, .006305, -.458047, -.242717, 0),
+    (3.515, 2846877, -.290625, .022222, .120313, .230556, .749541, -.301540, -.036068, .046475, .073053, -.518645, -.004907, -.329071, -.004536, -.458256, -.255454, 0),
+    (3.547, 2846878, -.278125, .016667, .120312, .233333, .751266, -.289563, -.043151, .047092, .073075, -.589112, -.003893, -.329581, -.018576, -.458537, -.268208, 0),
+    (3.578, 2846879, -.265625, .005556, .121875, .238889, .754126, -.277966, -.053632, .044482, .076130, -.602403, -.002394, -.329743, -.030691, -.458853, -.278418, 0),
+    (3.609, 2846880, -.250000, -.005556, .125000, .241667, .756261, -.260497, -.064712, .046854, .067264, -.609553, .003282, -.329631, -.046150, -.459249, -.291181, 0),
+    (3.640, 2846880, -.250000, -.005556, .125000, .241667, .756261, -.260497, -.064712, .046854, .067264, -.610714, .006943, -.329551, -.058574, -.459570, -.301389, 0),
+    (3.672, 2846882, -.225000, -.016667, .126562, .250000, .768319, -.235144, -.079418, .046390, .069899, -.552508, .010235, -.329560, -.073165, -.460011, -.314155, 0),
+    (3.703, 2846882, -.225000, -.016667, .126562, .250000, .768319, -.235144, -.079418, .046390, .069899, -.529524, .013171, -.329594, -.086058, -.460506, -.326931, 0),
+    (3.734, 2846883, -.212500, -.027778, .126563, .247222, .773822, -.226673, -.082517, .044207, .074871, -.474609, .014865, -.329596, -.095325, -.460941, -.337150, 0),
+    (3.765, 2846884, -.200000, -.038889, .129688, .247222, .764577, -.214289, -.081582, .039794, .070267, -.453363, .016130, -.329588, -.103552, -.461415, -.347364, 0),
+    (3.812, 2846885, -.187500, -.050000, .129688, .247222, .757896, -.202850, -.091523, .045485, .074200, -.423321, .017639, -.329583, -.113031, -.462066, -.360145, 0),
+    (3.843, 2846886, -.178125, -.100000, .131250, .200000, .705247, -.189556, -.099490, .045046, .081743, -.394719, .018774, -.329585, -.119825, -.462620, -.370379, 0),
+    (3.875, 2846887, -.168750, -.111111, .132812, .197222, .677991, -.179781, -.100359, .041622, .080052, -.320195, .019693, -.329587, -.126293, -.463354, -.383162, 0),
+    (3.906, 2846888, -.159375, -.105556, .134375, .205556, .638138, None, None, None, None, -.289586, .019850, -.329586, -.130868, -.464134, -.395947, 0),
+    (3.937, 2846889, -.146875, -.105556, .135938, .213889, .627317, None, None, None, None, -.260649, .019563, -.329586, -.133889, -.464804, -.406177, 0),
+    (3.968, 2846890, -.137500, -.116667, .139062, .208333, .611879, None, None, None, None, -.226627, .020522, -.329586, -.136376, -.465653, -.418972, 0),
+    (4.000, 2846891, -.128125, -.111111, .142188, .216667, .604567, None, None, None, None, -.208162, .020562, -.319440, -.138192, -.466488, -.431617, 0),
+    (4.031, 2846892, -.121875, -.105556, .143750, .230556, .601288, None, None, None, None, -.199358, .020432, -.297285, -.139172, -.466946, -.438741, 0),
+    (4.062, 2846893, -.115625, -.083333, .145312, .255556, .615159, None, None, None, None, -.204869, .020651, -.258432, -.141965, -.467660, -.451288, 0),
+    (4.093, 2846894, -.109375, -.100000, .146875, .247222, .611839, None, None, None, None, -.202687, .019458, -.252290, -.144572, -.468238, -.461225, 0),
+    (4.125, 2846895, -.103125, -.050000, .150000, .294444, .664349, None, None, None, None, -.185900, .019378, -.243722, -.146054, -.468587, -.467016, 0),
+    (4.156, 2846896, -.096875, -.050000, .153125, .300000, .700167, None, None, None, None, -.168217, .021213, -.222334, -.147465, -.469036, -.475859, 0),
+    (4.187, 2846897, -.093750, -.050000, .156250, .302778, .717604, None, None, None, None, -.208880, .020611, -.229069, -.150382, -.469476, -.484741, 0),
+    (4.218, 2846898, -.087500, -.050000, .159375, .302778, .727847, None, None, None, None, -.191266, .020012, -.220441, -.152897, -.469875, -.491751, 0),
+    (4.250, 2846899, -.081250, -.044444, .160937, .311111, .736359, None, None, None, None, -.129406, .022288, -.193239, -.154391, -.470210, -.499700, 0),
+    (4.281, 2846899, -.081250, -.044444, .160937, .311111, .736359, None, None, None, None, -.132413, .021089, -.178823, -.155373, -.470398, -.505430, 0),
+    (4.312, 2846900, -.078125, -.044444, .164062, .313889, .785385, -.094048, -.100495, .054877, .091081, -.123780, .017127, -.165999, -.157035, -.470696, -.512092, 0),
+    (4.343, 2846901, -.075000, -.038889, .167187, .316667, .812826, None, None, None, None, -.108598, .020162, -.164612, -.157974, -.470956, -.518523, 0),
+    (4.375, 2846902, -.071875, -.038889, .170312, .319444, .828040, None, None, None, None, -.114470, .022804, -.168789, -.158676, -.471081, -.523776, 0),
+    (4.406, 2846903, -.068750, -.033333, .173437, .322222, .838719, -.087138, -.092771, .058380, .096605, -.119469, .023340, -.171947, -.159603, -.471201, -.529170, 0),
+    (4.437, 2846904, -.065625, -.027778, .176562, .327778, .848781, -.082682, -.089152, .058273, .104484, -.099038, .026102, -.168223, -.160207, -.471289, -.535840, 0),
+    (4.468, 2846905, -.062500, -.027778, .182812, .330556, .856674, -.084961, -.081074, .056870, .102346, -.103460, .027778, -.168281, -.160559, -.471282, -.541157, 0),
+    (4.515, 2846907, -.056250, -.016667, .187500, .338889, .874924, None, None, None, None, -.123478, .029277, -.168343, -.162121, -.471224, -.550418, 0),
+    (4.547, 2846907, -.056250, -.016667, .187500, .338889, .874924, None, None, None, None, -.118348, .030396, -.171214, -.163044, -.471175, -.555808, 0),
+    (4.578, 2846908, -.053125, -.011111, .192187, .344444, .886584, None, None, None, None, -.091150, .034459, -.167001, -.163606, -.471001, -.562578, 0),
+    (4.609, 2846909, -.050000, -.005556, .196875, .344444, .898609, None, None, None, None, -.078492, .034712, -.143991, -.163531, -.470672, -.568719, 0),
+    (4.656, 2846911, -.043750, .005556, .206250, .355556, .907547, None, None, None, None, -.073561, .034445, -.111507, -.164187, -.470103, -.574681, 0),
+    (4.687, 2846912, -.043750, .011111, .210938, .361111, .910553, None, None, None, None, -.060974, .034902, -.101669, -.164592, -.469499, -.578873, 0),
+    (4.718, 2846913, -.040625, .016667, .214063, .363889, .913773, None, None, None, None, -.037891, .034869, -.100855, -.164253, -.468875, -.582977, 0),
+    (4.750, 2846914, -.040625, .027778, .220313, .366667, .917725, None, None, None, None, -.033115, .034471, -.096231, -.163751, -.468378, -.586166, 0),
+    (4.797, 2846915, -.037500, .033333, .226562, .375000, .921545, None, None, None, None, -.030033, .036795, -.085880, -.163154, -.467507, -.590547, 0),
+    (4.828, 2846916, -.037500, .044444, .231250, .380556, .926902, None, None, None, None, -.019865, .037443, -.086005, -.162412, -.466706, -.594060, 0),
+    (4.859, 2846917, -.037500, .055556, .237500, .386111, .929785, None, None, None, None, -.004386, .037073, -.087165, -.161064, -.465919, -.597634, 0),
+    (4.906, 2846918, -.034375, .072222, .242188, .397222, .933297, None, None, None, None, -.014927, .000812, -.078318, -.159444, -.465488, -.602253, 0),
+    (4.953, 2846920, -.031250, .116667, .254688, .425000, .941128, None, None, None, None, .019692, .012422, -.072986, -.157694, -.465961, -.606289, 0),
+    (5.000, 2846921, -.031250, .144444, .262500, .441667, .947718, None, None, None, None, .019773, .006882, -.070911, -.154785, -.465924, -.610253, 0),
+    (5.047, 2846923, -.028125, .194444, .276562, .475000, .956095, None, None, None, None, .031948, .007786, -.068574, -.152326, -.466111, -.613508, 0),
+    (5.093, 2846924, -.028125, .227778, .284375, .494444, .962223, None, None, None, None, .044744, .008193, -.066367, -.148732, -.466179, -.617185, 0),
+    (5.140, 2846925, -.025000, .261111, .292188, .519444, .969194, None, None, None, None, .047294, .017166, -.065285, -.145361, -.466171, -.620301, 0),
+    (5.187, 2846927, -.021875, .333333, .309375, .561111, .980743, None, None, None, None, .057038, .047595, -.059284, -.140713, -.464745, -.624397, 0),
+    (5.234, 2846928, -.012500, .377778, .323437, .594444, .990380, None, None, None, None, .057581, .075573, -.051735, -.136319, -.462217, -.627867, 0),
+    (5.281, 2846930, .009375, .405556, .360937, .594444, .993656, None, None, None, None, .074714, .095932, -.039716, -.132490, -.458909, -.630475, 8),
+    (5.328, 2846931, .018750, .411111, .379688, .588889, .995320, None, None, None, None, .122055, .122143, -.012071, -.125813, -.452946, -.632920, 8),
+    (5.359, 2846932, .031250, .416667, .396875, .583333, .994528, None, None, None, None, .125095, .119864, -.001614, -.123017, -.450442, -.633397, 8),
+    (5.406, 2846934, .071875, .433333, .442187, .566667, .975642, None, None, None, None, .157327, .106218, .045379, -.115722, -.444273, -.632562, 8),
+    (5.437, 2846934, .071875, .433333, .442187, .566667, .975642, None, None, None, None, .169492, .106943, .059094, -.111667, -.441149, -.631261, 8),
+    (5.468, 2846935, .100000, .438889, .465625, .558333, .950231, None, None, None, None, .201986, .101905, .113417, -.106396, -.437210, -.628191, 8),
+    (5.515, 2846936, .134375, .450000, .495313, .547222, .919356, None, None, None, None, .211726, .098718, .144831, -.102199, -.434064, -.624355, 8),
+)
+
+
+def _replay_f170_gate1_latency_rows():
+    controller = CleanCourseController(_config())
+    samples = {}
+    outputs = []
+    base_s = 100.0
+    for index, row in enumerate(_F170_GATE1_LATENCY_ROWS):
+        aperture_center = (
+            None if row[7] is None else (row[7], row[8])
+        )
+        aperture_half = (
+            None if row[9] is None else (row[9], row[10])
+        )
+        track = _f163_trace_track(
+            outer_center=(row[2], row[3]),
+            outer_span=(row[4], row[5]),
+            confidence=row[6],
+            aperture_center=aperture_center,
+            aperture_half=aperture_half,
+            clipping=FrameEdge(row[17]),
+        )
+        now = base_s + row[0]
+        update = _update([track], frame_id=row[1])
+        if index == 0:
+            controller.initialize(
+                update,
+                gate_index=1,
+                fallback_center_norm=(row[2], row[3]),
+                fallback_apparent_scale=math.sqrt(row[4] * row[5]),
+                now_s=now,
+            )
+        else:
+            controller.observe(
+                update,
+                now_s=now,
+                body_rates=(row[11], row[12], row[13]),
+            )
+        output = _command(
+            controller,
+            now,
+            roll=row[14],
+            pitch=row[15],
+            yaw=row[16],
+            accel_trust=0.0,
+        )
+        outputs.append(output)
+        vertical_motion = controller._last_vertical_motion
+        lateral_motion = controller._last_lateral_motion
+        censor_bound = controller.current.vertical_censor_bound
+        expected_censored_path = None
+        if censor_bound is not None and FrameEdge(row[17]) & (
+            FrameEdge.TOP | FrameEdge.BOTTOM
+        ):
+            if FrameEdge(row[17]) & FrameEdge.BOTTOM:
+                raw_bound = max(float(censor_bound), 0.0)
+                expected_censored_path = max(
+                    controller._compensated_ey(raw_bound, row[15]), 0.0
+                )
+            else:
+                raw_bound = min(float(censor_bound), 0.0)
+                expected_censored_path = min(
+                    controller._compensated_ey(raw_bound, row[15]), 0.0
+                )
+        samples[row[0]] = {
+            "serial": controller._current_fresh_outer_y_observation_serial,
+            "direction_sign": controller._vertical_direction_sign,
+            "direction_streak": controller._vertical_direction_streak,
+            "direction_supported": controller._vertical_direction_supported,
+            "direction_source": controller._vertical_direction_source,
+            "vertical_motion": vertical_motion,
+            "vertical_visual": controller._last_vertical_visual_delta,
+            "vertical_target": controller._last_vertical_collective_target,
+            "support": controller._last_vertical_support,
+            "wire": output.thrust,
+            "path_error": controller._last_vertical_path_error,
+            "path_rate": controller._last_vertical_path_rate,
+            "expected_censored_path": expected_censored_path,
+            "lateral_motion": lateral_motion,
+            "lateral_direction_sign": controller._last_lateral_direction_sign,
+            "lateral_reversal_sign": controller._last_lateral_reversal_sign,
+            "lateral_reference": controller._lateral_intercept_reference_x,
+            "output": output,
+        }
+    return controller, samples, outputs
+
+
+def test_f171_f170_gate1_motion_reverses_collective_before_censorship():
+    controller, samples, outputs = _replay_f170_gate1_latency_rows()
+
+    assert samples[4.218]["direction_sign"] == -1
+    assert samples[4.218]["direction_supported"]
+    assert samples[4.250]["direction_streak"] == 1
+    assert not samples[4.250]["direction_supported"]
+    # A command tick that republishes frame 2846899 is not another optical
+    # vote; the distinct-frame evidence clock stays at one.
+    assert samples[4.281]["serial"] == samples[4.250]["serial"]
+    assert samples[4.281]["direction_streak"] == 1
+    assert samples[4.312]["direction_streak"] == 2
+    assert not samples[4.312]["direction_supported"]
+
+    reversal = samples[4.343]
+    motion = reversal["vertical_motion"]
+    assert reversal["direction_sign"] == 1
+    assert reversal["direction_streak"] == 3
+    assert reversal["direction_supported"]
+    assert reversal["direction_source"] == "coherent_optical_motion"
+    assert motion.bearing_error < 0.0
+    assert motion.fallback_intercept_error < 0.0
+    assert motion.optical_intercept_error > 0.0
+    assert motion.control_authority == pytest.approx(0.0)
+    assert reversal["vertical_visual"] < 0.0
+    assert reversal["vertical_target"] < reversal["support"]
+    assert reversal["wire"] > reversal["support"]
+
+    filtered_reversal = samples[4.687]
+    assert filtered_reversal["wire"] < filtered_reversal["support"]
+    assert filtered_reversal["wire"] > 0.25
+    # Scheduling/evidence costs 93 ms and the unchanged bounded collective
+    # path costs 344 ms.  Even the measured 220 ms worst plant delay leaves a
+    # 374 ms response window before the first BOTTOM frame; changing cadence
+    # or command bounds is therefore not the minimal causal candidate.
+    assert 4.343 - 4.250 == pytest.approx(0.093, abs=1e-9)
+    assert 4.687 - 4.343 == pytest.approx(0.344, abs=1e-9)
+    assert 4.687 + 0.220 < 5.281
+    assert all(
+        controller.config.min_thrust <= output.thrust <= controller.config.max_thrust
+        for output in outputs
+    )
+
+
+def test_f171_f170_fresh_bottom_and_projected_lateral_reversal_own_immediately():
+    controller, samples, outputs = _replay_f170_gate1_latency_rows()
+
+    first_bottom = samples[5.281]
+    assert first_bottom["direction_sign"] == 1
+    assert first_bottom["direction_supported"]
+    assert first_bottom["direction_source"] == "bottom_censor"
+    assert first_bottom["path_rate"] == pytest.approx(0.0)
+    assert first_bottom["vertical_motion"].physical_rate_norm_s == pytest.approx(
+        0.0
+    )
+    assert first_bottom["path_error"] == pytest.approx(
+        first_bottom["expected_censored_path"], abs=1e-12
+    )
+
+    before = samples[5.359]
+    assert before["lateral_motion"].optical_intercept_error < 0.0
+    assert before["output"].target_roll_rad < 0.0
+    reversal = samples[5.406]
+    lateral = reversal["lateral_motion"]
+    assert lateral.bearing_error > 0.0
+    assert lateral.fallback_intercept_error > 0.0
+    assert lateral.optical_intercept_error > 0.0
+    assert reversal["lateral_direction_sign"] == 1
+    assert reversal["lateral_reversal_sign"] == 1
+    assert reversal["output"].yaw_rate_rad_s > 0.0
+    assert reversal["lateral_reference"] >= 0.0
+    assert reversal["output"].target_roll_rad >= 0.0
+    assert all(
+        abs(output.yaw_rate_rad_s) <= controller.config.max_yaw_rate_rad_s
+        and abs(output.target_roll_rad) <= controller.config.max_target_roll_rad
+        for output in outputs
+    )
+
+
+def test_f171_motion_led_direction_rejects_nonfinite_inputs():
+    controller = CleanCourseController(_config())
+    motion = SimpleNamespace(
+        closure_rate_s=0.5,
+        bearing_error=0.1,
+        fallback_intercept_error=0.2,
+        optical_intercept_error=math.nan,
+        physical_rate_norm_s=0.1,
+    )
+    assert controller._motion_led_passage_direction(motion) == (0, 0.0)
+
+
+_F170_GATE0_RELEASE_ROWS = (
+    # t, frame, outer center/span/confidence, aperture center/half, visible,
+    # body rates, rpy, accel trust, horizontal specific force.
+    (1.672, 2846821, (.003125, .05), (.196875, .3472222222), .9941040108, (.00461444194, .04917092577), (.1000803125, .1796844292), True, (-.0339148010, -.0616019681, -.0312297366), (-.0028487149, -.3373136619, -.0080112092), 0.0, 2.2156701905),
+    (1.734, 2846823, (.00625, .05), (.2046875, .3611111111), .9969377066, (.00683486223, .04746985362), (.1034922939, .1881252572), True, (-.0428422990, -.1006881162, -.0403809439), (-.0043146423, -.3418052159, -.0101116389), .0179956131, 2.2307977392),
+    (1.953, 2846830, (.03125, .0888888889), (.253125, .4305555556), .9857744747, (.02436292111, .07804796786), (.1213049743, .2241954499), True, (-.0631528425, -.2181077540, -.0779761712), (-.0126675894, -.3803371708, -.0241727579), 0.0, 2.6369388311),
+    (2.093, 2846834, (.05, .1111111111), (.2890625, .4861111111), .9848236400, (.04122883549, .08992437), (.1367655367, .2438551863), True, (-.0853715169, -.1569942027, -.0980242680), (-.0183370157, -.4070261612, -.0372106147), 0.0, 2.9075359388),
+    (2.125, 2846835, (.053125, .1111111111), (.2953125, .5027777778), .9858755045, (.046372783, .0935012439), (.1416282727, .2560332117), True, (-.0902224111, -.1473847568, -.1018197651), (-.0199959178, -.4124014559, -.0409092023), 0.0, 2.9719491493),
+    (2.172, 2846836, (.053125, .1166666667), (.3015625, .5222222222), .9888713162, (.05179165217, .0943702428), (.1472341698, .2632214591), True, (-.0849364626, -.1075569033, -.1074987914), (-.0222592831, -.4192705825, -.0471968969), 0.0, 3.0694015832),
+    (2.218, 2846838, (.0625, .1166666667), (.325, .5611111111), .9900667192, (.06102559053, .0870109725), (.1541620128, .2832669833), True, (-.0946219790, -.0989382282, -.1033750738), (-.0240261854, -.4236832885, -.0519093765), 0.0, 3.1312770506),
+    (2.562, 2846848, (.115625, .0777777778), (.5625, .9222222222), .9677524953, None, None, False, (-.0074444230, -.0401675790, -.0021202893), (-.0381653072, -.4496967106, -.0758109977), 0.0, 3.4990307857),
+)
+
+
+def _f170_gate0_release_track(row, *, track_id="recorded-gate0"):
+    return _f163_trace_track(
+        outer_center=row[2],
+        outer_span=row[3],
+        confidence=row[4],
+        track_id=track_id,
+        aperture_center=row[5],
+        aperture_half=row[6],
+    ) if row[7] else _track(
+        track_id,
+        row[2][0],
+        row[2][1],
+        scale=math.sqrt(row[3][0] * row[3][1]),
+        confidence=row[4],
+        visible=False,
+    )
+
+
+def _replay_f170_gate0_release(*, stop_before_loss=False):
+    controller = CleanCourseController(_config())
+    samples = {}
+    outputs = []
+    base_s = 100.0
+    rows = (
+        _F170_GATE0_RELEASE_ROWS[:-1]
+        if stop_before_loss
+        else _F170_GATE0_RELEASE_ROWS
+    )
+    for index, row in enumerate(rows):
+        now = base_s + row[0]
+        update = _update(
+            [_f170_gate0_release_track(row)], frame_id=row[1]
+        )
+        if index == 0:
+            controller.initialize(
+                update,
+                gate_index=0,
+                fallback_center_norm=row[2],
+                fallback_apparent_scale=math.sqrt(row[3][0] * row[3][1]),
+                now_s=now,
+            )
+        else:
+            controller.observe(update, now_s=now, body_rates=row[8])
+        output = _command(
+            controller,
+            now,
+            roll=row[9][0],
+            pitch=row[9][1],
+            yaw=row[9][2],
+            accel_trust=row[10],
+            fh=row[11],
+        )
+        outputs.append(output)
+        admission = controller._last_commit_admission
+        samples[row[0]] = {
+            "state": controller.state,
+            "output": output,
+            "admission": admission,
+            "arm_until": controller._crossing_zero_arm_until_s,
+        }
+    return controller, samples, outputs
+
+
+def test_f171_f170_safe_commit_revoke_still_releases_exact_zero_once():
+    controller, samples, outputs = _replay_f170_gate0_release()
+
+    assert samples[1.953]["admission"].admissible
+    assert samples[2.093]["state"] is CleanCourseState.COMMIT
+    assert samples[2.172]["arm_until"] == pytest.approx(102.672)
+    revoked = samples[2.218]
+    assert revoked["state"] is CleanCourseState.TRACK
+    assert revoked["admission"].status == "corridor-known/not-contained"
+    assert revoked["admission"].y_tube > revoked["admission"].y_safe_half
+    assert revoked["admission"].y_tube < (
+        revoked["admission"].y_safe_half
+        + revoked["admission"].y_clearance_reserve
+    )
+    assert revoked["arm_until"] == pytest.approx(102.672)
+
+    exact_zero = samples[2.562]["output"]
+    assert samples[2.562]["state"] is CleanCourseState.COAST_FOR_CREDIT
+    assert (
+        exact_zero.target_roll_rad,
+        exact_zero.target_pitch_rad,
+        exact_zero.yaw_rate_rad_s,
+        exact_zero.thrust,
+    ) == (0.0, 0.0, 0.0, 0.0)
+    recovery = _command(
+        controller,
+        102.593,
+        roll=_F170_GATE0_RELEASE_ROWS[-1][9][0],
+        pitch=_F170_GATE0_RELEASE_ROWS[-1][9][1],
+        yaw=_F170_GATE0_RELEASE_ROWS[-1][9][2],
+        accel_trust=0.0,
+    )
+    assert recovery.thrust > 0.0
+    assert controller.config.min_thrust <= recovery.thrust <= controller.config.max_thrust
+    assert sum(output.thrust == 0.0 for output in outputs + [recovery]) == 1
+    assert controller.gate_index == 0
+
+
+def test_f171_crossing_release_expires_and_rejects_tracker_alias_loss():
+    base_s = 100.0
+    controller, samples, _outputs = _replay_f170_gate0_release(
+        stop_before_loss=True
+    )
+    assert samples[2.218]["arm_until"] == pytest.approx(102.672)
+    loss = _F170_GATE0_RELEASE_ROWS[-1]
+    controller.observe(
+        _update([_f170_gate0_release_track(loss)], frame_id=loss[1] + 100),
+        now_s=base_s + 2.703,
+        body_rates=loss[8],
+    )
+    expired = _command(
+        controller,
+        base_s + 2.703,
+        roll=loss[9][0],
+        pitch=loss[9][1],
+        yaw=loss[9][2],
+        accel_trust=0.0,
+    )
+    assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
+    assert expired.thrust > 0.0
+
+    controller, samples, _outputs = _replay_f170_gate0_release(
+        stop_before_loss=True
+    )
+    visible = _F170_GATE0_RELEASE_ROWS[-2]
+    alias = _f170_gate0_release_track(visible, track_id="fresh-alias")
+    controller.observe(
+        _update([alias], frame_id=visible[1] + 1),
+        now_s=base_s + 2.250,
+        body_rates=visible[8],
+    )
+    alias_output = _command(
+        controller,
+        base_s + 2.250,
+        roll=visible[9][0],
+        pitch=visible[9][1],
+        yaw=visible[9][2],
+        accel_trust=0.0,
+    )
+    assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
+    assert controller._crossing_zero_arm_until_s is None
+    assert alias_output.thrust > 0.0
+
+
+def test_f171_crossing_release_never_survives_a_center_budget_escape():
+    controller = CleanCourseController(_config())
+    admission = _CommitAdmission(
+        False,
+        "corridor-known/not-contained",
+        x_tube=0.10,
+        y_tube=0.10,
+        x_budget=0.05,
+        y_budget=0.05,
+        x_center_error=0.06,
+        y_center_error=0.0,
+        x_safe_half=0.12,
+        y_safe_half=0.12,
+        x_clearance_reserve=0.08,
+        y_clearance_reserve=0.08,
+    )
+    assert not controller._commit_tube_inside_mathematical_opening(admission)
 
 
 def test_f168_commit_pitch_transfer_and_response_are_direction_safe():

@@ -920,6 +920,8 @@ class _CommitAdmission:
     y_tube: Optional[float] = None
     x_budget: Optional[float] = None
     y_budget: Optional[float] = None
+    x_center_error: Optional[float] = None
+    y_center_error: Optional[float] = None
     x_clearance_reserve: Optional[float] = None
     y_clearance_reserve: Optional[float] = None
     y_upper_clearance_reserve: Optional[float] = None
@@ -1330,6 +1332,18 @@ class CleanCourseController:
         self._commit_safe_since_s: Optional[float] = None
         self._commit_entry_s: Optional[float] = None
         self._commit_pitch_target_rad: Optional[float] = None
+        # A sustained safe COMMIT certifies a physical crossing trajectory as
+        # well as leasing active crossing control.  Fresh unsafe geometry may
+        # revoke the latter immediately, but it must not erase the mandatory
+        # exact-zero release if that same, still-close gate then disappears
+        # inside the already-modelled visual blackout.  This is deliberately a
+        # gate/track/time-scoped release lease, never permission to re-enter
+        # COMMIT or continue blind steering.
+        self._crossing_zero_arm_gate_index: Optional[int] = None
+        self._crossing_zero_arm_hypothesis: Optional[_Hypothesis] = None
+        self._crossing_zero_arm_until_s: Optional[float] = None
+        self._crossing_zero_arm_frame_identity: Optional[Tuple[Any, Any]] = None
+        self._crossing_zero_arm_last_safe_measurement_s: Optional[float] = None
         self._last_commit_admission = _CommitAdmission(
             False, "not-evaluated"
         )
@@ -1392,6 +1406,8 @@ class CleanCourseController:
         self._last_lateral_baseline_reference_x = 0.0
         self._last_lateral_projection_delta_x = 0.0
         self._last_lateral_direction_override_x = 0.0
+        self._last_lateral_direction_sign = 0
+        self._last_lateral_reversal_sign = 0
         self._last_vertical_motion: Optional[_PassageMotion] = None
         # Near-plane vertical direction is a trajectory state, deliberately
         # separate from the attitude-compensated image bearing.  The streak is
@@ -1472,6 +1488,8 @@ class CleanCourseController:
         self._last_lateral_baseline_reference_x = 0.0
         self._last_lateral_projection_delta_x = 0.0
         self._last_lateral_direction_override_x = 0.0
+        self._last_lateral_direction_sign = 0
+        self._last_lateral_reversal_sign = 0
         self._last_vertical_motion = None
         self._promoted_reconcile_gate_index = None
         self._promoted_reconcile_expiry_s = None
@@ -1487,6 +1505,7 @@ class CleanCourseController:
         self._commit_safe_since_s = None
         self._commit_entry_s = None
         self._commit_pitch_target_rad = None
+        self._clear_crossing_zero_arm()
         self._imu_accel_trust = 1.0
         self._reset_vertical_direction()
         identity = _frame_identity(update)
@@ -1656,9 +1675,43 @@ class CleanCourseController:
                 self.state = CleanCourseState.COAST_FOR_CREDIT
                 self._coast_zero_sent = False
                 self._coast_race_boot_ms = self._last_race_boot_ms
+                self._clear_crossing_zero_arm()
             if fresh:
                 self._refresh_successor(tracks, now_s)
             return
+
+        # F171: F170 safely revoked COMMIT when the measured tube escaped its
+        # reduced corridor, then forgot that the same close, growing gate had
+        # already earned a crossing release.  Its first fresh loss consequently
+        # fell through TRACK/PREDICT and the credited physical crossing sent no
+        # exact zero.  A still-live certified release arm may enter the existing
+        # one-send COAST path, but cannot retain COMMIT pitch/steering custody.
+        if (
+            fresh
+            and match is None
+            and self.state in {
+                CleanCourseState.TRACK,
+                CleanCourseState.PREDICT,
+            }
+            and self._crossing_zero_arm_active(now_s)
+        ):
+            # A tracker alias loss is not physical gate loss.  Any fresh
+            # spatial/scale-compatible replacement invalidates this release
+            # lease and leaves ordinary identity recovery in custody; only an
+            # actually missing authorized-gate lineage may exact-zero.
+            compatible_replacements = self._compatible_replacements(
+                self.current,
+                tracks,
+            )
+            if compatible_replacements:
+                self._clear_crossing_zero_arm()
+            else:
+                self.state = CleanCourseState.COAST_FOR_CREDIT
+                self._coast_zero_sent = False
+                self._coast_race_boot_ms = self._last_race_boot_ms
+                self._clear_crossing_zero_arm()
+                self._refresh_successor(tracks, now_s)
+                return
 
         # F78b: the pending-credit window is an authority overlay, not just
         # a SEARCH-command posture — the same-track match path must not
@@ -1812,6 +1865,7 @@ class CleanCourseController:
         self._commit_safe_since_s = None
         self._commit_entry_s = None
         self._commit_pitch_target_rad = None
+        self._clear_crossing_zero_arm()
         self._last_commit_admission = _CommitAdmission(
             False, "authoritative-gate-change"
         )
@@ -1937,6 +1991,8 @@ class CleanCourseController:
         self._last_lateral_baseline_reference_x = 0.0
         self._last_lateral_projection_delta_x = 0.0
         self._last_lateral_direction_override_x = 0.0
+        self._last_lateral_direction_sign = 0
+        self._last_lateral_reversal_sign = 0
         self._zero_recovery_applied = False
         self._pre_cross_brake_active = False  # main path recomputes below
         self._successor_heading_blend = 0.0
@@ -1948,6 +2004,8 @@ class CleanCourseController:
         else:
             dt = _clamp(now_s - self._last_command_s, 1e-3, 0.10)
         self._last_command_s = float(now_s)
+        if self._crossing_zero_arm_until_s is not None:
+            self._crossing_zero_arm_active(now_s)
         if self._zero_recovery_pending and self._zero_command_s is not None:
             # The zero-send impulse lasts until the next powered controller
             # tick, not for the duration of the tick that preceded it.  Use
@@ -2141,6 +2199,17 @@ class CleanCourseController:
             if near_plane_close
             else _CommitAdmission(False, "outside-proximity")
         )
+        if self._crossing_zero_arm_until_s is not None:
+            if commit_admission.status == "directionally-censored" or (
+                commit_admission.status == "corridor-known/not-contained"
+                and not self._commit_tube_inside_mathematical_opening(
+                    commit_admission
+                )
+            ):
+                # The release lease survives only F170's reserve-only miss.
+                # One-sided clipping or a complete tube outside the measured
+                # opening is contrary evidence, not a credible crossing loss.
+                self._clear_crossing_zero_arm()
         if near_plane_close and commit_admission.admissible:
             if self._commit_safe_since_s is None:
                 self._commit_safe_since_s = now_s
@@ -2166,6 +2235,7 @@ class CleanCourseController:
             # COMMIT carries that exact longitudinal target; it cannot inject
             # a new nose-down endpoint after certifying a braking approach.
             self._commit_pitch_target_rad = float(self._prev_target_pitch)
+            self._arm_crossing_zero_release()
 
         if self.state is CleanCourseState.COMMIT:
             if not entered_commit and self.current is not None:
@@ -2191,6 +2261,19 @@ class CleanCourseController:
                     self._commit_pitch_target_rad = None
                     self._commit_safe_since_s = None
                     commit_admission = continued_admission
+                    if (
+                        continued_admission.status
+                        == "directionally-censored"
+                        or not self._commit_tube_inside_mathematical_opening(
+                            continued_admission
+                        )
+                    ):
+                        self._clear_crossing_zero_arm()
+                elif continued_admission.admissible:
+                    # Refresh only from another fresh, safe certified tube.
+                    # Unsafe TRACK frames retain the last bounded expiry but
+                    # can never extend it.
+                    self._arm_crossing_zero_release()
             commit_timed_out = (
                 self._commit_entry_s is None
                 or now_s - self._commit_entry_s > cfg.commit_timeout_s
@@ -3278,6 +3361,8 @@ class CleanCourseController:
                 y_tube=y_tube,
                 x_budget=x_budget,
                 y_budget=y_budget,
+                x_center_error=corridor.center_x,
+                y_center_error=compensated_center_y,
                 **clearance,
                 **common,
             )
@@ -3314,6 +3399,8 @@ class CleanCourseController:
             y_tube=y_tube,
             x_budget=x_budget,
             y_budget=y_budget,
+            x_center_error=corridor.center_x,
+            y_center_error=compensated_center_y,
             **clearance,
             closure_rate_s=closure,
             closure_agreement=agreement,
@@ -3489,8 +3576,21 @@ class CleanCourseController:
         else:
             ttc_s = cfg.commit_blackout_s
             ttc_std_s = 0.0
-        image_rate = float(axis.v)
-        physical_rate = image_rate - model_closure * error
+        vertical_censor = directional_censor & (
+            FrameEdge.TOP | FrameEdge.BOTTOM
+        )
+        # A clipped center is an inequality measurement, not a new sample of
+        # the Kalman center/rate.  F170's live BOTTOM center froze at +0.378
+        # while the filter kept extrapolating downward; consuming that stale
+        # rate delayed the visibility-preserving reversal and made diagnostics
+        # look like live motion.  Keep horizontal clipped-axis behavior intact,
+        # but let a fresh vertical edge own bounded position/direction alone.
+        image_rate = 0.0 if vertical_censor else float(axis.v)
+        physical_rate = (
+            0.0
+            if vertical_censor
+            else image_rate - model_closure * error
+        )
         freshness = _clamp01(
             1.0 - max(0.0, float(measurement_age_s)) / cfg.predict_max_gap_s
         )
@@ -3680,14 +3780,14 @@ class CleanCourseController:
 
         raw_outer_error = float(axis.p)
         if edge != FrameEdge.NONE and current.vertical_censor_bound is not None:
+            # The fresh edge bound is the only measured vertical coordinate.
+            # Do not max/min-fuse it with a predicted center: that silently
+            # restores stale tracker extrapolation as the control owner.
+            bound = float(current.vertical_censor_bound)
             if edge & FrameEdge.BOTTOM:
-                raw_outer_error = max(
-                    raw_outer_error, current.vertical_censor_bound, 0.0
-                )
+                raw_outer_error = max(bound, 0.0)
             elif edge & FrameEdge.TOP:
-                raw_outer_error = min(
-                    raw_outer_error, current.vertical_censor_bound, 0.0
-                )
+                raw_outer_error = min(bound, 0.0)
         outer_error = self._compensated_ey(raw_outer_error, pitch_rad)
         if edge & FrameEdge.BOTTOM:
             outer_error = max(outer_error, 0.0)
@@ -3727,7 +3827,7 @@ class CleanCourseController:
             axis=axis,
             outer_error=outer_error,
             error=error,
-            image_rate_norm_s=float(axis.v),
+            image_rate_norm_s=(0.0 if edge != FrameEdge.NONE else float(axis.v)),
             evidence_age_s=age_s,
             freshness_authority=freshness,
             directional_censor=edge,
@@ -5239,6 +5339,98 @@ class CleanCourseController:
         self._vertical_direction_edge_active = False
         self._vertical_direction_magnitude = 0.0
 
+    def _clear_crossing_zero_arm(self) -> None:
+        """Drop the certified physical-crossing release lease."""
+
+        self._crossing_zero_arm_gate_index = None
+        self._crossing_zero_arm_hypothesis = None
+        self._crossing_zero_arm_until_s = None
+        self._crossing_zero_arm_frame_identity = None
+        self._crossing_zero_arm_last_safe_measurement_s = None
+
+    def _arm_crossing_zero_release(self) -> None:
+        """Retain one bounded exact-zero release from a fresh safe COMMIT."""
+
+        current = self.current
+        if current is None or current.track_id is None:
+            return
+        identity = self._last_frame_identity
+        measurement_s = float(current.last_measurement_s)
+        same_certified_frame = bool(
+            self._crossing_zero_arm_gate_index == self.gate_index
+            and self._crossing_zero_arm_hypothesis is current
+            and (
+                (
+                    identity is not None
+                    and identity == self._crossing_zero_arm_frame_identity
+                )
+                or (
+                    identity is None
+                    and self._crossing_zero_arm_last_safe_measurement_s
+                    is not None
+                    and measurement_s
+                    <= self._crossing_zero_arm_last_safe_measurement_s + 1e-9
+                )
+            )
+        )
+        if same_certified_frame:
+            return
+        self._crossing_zero_arm_gate_index = int(self.gate_index)
+        self._crossing_zero_arm_hypothesis = current
+        # Expiry belongs to the distinct safe camera evidence, not to however
+        # late the command loop happens to consume it.  Scheduler delay can
+        # never extend a crossing lease.
+        self._crossing_zero_arm_until_s = (
+            measurement_s + self.config.commit_blackout_s
+        )
+        self._crossing_zero_arm_frame_identity = identity
+        self._crossing_zero_arm_last_safe_measurement_s = measurement_s
+
+    def _crossing_zero_arm_active(self, now_s: float) -> bool:
+        """Return whether the certified release still owns this same close gate."""
+
+        current = self.current
+        active = bool(
+            self._crossing_zero_arm_until_s is not None
+            and float(now_s) <= self._crossing_zero_arm_until_s
+            and self._crossing_zero_arm_gate_index == self.gate_index
+            and current is not None
+            and current is self._crossing_zero_arm_hypothesis
+            and current.outer_log_scale >= self.config.commit_min_log_scale
+        )
+        if not active:
+            self._clear_crossing_zero_arm()
+        return active
+
+    @staticmethod
+    def _commit_tube_inside_mathematical_opening(
+        admission: _CommitAdmission,
+    ) -> bool:
+        """Whether an unsafe reduced tube still fits the measured opening."""
+
+        values = (
+            admission.x_tube,
+            admission.y_tube,
+            admission.x_center_error,
+            admission.y_center_error,
+            admission.x_budget,
+            admission.y_budget,
+            admission.x_safe_half,
+            admission.y_safe_half,
+            admission.x_clearance_reserve,
+            admission.y_clearance_reserve,
+        )
+        if any(value is None for value in values):
+            return False
+        return bool(
+            abs(admission.x_center_error) <= admission.x_budget
+            and abs(admission.y_center_error) <= admission.y_budget
+            and admission.x_tube
+            <= admission.x_safe_half + admission.x_clearance_reserve
+            and admission.y_tube
+            <= admission.y_safe_half + admission.y_clearance_reserve
+        )
+
     @staticmethod
     def _projected_passage_direction(
         motion: _PassageMotion,
@@ -5257,6 +5449,58 @@ class CleanCourseController:
         if fallback < 0.0 and optical < 0.0:
             return -1, min(abs(fallback), abs(optical))
         return 0, 0.0
+
+    def _motion_led_passage_direction(
+        self,
+        motion: _PassageMotion,
+    ) -> Tuple[int, float]:
+        """Return a conservative sign/magnitude from coherent optical motion.
+
+        This is deliberately independent of the static compensated bearing.
+        Raw image motion, expansion-de-dilated motion, and the TTC endpoint all
+        have to agree while closure is credible.  The resulting magnitude is
+        the smallest distance any of those rates can cover during the existing
+        blackout horizon; covariance may shape feedforward elsewhere but cannot
+        turn this shared sign into its opposite.
+        """
+
+        cfg = self.config
+        horizon_s = max(1e-6, cfg.commit_blackout_s)
+        image_rate = (
+            float(motion.fallback_intercept_error)
+            - float(motion.bearing_error)
+        ) / horizon_s
+        optical = float(motion.optical_intercept_error)
+        physical_rate = float(motion.physical_rate_norm_s)
+        if not all(
+            math.isfinite(value)
+            for value in (
+                motion.closure_rate_s,
+                optical,
+                physical_rate,
+                image_rate,
+            )
+        ):
+            return 0, 0.0
+        if (
+            motion.closure_rate_s < cfg.passage_min_closure_rate_s
+            or optical * physical_rate <= 0.0
+            or optical * image_rate <= 0.0
+        ):
+            return 0, 0.0
+        error_cap = max(
+            cfg.vertical_optical_error_max_far_norm,
+            cfg.vertical_optical_error_max_near_norm,
+        )
+        return (
+            1 if optical > 0.0 else -1,
+            min(
+                abs(optical),
+                abs(physical_rate) * horizon_s,
+                abs(image_rate) * horizon_s,
+                error_cap,
+            ),
+        )
 
     def _update_vertical_direction(
         self,
@@ -5303,6 +5547,32 @@ class CleanCourseController:
 
         self._vertical_direction_edge_active = False
         sign, direction_magnitude = self._projected_passage_direction(motion)
+        motion_sign, motion_magnitude = self._motion_led_passage_direction(
+            motion
+        )
+        direction_source = "coherent_motion"
+        if sign == 0 and motion_sign != 0:
+            # F171, F170 Gate 1: static pitch compensation kept the short
+            # fallback endpoint above the aperture for another 0.84 s after
+            # fresh outer image motion and the TTC/de-dilated endpoint already
+            # showed a bottom-side miss.  Requiring that static endpoint to
+            # agree made it a direction veto.  Three distinct outer frames
+            # still earn ownership below, but closure-credible, same-sign raw
+            # and de-dilated motion may now establish the near-plane direction
+            # before the compensated position crosses.  Projection covariance
+            # continues to bound magnitude; it does not erase sign.
+            sign = motion_sign
+            direction_magnitude = motion_magnitude
+            direction_source = "coherent_optical_motion"
+        elif sign != 0 and motion_sign == sign:
+            # Crossing the static fallback through zero must not collapse an
+            # already coherent momentum request.  Keep the stronger of two
+            # independently bounded magnitudes while the established endpoint
+            # agreement continues to own the same sign.
+            direction_magnitude = max(
+                direction_magnitude,
+                motion_magnitude,
+            )
         fresh_y_owned = bool(
             self._current_fresh_observation_track_id == current.track_id
             and self._current_fresh_outer_y_observation_s is not None
@@ -5351,7 +5621,7 @@ class CleanCourseController:
             >= cfg.vertical_direction_streak_frames
         ):
             self._vertical_direction_supported = True
-            self._vertical_direction_source = "coherent_motion"
+            self._vertical_direction_source = direction_source
             self._vertical_direction_magnitude = direction_magnitude
 
     def _vertical_collective_target(
@@ -5482,8 +5752,7 @@ class CleanCourseController:
                         )
                     else:
                         magnitude = min(
-                            abs(motion.fallback_intercept_error),
-                            abs(motion.optical_intercept_error),
+                            abs(self._vertical_direction_magnitude),
                             error_cap,
                         )
                     magnitude *= path.freshness_authority
@@ -5687,6 +5956,25 @@ class CleanCourseController:
             current_motion,
             record=True,
         )
+        direction_sign, _direction_magnitude = (
+            self._projected_passage_direction(current_motion)
+        )
+        fresh_current_x = bool(
+            self._current_fresh_observation_track_id == current.track_id
+            and current_age <= self.config.x_steer_max_age_s
+        )
+        coherent_current_sign = 0
+        if (
+            fresh_current_x
+            and current_edge == FrameEdge.NONE
+            and direction_sign != 0
+            and current_motion.bearing_error * direction_sign > 0.0
+        ):
+            # Bearing, short-horizon optical motion, and TTC/de-dilated motion
+            # now agree on the same side.  This is a direction fact even when
+            # the precise plane-miss magnitude remains uncertain.
+            coherent_current_sign = direction_sign
+        self._last_lateral_direction_sign = coherent_current_sign
         desired = 0.0 if current_path_released else current_desired
         if not current_path_released and current_edge & FrameEdge.RIGHT:
             desired = max(desired, current_error, 0.0)
@@ -5714,6 +6002,36 @@ class CleanCourseController:
                 record=False,
             )
             desired = desired + authority * (successor_desired - desired)
+        turn_reference = self._turn_reference_x
+        coordinated_reversal_sign = 0
+        if (
+            not current_path_released
+            and coherent_current_sign != 0
+            and desired * coherent_current_sign > 0.0
+            and (
+                turn_reference is None
+                or turn_reference * coherent_current_sign >= 0.0
+            )
+        ):
+            coordinated_reversal_sign = coherent_current_sign
+        self._last_lateral_reversal_sign = coordinated_reversal_sign
+        if coordinated_reversal_sign != 0:
+            # F170 Gate 1: yaw had already reversed, but the 0.15 s lateral
+            # filter and the carried roll target kept banking left for another
+            # 0.18--0.49 s.  Once all fresh current-gate path observables and
+            # the yaw reference agree on the new side, old opposite-signed
+            # memory is no longer evidence.  Neutralize only that stale carry;
+            # the new bank still passes through the existing bounded filter,
+            # slew, and roll envelope.
+            if (
+                self._lateral_intercept_reference_x is not None
+                and self._lateral_intercept_reference_x
+                * coordinated_reversal_sign
+                < 0.0
+            ):
+                self._lateral_intercept_reference_x = 0.0
+            if self._prev_target_roll * coordinated_reversal_sign < 0.0:
+                self._prev_target_roll = 0.0
         alpha = _clamp01(
             dt / max(1e-6, self.config.turn_reference_tau_s + dt)
         )
@@ -5989,6 +6307,7 @@ class CleanCourseController:
         self._commit_safe_since_s = None
         self._commit_entry_s = None
         self._commit_pitch_target_rad = None
+        self._clear_crossing_zero_arm()
         self._reset_vertical_direction()
         self._clear_current_fresh_observation()
         # Initialize the real bounded yaw sweep from the last observed
@@ -6007,6 +6326,7 @@ class CleanCourseController:
     def _exit_coast(self) -> None:
         self._coast_zero_sent = False
         self._coast_race_boot_ms = None
+        self._clear_crossing_zero_arm()
 
     def _slew_roll(
         self,
@@ -6591,6 +6911,8 @@ def _clean_course_tick_trace(
             "y_tube": admission.y_tube,
             "x_budget": admission.x_budget,
             "y_budget": admission.y_budget,
+            "x_center_error": admission.x_center_error,
+            "y_center_error": admission.y_center_error,
             "x_clearance_reserve": admission.x_clearance_reserve,
             "y_clearance_reserve": admission.y_clearance_reserve,
             "y_upper_clearance_reserve": (
@@ -6610,6 +6932,33 @@ def _clean_course_tick_trace(
             "closure_agreement": admission.closure_agreement,
             "ttc_s": admission.ttc_s,
             "longitudinal_reachable": admission.longitudinal_reachable,
+        },
+        "crossing_zero_release": {
+            "armed": controller._crossing_zero_arm_until_s is not None,
+            "gate_index": controller._crossing_zero_arm_gate_index,
+            "track_id": (
+                None
+                if controller._crossing_zero_arm_hypothesis is None
+                else controller._crossing_zero_arm_hypothesis.track_id
+            ),
+            "last_safe_age_s": (
+                None
+                if controller._crossing_zero_arm_last_safe_measurement_s
+                is None
+                else max(
+                    0.0,
+                    now_s
+                    - controller._crossing_zero_arm_last_safe_measurement_s,
+                )
+            ),
+            "remaining_s": (
+                None
+                if controller._crossing_zero_arm_until_s is None
+                else max(
+                    0.0,
+                    controller._crossing_zero_arm_until_s - now_s,
+                )
+            ),
         },
         "successor": successor_trace,
         "turn_successor_authority": controller._successor_heading_blend,
@@ -6637,6 +6986,10 @@ def _clean_course_tick_trace(
             "direction_override_x": (
                 controller._last_lateral_direction_override_x
             ),
+            "coherent_direction_sign": (
+                controller._last_lateral_direction_sign
+            ),
+            "reversal_sign": controller._last_lateral_reversal_sign,
         },
         "lateral_passage_motion": passage_motion_trace(
             controller._last_lateral_motion
