@@ -3712,10 +3712,13 @@ def test_f168_release_rebind_keeps_successor_yaw_roll_and_vertical_coherent():
     )
     old_successor = _f163_trace_track(
         track_id="old-successor",
-        outer_center=(-0.42, -0.28),
-        outer_span=(0.11, 0.22),
-        confidence=0.80,
+        # F168 t=2.344: last accepted alias before the tracker re-keyed the
+        # same physical Gate 1 as 000004.
+        outer_center=(-0.38125, 0.04444444444444451),
+        outer_span=(0.0765625, 0.16944444444444445),
+        confidence=0.623,
     )
+    controller._track_first_seen_s["old-successor"] = 101.50
     controller.observe(
         _update([current_edge, old_successor], frame_id=2053015),
         now_s=102.50,
@@ -3739,9 +3742,12 @@ def test_f168_release_rebind_keeps_successor_yaw_roll_and_vertical_coherent():
 
     replacement = _f163_trace_track(
         track_id="fresh-successor",
-        outer_center=(-0.45, -0.30),
-        outer_span=(0.12, 0.24),
-        confidence=0.84,
+        # Exact F168 t=2.937 replacement geometry.  Its perspective aspect
+        # (0.469) is suspicious for cold adoption but is uniquely compatible
+        # with the maintained, race-scoped successor lineage.
+        outer_center=(-0.34375, -0.005555555555555536),
+        outer_span=(0.09375, 0.20),
+        confidence=0.690,
     )
     controller.observe(
         _update([replacement], frame_id=2053017), now_s=102.62
@@ -3753,6 +3759,7 @@ def test_f168_release_rebind_keeps_successor_yaw_roll_and_vertical_coherent():
     assert precredit.yaw_rate_rad_s < 0.0
     assert precredit.target_roll_rad < 0.0
     assert precredit.yaw_rate_rad_s * precredit.target_roll_rad > 0.0
+    assert precredit.target_roll_rad <= pending.target_roll_rad
     assert controller._last_vertical_path_error < 0.0
     assert precredit.successor_track_id == "fresh-successor"
 
@@ -3770,8 +3777,8 @@ def test_f168_release_rebind_keeps_successor_yaw_roll_and_vertical_coherent():
     # state survive that immediate handoff.
     second_alias = _f163_trace_track(
         track_id="fresh-successor-2",
-        outer_center=(-0.46, -0.31),
-        outer_span=(0.13, 0.25),
+        outer_center=(-0.35, -0.01666666666666672),
+        outer_span=(0.0953125, 0.20277777777777778),
         confidence=0.86,
     )
     controller.observe(

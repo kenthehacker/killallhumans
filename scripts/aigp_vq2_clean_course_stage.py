@@ -3756,16 +3756,18 @@ class CleanCourseController:
                 continue
             if bool(getattr(track, "ambiguous", False)):
                 continue
-            if _suspicious_adoption_geometry(track):
-                continue
             clipping = getattr(track, "clipping", FrameEdge.NONE)
             if type(clipping) is not FrameEdge:
                 clipping = FrameEdge.NONE
-            # A small uncensored box is explicitly ambiguous between a whole
-            # distant gate and a near fragment.  It may be searched for, but
-            # cannot silently inherit the already-authorized lineage.  A
-            # directional clip keeps its one-sided evidence and is judged by
-            # the censored innovation model instead.
+            # Cold adoption's generic aspect-ratio debris veto does not apply
+            # here: a perspective-skewed gate can legitimately cross that
+            # bound while remaining the unique spatial/scale-continuous
+            # replacement of a race-scoped lineage (F168 Gate 1, aspect
+            # 0.469).  A small uncensored box is still explicitly ambiguous
+            # between a whole distant gate and a near fragment.  It may be
+            # searched for, but cannot silently inherit the authorized
+            # lineage.  A directional clip keeps its one-sided evidence and
+            # is judged by the censored innovation model instead.
             if (
                 clipping == FrameEdge.NONE
                 and math.log(max(1e-6, float(track.apparent_scale)))
