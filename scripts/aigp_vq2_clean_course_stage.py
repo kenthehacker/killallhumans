@@ -2838,6 +2838,7 @@ class CleanCourseController:
             collective,
             support,
             vertical_motion,
+            dt=dt,
         )
         if vertical_motion is not None:
             floor_gate_y = vertical_motion.bearing_error
@@ -3521,12 +3522,13 @@ class CleanCourseController:
         vertical_censor = directional_censor & (
             FrameEdge.TOP | FrameEdge.BOTTOM
         )
-        # A clipped center is an inequality measurement, not a new sample of
-        # the Kalman center/rate.  F170's live BOTTOM center froze at +0.378
-        # while the filter kept extrapolating downward; consuming that stale
-        # rate delayed the visibility-preserving reversal and made diagnostics
-        # look like live motion.  Keep horizontal clipped-axis behavior intact,
-        # but let a fresh vertical edge own bounded position/direction alone.
+        # A directionally proved clipped center is an inequality measurement,
+        # not a new sample of the Kalman center/rate.  F170's live BOTTOM
+        # center froze at +0.378 while the filter kept extrapolating downward;
+        # consuming that stale rate delayed the visibility-preserving reversal
+        # and made diagnostics look like live motion.  An attitude-ambiguous
+        # raw edge is filtered out before this boundary, while a proved edge
+        # owns bounded position/direction alone.
         image_rate = 0.0 if vertical_censor else float(axis.v)
         physical_rate = (
             0.0
@@ -3648,6 +3650,64 @@ class CleanCourseController:
             * cfg.vertical_pitch_comp_norm_per_rad
         )
 
+    def _compensated_vertical_censor_edge(
+        self,
+        current: _Hypothesis,
+        *,
+        pitch_rad: float,
+    ) -> FrameEdge:
+        """Return only the edge direction proved after attitude correction.
+
+        A clipped outer-box center is an image-coordinate inequality.  For a
+        BOTTOM clip, the true raw center is at least the reported bound; after
+        pitch compensation the same lower bound can still be negative.  In
+        that case the edge does *not* prove that the aperture is below the
+        flight path.  F177's two failed Gate-0 repeats hit exactly this seam:
+        nose-up pitch made the raw box touch BOTTOM while the compensated
+        lower bound and established trajectory still required climb.
+
+        Preserve the raw edge on the hypothesis for FOV/admission safety, but
+        return no vertical direction until the transformed inequality proves
+        its sign.  Once a sign-definite edge has earned same-track ownership,
+        subsequent same-edge frames may retain it; this preserves persistent
+        geometrically consistent censorship if attitude later moves the bound
+        across zero.  A first ambiguous edge does not refresh the last exact-y
+        age in ``_vertical_path_observation`` below, so it cannot authorize
+        indefinite stale extrapolation.  A geometrically consistent TOP or
+        BOTTOM bound retains immediate one-sided ownership.
+        """
+
+        edge = current.vertical_censor_edge & (
+            FrameEdge.TOP | FrameEdge.BOTTOM
+        )
+        bound = current.vertical_censor_bound
+        if edge == FrameEdge.NONE or bound is None:
+            return edge
+        compensated_bound = self._compensated_ey(float(bound), pitch_rad)
+        retained_bottom = bool(
+            self._vertical_direction_track_id == current.track_id
+            and self._vertical_direction_edge_active
+            and self._vertical_direction_sign > 0
+        )
+        retained_top = bool(
+            self._vertical_direction_track_id == current.track_id
+            and self._vertical_direction_edge_active
+            and self._vertical_direction_sign < 0
+        )
+        if (
+            edge & FrameEdge.BOTTOM
+            and compensated_bound < 0.0
+            and not retained_bottom
+        ):
+            edge &= ~FrameEdge.BOTTOM
+        if (
+            edge & FrameEdge.TOP
+            and compensated_bound > 0.0
+            and not retained_top
+        ):
+            edge &= ~FrameEdge.TOP
+        return edge
+
     def _vertical_path_observation(
         self,
         current: _Hypothesis,
@@ -3673,19 +3733,33 @@ class CleanCourseController:
         # legacy seam keeps focused direct-state fixtures honest without
         # changing the live aperture/outer boundary repaired by F166.
         axis = current.y_axis if direct_outer_only else current.outer_y_axis
-        edge = current.vertical_censor_edge & (
+        raw_edge = current.vertical_censor_edge & (
             FrameEdge.TOP | FrameEdge.BOTTOM
+        )
+        edge = self._compensated_vertical_censor_edge(
+            current,
+            pitch_rad=pitch_rad,
+        )
+        ambiguous_attitude_edge = bool(
+            raw_edge != FrameEdge.NONE and edge == FrameEdge.NONE
         )
         if (
             self._current_fresh_observation_track_id == current.track_id
         ):
             # Explicit camera-frame freshness cannot be extended by a tracker
             # republication of the same frozen image.
-            evidence_s = (
-                self._current_fresh_outer_y_observation_s
-                if self._current_fresh_outer_y_observation_s is not None
-                else NEVER_MEASURED_S
-            )
+            if ambiguous_attitude_edge:
+                # The new frame refreshes only an ambiguous inequality, not an
+                # exact center/rate.  Carry the last compensated trajectory
+                # through the ordinary prediction horizon without letting
+                # repeated clipped frames renew it indefinitely.
+                evidence_s = current.last_outer_y_measurement_s
+            else:
+                evidence_s = (
+                    self._current_fresh_outer_y_observation_s
+                    if self._current_fresh_outer_y_observation_s is not None
+                    else NEVER_MEASURED_S
+                )
         elif current is self.successor:
             # Once an exact-zero crossing has physically released the old
             # path, pending-credit control may preview the retained successor
@@ -3696,7 +3770,7 @@ class CleanCourseController:
             evidence_s = (
                 current.last_outer_y_evidence_s
                 if edge != FrameEdge.NONE
-                else current.last_y_measurement_s
+                else current.last_outer_y_measurement_s
             )
         elif direct_outer_only:
             # Compatibility for focused direct-state fixtures that do not pass
@@ -3799,8 +3873,9 @@ class CleanCourseController:
         evidence_age = now_s - current.last_outer_y_evidence_s
         if evidence_age > cfg.vertical_qualify_max_age_s:
             return 0
-        edge = current.vertical_censor_edge & (
-            FrameEdge.TOP | FrameEdge.BOTTOM
+        edge = self._compensated_vertical_censor_edge(
+            current,
+            pitch_rad=pitch_rad,
         )
         if edge & FrameEdge.BOTTOM:
             return 1
@@ -5915,23 +5990,26 @@ class CleanCourseController:
         target: float,
         support: float,
         motion: Optional[_PassageMotion],
+        *,
+        dt: float,
     ) -> float:
-        """Retire carried Gate-0 vertical energy before endpoint reversal.
+        """Make the carried Gate-0 collective follow the response endpoint.
 
-        The outer-owned passage law maps a normalized projected miss to
-        collective with ``vertical_optical_collective_gain``.  Invert that
-        same mapping at the real carried-wire boundary: if the current wire
-        and target are still accelerating toward one side, compare their
-        equivalent optical carry with the response-horizon endpoint remaining
-        on that side.  As the endpoint reserve shrinks below the carried
-        energy, taper the *same* target continuously toward tilt support.
+        The ordinary visual law selects a target and the 0.25-second carry
+        filter then delays it.  F177 shaped only that target: its projected
+        endpoint crossed at t=1.937, the shaping seam released, and the wire
+        remained on the old side of support until t=2.250.  Nominal support
+        also did not arrest the already established sink.
 
-        This is not another position/velocity controller and it never chooses
-        the opposite direction.  The existing optical owner commands the
-        eventual reversal; this seam merely makes its launch-to-approach
-        handoff bumpless instead of waiting for a sign crossing and then using
-        fast reversal authority.  Aperture geometry, IMU velocity, and static
-        support do not acquire trajectory ownership here.
+        Map the same outer-owned response endpoint to the collective that the
+        wire should carry, including a smooth crossing of nominal support when
+        stopping requires braking-side authority.  Then invert the *actual*
+        first-order carry equation for one tick.  The resulting wire step is
+        bounded by the existing vertical-response slew and never overshoots
+        the visual endpoint target.  This is lag compensation at the real
+        actuator-command boundary, not a second position/velocity owner:
+        aperture geometry, IMU velocity, and static support do not choose its
+        direction or magnitude.
         """
 
         cfg = self.config
@@ -5954,6 +6032,7 @@ class CleanCourseController:
             float(self._collective),
             float(motion.optical_intercept_error),
             float(motion.physical_rate_norm_s),
+            float(dt),
         )
         if not all(math.isfinite(value) for value in values):
             self._last_gate0_energy_floor_delta = 0.0
@@ -5962,28 +6041,48 @@ class CleanCourseController:
         response_endpoint = float(motion.optical_intercept_error) + (
             float(motion.physical_rate_norm_s) * cfg.commit_blackout_s
         )
-        target_delta = original - float(support)
         carry_delta = float(self._collective) - float(support)
-        # Collective and image miss have opposite signs.  Shape only an
-        # established same-direction carry; a newly requested reversal keeps
-        # its ordinary bounded path and a centered/no-energy state is a no-op.
+        response_wire = _clamp(
+            float(support)
+            - cfg.vertical_optical_collective_gain * response_endpoint,
+            cfg.min_thrust,
+            cfg.max_thrust,
+        )
+        response_delta = response_wire - float(support)
+        # Leave ordinary acceleration alone while the response endpoint asks
+        # for at least as much energy on the side the wire already carries.
+        # Take ownership only of stopping/reversal: the response target is
+        # nearer neutral, neutral, or on the braking side.
         if (
-            abs(target_delta) <= 1e-9
-            or abs(carry_delta) <= 1e-9
-            or target_delta * carry_delta <= 0.0
-            or target_delta * response_endpoint >= 0.0
+            abs(carry_delta) <= 1e-9
+            or (
+                carry_delta * response_delta > 0.0
+                and abs(response_delta) >= abs(carry_delta)
+            )
         ):
             self._last_gate0_energy_floor_delta = 0.0
             return original
 
-        equivalent_carry_miss = abs(carry_delta) / max(
-            1e-6, cfg.vertical_optical_collective_gain
+        max_wire_step = (
+            cfg.vertical_direction_fast_slew_per_s
+            * _clamp(float(dt), 1e-3, 0.10)
         )
-        remaining_miss = abs(response_endpoint)
-        authority = _clamp01(
-            remaining_miss / max(1e-6, equivalent_carry_miss)
+        desired_wire = float(self._collective) + _clamp(
+            response_wire - float(self._collective),
+            -max_wire_step,
+            max_wire_step,
         )
-        shaped = float(support) + authority * target_delta
+        alpha = _clamp01(
+            float(dt)
+            / max(1e-6, cfg.collective_decay_tau_s + float(dt))
+        )
+        # Invert exactly the filter used by _continuous_collective().  The
+        # internal target may cross support to brake established motion, but
+        # the commanded wire reaches only the bounded desired_wire this tick.
+        shaped = float(self._collective) + (
+            desired_wire - float(self._collective)
+        ) / max(1e-6, alpha)
+        shaped = _clamp(shaped, cfg.min_thrust, cfg.max_thrust)
         self._last_gate0_energy_floor_delta = float(shaped - original)
         return shaped
 
@@ -6240,6 +6339,9 @@ class CleanCourseController:
                     )
                 )
             )
+            launch_transfer_active = self._launch_descent_transfer_active(
+                now_s
+            )
             gate0_energy_owned = bool(
                 self.gate_index == 0
                 and self._course_start_s is not None
@@ -6253,18 +6355,24 @@ class CleanCourseController:
                 direction_matches
                 and self._vertical_direction_fast_until_s is not None
                 and now_s <= self._vertical_direction_fast_until_s
-                # Gate 0 now retires carried vertical energy continuously from
-                # the response endpoint.  A later sign crossing must not
-                # bypass that trajectory with a neutral-support jump (F175's
-                # up-dip-up handoff).  One-sided frame censorship remains an
-                # immediate visibility fact and keeps the bounded fast path.
-                and (not gate0_energy_owned or edge_owned)
+                # Ordinary launch motion cannot retire boost-owned carry
+                # before the complete bumpless transfer.  Afterward a
+                # coherent reversal keeps bounded fast authority; F177
+                # detected it 141 ms earlier than F175 but suppressed the
+                # response for the whole Gate-0 leg.  Edge ownership remains
+                # immediate at every phase.
+                and (not launch_transfer_active or edge_owned)
             )
             if (
                 fast_active
                 and not self._vertical_direction_fast_applied
                 and support is not None
                 and math.isfinite(float(support))
+                # Gate-0 response-horizon shaping already moves the carried
+                # wire through neutral with a bounded step.  Do not recreate
+                # F175's one-tick support snap.  Other legs and a fresh frame
+                # edge retain the established immediate neutral retirement.
+                and not gate0_energy_owned
             ):
                 neutral = _clamp(
                     float(support),

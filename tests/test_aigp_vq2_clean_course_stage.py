@@ -6006,12 +6006,14 @@ def test_f168_newest_f167_launch_replay_has_one_bumpless_vertical_owner():
     ) >= -0.0073
     recovery = [sample for sample in samples if sample["t"] >= 0.969]
     # A continuous visual descent request may keep reducing the carried wire;
-    # what must not recur is F174's one-tick boost-carry retirement.  Retain a
-    # bounded ordinary-filter step through the remainder of the launch fade.
+    # what must not recur is F174's one-tick boost-carry retirement.  The
+    # response-horizon handoff may outrun the ordinary filter, but remains
+    # bounded by the explicit reversal slew across these sparse trace rows.
     assert max(
-        left["wire"] - right["wire"]
+        (left["wire"] - right["wire"])
+        / (right["t"] - left["t"])
         for left, right in zip(recovery, recovery[1:])
-    ) < 0.003
+    ) <= controller.config.vertical_direction_fast_slew_per_s + 1e-9
     assert _maximum_advance_to_brake_reversal(
         [sample["pitch"] for sample in samples]
     ) < math.radians(0.5)
@@ -6172,22 +6174,22 @@ def test_f176_f175_gate0_energy_handoff_has_no_support_dip_or_rebound():
 
     handoff = [sample for sample in samples if 1.125 <= sample["t"] <= 2.219]
     assert any(sample["floor"] > 0.0 for sample in handoff)
-    # Static support is no longer a trajectory owner.  The outer-owned path
-    # can cross it, while response-horizon shaping starts before the eventual
-    # sign reversal and reduces the old-side carry continuously.
-    assert any(sample["target"] < sample["support"] for sample in handoff)
-    assert any(sample["wire"] < sample["support"] for sample in handoff)
+    # Static support is no longer a trajectory owner.  If the outer-owned
+    # response path crosses it, the handoff must still retire the old-side
+    # carry continuously; this regression must not require a below-support
+    # pulse and thereby reject a future safer energy trajectory.
     shaped = [sample for sample in handoff if sample["floor"] > 1e-9]
     assert shaped
     assert shaped[0]["t"] <= 1.922
     # Rows are camera observations with variable 31--156 ms gaps.  Normalize
-    # by elapsed time so a sparse replay cannot look like a command step; the
-    # F175 rebound was about .24 collective/s on consecutive live ticks.
+    # by elapsed time so a sparse replay cannot look like a command step.  The
+    # old neutral snap was about .24 collective/s; the response-boundary path
+    # is limited by the existing, explicit reversal slew instead.
     assert max(
         abs(right["wire"] - left["wire"])
         / (right["t"] - left["t"])
         for left, right in zip(handoff, handoff[1:])
-    ) < 0.05
+    ) <= controller.config.vertical_direction_fast_slew_per_s + 1e-9
     committed = [sample for sample in samples if sample["state"] is CleanCourseState.COMMIT]
     assert committed
     assert committed[0]["t"] <= 2.031
@@ -6196,6 +6198,214 @@ def test_f176_f175_gate0_energy_handoff_has_no_support_dip_or_rebound():
         controller.config.min_thrust <= sample["wire"] <= controller.config.max_thrust
         for sample in samples
     )
+
+
+def _parse_f177_gate0_recorded_prefix(text):
+    rows = []
+    for line in text.splitlines():
+        fields = line.split()
+        rows.append(
+            (
+                float(fields[0]),
+                int(fields[1]),
+                (float(fields[2]), float(fields[3])),
+                (float(fields[4]), float(fields[5])),
+                float(fields[6]),
+                FrameEdge(int(fields[7])),
+                (float(fields[8]), float(fields[9]), float(fields[10])),
+                float(fields[11]),
+            )
+        )
+    return tuple(rows)
+
+
+# Recorded Gate-0 observations from the three F177 traces.  The regression
+# below deliberately consumes only the final twelve-frame ownership seam;
+# earlier open-loop geometry is not treated as a trajectory simulation.
+_F177_GATE0_RECORDED_PREFIXES = {
+    '20260802T095224Z-visual-course-8784afdc': _parse_f177_gate0_recorded_prefix("""\
+2.078 3200948 0.043750 0.172222 0.281250 0.486111 0.984336842 0 -0.077660679 -0.142080622 -0.098473076 -0.409059861
+2.125 3200949 0.053125 0.177778 0.295312 0.502778 0.986052718 0 -0.088755577 -0.129755753 -0.104707334 -0.416730918
+2.172 3200951 0.053125 0.183333 0.309375 0.538889 0.989302036 0 -0.085474691 -0.106257873 -0.103161532 -0.421809736
+2.219 3200952 0.059375 0.183333 0.320312 0.561111 0.991638101 0 -0.092304803 -0.089541974 -0.099367593 -0.426536146
+2.266 3200954 0.068750 0.172222 0.346875 0.602778 0.991362154 0 -0.093157805 -0.076673570 -0.103731621 -0.430132337
+2.313 3200955 0.078125 0.172222 0.364063 0.633333 0.990762081 0 -0.088314026 -0.067437442 -0.101469863 -0.433226907
+2.359 3200956 0.015625 0.166667 0.448437 0.661111 0.959887701 0 -0.073725789 -0.055013193 -0.090807710 -0.436739204
+2.391 3200957 0.031250 0.161111 0.464062 0.688889 0.949216672 0 -0.082505836 -0.046654666 -0.076703001 -0.438570836
+2.438 3200959 0.056250 0.144444 0.489062 0.755556 0.952184403 0 -0.092536776 -0.037569924 -0.045033041 -0.440632533
+2.484 3200960 0.071875 0.133333 0.507812 0.797222 0.956559904 0 -0.054833650 -0.067995506 -0.030593995 -0.442735643
+2.531 3200961 0.087500 0.122222 0.525000 0.850000 0.964222449 0 -0.010465617 -0.053699376 -0.003151153 -0.446137974
+2.578 3200963 0.125000 0.072222 0.570312 0.925000 0.969493897 0 0.035130561 -0.042771774 0.022194769 -0.448334822
+"""),
+    '20260802T095259Z-visual-course-bcdca6ee': _parse_f177_gate0_recorded_prefix("""\
+2.078 3202008 0.050000 0.183333 0.295312 0.500000 0.984209557 0 -0.079337103 -0.157348150 -0.097411581 -0.406486234
+2.109 3202009 0.050000 0.188889 0.300000 0.516667 0.989042208 0 -0.078294931 -0.122762764 -0.099379831 -0.411216742
+2.156 3202010 0.053125 0.183333 0.307813 0.538889 0.991338016 0 -0.091492196 -0.109764645 -0.109130078 -0.417534438
+2.203 3202011 0.056250 0.183333 0.318750 0.558333 0.991899958 0 -0.091969265 -0.092781695 -0.105424345 -0.421941351
+2.250 3202013 0.065625 0.183333 0.343750 0.600000 0.992181689 0 -0.099480627 -0.075021507 -0.103598908 -0.426009442
+2.296 3202014 0.075000 0.177778 0.360938 0.630556 0.991499841 0 -0.090011058 -0.067552367 -0.105492026 -0.429135346
+2.343 3202016 0.025000 0.166667 0.459375 0.691667 0.964988926 0 -0.081090970 -0.056428077 -0.095207207 -0.432300311
+2.390 3202017 0.040625 0.161111 0.475000 0.722222 0.956214129 0 -0.102193711 -0.045117935 -0.074562647 -0.434857083
+2.437 3202018 0.053125 0.150000 0.485938 0.752778 0.954740377 0 -0.079952111 -0.038811794 -0.046967991 -0.436992976
+2.484 3202020 0.087500 0.133333 0.523438 0.844444 0.963163683 0 -0.059334246 -0.078678416 -0.026106716 -0.439275845
+2.531 3202021 0.106250 0.111111 0.546875 0.886111 0.967338752 8 -0.001076242 -0.068054752 -0.001362266 -0.443481714
+2.578 3202023 0.140625 0.038889 0.600000 0.958333 0.966596040 8 0.243073704 -0.044358591 0.024657549 -0.445923462
+"""),
+    '20260802T095323Z-visual-course-9edace67': _parse_f177_gate0_recorded_prefix("""\
+2.109 3202723 0.050000 0.177778 0.295312 0.497222 0.987151546 0 -0.086688927 -0.125857053 -0.097782911 -0.410018223
+2.140 3202724 0.050000 0.183333 0.300000 0.516667 0.989428327 0 -0.088512427 -0.117859294 -0.101839707 -0.413461390
+2.187 3202725 0.050000 0.177778 0.306250 0.533333 0.992772526 0 -0.099062613 -0.089872574 -0.113176481 -0.419081302
+2.234 3202727 0.062500 0.172222 0.331250 0.580556 0.992553674 0 -0.105388692 -0.081615423 -0.113756948 -0.422797654
+2.281 3202728 0.068750 0.172222 0.345313 0.600000 0.991303421 0 -0.103119528 -0.068324519 -0.109980383 -0.426601336
+2.328 3202730 0.012500 0.166667 0.445312 0.655556 0.960135235 0 -0.096276424 -0.059203995 -0.109561586 -0.429367747
+2.375 3202731 0.025000 0.155556 0.459375 0.686111 0.950536466 0 -0.118247597 -0.046327533 -0.093519897 -0.432400424
+2.406 3202732 0.040625 0.150000 0.471875 0.722222 0.950984653 0 -0.116739935 -0.043671274 -0.083772996 -0.433722044
+2.453 3202734 0.068750 0.133333 0.501563 0.797222 0.958327709 0 -0.084342516 -0.088552592 -0.047370349 -0.436536628
+2.500 3202735 0.087500 0.127778 0.520312 0.841667 0.965634982 0 -0.061265899 -0.089261887 -0.030602385 -0.440926283
+2.547 3202736 0.106250 0.111111 0.543750 0.886111 0.969488572 8 0.013744806 -0.050369655 0.005191015 -0.444338494
+2.593 3202738 0.137500 0.038889 0.600000 0.958333 0.967563459 8 0.214732104 -0.048970995 0.028704277 -0.446276471
+"""),
+}
+_F177_GATE0_APERTURES = {
+    ("20260802T095224Z-visual-course-8784afdc", 3200961): (
+        (0.10857789830847364, 0.04334371494675909),
+        (0.22084696293374592, 0.4046110253325066),
+    ),
+    ("20260802T095259Z-visual-course-bcdca6ee", 3202020): (
+        (0.10802849831066452, 0.05380307559495312),
+        (0.21824353733370247, 0.407819387541435),
+    ),
+    ("20260802T095323Z-visual-course-9edace67", 3202735): (
+        (0.10748654678684894, 0.05044478449924228),
+        (0.2164418183868753, 0.4047474664765797),
+    ),
+}
+
+@pytest.mark.parametrize(
+    ("run_id", "first_edge_index"),
+    (
+        ("20260802T095224Z-visual-course-8784afdc", None),
+        ("20260802T095259Z-visual-course-bcdca6ee", 10),
+        ("20260802T095323Z-visual-course-9edace67", 10),
+    ),
+)
+def test_f178_f177_gate0_edge_inequality_cannot_erase_compensated_climb(
+    run_id, first_edge_index
+):
+    # Exact accepted outer observations around Gate 0's close-range topology
+    # boundary.  Trace SHA-256 values, in parameter order:
+    # 18160f7d7dc0a748cf1489d5b8488c58d395123bcca361f29634d25e362eccf9
+    # ab501272b6f504a14be35c13295a902d15269504e744fca2c995c4c51b8a9ba3
+    # 738624d0a6be03cc9901a2b45e64892caffef07bf777595eefbf01a352ccb7cf
+    # (The compact external artifact hashes remain outside Git.)  The first
+    # sequence was credited.  In the latter two, one fresh BOTTOM frame sat
+    # between the last exact aperture and an engulfing frame and caused the
+    # fatal .010--.011 one-tick wire collapse in F177/e3513b2.
+    rows = _F177_GATE0_RECORDED_PREFIXES[run_id][-12:]
+    controller = CleanCourseController(
+        _config(launch_boost_duration_s=0.0)
+    )
+    first = rows[0]
+    initial = _f163_trace_track(
+        track_id="recorded-gate0",
+        outer_center=first[2],
+        outer_span=first[3],
+        confidence=first[4],
+        clipping=first[5],
+    )
+    controller.initialize(
+        _update([initial], frame_id=first[1]),
+        gate_index=0,
+        fallback_center_norm=initial.center_norm,
+        fallback_apparent_scale=initial.apparent_scale,
+        now_s=100.0 + first[0],
+    )
+
+    samples = []
+    for index, row in enumerate(rows):
+        aperture = _F177_GATE0_APERTURES.get((run_id, row[1]))
+        track = _f163_trace_track(
+            track_id="recorded-gate0",
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            clipping=row[5],
+            aperture_center=None if aperture is None else aperture[0],
+            aperture_half=None if aperture is None else aperture[1],
+        )
+        now = 100.0 + row[0]
+        if index:
+            controller.observe(
+                _update([track], frame_id=row[1]),
+                now_s=now,
+                body_rates=row[6],
+            )
+        output = _command(
+            controller,
+            now,
+            pitch=row[7],
+            accel_trust=0.0,
+        )
+        samples.append(
+            {
+                "t": row[0],
+                "raw_edge": controller.current.vertical_censor_edge,
+                "motion_edge": (
+                    None
+                    if controller._last_vertical_motion is None
+                    else controller._last_vertical_motion.directional_censor
+                ),
+                "source": controller._vertical_direction_source,
+                "sign": controller._vertical_direction_sign,
+                "visual": controller._last_vertical_visual_delta,
+                "support": controller._last_vertical_support,
+                "target": controller._last_vertical_collective_target,
+                "wire": output.thrust,
+                "admission": controller._last_commit_admission.status,
+                "last_exact_y_s": controller.current.last_outer_y_measurement_s,
+            }
+        )
+
+    assert controller.config.min_thrust <= min(
+        sample["wire"] for sample in samples
+    )
+    assert max(sample["wire"] for sample in samples) <= (
+        controller.config.max_thrust
+    )
+    if first_edge_index is None:
+        # The credited trace's almost identical outer geometry remained
+        # uncensored and its established climb path stayed continuous.
+        assert all(sample["raw_edge"] == FrameEdge.NONE for sample in samples)
+        assert samples[-2]["target"] > samples[-2]["support"]
+        assert samples[-1]["wire"] >= samples[-2]["wire"] - 0.003
+        return
+
+    previous = samples[first_edge_index - 1]
+    edge = samples[first_edge_index]
+    engulfing = samples[first_edge_index + 1]
+    assert previous["sign"] == -1
+    assert previous["visual"] > 0.0
+    assert previous["target"] > previous["support"]
+    assert edge["raw_edge"] == FrameEdge.BOTTOM
+    assert edge["admission"] == "directionally-censored"
+    # Raw BOTTOM remains immediate visibility/admission evidence, but its
+    # pitch-compensated lower bound is about -.103 and therefore contains
+    # zero.  It cannot replace the established climb with bottom_censor.
+    assert edge["motion_edge"] == FrameEdge.NONE, run_id
+    assert edge["sign"] == -1
+    assert edge["source"] != "bottom_censor"
+    assert edge["visual"] > 0.0
+    assert edge["target"] > edge["support"]
+    assert previous["wire"] - edge["wire"] < 0.006
+    assert edge["wire"] > edge["support"]
+    # The engulfing/republication tick is not a second accepted censor frame.
+    # Carry remains bounded but ages from the last exact observation.
+    assert engulfing["sign"] == -1
+    assert engulfing["source"] != "bottom_censor"
+    assert engulfing["last_exact_y_s"] == pytest.approx(
+        previous["last_exact_y_s"]
+    )
+    assert engulfing["wire"] > engulfing["support"]
 
 
 def test_f170_failed_f168_topology_jump_cannot_cancel_launch_floor():
