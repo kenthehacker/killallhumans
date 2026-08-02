@@ -6094,9 +6094,12 @@ def test_f176_f175_gate0_energy_handoff_has_no_support_dip_or_rebound():
     # 73351EE0F7ABE464951A9C75CFB5C8F9929F690255343460EE9B60F6E24373A7.
     # The live wire fell below tilt support from about1.19--2.11 s, then the
     # direction reversal stepped it sharply upward at2.14.  Replay actual
-    # tracker geometry/rates and attitude through COMMIT.  The minimum launch
-    # energy must smoothstep to support, never pass through it into a dip, and
-    # preserve the safe COMMIT reached by the recorded observations.
+    # tracker geometry/rates and attitude through COMMIT.  F176's static
+    # support floor removed the command dip but also erased the continuous
+    # outer-rate correction and deterministically drove the lower gate edge
+    # out of frame.  The replacement must permit bounded correction across
+    # nominal support while retiring its carried energy before endpoint
+    # reversal, without the recorded one-tick rebound, and preserve COMMIT.
     rows = (
         # t, frame, outer center/span/conf, aperture center/half, rates, pitch, fh
         (0.000, 3073646, (-.006250, -.033333), (.125000, .222222), .847488296, (-.006113, -.042682), (.049318, .100244), (-.000024735, .000363776, -.000001474), -.309571434, .011122872),
@@ -6169,15 +6172,22 @@ def test_f176_f175_gate0_energy_handoff_has_no_support_dip_or_rebound():
 
     handoff = [sample for sample in samples if 1.125 <= sample["t"] <= 2.219]
     assert any(sample["floor"] > 0.0 for sample in handoff)
-    assert all(
-        sample["target"] >= sample["support"] - 1e-12
-        and sample["wire"] >= sample["support"] - 1e-12
-        for sample in handoff
-    )
+    # Static support is no longer a trajectory owner.  The outer-owned path
+    # can cross it, while response-horizon shaping starts before the eventual
+    # sign reversal and reduces the old-side carry continuously.
+    assert any(sample["target"] < sample["support"] for sample in handoff)
+    assert any(sample["wire"] < sample["support"] for sample in handoff)
+    shaped = [sample for sample in handoff if sample["floor"] > 1e-9]
+    assert shaped
+    assert shaped[0]["t"] <= 1.922
+    # Rows are camera observations with variable 31--156 ms gaps.  Normalize
+    # by elapsed time so a sparse replay cannot look like a command step; the
+    # F175 rebound was about .24 collective/s on consecutive live ticks.
     assert max(
         abs(right["wire"] - left["wire"])
+        / (right["t"] - left["t"])
         for left, right in zip(handoff, handoff[1:])
-    ) < 0.003
+    ) < 0.05
     committed = [sample for sample in samples if sample["state"] is CleanCourseState.COMMIT]
     assert committed
     assert committed[0]["t"] <= 2.031

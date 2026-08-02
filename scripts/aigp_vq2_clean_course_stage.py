@@ -2834,6 +2834,11 @@ class CleanCourseController:
             vertical_motion,
             path=vertical_path if vertical_path_fresh else None,
         )
+        collective = self._gate0_arrival_energy_collective(
+            collective,
+            support,
+            vertical_motion,
+        )
         if vertical_motion is not None:
             floor_gate_y = vertical_motion.bearing_error
 
@@ -5891,28 +5896,96 @@ class CleanCourseController:
         target = support + visual_delta + imu_delta + zero_recovery_delta
         if self._vertical_direction_source == "coherent_optical_brake":
             target = min(target, support)
-        unfloored_target = target
-        if (
-            current is self.current
-            and self.gate_index == 0
-            and self._course_start_s is not None
-            and self.config.launch_boost_duration_s > 0.0
-        ):
-            # Gate 0 inherits the bounded launch-energy objective until race
-            # ownership advances.  Boost still smoothsteps to neutral support
-            # and fresh outer vision may request more lift, but no later visual
-            # handoff creates F175's support-to-descent-to-climb cycle.  Exact
-            # zero is emitted on its separate mandatory crossing path.
-            target = max(target, support)
-        self._last_gate0_energy_floor_delta = float(
-            target - unfloored_target
-        )
+        # Gate-0 launch energy is shaped at the response-horizon boundary in
+        # command(), after the time-owned motor spin-up floor has been applied.
+        # Do not impose a static support floor here: F176 proved that nominal
+        # tilt support is not a neutral plant state during the launch/brake
+        # transient, and pinning both target and wire to it erased the only
+        # continuous outer-rate feedback until the gate became BOTTOM-censored.
+        self._last_gate0_energy_floor_delta = 0.0
         self._last_vertical_support = float(support)
         self._last_vertical_visual_delta = float(visual_delta)
         self._last_vertical_imu_delta = float(imu_delta)
         self._last_zero_recovery_delta = float(zero_recovery_delta)
         self._last_vertical_collective_target = float(target)
         return target
+
+    def _gate0_arrival_energy_collective(
+        self,
+        target: float,
+        support: float,
+        motion: Optional[_PassageMotion],
+    ) -> float:
+        """Retire carried Gate-0 vertical energy before endpoint reversal.
+
+        The outer-owned passage law maps a normalized projected miss to
+        collective with ``vertical_optical_collective_gain``.  Invert that
+        same mapping at the real carried-wire boundary: if the current wire
+        and target are still accelerating toward one side, compare their
+        equivalent optical carry with the response-horizon endpoint remaining
+        on that side.  As the endpoint reserve shrinks below the carried
+        energy, taper the *same* target continuously toward tilt support.
+
+        This is not another position/velocity controller and it never chooses
+        the opposite direction.  The existing optical owner commands the
+        eventual reversal; this seam merely makes its launch-to-approach
+        handoff bumpless instead of waiting for a sign crossing and then using
+        fast reversal authority.  Aperture geometry, IMU velocity, and static
+        support do not acquire trajectory ownership here.
+        """
+
+        cfg = self.config
+        original = float(target)
+        if not (
+            self.gate_index == 0
+            and self._course_start_s is not None
+            and cfg.launch_boost_duration_s > 0.0
+            and motion is not None
+            and motion.directional_censor == FrameEdge.NONE
+            and motion.closure_rate_s >= cfg.passage_min_closure_rate_s
+            and self._collective is not None
+        ):
+            self._last_gate0_energy_floor_delta = 0.0
+            return original
+
+        values = (
+            original,
+            float(support),
+            float(self._collective),
+            float(motion.optical_intercept_error),
+            float(motion.physical_rate_norm_s),
+        )
+        if not all(math.isfinite(value) for value in values):
+            self._last_gate0_energy_floor_delta = 0.0
+            return original
+
+        response_endpoint = float(motion.optical_intercept_error) + (
+            float(motion.physical_rate_norm_s) * cfg.commit_blackout_s
+        )
+        target_delta = original - float(support)
+        carry_delta = float(self._collective) - float(support)
+        # Collective and image miss have opposite signs.  Shape only an
+        # established same-direction carry; a newly requested reversal keeps
+        # its ordinary bounded path and a centered/no-energy state is a no-op.
+        if (
+            abs(target_delta) <= 1e-9
+            or abs(carry_delta) <= 1e-9
+            or target_delta * carry_delta <= 0.0
+            or target_delta * response_endpoint >= 0.0
+        ):
+            self._last_gate0_energy_floor_delta = 0.0
+            return original
+
+        equivalent_carry_miss = abs(carry_delta) / max(
+            1e-6, cfg.vertical_optical_collective_gain
+        )
+        remaining_miss = abs(response_endpoint)
+        authority = _clamp01(
+            remaining_miss / max(1e-6, equivalent_carry_miss)
+        )
+        shaped = float(support) + authority * target_delta
+        self._last_gate0_energy_floor_delta = float(shaped - original)
+        return shaped
 
     def _lateral_path_reference(
         self,
@@ -6167,8 +6240,10 @@ class CleanCourseController:
                     )
                 )
             )
-            launch_transfer_active = self._launch_descent_transfer_active(
-                now_s
+            gate0_energy_owned = bool(
+                self.gate_index == 0
+                and self._course_start_s is not None
+                and self.config.launch_boost_duration_s > 0.0
             )
             edge_owned = self._vertical_direction_source in (
                 "bottom_censor",
@@ -6178,14 +6253,12 @@ class CleanCourseController:
                 direction_matches
                 and self._vertical_direction_fast_until_s is not None
                 and now_s <= self._vertical_direction_fast_until_s
-                # F174 retired boost-owned carry to support on an ordinary
-                # Gate-0 image-motion reversal at t=.656, bypassing the very
-                # launch envelope that made the handoff bumpless.  Coherent
-                # motion still shapes the target during that transfer, but it
-                # reaches the wire through the ordinary bounded carry.  A
-                # one-sided frame edge remains an immediate visibility fact
-                # and is never delayed by launch ownership.
-                and (not launch_transfer_active or edge_owned)
+                # Gate 0 now retires carried vertical energy continuously from
+                # the response endpoint.  A later sign crossing must not
+                # bypass that trajectory with a neutral-support jump (F175's
+                # up-dip-up handoff).  One-sided frame censorship remains an
+                # immediate visibility fact and keeps the bounded fast path.
+                and (not gate0_energy_owned or edge_owned)
             )
             if (
                 fast_active
@@ -6244,20 +6317,6 @@ class CleanCourseController:
         self._collective = _clamp(
             self._collective, self.config.min_thrust, self.config.max_thrust
         )
-        if (
-            support is not None
-            and math.isfinite(float(support))
-            and self.gate_index == 0
-            and self._course_start_s is not None
-            and self.config.launch_boost_duration_s > 0.0
-        ):
-            # The Gate-0 launch owner promises a minimum tilt-adjusted energy
-            # trajectory until authoritative ownership advances.  Enforce the
-            # same floor at the carried wire boundary so a rising support
-            # estimate cannot slip through the 0.25 s filter and recreate the
-            # F175 below-support dip.  Mandatory exact zero bypasses this
-            # helper on its separate crossing-safety path.
-            self._collective = max(self._collective, float(support))
         return self._collective
 
     def _governed_collective(
