@@ -1408,6 +1408,7 @@ class CleanCourseController:
         self._vertical_direction_supported = False
         self._vertical_direction_source: Optional[str] = None
         self._vertical_direction_fast_until_s: Optional[float] = None
+        self._vertical_direction_fast_applied = False
         self._vertical_direction_edge_active = False
         self._vertical_direction_magnitude = 0.0
         # Trace the terms at their real controller boundary.  These are
@@ -1917,7 +1918,6 @@ class CleanCourseController:
         # ticks, but cannot silently authorize SEARCH or stale vision.
         self._vertical_direction_supported = False
         self._vertical_direction_source = None
-        self._vertical_direction_magnitude = 0.0
         self._last_vertical_support = None
         self._last_vertical_visual_delta = 0.0
         self._last_vertical_imu_delta = 0.0
@@ -2361,7 +2361,10 @@ class CleanCourseController:
                     target_pitch_rad=commit_pitch_target,
                     yaw_rate_rad_s=commit_yaw,
                     thrust=self._continuous_collective(
-                        commit_target, dt, now_s=now_s
+                        commit_target,
+                        dt,
+                        now_s=now_s,
+                        support=support,
                     ),
                     state=self.state,
                     gate_index=self.gate_index,
@@ -2505,7 +2508,10 @@ class CleanCourseController:
                     ),
                     yaw_rate_rad_s=pending_yaw,
                     thrust=self._continuous_collective(
-                        search_target, dt, now_s=now_s
+                        search_target,
+                        dt,
+                        now_s=now_s,
+                        support=support,
                     ),
                     state=self.state,
                     gate_index=self.gate_index,
@@ -2533,7 +2539,10 @@ class CleanCourseController:
                 target_pitch_rad=target_pitch,
                 yaw_rate_rad_s=sweep_yaw,
                 thrust=self._continuous_collective(
-                    search_target, dt, now_s=now_s
+                    search_target,
+                    dt,
+                    now_s=now_s,
+                    support=support,
                 ),
                 state=self.state,
                 gate_index=self.gate_index,
@@ -2557,7 +2566,10 @@ class CleanCourseController:
                 target_pitch_rad=cfg.spawn_pitch_rad + cfg.brake_pitch_rad,
                 yaw_rate_rad_s=0.0,
                 thrust=self._continuous_collective(
-                    fallback_target, dt, now_s=now_s
+                    fallback_target,
+                    dt,
+                    now_s=now_s,
+                    support=support,
                 ),
                 state=self.state,
                 gate_index=self.gate_index,
@@ -2902,7 +2914,10 @@ class CleanCourseController:
         )
         self._last_vertical_collective_target = float(collective_target)
         thrust = self._continuous_collective(
-            collective_target, dt, now_s=now_s
+            collective_target,
+            dt,
+            now_s=now_s,
+            support=support,
         )
 
         # Lateral: per the 2026-07-29 crossing-geometry analysis, positive
@@ -5327,6 +5342,7 @@ class CleanCourseController:
         self._vertical_direction_supported = False
         self._vertical_direction_source = None
         self._vertical_direction_fast_until_s = None
+        self._vertical_direction_fast_applied = False
         self._vertical_direction_edge_active = False
         self._vertical_direction_magnitude = 0.0
 
@@ -5427,11 +5443,28 @@ class CleanCourseController:
         if censor != FrameEdge.NONE:
             sign = 1 if censor & FrameEdge.BOTTOM else -1
             first_edge_frame = not self._vertical_direction_edge_active
+            continuing_direction = sign == self._vertical_direction_sign
+            error_cap = max(
+                cfg.vertical_optical_error_max_far_norm,
+                cfg.vertical_optical_error_max_near_norm,
+            )
+            edge_magnitude = min(abs(motion.bearing_error), error_cap)
+            if continuing_direction:
+                # Censorship is an inequality, not evidence that the
+                # preceding coherent miss became smaller.  Preserve the last
+                # same-direction motion urgency while distinct fresh edge
+                # frames continue; freshness below supplies the bounded decay
+                # if observations stop.
+                edge_magnitude = max(
+                    edge_magnitude,
+                    self._vertical_direction_magnitude,
+                )
             self._vertical_direction_edge_active = True
-            if sign != self._vertical_direction_sign or first_edge_frame:
+            if not continuing_direction or first_edge_frame:
                 self._vertical_direction_fast_until_s = (
                     now_s + cfg.vertical_direction_fast_window_s
                 )
+                self._vertical_direction_fast_applied = False
             self._vertical_direction_sign = sign
             self._vertical_direction_streak_sign = sign
             self._vertical_direction_streak = max(
@@ -5442,6 +5475,7 @@ class CleanCourseController:
             self._vertical_direction_source = (
                 "bottom_censor" if sign > 0 else "top_censor"
             )
+            self._vertical_direction_magnitude = edge_magnitude
             return
 
         self._vertical_direction_edge_active = False
@@ -5512,6 +5546,7 @@ class CleanCourseController:
                 self._vertical_direction_fast_until_s = (
                     now_s + cfg.vertical_direction_fast_window_s
                 )
+                self._vertical_direction_fast_applied = False
 
         if (
             fresh_y_owned
@@ -5647,19 +5682,24 @@ class CleanCourseController:
                 if self._vertical_direction_supported:
                     if motion.directional_censor != FrameEdge.NONE:
                         magnitude = min(
-                            abs(motion.bearing_error), error_cap
+                            max(
+                                abs(motion.bearing_error),
+                                abs(self._vertical_direction_magnitude),
+                            ),
+                            error_cap,
                         )
                     else:
                         magnitude = min(
                             abs(self._vertical_direction_magnitude),
                             error_cap,
                         )
-                    magnitude *= path.freshness_authority
-                    self._vertical_direction_magnitude = magnitude
+                    effective_magnitude = (
+                        magnitude * path.freshness_authority
+                    )
                     directional_delta = (
                         -cfg.vertical_optical_collective_gain
                         * self._vertical_direction_sign
-                        * magnitude
+                        * effective_magnitude
                     )
                     # Coherent motion/one-sided clipping may reverse a static
                     # compensated bearing near the plane.  When both agree,
@@ -5987,7 +6027,12 @@ class CleanCourseController:
         ) * self._course_range_ramp(current)
 
     def _continuous_collective(
-        self, target: float, dt: float, *, now_s: float
+        self,
+        target: float,
+        dt: float,
+        *,
+        now_s: float,
+        support: Optional[float] = None,
     ) -> float:
         """Carry one bounded collective, with a bounded direction reversal."""
 
@@ -6030,6 +6075,36 @@ class CleanCourseController:
                 and self._vertical_direction_fast_until_s is not None
                 and now_s <= self._vertical_direction_fast_until_s
             )
+            if (
+                fast_active
+                and not self._vertical_direction_fast_applied
+                and support is not None
+                and math.isfinite(float(support))
+            ):
+                neutral = _clamp(
+                    float(support),
+                    self.config.min_thrust,
+                    self.config.max_thrust,
+                )
+                wrong_sign_carry = bool(
+                    (
+                        self._vertical_direction_sign > 0
+                        and target < neutral < self._collective
+                    )
+                    or (
+                        self._vertical_direction_sign < 0
+                        and target > neutral > self._collective
+                    )
+                )
+                if wrong_sign_carry:
+                    # A three-frame coherent reversal has retired the old
+                    # trajectory.  Do not spend the 0.25 s carry filter
+                    # continuing its opposite acceleration: remove only that
+                    # stale bias to tilt support, then retain the ordinary
+                    # bounded filter/slew toward the visual target below.
+                    self._collective = neutral
+                    self._vertical_direction_fast_applied = True
+                    direction_delta = target - self._collective
             alpha = _clamp01(
                 dt
                 / max(

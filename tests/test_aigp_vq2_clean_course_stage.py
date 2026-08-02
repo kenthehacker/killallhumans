@@ -6372,17 +6372,21 @@ def test_f171_f170_gate1_motion_reverses_collective_before_censorship():
     assert motion.control_authority == pytest.approx(0.0)
     assert reversal["vertical_visual"] < 0.0
     assert reversal["vertical_target"] < reversal["support"]
-    assert reversal["wire"] > reversal["support"]
+    # F174: a confirmed trajectory reversal retires only the stale
+    # above-support carry to neutral support, then the ordinary bounded
+    # filter continues toward the visual descent target on the same tick.
+    assert reversal["vertical_target"] <= reversal["wire"]
+    assert reversal["wire"] <= reversal["support"]
 
     filtered_reversal = samples[4.687]
     assert filtered_reversal["wire"] < filtered_reversal["support"]
     assert filtered_reversal["wire"] > 0.25
-    # Scheduling/evidence costs 93 ms and the unchanged bounded collective
-    # path costs 344 ms.  Even the measured 220 ms worst plant delay leaves a
-    # 374 ms response window before the first BOTTOM frame; changing cadence
-    # or command bounds is therefore not the minimal causal candidate.
+    # Scheduling/evidence costs 93 ms, but the old bounded carry no longer
+    # consumes another 344 ms before crossing support.  This is the same seam
+    # isolated live by F173 (360 ms command carry versus ~62 ms scheduling and
+    # ~62 ms actuator follow-up); cadence and command bounds stay unchanged.
     assert 4.343 - 4.250 == pytest.approx(0.093, abs=1e-9)
-    assert 4.687 - 4.343 == pytest.approx(0.344, abs=1e-9)
+    assert reversal["wire"] <= reversal["support"]
     assert 4.687 + 0.220 < 5.281
     assert all(
         controller.config.min_thrust <= output.thrust <= controller.config.max_thrust
@@ -6628,6 +6632,98 @@ def test_f173_f172_successor_lineage_rejects_one_frame_fragment():
 
     assert post_credit_frames == [2966057, 2966058, 2966059, 2966060]
     assert controller._last_reconcile_status == "exact-current"
+
+
+def test_f174_f173_reversal_retires_carry_and_censor_retains_urgency():
+    # F173 flight 20260802T080623Z-visual-course-fb04de6f.  The live reversal
+    # at4.390 made its target descend immediately, but stale above-support
+    # carry remained on the wire for 360 ms.  At5.297 fresh BOTTOM evidence
+    # then replaced motion urgency with a shrinking pitch-compensated bound,
+    # relaxing target .228 -> .246 and finally to support.  This compact public
+    # replay uses the exact later observations that reproduce both contracts.
+    rows = (
+        # t, clean frame, outer center/span/confidence, edge, rates, rpy.
+        (4.922, 3010193, (-.015625, .0944444444), (.2390625, .4222222222), .9638526453, FrameEdge.NONE, (.0385854618, -.0021217133, -.0509672474), (-.1280978671, -.4607568229, -.5720189095)),
+        (5.000, 3010195, (-.009375, .1277777778), (.2546875, .45), .9751215587, FrameEdge.NONE, (.0735609533, .0069662525, -.0404690776), (-.1221256287, -.4612206111, -.5759460244)),
+        (5.031, 3010196, (-.003125, .1555555556), (.2625, .4722222222), .9812630307, FrameEdge.NONE, (.0867045523, .0015884793, -.0330638636), (-.1186458651, -.4612413446, -.5773460154)),
+        (5.062, 3010197, (.00625, .1722222222), (.2765625, .4916666667), .9870998440, FrameEdge.NONE, (.0933672191, -.0003990413, -.0266929950), (-.1157333759, -.4613413134, -.5782403823)),
+        (5.109, 3010199, (.01875, .2166666667), (.2953125, .5277777778), .9926994213, FrameEdge.NONE, (.1245627553, .0024936019, -.0141223615), (-.1099658794, -.4613668218, -.5792823637)),
+        (5.172, 3010200, (.028125, .2444444444), (.309375, .5527777778), .9945639029, FrameEdge.NONE, (.1468748600, .0110528848, .0009746429), (-.1031185446, -.4611474935, -.5796644732)),
+        (5.218, 3010201, (.0375, .2722222222), (.321875, .5777777778), .9960909789, FrameEdge.NONE, (.3879571707, .0316613696, .0302832935), (-.0920649900, -.4600731972, -.5788737715)),
+        (5.250, 3010202, (.05, .3), (.3375, .6027777778), .9977640683, FrameEdge.NONE, (.3817227037, .0403055481, .0557424490), (-.0774738273, -.4586083564, -.5772011233)),
+        (5.297, 3010204, (.071875, .3444444444), (.3671875, .6527777778), .9986213692, FrameEdge.BOTTOM, (.2415880413, .0529311455, .0784137238), (-.0677267527, -.4564948008, -.5740894558)),
+        (5.343, 3010205, (.090625, .35), (.3828125, .65), .9985389455, FrameEdge.BOTTOM, (.3834108264, .0840793631, .0986286391), (-.0552893582, -.4530573326, -.5695912033)),
+        (5.531, 3010211, (.253125, .3166666667), (.525, .6805555556), .9449099209, FrameEdge.BOTTOM, (.3829599173, .0772473893, .3087166388), (-.0046151401, -.4370653416, -.5289714569)),
+        (5.718, 3010216, (.43125, .25), (.56875, .75), .8783564716, FrameEdge.BOTTOM, (.6202157886, .0420987538, .3311250050), (.0552252407, -.4263956118, -.4600109153)),
+        (5.797, 3010219, (.53125, .1111111111), (.4703125, .8888888889), .9568110183, FrameEdge.BOTTOM, (.6137442143, .0315244726, .3291939635), (.0904880261, -.4249738477, -.4321483165)),
+    )
+
+    def track(row):
+        return _f163_trace_track(
+            track_id="recorded-gate1",
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            clipping=row[5],
+        )
+
+    controller = CleanCourseController(_config())
+    base_s = 100.0
+    controller.initialize(
+        _update([track(rows[0])], frame_id=rows[0][1]),
+        gate_index=1,
+        fallback_center_norm=rows[0][2],
+        fallback_apparent_scale=math.sqrt(rows[0][3][0] * rows[0][3][1]),
+        now_s=base_s + rows[0][0],
+    )
+    samples = {}
+    for index, row in enumerate(rows):
+        now = base_s + row[0]
+        if index:
+            controller.observe(
+                _update([track(row)], frame_id=row[1]),
+                now_s=now,
+                body_rates=row[6],
+            )
+        output = _command(
+            controller,
+            now,
+            roll=row[7][0],
+            pitch=row[7][1],
+            yaw=row[7][2],
+            accel_trust=0.0,
+        )
+        samples[row[0]] = {
+            "source": controller._vertical_direction_source,
+            "magnitude": controller._vertical_direction_magnitude,
+            "visual": controller._last_vertical_visual_delta,
+            "support": controller._last_vertical_support,
+            "target": controller._last_vertical_collective_target,
+            "wire": output.thrust,
+            "path_error": controller._last_vertical_path_error,
+        }
+        assert controller.config.min_thrust <= output.thrust <= (
+            controller.config.max_thrust
+        )
+
+    before = samples[5.062]
+    reversal = samples[5.109]
+    assert before["wire"] > before["support"]
+    assert reversal["source"] == "coherent_motion"
+    assert reversal["target"] < reversal["support"]
+    assert reversal["target"] <= reversal["wire"] <= reversal["support"]
+
+    retained = samples[5.250]["magnitude"]
+    assert retained > 0.20
+    for elapsed in (5.297, 5.343, 5.531, 5.718, 5.797):
+        censored = samples[elapsed]
+        assert censored["source"] == "bottom_censor"
+        assert censored["magnitude"] >= retained
+        assert censored["visual"] < 0.0
+        assert censored["target"] < censored["support"]
+    # Static pitch compensation has driven the mathematical center bound to
+    # zero, but fresh one-sided visibility evidence still owns descent.
+    assert samples[5.797]["path_error"] == pytest.approx(0.0)
 
 
 def test_f168_commit_pitch_transfer_and_response_are_direction_safe():
