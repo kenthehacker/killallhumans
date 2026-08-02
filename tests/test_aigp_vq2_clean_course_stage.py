@@ -30,7 +30,6 @@ from scripts.aigp_vq2_clean_course_stage import (
     CleanCourseRuntime,
     CleanCourseState,
     NavigationOutput,
-    _CommitAdmission,
     _directional_brake_response_authority,
     clamp_final_command,
     run_clean_course_stage,
@@ -6467,17 +6466,12 @@ def _f170_gate0_release_track(row, *, track_id="recorded-gate0"):
     )
 
 
-def _replay_f170_gate0_release(*, stop_before_loss=False):
+def _replay_f170_gate0_release():
     controller = CleanCourseController(_config())
     samples = {}
     outputs = []
     base_s = 100.0
-    rows = (
-        _F170_GATE0_RELEASE_ROWS[:-1]
-        if stop_before_loss
-        else _F170_GATE0_RELEASE_ROWS
-    )
-    for index, row in enumerate(rows):
+    for index, row in enumerate(_F170_GATE0_RELEASE_ROWS):
         now = base_s + row[0]
         update = _update(
             [_f170_gate0_release_track(row)], frame_id=row[1]
@@ -6507,112 +6501,31 @@ def _replay_f170_gate0_release(*, stop_before_loss=False):
             "state": controller.state,
             "output": output,
             "admission": admission,
-            "arm_until": controller._crossing_zero_arm_until_s,
         }
     return controller, samples, outputs
 
 
-def test_f171_f170_safe_commit_revoke_still_releases_exact_zero_once():
+def test_f172_f170_revoked_commit_loss_stays_powered_until_current_proof():
+    # F171 flight 20260802T073212Z-visual-course-d863a812 followed F170 almost
+    # exactly through t=2.500, then a delayed release lease converted the first
+    # engulfing-anchor rejection into exact zero at2.547.  Its last nominally
+    # safe frame had only 0.66 px vertical reserve, fresh geometry had already
+    # revoked COMMIT, and Gate0 received no credit before collision.  A revoked
+    # unsafe tube cannot certify a later crossing.  Exact zero remains mandatory
+    # for close loss while COMMIT itself still owns the current safety proof.
     controller, samples, outputs = _replay_f170_gate0_release()
 
     assert samples[1.953]["admission"].admissible
     assert samples[2.093]["state"] is CleanCourseState.COMMIT
-    assert samples[2.172]["arm_until"] == pytest.approx(102.672)
     revoked = samples[2.218]
     assert revoked["state"] is CleanCourseState.TRACK
     assert revoked["admission"].status == "corridor-known/not-contained"
     assert revoked["admission"].y_tube > revoked["admission"].y_safe_half
-    assert revoked["admission"].y_tube < (
-        revoked["admission"].y_safe_half
-        + revoked["admission"].y_clearance_reserve
-    )
-    assert revoked["arm_until"] == pytest.approx(102.672)
-
-    exact_zero = samples[2.562]["output"]
-    assert samples[2.562]["state"] is CleanCourseState.COAST_FOR_CREDIT
-    assert (
-        exact_zero.target_roll_rad,
-        exact_zero.target_pitch_rad,
-        exact_zero.yaw_rate_rad_s,
-        exact_zero.thrust,
-    ) == (0.0, 0.0, 0.0, 0.0)
-    recovery = _command(
-        controller,
-        102.593,
-        roll=_F170_GATE0_RELEASE_ROWS[-1][9][0],
-        pitch=_F170_GATE0_RELEASE_ROWS[-1][9][1],
-        yaw=_F170_GATE0_RELEASE_ROWS[-1][9][2],
-        accel_trust=0.0,
-    )
-    assert recovery.thrust > 0.0
-    assert controller.config.min_thrust <= recovery.thrust <= controller.config.max_thrust
-    assert sum(output.thrust == 0.0 for output in outputs + [recovery]) == 1
+    loss = samples[2.562]
+    assert loss["state"] is not CleanCourseState.COAST_FOR_CREDIT
+    assert loss["output"].thrust > 0.0
+    assert sum(output.thrust == 0.0 for output in outputs) == 0
     assert controller.gate_index == 0
-
-
-def test_f171_crossing_release_expires_and_rejects_tracker_alias_loss():
-    base_s = 100.0
-    controller, samples, _outputs = _replay_f170_gate0_release(
-        stop_before_loss=True
-    )
-    assert samples[2.218]["arm_until"] == pytest.approx(102.672)
-    loss = _F170_GATE0_RELEASE_ROWS[-1]
-    controller.observe(
-        _update([_f170_gate0_release_track(loss)], frame_id=loss[1] + 100),
-        now_s=base_s + 2.703,
-        body_rates=loss[8],
-    )
-    expired = _command(
-        controller,
-        base_s + 2.703,
-        roll=loss[9][0],
-        pitch=loss[9][1],
-        yaw=loss[9][2],
-        accel_trust=0.0,
-    )
-    assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
-    assert expired.thrust > 0.0
-
-    controller, samples, _outputs = _replay_f170_gate0_release(
-        stop_before_loss=True
-    )
-    visible = _F170_GATE0_RELEASE_ROWS[-2]
-    alias = _f170_gate0_release_track(visible, track_id="fresh-alias")
-    controller.observe(
-        _update([alias], frame_id=visible[1] + 1),
-        now_s=base_s + 2.250,
-        body_rates=visible[8],
-    )
-    alias_output = _command(
-        controller,
-        base_s + 2.250,
-        roll=visible[9][0],
-        pitch=visible[9][1],
-        yaw=visible[9][2],
-        accel_trust=0.0,
-    )
-    assert controller.state is not CleanCourseState.COAST_FOR_CREDIT
-    assert controller._crossing_zero_arm_until_s is None
-    assert alias_output.thrust > 0.0
-
-
-def test_f171_crossing_release_never_survives_a_center_budget_escape():
-    controller = CleanCourseController(_config())
-    admission = _CommitAdmission(
-        False,
-        "corridor-known/not-contained",
-        x_tube=0.10,
-        y_tube=0.10,
-        x_budget=0.05,
-        y_budget=0.05,
-        x_center_error=0.06,
-        y_center_error=0.0,
-        x_safe_half=0.12,
-        y_safe_half=0.12,
-        x_clearance_reserve=0.08,
-        y_clearance_reserve=0.08,
-    )
-    assert not controller._commit_tube_inside_mathematical_opening(admission)
 
 
 def test_f168_commit_pitch_transfer_and_response_are_direction_safe():
