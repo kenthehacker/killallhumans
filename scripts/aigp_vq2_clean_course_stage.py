@@ -653,6 +653,14 @@ SEARCH_SWEEP_GAIN = 2.0  # heading-error gain to the bounded yaw rate
 # restoring the deleted persistence/age qualification.  The derotated reference
 # remains the sole command-bearing state.
 TURN_REFERENCE_TAU_S = 0.15
+# F178 fixed-hash Gate-1 flights measured 0.375--0.422 s from the first
+# bank-reversal request to actual roll crossing zero.  A position-centered
+# camera is therefore not a velocity-centered aircraft.  Project the
+# current-gate optical plane intercept through at most this measured response
+# horizon so the carried bank can be retired before the image center crosses.
+# The horizon is shortened from measured roll by the existing bounded target
+# slew; it is not additional roll authority and cannot change command bounds.
+LATERAL_ROLL_UNWIND_HORIZON_S = 0.42
 BLEND_FAR_LOG_SCALE = -1.6  # below this the successor gets no blend
 BLEND_NEAR_LOG_SCALE = -0.9  # at this apparent scale closure reaches one
 SUCCESSOR_MIN_LOG_SCALE_GAP = 0.25  # successor must remain visibly farther
@@ -890,6 +898,10 @@ class _ApertureCorridorCertificate:
     half_ratio_y: float
     center_std_x_norm: float
     center_std_y_norm: float
+    # False means the frame independently met passage geometry semantics.
+    # True means a later fitted-but-non-passage frame conservatively continued
+    # an already certified same-track corridor; it can never originate one.
+    continuity_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -905,6 +917,7 @@ class _TransportedCorridor:
     center_std_x: float
     center_std_y: float
     live: bool
+    continuity_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -915,6 +928,7 @@ class _CommitAdmission:
     status: str
     corridor_known: bool = False
     corridor_live: bool = False
+    corridor_continuity_only: bool = False
     corridor_age_s: Optional[float] = None
     x_tube: Optional[float] = None
     y_tube: Optional[float] = None
@@ -1164,6 +1178,7 @@ class CleanCourseConfig:
     max_target_roll_rad: float = MAX_TARGET_ROLL_RAD
     roll_pursuit_slew_rad_s: float = ROLL_PURSUIT_SLEW_RAD_S
     roll_pursuit_fast_ex_norm: float = ROLL_PURSUIT_FAST_EX_NORM
+    lateral_roll_unwind_horizon_s: float = LATERAL_ROLL_UNWIND_HORIZON_S
     yaw_error_sign: float = YAW_ERROR_SIGN
     yaw_error_gain: float = YAW_ERROR_GAIN
     max_yaw_rate_rad_s: float = MAX_COURSE_YAW_RATE_RAD_S
@@ -1394,6 +1409,17 @@ class CleanCourseController:
         self._last_lateral_direction_override_x = 0.0
         self._last_lateral_direction_sign = 0
         self._last_lateral_reversal_sign = 0
+        # Distinct-frame trend of the current gate's optical plane intercept.
+        # It is keyed to the current hypothesis and reset on authoritative gate
+        # change; command-loop republications cannot manufacture acceleration.
+        self._lateral_response_track_id: Optional[str] = None
+        self._lateral_response_observation_s: Optional[float] = None
+        self._lateral_response_intercept_x: Optional[float] = None
+        self._lateral_response_intercept_trend_x_s = 0.0
+        self._lateral_response_trend_samples: List[float] = []
+        self._last_lateral_response_horizon_s = 0.0
+        self._last_lateral_response_endpoint_x = 0.0
+        self._last_lateral_response_delta_x = 0.0
         self._last_vertical_motion: Optional[_PassageMotion] = None
         # Near-plane vertical direction is a trajectory state, deliberately
         # separate from the attitude-compensated image bearing.  The streak is
@@ -1479,6 +1505,7 @@ class CleanCourseController:
         self._last_lateral_direction_override_x = 0.0
         self._last_lateral_direction_sign = 0
         self._last_lateral_reversal_sign = 0
+        self._reset_lateral_response()
         self._last_vertical_motion = None
         self._promoted_reconcile_gate_index = None
         self._promoted_reconcile_expiry_s = None
@@ -1815,6 +1842,7 @@ class CleanCourseController:
         # the newly authoritative leg.
         self._reset_vertical_direction()
         self._clear_current_fresh_observation()
+        self._reset_lateral_response()
         self._near_plane_since_s = None
         self._commit_safe_since_s = None
         self._commit_entry_s = None
@@ -1946,6 +1974,9 @@ class CleanCourseController:
         self._last_lateral_direction_override_x = 0.0
         self._last_lateral_direction_sign = 0
         self._last_lateral_reversal_sign = 0
+        self._last_lateral_response_horizon_s = 0.0
+        self._last_lateral_response_endpoint_x = 0.0
+        self._last_lateral_response_delta_x = 0.0
         self._zero_recovery_applied = False
         self._pre_cross_brake_active = False  # main path recomputes below
         self._successor_heading_blend = 0.0
@@ -2273,6 +2304,7 @@ class CleanCourseController:
                     self.current,
                     self.successor,
                     successor_authority=commit_blend,
+                    roll_rad=roll_rad,
                     now_s=now_s,
                     dt=dt,
                 )
@@ -2475,6 +2507,7 @@ class CleanCourseController:
                             self.current,
                             self.successor,
                             successor_authority=pending_blend,
+                            roll_rad=roll_rad,
                             now_s=now_s,
                             dt=dt,
                             current_path_released=True,
@@ -2646,6 +2679,7 @@ class CleanCourseController:
             current,
             self.successor,
             successor_authority=blend,
+            roll_rad=roll_rad,
             now_s=now_s,
             dt=dt,
         )
@@ -3217,6 +3251,7 @@ class CleanCourseController:
         common = {
             "corridor_known": True,
             "corridor_live": corridor.live,
+            "corridor_continuity_only": corridor.continuity_only,
             "corridor_age_s": corridor.source_age_s,
         }
         fresh_outer_frame = bool(
@@ -4243,7 +4278,16 @@ class CleanCourseController:
         gate_index: Optional[int],
         scale_credible: bool = True,
     ) -> None:
-        """Capture a passage-usable aperture against the co-timed outer box."""
+        """Capture or conservatively continue one race-owned corridor.
+
+        A passage-usable fit is the only evidence allowed to originate or
+        independently replace a certificate.  Once that contract is met, a
+        fresh complete fitted tracking geometry may continue the same-track,
+        same-authoritative-gate certificate through a close-range confidence
+        or temporal-prior seam.  Continuation intersects the transported
+        nominal opening with the current fitted opening, so it can only retain
+        or narrow passage geometry and never bypass body-clearance containment.
+        """
 
         aperture = _track_aperture(track)
         aperture_meas = _aperture_track_measurement(track)
@@ -4254,7 +4298,6 @@ class CleanCourseController:
             aperture is None
             or aperture_meas is None
             or not scale_credible
-            or not bool(getattr(aperture, "passage_usable", False))
             or getattr(aperture, "half_size_norm", None) is None
             or bool(
                 clipping
@@ -4283,23 +4326,100 @@ class CleanCourseController:
             and existing.frame_identity == identity
         ):
             return
+        passage_usable = bool(getattr(aperture, "passage_usable", False))
+        continuity_only = False
+        center_x = float(center[0])
+        center_y = float(center[1])
+        center_std_x = max(1e-3, float(stds[0]))
+        center_std_y = max(1e-3, float(stds[1]))
+        if not passage_usable:
+            # Tracking geometry cannot create passage authority.  It may only
+            # continue a live lineage whose nominal geometry was already
+            # certified for this exact race-owned gate.
+            all_edges = (
+                FrameEdge.LEFT
+                | FrameEdge.TOP
+                | FrameEdge.RIGHT
+                | FrameEdge.BOTTOM
+            )
+            aperture_clipping = getattr(aperture, "clipping", FrameEdge.NONE)
+            if type(aperture_clipping) is not FrameEdge:
+                aperture_clipping = FrameEdge.NONE
+            visible_edges = getattr(aperture, "visible_edges", FrameEdge.NONE)
+            complete_visibility = bool(
+                getattr(aperture, "complete_visibility", visible_edges == all_edges)
+            )
+            if (
+                identity is None
+                or gate_index is None
+                or existing is None
+                or existing.track_id != hypothesis.track_id
+                or existing.gate_index != gate_index
+                or aperture_clipping != FrameEdge.NONE
+                or not complete_visibility
+            ):
+                return
+            predicted = self._transported_corridor(
+                hypothesis,
+                now_s=now_s,
+                gate_index=gate_index,
+            )
+            if predicted is None:
+                return
+
+            def conservative_intersection(
+                nominal_center: float,
+                nominal_half: float,
+                fitted_center: float,
+                fitted_half: float,
+            ) -> Optional[Tuple[float, float]]:
+                lower = max(
+                    nominal_center - nominal_half,
+                    fitted_center - fitted_half,
+                )
+                upper = min(
+                    nominal_center + nominal_half,
+                    fitted_center + fitted_half,
+                )
+                if upper - lower <= 2e-6:
+                    return None
+                return 0.5 * (lower + upper), 0.5 * (upper - lower)
+
+            x_intersection = conservative_intersection(
+                predicted.center_x,
+                predicted.half_x,
+                center_x,
+                half_x,
+            )
+            y_intersection = conservative_intersection(
+                predicted.center_y,
+                predicted.half_y,
+                center_y,
+                half_y,
+            )
+            if x_intersection is None or y_intersection is None:
+                return
+            center_x, half_x = x_intersection
+            center_y, half_y = y_intersection
+            center_std_x = max(center_std_x, predicted.center_std_x)
+            center_std_y = max(center_std_y, predicted.center_std_y)
+            continuity_only = True
         hypothesis.corridor_certificate = _ApertureCorridorCertificate(
             track_id=hypothesis.track_id,
             gate_index=gate_index,
             frame_identity=identity,
             source_s=float(now_s),
-            aperture_center_x=float(center[0]),
-            aperture_center_y=float(center[1]),
+            aperture_center_x=center_x,
+            aperture_center_y=center_y,
             aperture_half_x=half_x,
             aperture_half_y=half_y,
-            offset_ratio_x=(float(center[0]) - float(outer_center[0]))
-            / outer_half_x,
-            offset_ratio_y=(float(center[1]) - float(outer_center[1]))
-            / outer_half_y,
+            offset_ratio_x=(center_x - float(outer_center[0])) / outer_half_x,
+            offset_ratio_y=(center_y - float(outer_center[1])) / outer_half_y,
             half_ratio_x=half_x / outer_half_x,
             half_ratio_y=half_y / outer_half_y,
-            center_std_x_norm=max(1e-3, float(stds[0])),
-            center_std_y_norm=max(1e-3, float(stds[1])),
+            center_std_x_norm=center_std_x,
+            center_std_y_norm=center_std_y,
+            continuity_only=continuity_only,
         )
 
     def _transported_corridor(
@@ -4370,6 +4490,7 @@ class CleanCourseController:
             center_std_x=float(center_std_x),
             center_std_y=float(center_std_y),
             live=live,
+            continuity_only=certificate.continuity_only,
         )
 
     def _hypothesis_from_track(
@@ -5430,6 +5551,20 @@ class CleanCourseController:
         self._vertical_direction_edge_active = False
         self._vertical_direction_magnitude = 0.0
 
+    def _reset_lateral_response(
+        self, track_id: Optional[str] = None
+    ) -> None:
+        """Clear current-gate plane-intercept trend at an ownership seam."""
+
+        self._lateral_response_track_id = track_id
+        self._lateral_response_observation_s = None
+        self._lateral_response_intercept_x = None
+        self._lateral_response_intercept_trend_x_s = 0.0
+        self._lateral_response_trend_samples: List[float] = []
+        self._last_lateral_response_horizon_s = 0.0
+        self._last_lateral_response_endpoint_x = 0.0
+        self._last_lateral_response_delta_x = 0.0
+
     @staticmethod
     def _projected_passage_direction(
         motion: _PassageMotion,
@@ -6136,12 +6271,132 @@ class CleanCourseController:
             )
         return desired
 
+    def _lateral_response_horizon_reference(
+        self,
+        current: _Hypothesis,
+        motion: _PassageMotion,
+        desired: float,
+        *,
+        roll_rad: float,
+        now_s: float,
+        current_edge: FrameEdge,
+        current_path_released: bool,
+    ) -> Tuple[float, int]:
+        """Retire carried bank using a fresh current-gate stopping horizon.
+
+        ``motion.optical_intercept_error`` already combines current image-x
+        motion with outer-owned closure/TTC.  Its distinct-frame trend predicts
+        where that plane intercept will be when the measured bank can unwind.
+        Only an established post-Gate0 current-gate bank may be weakened or
+        reversed; this path cannot strengthen the carried bank, influence yaw,
+        consume successor evidence, or alter the Gate0 controller.
+        """
+
+        cfg = self.config
+        optical = float(motion.optical_intercept_error)
+        if self._lateral_response_track_id != current.track_id:
+            self._reset_lateral_response(current.track_id)
+
+        observation_s = (
+            self._current_fresh_observation_s
+            if self._current_fresh_observation_track_id == current.track_id
+            else None
+        )
+        if (
+            observation_s is not None
+            and (
+                self._lateral_response_observation_s is None
+                or observation_s > self._lateral_response_observation_s + 1e-9
+            )
+        ):
+            previous_s = self._lateral_response_observation_s
+            previous_intercept = self._lateral_response_intercept_x
+            if previous_s is not None and previous_intercept is not None:
+                observation_dt = float(observation_s) - float(previous_s)
+                if observation_dt > 1e-6:
+                    # A three-slope median rejects one detector/topology jump.
+                    # The geometric bound is the complete normalized image
+                    # interval traversed during one measured unwind horizon.
+                    trend_limit = 2.0 / max(
+                        1e-6, cfg.lateral_roll_unwind_horizon_s
+                    )
+                    raw_trend = _clamp(
+                        (optical - float(previous_intercept)) / observation_dt,
+                        -trend_limit,
+                        trend_limit,
+                    )
+                    self._lateral_response_trend_samples.append(raw_trend)
+                    del self._lateral_response_trend_samples[:-3]
+                    ordered = sorted(self._lateral_response_trend_samples)
+                    robust_trend = ordered[len(ordered) // 2]
+                    alpha = _clamp01(
+                        observation_dt
+                        / max(
+                            1e-6,
+                            cfg.turn_reference_tau_s + observation_dt,
+                        )
+                    )
+                    self._lateral_response_intercept_trend_x_s += alpha * (
+                        robust_trend
+                        - self._lateral_response_intercept_trend_x_s
+                    )
+            self._lateral_response_observation_s = float(observation_s)
+            self._lateral_response_intercept_x = optical
+
+        if (
+            self.gate_index <= 0
+            or current_path_released
+            or observation_s is None
+            or now_s - observation_s > cfg.predict_frame_gap_s
+            or current_edge != FrameEdge.NONE
+            or motion.closure_rate_s < cfg.passage_min_closure_rate_s
+            or not math.isfinite(float(roll_rad))
+        ):
+            return float(desired), 0
+
+        # The existing bounded roll-target slew predicts how long the measured
+        # bank needs to reach neutral, capped by the 0.375--0.422 s live plant
+        # horizon.  This is anticipation, not added roll authority.
+        unwind_s = min(
+            cfg.lateral_roll_unwind_horizon_s,
+            abs(float(roll_rad)) / max(1e-6, cfg.target_slew_rad_s),
+        )
+        trend = float(self._lateral_response_intercept_trend_x_s)
+        if unwind_s <= 0.0 or not math.isfinite(trend):
+            return float(desired), 0
+        response_endpoint = _clamp(optical + trend * unwind_s, -1.0, 1.0)
+        self._last_lateral_response_horizon_s = float(unwind_s)
+        self._last_lateral_response_endpoint_x = float(response_endpoint)
+
+        # Convert measured bank back into the controller reference convention.
+        bank_reference = float(roll_rad) * cfg.roll_error_sign
+        if (
+            abs(bank_reference) <= 1e-9
+            or optical * bank_reference <= 0.0
+            or trend * bank_reference >= 0.0
+        ):
+            return float(desired), 0
+
+        shaped = float(desired)
+        if bank_reference < 0.0 and response_endpoint > shaped:
+            shaped = response_endpoint
+        elif bank_reference > 0.0 and response_endpoint < shaped:
+            shaped = response_endpoint
+        self._last_lateral_response_delta_x = float(shaped - desired)
+        reversal_sign = (
+            (1 if response_endpoint > 0.0 else -1)
+            if response_endpoint * bank_reference < 0.0
+            else 0
+        )
+        return _clamp(shaped, -1.0, 1.0), reversal_sign
+
     def _lateral_intercept_reference(
         self,
         current: _Hypothesis,
         successor: Optional[_Hypothesis],
         *,
         successor_authority: float,
+        roll_rad: float,
         now_s: float,
         dt: float,
         current_path_released: bool = False,
@@ -6163,6 +6418,17 @@ class CleanCourseController:
         current_desired = self._lateral_path_reference(
             current_motion,
             record=True,
+        )
+        current_desired, response_reversal_sign = (
+            self._lateral_response_horizon_reference(
+                current,
+                current_motion,
+                current_desired,
+                roll_rad=roll_rad,
+                now_s=now_s,
+                current_edge=current_edge,
+                current_path_released=current_path_released,
+            )
         )
         direction_sign, _direction_magnitude = (
             self._projected_passage_direction(current_motion)
@@ -6211,8 +6477,10 @@ class CleanCourseController:
             )
             desired = desired + authority * (successor_desired - desired)
         turn_reference = self._turn_reference_x
-        coordinated_reversal_sign = 0
+        coordinated_reversal_sign = response_reversal_sign
         if (
+            coordinated_reversal_sign == 0
+            and
             not current_path_released
             and coherent_current_sign != 0
             and desired * coherent_current_sign > 0.0
@@ -7101,6 +7369,7 @@ def _clean_course_tick_trace(
                     corridor.center_std_y,
                 ],
                 "live": corridor.live,
+                "continuity_only": corridor.continuity_only,
             }
         current_trace = {
             "track_id": current.track_id,
@@ -7171,6 +7440,9 @@ def _clean_course_tick_trace(
             "status": admission.status,
             "corridor_known": admission.corridor_known,
             "corridor_live": admission.corridor_live,
+            "corridor_continuity_only": (
+                admission.corridor_continuity_only
+            ),
             "corridor_age_s": admission.corridor_age_s,
             "x_tube": admission.x_tube,
             "y_tube": admission.y_tube,
@@ -7226,6 +7498,16 @@ def _clean_course_tick_trace(
                 controller._last_lateral_direction_sign
             ),
             "reversal_sign": controller._last_lateral_reversal_sign,
+            "response_horizon_s": (
+                controller._last_lateral_response_horizon_s
+            ),
+            "response_endpoint_x": (
+                controller._last_lateral_response_endpoint_x
+            ),
+            "response_delta_x": controller._last_lateral_response_delta_x,
+            "intercept_trend_x_s": (
+                controller._lateral_response_intercept_trend_x_s
+            ),
         },
         "lateral_passage_motion": passage_motion_trace(
             controller._last_lateral_motion

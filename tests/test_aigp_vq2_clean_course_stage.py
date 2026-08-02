@@ -5017,6 +5017,8 @@ def _f163_trace_track(
     aperture_center=None,
     aperture_half=None,
     aperture_log_scale=None,
+    aperture_confidence=0.90,
+    aperture_passage_usable=True,
     clipping=FrameEdge.NONE,
 ):
     """Faithful recorded-state adapter using the real tracker unit contract.
@@ -5043,10 +5045,19 @@ def _f163_trace_track(
                 if aperture_log_scale is None
                 else float(aperture_log_scale)
             ),
-            confidence=0.90,
+            confidence=float(aperture_confidence),
             measurement_std=(0.006, 0.009, 0.03),
-            passage_usable=True,
+            passage_usable=bool(aperture_passage_usable),
             half_size_norm=tuple(float(v) for v in aperture_half),
+            fitted=True,
+            complete_visibility=True,
+            clipping=FrameEdge.NONE,
+            visible_edges=(
+                FrameEdge.LEFT
+                | FrameEdge.TOP
+                | FrameEdge.RIGHT
+                | FrameEdge.BOTTOM
+            ),
         )
     return SimpleNamespace(
         track_id=track_id,
@@ -6738,6 +6749,15 @@ def _replay_f170_gate1_latency_rows():
             "lateral_direction_sign": controller._last_lateral_direction_sign,
             "lateral_reversal_sign": controller._last_lateral_reversal_sign,
             "lateral_reference": controller._lateral_intercept_reference_x,
+            "lateral_response_horizon": (
+                controller._last_lateral_response_horizon_s
+            ),
+            "lateral_response_endpoint": (
+                controller._last_lateral_response_endpoint_x
+            ),
+            "lateral_response_delta": (
+                controller._last_lateral_response_delta_x
+            ),
             "output": output,
         }
     return controller, samples, outputs
@@ -6826,7 +6846,14 @@ def test_f171_f170_fresh_bottom_and_projected_lateral_reversal_own_immediately()
 
     before = samples[5.359]
     assert before["lateral_motion"].optical_intercept_error < 0.0
-    assert before["output"].target_roll_rad < 0.0
+    # F179: the distinct-frame plane-intercept trend predicts the reversal
+    # through the measured bank-unwind horizon.  Current-gate roll therefore
+    # retires before the instantaneous mathematical intercept changes sign.
+    assert before["lateral_response_horizon"] > 0.0
+    assert before["lateral_response_endpoint"] > 0.0
+    assert before["lateral_response_delta"] > 0.0
+    assert before["lateral_reversal_sign"] == 1
+    assert before["output"].target_roll_rad > 0.0
     reversal = samples[5.406]
     lateral = reversal["lateral_motion"]
     assert lateral.bearing_error > 0.0
@@ -7514,6 +7541,203 @@ def test_f163_gate1_trace_transports_geometry_without_modality_false_closure():
         "corridor-known/not-contained"
     )
     assert not controller._last_commit_admission.admissible
+
+
+_F178_GATE1_RESPONSE_ROWS = (
+    # Narrow suffix of run 20260802T105051Z-visual-course-44075b1d, trace
+    # fd95794f9d8e938696fdd31ad6e26a7bfcf82a1695a678737ee6fcc39610078c.
+    # t, frame, outer center/span/confidence, body rates, rpy.
+    (3.235, 3306189, (-.334375, .044444), (.107813, .211111), .715502, (-.242249, -.006706, -.330014), (.029429, -.454626, -.189146)),
+    (3.360, 3306192, (-.306250, .027778), (.110938, .216667), .732290, (-.294377, -.011606, -.347323), (.014690, -.455682, -.230981)),
+    (3.485, 3306196, (-.262500, .000000), (.114063, .230556), .743537, (-.513419, -.007800, -.329214), (-.011511, -.456867, -.277263)),
+    (3.610, 3306200, (-.212500, -.033333), (.118750, .247222), .752397, (-.582900, .004382, -.329280), (-.060423, -.458402, -.320664)),
+    (3.735, 3306204, (-.162500, -.061111), (.123438, .261111), .766526, (-.420798, .016046, -.329578), (-.102773, -.460330, -.366615)),
+    (3.860, 3306207, (-.128125, -.077778), (.128125, .275000), .778385, (-.364134, .019106, -.329602), (-.131943, -.463049, -.415164)),
+    (3.985, 3306211, (-.090625, -.088889), (.134375, .288889), .780772, (-.222279, .018628, -.237993), (-.147957, -.465559, -.455954)),
+    (4.125, 3306215, (-.068750, -.100000), (.145312, .302778), .795898, (-.123999, .017300, -.178462), (-.156804, -.467445, -.489168)),
+    (4.219, 3306218, (-.059375, -.100000), (.150000, .313889), .807424, (-.079387, .015796, -.159333), (-.158418, -.468283, -.505653)),
+    (4.329, 3306221, (-.053125, -.094444), (.159375, .325000), .830244, (-.059165, .015260, -.140151), (-.157864, -.469061, -.522772)),
+    (4.391, 3306223, (-.046875, -.088889), (.165625, .333333), .848601, (-.058305, .015457, -.139908), (-.157077, -.469500, -.532689)),
+    (4.438, 3306225, (-.040625, -.083333), (.170312, .338889), .873937, (-.054037, .015576, -.131226), (-.156262, -.469834, -.542105)),
+    (4.516, 3306227, (-.034375, -.072222), (.176562, .350000), .891722, (-.048124, .015861, -.113440), (-.155286, -.470131, -.552765)),
+    (4.625, 3306231, (-.028125, -.055556), (.192188, .366667), .928623, (-.004957, .016330, -.075265), (-.151988, -.470019, -.565020)),
+    (4.719, 3306233, (-.025000, -.050000), (.200000, .375000), .948683, (.029428, .017599, -.060698), (-.147293, -.469458, -.572222)),
+    (4.797, 3306236, (-.021875, -.038889), (.212500, .391667), .950520, (.034783, .018448, -.057728), (-.142810, -.468758, -.577462)),
+    (4.875, 3306238, (-.018750, -.033333), (.220312, .400000), .947637, (.043156, .020890, -.048013), (-.137155, -.467772, -.582193)),
+    (4.922, 3306239, (-.018750, -.033333), (.225000, .408333), .947705, (.057826, .021881, -.045198), (-.134213, -.467161, -.584455)),
+    (4.969, 3306241, (-.012500, -.027778), (.235938, .425000), .948297, (.068550, .007423, -.044763), (-.129769, -.466598, -.587001)),
+    (5.016, 3306242, (-.012500, -.027778), (.240625, .430556), .949853, (.075988, .004070, -.041180), (-.125278, -.466814, -.589367)),
+    (5.047, 3306243, (-.009375, -.022222), (.245313, .438889), .950789, (.086498, .008872, -.033622), (-.121771, -.466701, -.590809)),
+    (5.079, 3306244, (-.009375, -.022222), (.250000, .447222), .954654, (.093353, .007989, -.028030), (-.118805, -.466562, -.591766)),
+    (5.110, 3306245, (-.003125, -.022222), (.257812, .455556), .959714, (.097949, .005094, -.023954), (-.115778, -.466484, -.592560)),
+    (5.157, 3306246, (.003125, -.016667), (.267188, .472222), .964781, (.115226, .005834, -.021360), (-.110032, -.466361, -.593798)),
+)
+
+
+def _replay_f178_gate1_response(*, response_horizon_s=0.42):
+    nominal_row = next(
+        row for row in _F178_GATE1_RESPONSE_ROWS if row[0] == 4.438
+    )
+    nominal_center = (-.0620852365, -.1528129705)
+    nominal_half = (.0539122930, .0876750328)
+    offset_ratio = tuple(
+        (nominal_center[axis] - nominal_row[2][axis]) / nominal_row[3][axis]
+        for axis in range(2)
+    )
+    half_ratio = tuple(
+        nominal_half[axis] / nominal_row[3][axis] for axis in range(2)
+    )
+    controller = CleanCourseController(
+        _config(lateral_roll_unwind_horizon_s=response_horizon_s)
+    )
+    samples = []
+    for index, row in enumerate(_F178_GATE1_RESPONSE_ROWS):
+        aperture_center = (
+            None
+            if row[0] < 4.438
+            else tuple(
+                row[2][axis] + offset_ratio[axis] * row[3][axis]
+                for axis in range(2)
+            )
+        )
+        aperture_half = (
+            None
+            if row[0] < 4.438
+            else tuple(
+                half_ratio[axis] * row[3][axis] for axis in range(2)
+            )
+        )
+        nominal_frame = row[0] == 4.438
+        track = _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            aperture_center=aperture_center,
+            aperture_half=aperture_half,
+            aperture_confidence=(.90 if nominal_frame else .22),
+            aperture_passage_usable=nominal_frame,
+        )
+        now = 100.0 + row[0]
+        update = _update([track], frame_id=row[1])
+        if index == 0:
+            controller.initialize(
+                update,
+                gate_index=1,
+                fallback_center_norm=row[2],
+                fallback_apparent_scale=math.sqrt(row[3][0] * row[3][1]),
+                now_s=now,
+            )
+        else:
+            controller.observe(update, now_s=now, body_rates=row[5])
+        output = _command(
+            controller,
+            now,
+            roll=row[6][0],
+            pitch=row[6][1],
+            yaw=row[6][2],
+            accel_trust=0.0,
+        )
+        corridor = controller._transported_corridor(
+            controller.current, now_s=now
+        )
+        samples.append(
+            {
+                "row": row,
+                "output": output,
+                "corridor": corridor,
+                "response_delta": controller._last_lateral_response_delta_x,
+                "response_endpoint": (
+                    controller._last_lateral_response_endpoint_x
+                ),
+                "response_horizon": (
+                    controller._last_lateral_response_horizon_s
+                ),
+                "admission": controller._last_commit_admission,
+            }
+        )
+    return controller, samples
+
+
+def test_f179_f178_gate1_response_horizon_retires_bank_before_center_crossing():
+    controller, samples = _replay_f178_gate1_response()
+    _legacy, legacy_samples = _replay_f178_gate1_response(response_horizon_s=0.0)
+
+    anticipatory = [sample for sample in samples if sample["response_delta"] > 0.0]
+    assert anticipatory
+    first = anticipatory[0]
+    assert first["row"][2][0] < 0.0
+    assert first["response_horizon"] > 0.0
+    assert first["response_horizon"] <= (
+        controller.config.lateral_roll_unwind_horizon_s + 1e-9
+    )
+    before_cross = next(sample for sample in samples if sample["row"][0] == 5.110)
+    legacy_before_cross = next(
+        sample for sample in legacy_samples if sample["row"][0] == 5.110
+    )
+    assert before_cross["row"][2][0] < 0.0
+    assert before_cross["response_endpoint"] > 0.0
+    assert before_cross["output"].target_roll_rad >= 0.0
+    assert legacy_before_cross["output"].target_roll_rad < 0.0
+    assert before_cross["output"].yaw_rate_rad_s < 0.0
+    assert controller.gate_index == 1
+    assert controller.successor is None
+
+
+def test_f179_f178_fitted_tracking_geometry_continues_but_cannot_widen_corridor():
+    controller, samples = _replay_f178_gate1_response()
+    nominal_sample = next(
+        sample for sample in samples if sample["row"][0] == 4.438
+    )
+    nominal = nominal_sample["corridor"]
+    final = samples[-1]["corridor"]
+
+    assert nominal is not None and not nominal.continuity_only
+    assert final is not None and final.live and final.continuity_only
+    assert final.source_age_s == pytest.approx(0.0, abs=1e-9)
+    assert _F178_GATE1_RESPONSE_ROWS[-1][0] - nominal_sample["row"][0] > (
+        controller.config.predict_max_gap_s
+    )
+    assert all(
+        sample["corridor"] is not None
+        and sample["corridor"].half_x
+        <= sample["row"][3][0] * (nominal.half_x / nominal_sample["row"][3][0])
+        + 1e-9
+        and sample["corridor"].half_y
+        <= sample["row"][3][1] * (nominal.half_y / nominal_sample["row"][3][1])
+        + 1e-9
+        for sample in samples
+        if sample["row"][0] >= 4.438
+    )
+    assert not samples[-1]["admission"].admissible
+    assert controller.state is CleanCourseState.TRACK
+
+    source_s = controller.current.corridor_certificate.source_s
+    final_row = _F178_GATE1_RESPONSE_ROWS[-1]
+    repeated = _f163_trace_track(
+        outer_center=final_row[2],
+        outer_span=final_row[3],
+        confidence=final_row[4],
+        aperture_center=(final.center_x, final.center_y),
+        aperture_half=(final.half_x, final.half_y),
+        aperture_confidence=.22,
+        aperture_passage_usable=False,
+    )
+    controller.observe(
+        _update([repeated], frame_id=final_row[1]),
+        now_s=105.250,
+        body_rates=final_row[5],
+    )
+    assert controller.current.corridor_certificate.source_s == source_s
+
+    temporal_only = CleanCourseController(_config())
+    temporal_only.initialize(
+        _update([repeated], frame_id=1),
+        gate_index=1,
+        fallback_center_norm=final_row[2],
+        fallback_apparent_scale=math.sqrt(final_row[3][0] * final_row[3][1]),
+        now_s=100.0,
+    )
+    assert temporal_only.current.corridor_certificate is None
 
 
 def test_f167_f166_gate1_trace_keeps_coherent_lateral_intercept_authority():
