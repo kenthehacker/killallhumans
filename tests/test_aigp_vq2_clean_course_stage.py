@@ -6003,13 +6003,88 @@ def test_f168_newest_f167_launch_replay_has_one_bumpless_vertical_owner():
         sample["wire"] - sample["support"] for sample in samples
     ) >= -0.0073
     recovery = [sample for sample in samples if sample["t"] >= 0.969]
+    # A continuous visual descent request may keep reducing the carried wire;
+    # what must not recur is F174's one-tick boost-carry retirement.  Retain a
+    # bounded ordinary-filter step through the remainder of the launch fade.
     assert max(
         left["wire"] - right["wire"]
         for left, right in zip(recovery, recovery[1:])
-    ) < 0.0002
+    ) < 0.003
     assert _maximum_advance_to_brake_reversal(
         [sample["pitch"] for sample in samples]
     ) < math.radians(0.5)
+
+
+def test_f175_f174_launch_motion_cannot_retire_boost_carry_to_support():
+    # F174 run 20260802T082538Z-visual-course-6f5a6798, trace SHA-256
+    # D265006DB8E5E15E74DF0434B8997AF826144AB578DF6E1BED0DC789CBD0DE41.
+    # At t=.656 the third coherent frame changed direction on an ordinary
+    # centered launch arc.  F174 bypassed its own launch envelope and snapped
+    # wire collective from .2877 to .2594 support.  Replay actual tracker
+    # geometry and attitude/rate observations: direction remains valid, but
+    # boost-owned carry must transfer through the ordinary bounded filter.
+    rows = (
+        # t, frame, outer center/span/conf, aperture center/half, rates, pitch, fh
+        (0.000, 3044714, (-.006250, -.033333), (.125000, .225000), .845676377, (-.000895, -.022420), (.056776, .110479), (-.000095418, .000106570, -.000002976), -.310251554, .005014339),
+        (0.109, 3044717, (-.006250, -.022222), (.125000, .233333), .836790509, (-.003240, -.025815), (.055247, .102652), (-.008168218, -.000578058, -.003395550), -.310457899, 3.151008345),
+        (0.218, 3044720, (-.003125, -.022222), (.126563, .230556), .839874598, (-.001646, -.023156), (.054902, .106157), (-.001423049, -.007441565, -.003323640), -.311348557, 3.609293186),
+        (0.312, 3044723, (-.003125, -.027778), (.126563, .225000), .848565331, (-.001181, -.018533), (.056945, .110200), (.000213635, -.008857684, -.002400312), -.312055513, 3.599411819),
+        (0.375, 3044725, (-.006250, -.027778), (.125000, .227778), .787093389, (-.002271, -.015940), (.059113, .113162), (-.001446349, -.008843887, -.001870421), -.312617428, 3.580297437),
+        (0.406, 3044726, (-.006250, -.022222), (.125000, .230556), .794999202, (-.002683, -.020014), (.065546, .117236), (-.001271248, -.009100482, -.001938039), -.312927006, 3.567638601),
+        (0.437, 3044727, (-.003125, -.016667), (.128125, .227778), .758974641, (-.014928, -.020734), (.052158, .083283), (-.001631996, -.009336737, -.002384082), -.313186321, 3.557010261),
+        (0.468, 3044728, (-.003125, -.016667), (.128125, .230556), .794417551, (-.004218, -.013930), (.062584, .105519), (-.008256657, -.008630282, -.004687532), -.313497325, 3.537708538),
+        (0.500, 3044729, (-.003125, -.005556), (.129687, .238889), .817506708, (-.002543, -.010309), (.065862, .118642), (-.011235090, -.008138084, -.008480559), -.313670325, 3.515222446),
+        (0.547, 3044730, (-.003125, -.005556), (.129687, .233333), .836885823, (-.001928, -.010340), (.068968, .118104), (-.002795335, -.006957645, -.010153882), -.314089421, 3.427582240),
+        (0.578, 3044731, (-.003125, -.005556), (.131250, .233333), .852447620, (-.002292, -.007111), (.070011, .126555), (-.006511534, -.006092777, -.007497830), -.314317450, 3.334723388),
+        (0.609, 3044732, (-.003125, -.005556), (.134375, .236111), .862821143, (.001084, -.002246), (.065657, .121690), (-.008950191, -.005068672, -.005499959), -.314430222, 3.252154630),
+        (0.656, 3044734, (-.003125, .005556), (.134375, .238889), .874128514, (.000838, .006618), (.062836, .108255), (.000350581, -.004071111, -.002888916), -.314670251, 3.093252751),
+    )
+    controller = CleanCourseController(
+        _config(launch_boost_duration_s=LAUNCH_BOOST_DURATION_S)
+    )
+    samples = {}
+    for index, row in enumerate(rows):
+        now = 100.0 + row[0]
+        track = _f163_trace_track(
+            outer_center=row[2],
+            outer_span=row[3],
+            confidence=row[4],
+            aperture_center=row[5],
+            aperture_half=row[6],
+        )
+        update = _update([track], frame_id=row[1])
+        if index == 0:
+            controller.initialize(
+                update,
+                gate_index=0,
+                fallback_center_norm=row[2],
+                fallback_apparent_scale=math.sqrt(row[3][0] * row[3][1]),
+                now_s=now,
+            )
+        else:
+            controller.observe(update, now_s=now, body_rates=row[7])
+        output = _command(
+            controller,
+            now,
+            pitch=row[8],
+            fh=row[9],
+            accel_trust=0.0,
+        )
+        samples[row[0]] = {
+            "wire": output.thrust,
+            "support": controller._last_vertical_support,
+            "target": controller._last_vertical_collective_target,
+            "direction_sign": controller._vertical_direction_sign,
+            "direction_supported": controller._vertical_direction_supported,
+        }
+
+    reversal = samples[0.656]
+    before = samples[0.609]
+    assert reversal["direction_sign"] == 1
+    assert reversal["direction_supported"]
+    assert reversal["target"] <= reversal["support"]
+    assert reversal["wire"] > reversal["support"] + 0.01
+    assert before["wire"] - reversal["wire"] < 0.01
 
 
 def test_f170_failed_f168_topology_jump_cannot_cancel_launch_floor():
@@ -6329,6 +6404,7 @@ def _replay_f170_gate1_latency_rows():
             "direction_streak": controller._vertical_direction_streak,
             "direction_supported": controller._vertical_direction_supported,
             "direction_source": controller._vertical_direction_source,
+            "direction_magnitude": controller._vertical_direction_magnitude,
             "vertical_motion": vertical_motion,
             "vertical_visual": controller._last_vertical_visual_delta,
             "vertical_target": controller._last_vertical_collective_target,
@@ -6370,6 +6446,16 @@ def test_f171_f170_gate1_motion_reverses_collective_before_censorship():
     assert motion.fallback_intercept_error < 0.0
     assert motion.optical_intercept_error > 0.0
     assert motion.control_authority == pytest.approx(0.0)
+    # F175: coherent raw/de-dilated motion establishes the sign, but the
+    # bounded TTC endpoint—not the smallest 0.5 s rate displacement—owns the
+    # anticipatory magnitude.  This is the defect reproduced again by F174 at
+    # t=4.406..5.031 before its bottom-censored miss.
+    assert reversal["direction_magnitude"] == pytest.approx(
+        min(
+            abs(motion.optical_intercept_error),
+            controller.config.vertical_optical_error_max_near_norm,
+        )
+    )
     assert reversal["vertical_visual"] < 0.0
     assert reversal["vertical_target"] < reversal["support"]
     # F174: a confirmed trajectory reversal retires only the stale
@@ -6380,7 +6466,10 @@ def test_f171_f170_gate1_motion_reverses_collective_before_censorship():
 
     filtered_reversal = samples[4.687]
     assert filtered_reversal["wire"] < filtered_reversal["support"]
-    assert filtered_reversal["wire"] > 0.25
+    # The full bounded endpoint now supplies material braking well before the
+    # recorded censor, instead of waiting for the raw center displacement.
+    assert filtered_reversal["wire"] < 0.25
+    assert filtered_reversal["wire"] > controller.config.min_thrust
     # Scheduling/evidence costs 93 ms, but the old bounded carry no longer
     # consumes another 344 ms before crossing support.  This is the same seam
     # isolated live by F173 (360 ms command carry versus ~62 ms scheduling and

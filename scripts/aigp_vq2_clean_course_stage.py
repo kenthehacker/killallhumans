@@ -5365,18 +5365,37 @@ class CleanCourseController:
             return -1, min(abs(fallback), abs(optical))
         return 0, 0.0
 
+    def _launch_descent_transfer_active(self, now_s: float) -> bool:
+        """Whether the minimum launch-energy owner is still handing off."""
+
+        cfg = self.config
+        return bool(
+            self.gate_index == 0
+            and self._course_start_s is not None
+            and cfg.launch_boost_duration_s > 0.0
+            and now_s - self._course_start_s
+            < (
+                cfg.launch_boost_duration_s
+                + cfg.launch_collective_transfer_s
+                + cfg.launch_pitch_blend_s
+            )
+        )
+
     def _motion_led_passage_direction(
         self,
         motion: _PassageMotion,
     ) -> Tuple[int, float]:
-        """Return a conservative sign/magnitude from coherent optical motion.
+        """Return a coherent sign and bounded TTC-endpoint magnitude.
 
         This is deliberately independent of the static compensated bearing.
         Raw image motion, expansion-de-dilated motion, and the TTC endpoint all
-        have to agree while closure is credible.  The resulting magnitude is
-        the smallest distance any of those rates can cover during the existing
-        blackout horizon; covariance may shape feedforward elsewhere but cannot
-        turn this shared sign into its opposite.
+        have to agree while closure is credible.  The rates establish direction;
+        once they do, the TTC endpoint owns bounded miss magnitude.  F174 showed
+        that taking the minimum short-horizon rate displacement waited for the
+        gate center to move before acting even though the endpoint already
+        predicted the bottom-side miss.  Covariance may shape feedforward
+        elsewhere but cannot shrink this independently coherent direction back
+        to a near-zero correction.
         """
 
         cfg = self.config
@@ -5403,18 +5422,13 @@ class CleanCourseController:
             or optical * image_rate <= 0.0
         ):
             return 0, 0.0
-        error_cap = max(
-            cfg.vertical_optical_error_max_far_norm,
-            cfg.vertical_optical_error_max_near_norm,
-        )
+        # This path is specifically near-plane arrival ownership, so retain the
+        # existing near optical-error envelope rather than granting the full
+        # far-field position range to a projected endpoint.
+        error_cap = cfg.vertical_optical_error_max_near_norm
         return (
             1 if optical > 0.0 else -1,
-            min(
-                abs(optical),
-                abs(physical_rate) * horizon_s,
-                abs(image_rate) * horizon_s,
-                error_cap,
-            ),
+            min(abs(optical), error_cap),
         )
 
     def _update_vertical_direction(
@@ -5483,6 +5497,23 @@ class CleanCourseController:
         motion_sign, motion_magnitude = self._motion_led_passage_direction(
             motion
         )
+        if motion_sign != 0 and self._launch_descent_transfer_active(now_s):
+            # The TTC endpoint describes where the current motion will arrive,
+            # but during motor spin-up that motion was deliberately created by
+            # the minimum launch-energy owner.  Let direction participate in
+            # the bumpless descent fade while retaining the former bounded
+            # short-horizon magnitude until that ownership transfer completes.
+            # This prevents an ordinary centered launch arc (F174 t=.656) from
+            # being treated as a fully developed near-plane miss.
+            horizon_s = max(1e-6, cfg.commit_blackout_s)
+            motion_magnitude = min(
+                motion_magnitude,
+                abs(float(motion.physical_rate_norm_s)) * horizon_s,
+                abs(
+                    float(motion.fallback_intercept_error)
+                    - float(motion.bearing_error)
+                ),
+            )
         direction_source = "coherent_motion"
         if sign == 0 and motion_sign != 0:
             # F171, F170 Gate 1: static pitch compensation kept the short
@@ -6070,10 +6101,25 @@ class CleanCourseController:
                     )
                 )
             )
+            launch_transfer_active = self._launch_descent_transfer_active(
+                now_s
+            )
+            edge_owned = self._vertical_direction_source in (
+                "bottom_censor",
+                "top_censor",
+            )
             fast_active = bool(
                 direction_matches
                 and self._vertical_direction_fast_until_s is not None
                 and now_s <= self._vertical_direction_fast_until_s
+                # F174 retired boost-owned carry to support on an ordinary
+                # Gate-0 image-motion reversal at t=.656, bypassing the very
+                # launch envelope that made the handoff bumpless.  Coherent
+                # motion still shapes the target during that transfer, but it
+                # reaches the wire through the ordinary bounded carry.  A
+                # one-sided frame edge remains an immediate visibility fact
+                # and is never delayed by launch ownership.
+                and (not launch_transfer_active or edge_owned)
             )
             if (
                 fast_active
